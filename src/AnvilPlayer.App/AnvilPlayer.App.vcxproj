@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{9429F246-C478-44D9-BE79-65F45B7C3E3C}</ProjectGuid>
+    <Keyword>Win32Proj</Keyword>
+    <RootNamespace>AnvilPlayerApp</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(SolutionDir)src\PlaybackCore\include;$(SolutionDir)third_party\ffmpeg\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <AdditionalLibraryDirectories>$(SolutionDir)third_party\ffmpeg\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>avformat.lib;avcodec.lib;avutil.lib;swscale.lib;swresample.lib;comdlg32.lib;d3d11.lib;d3dcompiler.lib;dxgi.lib;dxguid.lib;dwmapi.lib;gdiplus.lib;shell32.lib;shlwapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+    <Manifest>
+      <AdditionalManifestFiles>app.manifest;%(AdditionalManifestFiles)</AdditionalManifestFiles>
+    </Manifest>
+    <PostBuildEvent>
+      <Command>xcopy "$(ProjectDir)assets\icons\*.png" "$(OutDir)assets\icons\" /Y /I /D
+xcopy "$(ProjectDir)assets\app.ico" "$(OutDir)assets\" /Y /I /D
+xcopy "$(SolutionDir)third_party\ffmpeg\bin\*.dll" "$(OutDir)" /Y /I /D</Command>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="src\d3d11_video_renderer.cpp" />
+    <ClCompile Include="src\embedded_ffplay.cpp" />
+    <ClCompile Include="src\external_video_decoder.cpp" />
+    <ClCompile Include="src\ffmpeg_video_decoder.cpp">
+      <Optimization Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">MaxSpeed</Optimization>
+      <InlineFunctionExpansion Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">AnySuitable</InlineFunctionExpansion>
+      <BasicRuntimeChecks Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Default</BasicRuntimeChecks>
+    </ClCompile>
+    <ClCompile Include="src\icon_painter.cpp" />
+    <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="src\main_window.cpp" />
+    <ClCompile Include="src\main_window_input.cpp" />
+    <ClCompile Include="src\main_window_layout.cpp" />
+    <ClCompile Include="src\main_window_paint.cpp" />
+    <ClCompile Include="src\string_util.cpp" />
+    <ClCompile Include="src\ui_draw.cpp" />
+    <ClCompile Include="src\wasapi_audio_player.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="include\AnvilPlayer\App\app_messages.h" />
+    <ClInclude Include="include\AnvilPlayer\App\d3d11_video_renderer.h" />
+    <ClInclude Include="include\AnvilPlayer\App\embedded_ffplay.h" />
+    <ClInclude Include="include\AnvilPlayer\App\external_video_decoder.h" />
+    <ClInclude Include="include\AnvilPlayer\App\ffmpeg_video_decoder.h" />
+    <ClInclude Include="include\AnvilPlayer\App\icon_painter.h" />
+    <ClInclude Include="include\AnvilPlayer\App\log_sink_ptr.h" />
+    <ClInclude Include="include\AnvilPlayer\App\main_window.h" />
+    <ClInclude Include="include\AnvilPlayer\App\string_util.h" />
+    <ClInclude Include="include\AnvilPlayer\App\ui_draw.h" />
+    <ClInclude Include="include\AnvilPlayer\App\ui_types.h" />
+    <ClInclude Include="include\AnvilPlayer\App\wasapi_audio_player.h" />
+    <ClInclude Include="src\resource.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="app.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\PlaybackCore\PlaybackCore.vcxproj">
+      <Project>{3D6A5899-B779-441C-AADE-7B786E5DEEA3}</Project>
+    </ProjectReference>
+  </ItemGroup>
+  <ItemGroup>
+    <Manifest Include="app.manifest" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

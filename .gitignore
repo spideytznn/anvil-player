@@ -1,0 +1,22 @@
+.vs/
+bin/
+obj/
+*.user
+*.suo
+*.aps
+*.VC.db
+*.VC.VC.opendb
+*.ipch
+x64/
+Debug/
+Release/
+
+# FFmpeg shared build is fetched into third_party/ffmpeg on demand
+# (see third_party/ffmpeg/README.md). Keep the README, ignore binaries.
+third_party/ffmpeg/bin/
+third_party/ffmpeg/doc/
+third_party/ffmpeg/presets/
+third_party/ffmpeg/include/
+third_party/ffmpeg/lib/
+third_party/ffmpeg/*.txt
+third_party/ffmpeg-shared.zip

@@ -1,0 +1,39 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PlaybackCore", "src\PlaybackCore\PlaybackCore.vcxproj", "{3D6A5899-B779-441C-AADE-7B786E5DEEA3}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "AnvilPlayer.App", "src\AnvilPlayer.App\AnvilPlayer.App.vcxproj", "{9429F246-C478-44D9-BE79-65F45B7C3E3C}"
+	ProjectSection(ProjectDependencies) = postProject
+		{3D6A5899-B779-441C-AADE-7B786E5DEEA3} = {3D6A5899-B779-441C-AADE-7B786E5DEEA3}
+	EndProjectSection
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PlaybackCore.Tests", "src\PlaybackCore.Tests\PlaybackCore.Tests.vcxproj", "{347D2898-F750-4505-90F1-0440C52BACD4}"
+	ProjectSection(ProjectDependencies) = postProject
+		{3D6A5899-B779-441C-AADE-7B786E5DEEA3} = {3D6A5899-B779-441C-AADE-7B786E5DEEA3}
+	EndProjectSection
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{3D6A5899-B779-441C-AADE-7B786E5DEEA3}.Debug|x64.ActiveCfg = Debug|x64
+		{3D6A5899-B779-441C-AADE-7B786E5DEEA3}.Debug|x64.Build.0 = Debug|x64
+		{3D6A5899-B779-441C-AADE-7B786E5DEEA3}.Release|x64.ActiveCfg = Release|x64
+		{3D6A5899-B779-441C-AADE-7B786E5DEEA3}.Release|x64.Build.0 = Release|x64
+		{9429F246-C478-44D9-BE79-65F45B7C3E3C}.Debug|x64.ActiveCfg = Debug|x64
+		{9429F246-C478-44D9-BE79-65F45B7C3E3C}.Debug|x64.Build.0 = Debug|x64
+		{9429F246-C478-44D9-BE79-65F45B7C3E3C}.Release|x64.ActiveCfg = Release|x64
+		{9429F246-C478-44D9-BE79-65F45B7C3E3C}.Release|x64.Build.0 = Release|x64
+		{347D2898-F750-4505-90F1-0440C52BACD4}.Debug|x64.ActiveCfg = Debug|x64
+		{347D2898-F750-4505-90F1-0440C52BACD4}.Debug|x64.Build.0 = Debug|x64
+		{347D2898-F750-4505-90F1-0440C52BACD4}.Release|x64.ActiveCfg = Release|x64
+		{347D2898-F750-4505-90F1-0440C52BACD4}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal
