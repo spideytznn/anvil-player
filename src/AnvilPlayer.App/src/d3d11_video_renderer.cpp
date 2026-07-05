@@ -84,12 +84,13 @@ struct DoviShaderConstants {
     float yccToRgb[3][4] = {};       // each row: r,g,b + pad
     float yccOffset[4] = {};
     float rgbToLms[3][4] = {};       // each row: r,g,b + pad (CMv4.0, reserved)
+    float curveMeta[4] = {};         // xyz = num_pivots per component
 
     // Scalars.
     int profile = 0;
     int compatibilityId = 0;
     int enabled = 0;                 // 1 when DV reshaping should be applied
-    float _pad0 = 0.0f;
+    float sampleScale = 1.0f;         // P010 R16_UNORM -> BL-normalized code range
 };
 
 static_assert(sizeof(DoviShaderConstants) % 16 == 0, "DoviShaderConstants must be 16-byte aligned");
@@ -196,6 +197,30 @@ float SourcePeakNits(const VideoColorMetadata& color, const anvil::playback::Vid
         return static_cast<float>(color.masteringDisplay.maxLuminanceNits);
     }
     return static_cast<float>(std::max(100, settings.peakBrightnessNits));
+}
+
+VideoColorMetadata NormalizeDolbyVisionOutput(VideoColorMetadata color, const bool hasDolbyVision) {
+    if (!hasDolbyVision) {
+        return color;
+    }
+
+    // Matches libplacebo/FFmpeg apply_dolbyvision: reshaped DV is BT.2020 PQ,
+    // independent of the often-unknown Profile 5 container color tags.
+    color.primaries = VideoColorPrimaries::Bt2020;
+    color.transfer = VideoTransferCharacteristic::Pq;
+    color.matrix = VideoMatrixCoefficients::Rgb;
+    color.range = VideoColorRange::Full;
+    return color;
+}
+
+float DoviTextureSampleScale(const int bitDepth) {
+    const int depth = std::clamp(bitDepth, 8, 16);
+    const uint64_t codeMax = (uint64_t{1} << depth) - 1;
+    const int bitShift = 16 - depth;
+    const uint64_t shiftedMax = codeMax << bitShift;
+    return shiftedMax > 0
+               ? static_cast<float>(65535.0 / static_cast<double>(shiftedMax))
+               : 1.0f;
 }
 
 bool WantsHdrOutput(const VideoColorMetadata& color,
@@ -711,13 +736,10 @@ bool D3D11VideoRenderer::CreatePipeline() {
         "                dot(float3(0.0691, 0.9195, 0.0114), c),\n"
         "                dot(float3(0.0164, 0.0880, 0.8956), c));\n"
         "}\n"
-        "float3 aces_film(float3 x) {\n"
-        "  const float a = 2.51;\n"
-        "  const float b = 0.03;\n"
-        "  const float c = 2.43;\n"
-        "  const float d = 0.59;\n"
-        "  const float e = 0.14;\n"
-        "  return saturate((x * (a * x + b)) / (x * (c * x + d) + e));\n"
+        "float3 dovi_lms_to_bt2020(float3 lms) {\n"
+        "  return float3(dot(float3(3.0644188, -2.1659768, 0.1015582), lms),\n"
+        "                dot(float3(-0.6561211, 1.7855412, -0.1294375), lms),\n"
+        "                dot(float3(0.0173632, -0.0472515, 1.0300425), lms));\n"
         "}\n"
         "float3 encoded_to_nits(float3 rgb) {\n"
         "  if (transferType == 2) return pq_to_nits(rgb);\n"
@@ -728,7 +750,13 @@ bool D3D11VideoRenderer::CreatePipeline() {
         "  float exposure = 1.0;\n"
         "  if (toneMapMode == 2) exposure = 100.0 / 140.0;\n"
         "  else if (toneMapMode == 3) exposure = 100.0 / 75.0;\n"
-        "  float3 mapped = aces_film(max(nits, 0.0) * exposure / 100.0);\n"
+        "  float3 working = max(nits, 0.0) * exposure;\n"
+        "  // Compress luma and scale RGB together to preserve hue in SDR.\n"
+        "  float luma = max(dot(working, float3(0.2126, 0.7152, 0.0722)), 0.0);\n"
+        "  float target = max(targetPeakNits, 1.0);\n"
+        "  float mappedLuma = luma / (1.0 + luma / target);\n"
+        "  float scale = mappedLuma / max(luma, 0.0001);\n"
+        "  float3 mapped = working * scale / target;\n"
         "  return pow(saturate(mapped), 1.0 / 2.2);\n"
         "}\n"
         // ---- Dolby Vision reshaping (register b1) ----
@@ -741,17 +769,31 @@ bool D3D11VideoRenderer::CreatePipeline() {
         "  float4 yccToRgb[3];\n"
         "  float4 yccOffset;\n"
         "  float4 rgbToLms[3];\n"
+        "  float4 curveMeta;\n"
         "  int doviProfile;\n"
         "  int doviCompatId;\n"
         "  int doviEnabled;\n"
-        "  float _doviPad0;\n"
+        "  float doviSampleScale;\n"
         "};\n"
+        "float3 dovi_ycc_to_rgb(float3 ycc) {\n"
+        "  return float3(dot(yccToRgb[0].xyz, ycc),\n"
+        "                dot(yccToRgb[1].xyz, ycc),\n"
+        "                dot(yccToRgb[2].xyz, ycc));\n"
+        "}\n"
+        "float3 dovi_rgb_to_lms(float3 rgb) {\n"
+        "  return float3(dot(rgbToLms[0].xyz, rgb),\n"
+        "                dot(rgbToLms[1].xyz, rgb),\n"
+        "                dot(rgbToLms[2].xyz, rgb));\n"
+        "}\n"
         // Read pivot i for component c. Returns 1.0 for out-of-range indices.
         "float dovi_pivot(int c, int i) {\n"
         "  if (i >= 9) return 1.0;\n"
         "  int slot = i / 3;\n"
         "  int comp = i % 3;\n"
         "  return pivots[c][slot][comp];\n"
+        "}\n"
+        "int dovi_num_pivots(int c) {\n"
+        "  return clamp((int)(curveMeta[c] + 0.5), 2, 9);\n"
         "}\n"
         // Read mapping method for piece s of component c. Returns -1 if none.
         "int dovi_method(int c, int s) {\n"
@@ -786,21 +828,28 @@ bool D3D11VideoRenderer::CreatePipeline() {
         "    m[f*4+2] = mmrCoef[c][s][f].z;\n"
         "    m[f*4+3] = mmrCoef[c][s][f].w;\n"
         "  }\n"
+        "  int order = clamp((int)(polyCoef[c][s].w + 0.5), 1, 3);\n"
+        "  float4 sigX = float4(rgb.x * rgb.y, rgb.x * rgb.z, rgb.y * rgb.z, rgb.x * rgb.y * rgb.z);\n"
         "  float result = m[0];\n"
-        "  int idx = 1;\n"
-        "  for (int t = 0; t < 3; ++t) {\n"
-        "    float term = 0.0;\n"
-        "    for (int ch = 0; ch < 3; ++ch) {\n"
-        "      float cv = rgb[ch];\n"
-        "      term += m[idx] * cv + m[idx+1] * cv * cv + m[idx+2] * cv * cv * cv;\n"
-        "      idx += 3;\n"
+        "  result += dot(float3(m[1], m[2], m[3]), rgb);\n"
+        "  result += dot(float4(m[4], m[5], m[6], m[7]), sigX);\n"
+        "  if (order >= 2) {\n"
+        "    float3 rgb2 = rgb * rgb;\n"
+        "    float4 sigX2 = sigX * sigX;\n"
+        "    result += dot(float3(m[8], m[9], m[10]), rgb2);\n"
+        "    result += dot(float4(m[11], m[12], m[13], m[14]), sigX2);\n"
+        "    if (order >= 3) {\n"
+        "      result += dot(float3(m[15], m[16], m[17]), rgb2 * rgb);\n"
+        "      result += dot(float4(m[18], m[19], m[20], m[21]), sigX2 * sigX);\n"
         "    }\n"
-        "    result += term;\n"
         "  }\n"
         "  return result;\n"
         "}\n"
-        // Apply full DV reshaping to a (I, Ct, Cp) triplet in the signaled
-        // (PQ-domain) sample space. Returns reshaped BT.2020 PQ RGB.
+        // Apply the RPU reshaping curve to a (I, Ct, Cp) triplet in the
+        // signaled PQ-domain sample space. The result is still PQ encoded and
+        // still in Dolby's intermediate RGB/LMS-oriented representation; it
+        // must be PQ-linearized and run through rgbToLms + LMS->BT.2020 before
+        // presentation.
         // Order (per libplacebo pl_shader_dovi_reshape + pl_color_repr_decode):
         //   1. piece-wise reshape per component (poly or MMR), input is the
         //      raw signaled value; pivots are in the same signaled domain.
@@ -810,18 +859,26 @@ bool D3D11VideoRenderer::CreatePipeline() {
         "float3 dovi_reshape(float3 ipt) {\n"
         "  float3 outRgb = ipt;\n"
         "  for (int c = 0; c < 3; ++c) {\n"
+        "    int numPivots = dovi_num_pivots(c);\n"
         "    float v = ipt[c];\n"
-        "    int s = dovi_find_piece(c, v, 9);\n"
+        "    int s = dovi_find_piece(c, v, numPivots);\n"
         "    int method = dovi_method(c, s);\n"
         "    if (method == 0) {\n"
         "      outRgb[c] = dovi_reshape_poly(c, s, v);\n"
         "    } else if (method == 1) {\n"
         "      outRgb[c] = dovi_reshape_mmr(c, s, ipt);\n"
         "    }\n"
+        "    outRgb[c] = clamp(outRgb[c], dovi_pivot(c, 0), dovi_pivot(c, numPivots - 1));\n"
         "  }\n"
         "  float3 shifted = outRgb - yccOffset.xyz;\n"
-        "  float3 rgb = mul(float3x3(yccToRgb[0].xyz, yccToRgb[1].xyz, yccToRgb[2].xyz), shifted);\n"
-        "  return rgb;\n"
+        "  float3 pqRgb = dovi_ycc_to_rgb(shifted);\n"
+        "  return pqRgb;\n"
+        "}\n"
+        "float3 dovi_to_bt2020_nits(float3 ipt) {\n"
+        "  float3 pqRgb = dovi_reshape(ipt);\n"
+        "  float3 linearRgb = pq_to_nits(pqRgb) / 10000.0;\n"
+        "  float3 lms = dovi_rgb_to_lms(linearRgb);\n"
+        "  return dovi_lms_to_bt2020(lms) * 10000.0;\n"
         "}\n"
         "float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_Target {\n"
         "  float y = texY.Sample(samp, uv);\n"
@@ -830,13 +887,12 @@ bool D3D11VideoRenderer::CreatePipeline() {
         "  // YCbCr). Apply per-frame RPU reshaping to recover BT.2020 PQ RGB,\n"
         "  // then output as HDR10 PQ or tone-map to SDR.\n"
         "  if (doviEnabled) {\n"
-        "    float3 ipt = float3(y, cbcr.x, cbcr.y);\n"
-        "    float3 rgb = dovi_reshape(ipt);\n"
+        "    float3 ipt = saturate(float3(y, cbcr.x, cbcr.y) * doviSampleScale);\n"
+        "    float3 bt2020Nits = dovi_to_bt2020_nits(ipt);\n"
         "    if (outputMode == 1) {\n"
-        "      return float4(saturate(rgb), 1.0);\n"
+        "      return float4(saturate(nits_to_pq(max(bt2020Nits, 0.0))), 1.0);\n"
         "    }\n"
-        "    float3 nits = pq_to_nits(rgb);\n"
-        "    return float4(tone_map_to_sdr(nits), 1.0);\n"
+        "    return float4(tone_map_to_sdr(bt2020_to_bt709(bt2020Nits)), 1.0);\n"
         "  }\n"
         "  float3 rgb = ycbcr_to_rgb(y, cbcr);\n"
         "  if (outputMode == 1) {\n"
@@ -925,7 +981,9 @@ bool D3D11VideoRenderer::UpdateColorPipeline(const NativeVideoFrame& frame) {
         return false;
     }
 
-    const VideoColorMetadata color = MergeColorMetadata(frame.color, mediaColor_);
+    const VideoColorMetadata color = NormalizeDolbyVisionOutput(
+        MergeColorMetadata(frame.color, mediaColor_),
+        frame.dovi && frame.dovi->valid);
     bool hdrOutput = WantsHdrOutput(color, videoSettings_, displayCapabilities_);
     DXGI_COLOR_SPACE_TYPE colorSpace = hdrOutput
                                            ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
@@ -1014,6 +1072,7 @@ void D3D11VideoRenderer::UpdateDoviConstants(const NativeVideoFrame& frame) {
     for (int c = 0; c < 3; ++c) {
         const auto& curve = dovi.curves[c];
         const int numPivots = std::min(curve.numPivots, static_cast<int>(kDoviMaxPivots));
+        dc.curveMeta[c] = static_cast<float>(std::max(2, numPivots));
         // Pivots: pack 9 values into 3 float4s (3 per float4, padding the 4th).
         for (int p = 0; p < 9; ++p) {
             const int slot = p / 3;
@@ -1050,6 +1109,7 @@ void D3D11VideoRenderer::UpdateDoviConstants(const NativeVideoFrame& frame) {
         for (int s = 0; s < kDoviMaxPieces; ++s) {
             if (s < numPieces && curve.pieces[s].method == DoviMappingMethod::Mmr) {
                 const auto& piece = curve.pieces[s];
+                dc.polyCoef[c][s][3] = static_cast<float>(std::clamp(piece.mmrOrder, 1, kDoviMmrMaxTerms));
                 float flat[24] = {};
                 flat[0] = piece.mmrConstant;
                 int idx = 1;
@@ -1085,6 +1145,7 @@ void D3D11VideoRenderer::UpdateDoviConstants(const NativeVideoFrame& frame) {
     dc.profile = dovi.profile;
     dc.compatibilityId = dovi.compatibilityId;
     dc.enabled = 1;
+    dc.sampleScale = DoviTextureSampleScale(dovi.blBitDepth);
 
     context_->UpdateSubresource(doviConstants_.Get(), 0, nullptr, &dc, 0, 0);
     doviEnabledLastFrame_ = true;

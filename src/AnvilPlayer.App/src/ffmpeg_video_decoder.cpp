@@ -9,6 +9,8 @@ extern "C" {
 #include <libavutil/pixdesc.h>
 }
 
+#include <emmintrin.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -64,6 +66,47 @@ uint16_t Yuv420P10SampleToP010(const uint8_t* value) {
     // 16-bit little-endian word. DXGI P010 expects those bits in the high
     // 10 bits, so shift before uploading to the P010 texture.
     return static_cast<uint16_t>((ReadLe16(value) & 0x03FFu) << 6);
+}
+
+void ConvertYuv420P10RowToP010(uint8_t* destination, const uint8_t* source, const int samples) {
+    const __m128i mask10 = _mm_set1_epi16(static_cast<short>(0x03FF));
+    int x = 0;
+    for (; x + 8 <= samples; x += 8) {
+        const __m128i src = _mm_loadu_si128(reinterpret_cast<const __m128i*>(source + static_cast<std::size_t>(x) * 2));
+        const __m128i out = _mm_slli_epi16(_mm_and_si128(src, mask10), 6);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(destination + static_cast<std::size_t>(x) * 2), out);
+    }
+    for (; x < samples; ++x) {
+        WriteLe16(destination + static_cast<std::size_t>(x) * 2,
+                  Yuv420P10SampleToP010(source + static_cast<std::size_t>(x) * 2));
+    }
+}
+
+void InterleaveYuv420P10RowToP010Uv(uint8_t* destination,
+                                    const uint8_t* sourceU,
+                                    const uint8_t* sourceV,
+                                    const int chromaSamples) {
+    const __m128i mask10 = _mm_set1_epi16(static_cast<short>(0x03FF));
+    int x = 0;
+    for (; x + 8 <= chromaSamples; x += 8) {
+        const __m128i u = _mm_slli_epi16(
+            _mm_and_si128(_mm_loadu_si128(reinterpret_cast<const __m128i*>(sourceU + static_cast<std::size_t>(x) * 2)), mask10),
+            6);
+        const __m128i v = _mm_slli_epi16(
+            _mm_and_si128(_mm_loadu_si128(reinterpret_cast<const __m128i*>(sourceV + static_cast<std::size_t>(x) * 2)), mask10),
+            6);
+        const __m128i lo = _mm_unpacklo_epi16(u, v);
+        const __m128i hi = _mm_unpackhi_epi16(u, v);
+        uint8_t* dst = destination + static_cast<std::size_t>(x) * 4;
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst), lo);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 16), hi);
+    }
+    for (; x < chromaSamples; ++x) {
+        WriteLe16(destination + static_cast<std::size_t>(x) * 4,
+                  Yuv420P10SampleToP010(sourceU + static_cast<std::size_t>(x) * 2));
+        WriteLe16(destination + static_cast<std::size_t>(x) * 4 + 2,
+                  Yuv420P10SampleToP010(sourceV + static_cast<std::size_t>(x) * 2));
+    }
 }
 
 VideoColorPrimaries MapColorPrimaries(const AVColorPrimaries value) {
@@ -1415,10 +1458,7 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
         for (int row = 0; row < srcH; ++row) {
             const uint8_t* srcRow = srcY + static_cast<std::size_t>(row) * srcYStride;
             uint8_t* dstRow = buffer->data() + static_cast<std::size_t>(row) * yStride;
-            for (int x = 0; x < srcW; ++x) {
-                WriteLe16(dstRow + static_cast<std::size_t>(x) * 2,
-                          Yuv420P10SampleToP010(srcRow + static_cast<std::size_t>(x) * 2));
-            }
+            ConvertYuv420P10RowToP010(dstRow, srcRow, srcW);
         }
         // Interleave U and V planes into a single UV plane (P010 layout).
         const uint8_t* srcU = frame->data[1];
@@ -1430,12 +1470,7 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
             const uint8_t* uRow = srcU + static_cast<std::size_t>(row) * srcUStride;
             const uint8_t* vRow = srcV + static_cast<std::size_t>(row) * srcVStride;
             uint8_t* dstRow = uvDst + static_cast<std::size_t>(row) * uvStride;
-            for (int x = 0; x < srcW / 2; ++x) {
-                WriteLe16(dstRow + static_cast<std::size_t>(x) * 4,
-                          Yuv420P10SampleToP010(uRow + static_cast<std::size_t>(x) * 2));
-                WriteLe16(dstRow + static_cast<std::size_t>(x) * 4 + 2,
-                          Yuv420P10SampleToP010(vRow + static_cast<std::size_t>(x) * 2));
-            }
+            InterleaveYuv420P10RowToP010Uv(dstRow, uRow, vRow, srcW / 2);
         }
         if (!dolbyVisionFirstPackedLogged_) {
             dolbyVisionFirstPackedLogged_ = true;
@@ -1866,8 +1901,9 @@ std::shared_ptr<const DolbyVisionFrameMetadata> FfmpegVideoDecoder::ExtractDolby
         ? 1.0 / static_cast<double>(1ULL << out->coefLog2Denom)
         : 1.0;
 
-    // Pivot normalization range: [0, 2^bl_bit_depth).
-    const double pivotMax = static_cast<double>(1ULL << std::min(out->blBitDepth, 16));
+    // Pivot normalization range matches libplacebo: [0, 2^bl_bit_depth - 1].
+    const int pivotDepth = std::clamp(out->blBitDepth, 1, 16);
+    const double pivotMax = static_cast<double>((1ULL << pivotDepth) - 1);
 
     // Per-component piece-wise reshaping curves.
     for (int c = 0; c < kDoviNumComponents; ++c) {
