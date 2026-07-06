@@ -39,6 +39,35 @@ std::wstring SubtitleSelectionText(const int selectedTrackIndex) {
     return L"Stream " + std::to_wstring(selectedTrackIndex);
 }
 
+std::wstring VideoSelectionText(const int selectedTrackIndex) {
+    if (selectedTrackIndex == anvil::playback::kVideoTrackAuto) {
+        return L"Auto";
+    }
+    if (selectedTrackIndex == anvil::playback::kVideoTrackDolbyVisionEnhancement) {
+        return L"DV EL";
+    }
+    return L"Stream " + std::to_wstring(selectedTrackIndex);
+}
+
+constexpr double kHdrToneCurveMaxNits = 10000.0;
+
+double ToneCurveNitsToUnit(const double nits) {
+    const double clamped = std::clamp(nits, 0.0, kHdrToneCurveMaxNits);
+    return std::log10(clamped + 1.0) / std::log10(kHdrToneCurveMaxNits + 1.0);
+}
+
+int ToneCurveX(const RECT& plot, const double nits) {
+    return plot.left + static_cast<int>(std::round(ToneCurveNitsToUnit(nits) * RectWidth(plot)));
+}
+
+int ToneCurveY(const RECT& plot, const double nits) {
+    return plot.bottom - static_cast<int>(std::round(ToneCurveNitsToUnit(nits) * RectHeight(plot)));
+}
+
+std::wstring NitsLabel(const double nits) {
+    return std::to_wstring(static_cast<int>(std::round(nits))) + L" nits";
+}
+
 }  // namespace
 
 void MainWindow::Paint() {
@@ -795,10 +824,16 @@ void MainWindow::DrawLogContent(HDC hdc, RECT cursor) const {
 void MainWindow::DrawSettingsContent(HDC hdc, const PlayerSettings& settings, RECT cursor) const {
     DrawSectionHeader(hdc, L"Video", cursor);
     DrawField(hdc, L"Decode", ToDisplayString(settings.video.hardwareDecode), cursor);
+    DrawField(hdc, L"Track", VideoSelectionText(settings.video.selectedTrackIndex), cursor);
     DrawField(hdc, L"Renderer", settings.video.renderer, cursor);
     DrawField(hdc, L"HDR", ToDisplayString(settings.video.hdrOutput), cursor);
     DrawField(hdc, L"Tone map", ToDisplayString(settings.video.toneMapping), cursor);
     DrawField(hdc, L"Dolby Vision", ToDisplayString(settings.video.dolbyVision), cursor);
+    DrawField(hdc, L"DV HDR", settings.video.dolbyVisionHdrOutput ? L"On" : L"Off", cursor);
+    if (settings.video.dolbyVisionHdrOutput) {
+        cursor.top += Scale(8);
+        DrawHdrToneCurveEditor(hdc, settings, cursor);
+    }
 
     cursor.top += Scale(8);
     DrawSectionHeader(hdc, L"Audio", cursor);
@@ -814,6 +849,122 @@ void MainWindow::DrawSettingsContent(HDC hdc, const PlayerSettings& settings, RE
     scale << static_cast<int>(settings.subtitles.fontScale * 100.0) << L"%";
     DrawField(hdc, L"Font", scale.str(), cursor);
     DrawField(hdc, L"External", settings.subtitles.externalSubtitleAutoLoad ? L"On" : L"Off", cursor);
+}
+
+void MainWindow::DrawHdrToneCurveEditor(HDC hdc, const PlayerSettings& settings, RECT& cursor) const {
+    const int editorHeight = Scale(156);
+    if (cursor.top + editorHeight > cursor.bottom ||
+        RectWidth(hdrToneCurvePlot_) <= 0 ||
+        RectHeight(hdrToneCurvePlot_) <= 0) {
+        return;
+    }
+
+    const RECT editor = MakeRect(cursor.left, cursor.top, cursor.right, cursor.top + editorHeight);
+    FillRoundRect(hdc, editor, RGB(11, 13, 17), Scale(7));
+    StrokeRoundRect(hdc, editor, palette_.border, Scale(7));
+
+    HFONT titleFont = CreateUiFont(Scale(11), FW_SEMIBOLD);
+    HFONT valueFont = CreateMonoFont(Scale(10), FW_SEMIBOLD);
+    HFONT axisFont = CreateUiFont(Scale(9), FW_NORMAL);
+
+    RECT title = MakeRect(editor.left + Scale(10), editor.top + Scale(8), editor.right - Scale(90), editor.top + Scale(28));
+    DrawTextInRect(hdc, L"HDR Tone Curve", title, titleFont, palette_.text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    RECT peak = MakeRect(editor.right - Scale(178), editor.top + Scale(8), editor.right - Scale(76), editor.top + Scale(28));
+    DrawTextInRect(hdc,
+                   NitsLabel(settings.video.hdrToneCurve.back().outputNits),
+                   peak,
+                   valueFont,
+                   palette_.muted,
+                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    const RECT plot = hdrToneCurvePlot_;
+    FillRoundRect(hdc, plot, RGB(6, 8, 11), Scale(5));
+    StrokeRoundRect(hdc, plot, BlendColor(palette_.border, palette_.text, 0.05), Scale(5));
+
+    const double gridNits[] = {100.0, 1000.0, 10000.0};
+    for (const double nits : gridNits) {
+        const int x = ToneCurveX(plot, nits);
+        const int y = ToneCurveY(plot, nits);
+        DrawLine(hdc, x, plot.top, x, plot.bottom, BlendColor(palette_.border, palette_.background, 0.35));
+        DrawLine(hdc, plot.left, y, plot.right, y, BlendColor(palette_.border, palette_.background, 0.35));
+
+        RECT xLabel = MakeRect(x - Scale(20), plot.bottom + Scale(3), x + Scale(20), plot.bottom + Scale(18));
+        DrawTextInRect(hdc,
+                       nits >= 1000.0 ? std::to_wstring(static_cast<int>(nits / 1000.0)) + L"k" : std::to_wstring(static_cast<int>(nits)),
+                       xLabel,
+                       axisFont,
+                       palette_.dim,
+                       DT_CENTER | DT_TOP | DT_SINGLELINE);
+        RECT yLabel = MakeRect(editor.left + Scale(8), y - Scale(7), plot.left - Scale(6), y + Scale(8));
+        DrawTextInRect(hdc,
+                       nits >= 1000.0 ? std::to_wstring(static_cast<int>(nits / 1000.0)) + L"k" : std::to_wstring(static_cast<int>(nits)),
+                       yLabel,
+                       axisFont,
+                       palette_.dim,
+                       DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    HPEN referencePen = CreatePen(PS_SOLID, Scale(1), BlendColor(palette_.info, palette_.muted, 0.35));
+    HGDIOBJ oldPen = SelectObject(hdc, referencePen);
+    bool first = true;
+    for (const auto& curvePoint : anvil::playback::kDefaultHdrToneCurve) {
+        const int x = ToneCurveX(plot, curvePoint.inputNits);
+        const int y = ToneCurveY(plot, curvePoint.outputNits);
+        if (first) {
+            MoveToEx(hdc, x, y, nullptr);
+            first = false;
+        } else {
+            LineTo(hdc, x, y);
+        }
+    }
+    SelectObject(hdc, oldPen);
+    DeleteObject(referencePen);
+
+    HPEN curvePen = CreatePen(PS_SOLID, Scale(2), palette_.accent);
+    oldPen = SelectObject(hdc, curvePen);
+    first = true;
+    for (std::size_t index = 0; index < settings.video.hdrToneCurve.size(); ++index) {
+        const double inputNits = index < anvil::playback::kDefaultHdrToneCurve.size()
+                                     ? anvil::playback::kDefaultHdrToneCurve[index].inputNits
+                                     : settings.video.hdrToneCurve[index].inputNits;
+        const auto& curvePoint = settings.video.hdrToneCurve[index];
+        const int x = ToneCurveX(plot, inputNits);
+        const int y = ToneCurveY(plot, curvePoint.outputNits);
+        if (first) {
+            MoveToEx(hdc, x, y, nullptr);
+            first = false;
+        } else {
+            LineTo(hdc, x, y);
+        }
+    }
+    SelectObject(hdc, oldPen);
+    DeleteObject(curvePen);
+
+    for (std::size_t index = 0; index < settings.video.hdrToneCurve.size(); ++index) {
+        const auto& curvePoint = settings.video.hdrToneCurve[index];
+        const double inputNits = index < anvil::playback::kDefaultHdrToneCurve.size()
+                                     ? anvil::playback::kDefaultHdrToneCurve[index].inputNits
+                                     : curvePoint.inputNits;
+        const int x = ToneCurveX(plot, inputNits);
+        const int y = ToneCurveY(plot, curvePoint.outputNits);
+        const bool selected = draggingHdrToneCurve_ && draggedHdrToneCurvePoint_ == static_cast<int>(index);
+        const int radius = selected ? Scale(5) : Scale(4);
+        const COLORREF fill = index == 0 ? palette_.dim : (selected ? palette_.text : palette_.accent);
+        HBRUSH brush = CreateSolidBrush(fill);
+        HGDIOBJ oldBrush = SelectObject(hdc, brush);
+        HPEN pen = CreatePen(PS_SOLID, Scale(1), BlendColor(fill, RGB(0, 0, 0), 0.22));
+        oldPen = SelectObject(hdc, pen);
+        Ellipse(hdc, x - radius, y - radius, x + radius + 1, y + radius + 1);
+        SelectObject(hdc, oldPen);
+        SelectObject(hdc, oldBrush);
+        DeleteObject(pen);
+        DeleteObject(brush);
+    }
+
+    DeleteObject(titleFont);
+    DeleteObject(valueFont);
+    DeleteObject(axisFont);
+    cursor.top = editor.bottom + Scale(12);
 }
 
 }  // namespace anvil::app

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <string>
 
 namespace anvil::app {
 
@@ -43,6 +44,20 @@ void MainWindow::UpdateLayout() {
     };
 
     buttons_.clear();
+    hdrToneCurvePlot_ = RECT{};
+    const std::wstring dolbyVisionHdrTooltip = settings.video.dolbyVisionHdrOutput
+                                                   ? L"Disable Dolby Vision HDR output"
+                                                   : L"Enable Dolby Vision HDR output";
+    const auto addDolbyVisionHdrButton = [&](const int left, const int top) {
+        buttons_.push_back(UiButton{Command::ToggleDolbyVisionHdr,
+                                    MakeRect(left, top, left + transportButtonSize, top + transportButtonSize),
+                                    L"HDR",
+                                    dolbyVisionHdrTooltip,
+                                    IconKind::None,
+                                    ButtonKind::Icon,
+                                    false,
+                                    settings.video.dolbyVisionHdrOutput});
+    };
 
     if (fullscreen_) {
         topBar_ = RECT{};
@@ -116,14 +131,24 @@ void MainWindow::UpdateLayout() {
             transportControlsRight_ = x;
 
             bool showFullscreenSubtitleButton = showSubtitleButton;
-            int rightButtonCount = showFullscreenSubtitleButton ? 2 : 1;
+            bool showFullscreenDolbyVisionHdrButton = true;
+            int rightButtonCount = 2 + (showFullscreenSubtitleButton ? 1 : 0);
             int rightX = transportBar_.right - Scale(22) - rightClusterWidthFor(rightButtonCount);
             if (rightX < transportControlsRight_ + Scale(12)) {
                 showFullscreenSubtitleButton = false;
+                rightButtonCount = 2;
+                rightX = transportBar_.right - Scale(22) - rightClusterWidthFor(rightButtonCount);
+            }
+            if (rightX < transportControlsRight_ + Scale(12)) {
+                showFullscreenDolbyVisionHdrButton = false;
                 rightButtonCount = 1;
                 rightX = transportBar_.right - Scale(22) - rightClusterWidthFor(rightButtonCount);
             }
             transportRightControlsLeft_ = rightX;
+            if (showFullscreenDolbyVisionHdrButton) {
+                addDolbyVisionHdrButton(rightX, smallTop);
+                rightX += transportButtonSize + buttonGap;
+            }
             if (showFullscreenSubtitleButton) {
                 buttons_.push_back(UiButton{Command::SubtitleMenu,
                                             MakeRect(rightX, smallTop, rightX + transportButtonSize, smallTop + transportButtonSize),
@@ -186,14 +211,15 @@ void MainWindow::UpdateLayout() {
                          transportBar_.top + (compact ? Scale(18) : Scale(20)));
     const int topButtonY = topBar_.top + (RectHeight(topBar_) - topButtonSize) / 2;
     int topButtonX = topBar_.right - (compact ? Scale(10) : Scale(12)) - topButtonSize;
+    const bool settingsOpen = inspectorTab_ == InspectorTab::Settings;
     buttons_.push_back(UiButton{Command::Settings,
                                 MakeRect(topButtonX, topButtonY, topButtonX + topButtonSize, topButtonY + topButtonSize),
                                 L"",
-                                inspectorTab_ == InspectorTab::Settings ? L"Back to media" : L"Settings",
-                                IconKind::Cog,
+                                settingsOpen ? L"Back to media" : L"Settings",
+                                settingsOpen ? IconKind::ChevronLeft : IconKind::Cog,
                                 ButtonKind::Icon,
                                 false,
-                                inspectorTab_ == InspectorTab::Settings});
+                                false});
     topButtonX -= topButtonSize + (compact ? Scale(6) : Scale(8));
     buttons_.push_back(UiButton{Command::Open,
                                 MakeRect(topButtonX, topButtonY, topButtonX + topButtonSize, topButtonY + topButtonSize),
@@ -252,6 +278,44 @@ void MainWindow::UpdateLayout() {
                                     false,
                                     inspectorTab_ == InspectorTab::Log});
     }
+    if (inspectorTab_ == InspectorTab::Settings &&
+        settings.video.dolbyVisionHdrOutput &&
+        RectWidth(inspector_) > 0) {
+        const RECT inner = DeflateRectCopy(inspector_, Scale(16), Scale(16));
+        RECT cursor = inner;
+        if (showInspectorTabs_) {
+            cursor.top = inner.top + Scale(70) + Scale(14);
+        } else {
+            cursor.top = inner.top + Scale(22) + Scale(16);
+        }
+        const bool stackedFields = RectWidth(cursor) < Scale(250);
+        cursor.top += Scale(24);
+        cursor.top += (stackedFields ? Scale(40) : Scale(28)) * 6;
+        cursor.top += Scale(8);
+
+        const int editorHeight = Scale(156);
+        const RECT editor = MakeRect(cursor.left, cursor.top, cursor.right, cursor.top + editorHeight);
+        const RECT plot = MakeRect(editor.left + Scale(42),
+                                   editor.top + Scale(38),
+                                   editor.right - Scale(12),
+                                   editor.bottom - Scale(24));
+        if (editor.bottom <= cursor.bottom && RectWidth(plot) >= Scale(120) && RectHeight(plot) >= Scale(64)) {
+            hdrToneCurvePlot_ = plot;
+            const int resetWidth = Scale(58);
+            const int resetHeight = Scale(24);
+            buttons_.push_back(UiButton{Command::ResetHdrToneCurve,
+                                        MakeRect(editor.right - Scale(10) - resetWidth,
+                                                 editor.top + Scale(7),
+                                                 editor.right - Scale(10),
+                                                 editor.top + Scale(7) + resetHeight),
+                                        L"Reset",
+                                        L"Reset HDR tone curve",
+                                        IconKind::None,
+                                        ButtonKind::Tab,
+                                        false,
+                                        false});
+        }
+    }
 
     const int controlCenterY = transportBar_.top + (compact ? Scale(54) : Scale(58));
     const int centerX = (transportBar_.left + transportBar_.right) / 2;
@@ -304,12 +368,19 @@ void MainWindow::UpdateLayout() {
 
     const int rightTop = smallTop;
     const int rightEdge = transportBar_.right - Scale(22);
-    const int essentialRightButtonCount = showSubtitleButton ? 2 : 1;
+    const int essentialRightButtonCount = 2 + (showSubtitleButton ? 1 : 0);
     bool showVolumeButtons = rightEdge - rightClusterWidthFor(essentialRightButtonCount + 2) >= transportControlsRight_ + Scale(16);
+    bool showTransportDolbyVisionHdrButton = true;
     bool showTransportSubtitleButton = showSubtitleButton;
     int rightButtonCount = essentialRightButtonCount + (showVolumeButtons ? 2 : 0);
     if (rightEdge - rightClusterWidthFor(rightButtonCount) < transportControlsRight_ + Scale(12)) {
         showVolumeButtons = false;
+        showTransportSubtitleButton = showSubtitleButton &&
+                                      rightEdge - rightClusterWidthFor(3) >= transportControlsRight_ + Scale(12);
+        rightButtonCount = 2 + (showTransportSubtitleButton ? 1 : 0);
+    }
+    if (rightEdge - rightClusterWidthFor(rightButtonCount) < transportControlsRight_ + Scale(12)) {
+        showTransportDolbyVisionHdrButton = false;
         showTransportSubtitleButton = showSubtitleButton &&
                                       rightEdge - rightClusterWidthFor(2) >= transportControlsRight_ + Scale(12);
         rightButtonCount = showTransportSubtitleButton ? 2 : 1;
@@ -335,6 +406,10 @@ void MainWindow::UpdateLayout() {
                                     ButtonKind::Icon,
                                     false,
                                     false});
+        rightX += transportButtonSize + buttonGap;
+    }
+    if (showTransportDolbyVisionHdrButton) {
+        addDolbyVisionHdrButton(rightX, rightTop);
         rightX += transportButtonSize + buttonGap;
     }
     if (showTransportSubtitleButton) {

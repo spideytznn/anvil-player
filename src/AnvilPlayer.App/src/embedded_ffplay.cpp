@@ -4,8 +4,65 @@
 #include "AnvilPlayer/App/ui_draw.h"
 
 #include <algorithm>
+#include <system_error>
 
 namespace anvil::app {
+
+namespace {
+
+std::filesystem::path FindBundledFfplayFrom(std::filesystem::path start) {
+    std::error_code error;
+    for (int depth = 0; depth < 6 && !start.empty(); ++depth) {
+        const auto candidate = start / L"third_party" / L"ffmpeg" / L"bin" / L"ffplay.exe";
+        if (std::filesystem::exists(candidate, error)) {
+            return candidate;
+        }
+
+        const auto parent = start.parent_path();
+        if (parent == start) {
+            break;
+        }
+        start = parent;
+    }
+    return {};
+}
+
+std::filesystem::path FfplayExecutablePath() {
+    std::error_code error;
+
+    wchar_t modulePath[MAX_PATH]{};
+    const DWORD moduleLength = GetModuleFileNameW(nullptr, modulePath, static_cast<DWORD>(std::size(modulePath)));
+    if (moduleLength > 0 && moduleLength < std::size(modulePath)) {
+        const auto executableDir = std::filesystem::path(modulePath).parent_path();
+        const auto besideExecutable = executableDir / L"ffplay.exe";
+        if (std::filesystem::exists(besideExecutable, error)) {
+            return besideExecutable;
+        }
+        if (const auto bundled = FindBundledFfplayFrom(executableDir); !bundled.empty()) {
+            return bundled;
+        }
+    }
+
+    if (const auto bundled = FindBundledFfplayFrom(std::filesystem::current_path(error)); !bundled.empty()) {
+        return bundled;
+    }
+
+    return L"ffplay.exe";
+}
+
+std::wstring DolbyVisionLibplaceboFilter() {
+    return L"libplacebo="
+           L"apply_dolbyvision=1:"
+           L"tonemapping=auto:"
+           L"gamut_mode=perceptual:"
+           L"peak_detect=1:"
+           L"colorspace=bt709:"
+           L"color_primaries=bt709:"
+           L"color_trc=bt709:"
+           L"range=pc";
+}
+
+}  // namespace
 
 BOOL CALLBACK FindProcessWindowProc(HWND hwnd, LPARAM lParam) {
     auto* search = reinterpret_cast<WindowSearch*>(lParam);
@@ -32,7 +89,8 @@ bool EmbeddedFfplayPlayer::Start(HWND parent,
                                  RECT bounds,
                                  const std::filesystem::path& mediaPath,
                                  const std::chrono::milliseconds startPosition,
-                                 const double volume) {
+                                 const double volume,
+                                 const bool useLibplaceboDolbyVision) {
     Stop();
     if (!parent || mediaPath.empty()) {
         return false;
@@ -47,7 +105,8 @@ bool EmbeddedFfplayPlayer::Start(HWND parent,
     const int playbackWidth = std::max(1, RectWidth(bounds));
     const int playbackHeight = std::max(1, RectHeight(bounds));
     std::wstring commandLine =
-        L"ffplay -hide_banner -loglevel error -autoexit "
+        QuoteArgument(FfplayExecutablePath().wstring()) +
+        L" -hide_banner -loglevel error -autoexit "
         L"-framedrop -noborder "
         L"-window_title " +
         QuoteArgument(windowTitle_) +
@@ -57,7 +116,11 @@ bool EmbeddedFfplayPlayer::Start(HWND parent,
         std::to_wstring(playbackHeight) +
         L" -ss " +
         FormatFfmpegSeekTime(startPosition) +
-        L" -volume " + std::to_wstring(volumePercent) +
+        L" -volume " + std::to_wstring(volumePercent);
+    if (useLibplaceboDolbyVision) {
+        commandLine += L" -vf " + QuoteArgument(DolbyVisionLibplaceboFilter());
+    }
+    commandLine +=
         L" " + QuoteArgument(mediaPath.wstring());
     lastCommandLine_ = commandLine;
 

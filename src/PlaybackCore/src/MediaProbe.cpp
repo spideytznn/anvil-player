@@ -366,9 +366,9 @@ std::wstring PixelFormatName(const AVCodecParameters* parameters) {
     return Utf8ToWide(av_get_pix_fmt_name(static_cast<AVPixelFormat>(parameters->format)));
 }
 
-std::wstring DolbyVisionProfile(const AVCodecParameters* parameters) {
+const AVDOVIDecoderConfigurationRecord* DolbyVisionConfiguration(const AVCodecParameters* parameters) {
     if (!parameters) {
-        return {};
+        return nullptr;
     }
     for (int index = 0; index < parameters->nb_coded_side_data; ++index) {
         const AVPacketSideData& sideData = parameters->coded_side_data[index];
@@ -376,10 +376,38 @@ std::wstring DolbyVisionProfile(const AVCodecParameters* parameters) {
             sideData.size < static_cast<int>(sizeof(AVDOVIDecoderConfigurationRecord))) {
             continue;
         }
-        const auto* dovi = reinterpret_cast<const AVDOVIDecoderConfigurationRecord*>(sideData.data);
-        return L"Dolby Vision Profile " + std::to_wstring(static_cast<int>(dovi->dv_profile));
+        return reinterpret_cast<const AVDOVIDecoderConfigurationRecord*>(sideData.data);
     }
-    return {};
+    return nullptr;
+}
+
+std::wstring DolbyVisionProfile(const AVCodecParameters* parameters) {
+    const auto* dovi = DolbyVisionConfiguration(parameters);
+    if (!dovi) {
+        return {};
+    }
+    return L"Dolby Vision Profile " + std::to_wstring(static_cast<int>(dovi->dv_profile));
+}
+
+std::wstring DolbyVisionStreamDetails(const AVCodecParameters* parameters) {
+    const auto* dovi = DolbyVisionConfiguration(parameters);
+    if (!dovi) {
+        return {};
+    }
+
+    std::wstring details = L"Dolby Vision P" + std::to_wstring(static_cast<int>(dovi->dv_profile));
+    if (dovi->el_present_flag && !dovi->bl_present_flag) {
+        details += L" EL-only";
+    } else if (dovi->el_present_flag && dovi->bl_present_flag) {
+        details += L" BL+EL";
+    } else if (dovi->bl_present_flag) {
+        details += L" BL";
+    }
+    if (dovi->rpu_present_flag) {
+        details += L" RPU";
+    }
+    details += L" compat " + std::to_wstring(static_cast<int>(dovi->dv_bl_signal_compatibility_id));
+    return details;
 }
 
 std::wstring DetectHdrFormat(const AVCodecParameters* parameters, const VideoColorMetadata& color) {
@@ -427,6 +455,7 @@ std::wstring BuildVideoDetails(const AVStream* stream, const AVCodecParameters* 
     }
     AppendPart(parts, PixelFormatName(parameters));
     AppendPart(parts, ProfileName(parameters));
+    AppendPart(parts, DolbyVisionStreamDetails(parameters));
     if (parameters) {
         const auto color = BuildColorMetadata(parameters);
         if (color.IsHdr()) {

@@ -3,6 +3,9 @@
 #include "AnvilPlayer/App/string_util.h"
 
 extern "C" {
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersink.h>
+#include <libavfilter/buffersrc.h>
 #include <libavutil/opt.h>
 #include <libavutil/dovi_meta.h>
 #include <libavutil/mastering_display_metadata.h>
@@ -13,6 +16,7 @@ extern "C" {
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <cwctype>
@@ -24,6 +28,24 @@ extern "C" {
 #include <vector>
 
 namespace anvil::app {
+
+struct DoviLibplaceboFilterState {
+    AVFilterGraph* graph = nullptr;
+    AVFilterContext* source = nullptr;
+    AVFilterContext* sink = nullptr;
+    int width = 0;
+    int height = 0;
+    int format = AV_PIX_FMT_NONE;
+    bool hdrOutput = false;
+    AVRational timeBase{1, 1};
+    AVRational sampleAspectRatio{1, 1};
+
+    ~DoviLibplaceboFilterState() {
+        if (graph) {
+            avfilter_graph_free(&graph);
+        }
+    }
+};
 
 using anvil::playback::LogLevel;
 using anvil::playback::DolbyVisionFrameMetadata;
@@ -49,6 +71,25 @@ double RationalToDouble(const AVRational value) {
     }
     const double result = av_q2d(value);
     return std::isfinite(result) ? result : 0.0;
+}
+
+float Pq12CodeToNits(const uint16_t code) {
+    if (code == 0) {
+        return 0.0f;
+    }
+
+    constexpr double m1 = 2610.0 / 16384.0;
+    constexpr double m2 = 2523.0 / 32.0;
+    constexpr double c1 = 3424.0 / 4096.0;
+    constexpr double c2 = 2413.0 / 128.0;
+    constexpr double c3 = 2392.0 / 128.0;
+
+    const double v = std::clamp(static_cast<double>(code) / 4095.0, 0.0, 1.0);
+    const double p = std::pow(v, 1.0 / m2);
+    const double numerator = std::max(p - c1, 0.0);
+    const double denominator = std::max(c2 - c3 * p, 0.000001);
+    const double nits = 10000.0 * std::pow(numerator / denominator, 1.0 / m1);
+    return std::isfinite(nits) ? static_cast<float>(nits) : 0.0f;
 }
 
 uint16_t ReadLe16(const uint8_t* value) {
@@ -645,6 +686,45 @@ std::optional<std::chrono::milliseconds> PacketDuration(const AVPacket* packet, 
         av_rescale_q(packet->duration, streamTimeBase, AVRational{1, 1000})};
 }
 
+const AVDOVIDecoderConfigurationRecord* DolbyVisionConfig(const AVCodecParameters* parameters) {
+    if (!parameters) {
+        return nullptr;
+    }
+    for (int index = 0; index < parameters->nb_coded_side_data; ++index) {
+        const AVPacketSideData& sideData = parameters->coded_side_data[index];
+        if (sideData.type == AV_PKT_DATA_DOVI_CONF &&
+            sideData.size >= static_cast<int>(sizeof(AVDOVIDecoderConfigurationRecord))) {
+            return reinterpret_cast<const AVDOVIDecoderConfigurationRecord*>(sideData.data);
+        }
+    }
+    return nullptr;
+}
+
+bool IsDolbyVisionEnhancementLayer(const AVCodecParameters* parameters) {
+    const auto* dovi = DolbyVisionConfig(parameters);
+    return dovi &&
+           dovi->el_present_flag != 0 &&
+           dovi->bl_present_flag == 0;
+}
+
+std::wstring VideoStreamDescription(const AVStream* stream) {
+    if (!stream || !stream->codecpar) {
+        return L"unavailable";
+    }
+    const AVCodecParameters* parameters = stream->codecpar;
+    std::wstring details =
+        L"stream=" + std::to_wstring(stream->index >= 0 ? stream->index : -1) +
+        L" codec=" + Utf8ToWide(avcodec_get_name(parameters->codec_id)) +
+        L" size=" + std::to_wstring(parameters->width) + L"x" + std::to_wstring(parameters->height);
+    if (const auto* dovi = DolbyVisionConfig(parameters)) {
+        details +=
+            L" dv_profile=" + std::to_wstring(dovi->dv_profile) +
+            L" el=" + std::to_wstring(dovi->el_present_flag) +
+            L" bl=" + std::to_wstring(dovi->bl_present_flag);
+    }
+    return details;
+}
+
 }  // namespace
 
 FfmpegVideoDecoder::FfmpegVideoDecoder(LogSinkPtr logSink) : logSink_(std::move(logSink)) {}
@@ -660,11 +740,13 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
                                ClockCallback clockCallback,
                                const bool preferHardwareDecode,
                                ID3D11Device* sharedD3DDevice,
+                               const int selectedVideoTrackIndex,
                                std::wstring preferredSubtitleLanguage,
                                const int selectedSubtitleTrackIndex,
                                const std::chrono::milliseconds subtitleDelay,
                                const bool autoLoadExternalSubtitles,
-                               const bool oneShotFrame) {
+                               const bool oneShotFrame,
+                               const bool preferDolbyVisionHdrOutput) {
     Stop();
     if (mediaPath.empty()) {
         return false;
@@ -682,12 +764,17 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
     hardwareFormatLogged_ = false;
     zeroCopyFallbackLogged_ = false;
     bitmapSubtitleLogged_ = false;
+    dolbyVisionLibplaceboFailed_ = false;
+    dolbyVisionLibplaceboFrameLogged_ = false;
+    doviLibplaceboFilter_.reset();
     streamColorMetadata_ = {};
     preferredSubtitleLanguage_ = std::move(preferredSubtitleLanguage);
+    selectedVideoTrackIndex_ = selectedVideoTrackIndex;
     selectedSubtitleTrackIndex_ = selectedSubtitleTrackIndex;
     subtitleDelay_ = subtitleDelay;
     autoLoadExternalSubtitles_ = autoLoadExternalSubtitles;
     oneShotFrame_ = oneShotFrame;
+    preferDolbyVisionHdrOutput_ = preferDolbyVisionHdrOutput;
     subtitleCanvasWidth_ = 0;
     subtitleCanvasHeight_ = 0;
     subtitleCanvasLogged_ = false;
@@ -704,6 +791,7 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
     {
         std::scoped_lock lock(mutex_);
         latestFrame_.bgra.reset();
+        latestFrame_.yuv = {};
         latestFrame_.serial = 0;
         latestFrame_.width = latestFrame_.height = latestFrame_.stride = 0;
         latestFrame_.d3dTexture.Reset();
@@ -753,6 +841,7 @@ bool FfmpegVideoDecoder::LatestFrame(NativeVideoFrame& frame) const {
 void FfmpegVideoDecoder::ClearFrame() {
     std::scoped_lock lock(mutex_);
     latestFrame_.bgra.reset();
+    latestFrame_.yuv = {};
     latestFrame_.serial = 0;
     latestFrame_.width = latestFrame_.height = latestFrame_.stride = 0;
     latestFrame_.d3dTexture.Reset();
@@ -774,6 +863,52 @@ void FfmpegVideoDecoder::AcknowledgeFrameNotification() {
 NativeVideoQueueStats FfmpegVideoDecoder::Stats() const {
     std::scoped_lock lock(mutex_);
     return stats_;
+}
+
+int FfmpegVideoDecoder::SelectVideoStream(AVFormatContext* formatCtx) const {
+    if (!formatCtx) {
+        return AVERROR(EINVAL);
+    }
+
+    const auto streamAt = [formatCtx](const int streamIndex) -> AVStream* {
+        if (streamIndex < 0 || static_cast<unsigned int>(streamIndex) >= formatCtx->nb_streams) {
+            return nullptr;
+        }
+        return formatCtx->streams[streamIndex];
+    };
+
+    if (selectedVideoTrackIndex_ >= 0) {
+        AVStream* stream = streamAt(selectedVideoTrackIndex_);
+        if (stream && stream->codecpar && stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            LogThread(LogLevel::Info, L"decoder", L"video_stream selected=requested " + VideoStreamDescription(stream));
+            return selectedVideoTrackIndex_;
+        }
+        LogThread(LogLevel::Warning,
+                  L"decoder",
+                  L"video_stream requested_unavailable stream=" + std::to_wstring(selectedVideoTrackIndex_));
+    } else if (selectedVideoTrackIndex_ == anvil::playback::kVideoTrackDolbyVisionEnhancement) {
+        for (unsigned int index = 0; index < formatCtx->nb_streams; ++index) {
+            AVStream* stream = formatCtx->streams[index];
+            if (!stream || !stream->codecpar ||
+                stream->codecpar->codec_type != AVMEDIA_TYPE_VIDEO ||
+                !IsDolbyVisionEnhancementLayer(stream->codecpar)) {
+                continue;
+            }
+            LogThread(LogLevel::Info, L"decoder", L"video_stream selected=dolby_vision_enhancement " + VideoStreamDescription(stream));
+            return static_cast<int>(index);
+        }
+        LogThread(LogLevel::Warning, L"decoder", L"video_stream dolby_vision_enhancement_unavailable fallback=auto");
+    } else if (selectedVideoTrackIndex_ != anvil::playback::kVideoTrackAuto) {
+        LogThread(LogLevel::Warning,
+                  L"decoder",
+                  L"video_stream unknown_selection=" + std::to_wstring(selectedVideoTrackIndex_) + L" fallback=auto");
+    }
+
+    const int best = av_find_best_stream(formatCtx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    if (best >= 0) {
+        LogThread(LogLevel::Info, L"decoder", L"video_stream selected=auto " + VideoStreamDescription(streamAt(best)));
+    }
+    return best;
 }
 
 void FfmpegVideoDecoder::DecodeLoop() {
@@ -819,7 +954,7 @@ void FfmpegVideoDecoder::DecodeLoop() {
             LogThreadError(L"avformat_find_stream_info failed");
             break;
         }
-        videoStreamIndex = av_find_best_stream(formatCtx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+        videoStreamIndex = SelectVideoStream(formatCtx);
         if (videoStreamIndex < 0) {
             LogThreadError(L"no video stream found");
             break;
@@ -861,6 +996,9 @@ void FfmpegVideoDecoder::DecodeLoop() {
         dolbyVisionFirstFrameLogged_ = false;
         dolbyVisionFirstPackedLogged_ = false;
         dolbyVisionFirstQueueLogged_ = false;
+        dolbyVisionLibplaceboFailed_ = false;
+        dolbyVisionLibplaceboFrameLogged_ = false;
+        doviLibplaceboFilter_.reset();
         dolbyVisionProfile_ = 0;
         dolbyVisionLevel_ = 0;
         dolbyVisionCompatId_ = 0;
@@ -951,6 +1089,7 @@ void FfmpegVideoDecoder::DecodeLoop() {
     if (subtitleCodecCtx) avcodec_free_context(&subtitleCodecCtx);
     if (codecCtx) avcodec_free_context(&codecCtx);
     if (formatCtx) avformat_close_input(&formatCtx);
+    doviLibplaceboFilter_.reset();
     DrainQueuedFrames();
     running_.store(false);
 }
@@ -1376,6 +1515,276 @@ bool FfmpegVideoDecoder::DrainDecoder(AVCodecContext* codecCtx, SwsContext*& sws
     return true;
 }
 
+bool FfmpegVideoDecoder::EnsureDoviLibplaceboFilter(AVFrame* frame, const AVRational timeBase) {
+    if (!frame || frame->width <= 0 || frame->height <= 0) {
+        return false;
+    }
+
+    const int format = frame->format;
+    const AVRational sampleAspect = frame->sample_aspect_ratio.num > 0 && frame->sample_aspect_ratio.den > 0
+                                        ? frame->sample_aspect_ratio
+                                        : AVRational{1, 1};
+    if (doviLibplaceboFilter_ &&
+        doviLibplaceboFilter_->width == frame->width &&
+        doviLibplaceboFilter_->height == frame->height &&
+        doviLibplaceboFilter_->format == format &&
+        doviLibplaceboFilter_->hdrOutput == preferDolbyVisionHdrOutput_ &&
+        doviLibplaceboFilter_->timeBase.num == timeBase.num &&
+        doviLibplaceboFilter_->timeBase.den == timeBase.den &&
+        doviLibplaceboFilter_->sampleAspectRatio.num == sampleAspect.num &&
+        doviLibplaceboFilter_->sampleAspectRatio.den == sampleAspect.den) {
+        return true;
+    }
+
+    auto state = std::make_unique<DoviLibplaceboFilterState>();
+    state->width = frame->width;
+    state->height = frame->height;
+    state->format = format;
+    state->hdrOutput = preferDolbyVisionHdrOutput_;
+    state->timeBase = timeBase;
+    state->sampleAspectRatio = sampleAspect;
+    state->graph = avfilter_graph_alloc();
+    if (!state->graph) {
+        LogThread(LogLevel::Warning, L"decoder", L"dolby_vision_libplacebo unavailable=graph_alloc_failed");
+        return false;
+    }
+
+    const AVFilter* bufferSource = avfilter_get_by_name("buffer");
+    const AVFilter* bufferSink = avfilter_get_by_name("buffersink");
+    if (!bufferSource || !bufferSink) {
+        LogThread(LogLevel::Warning, L"decoder", L"dolby_vision_libplacebo unavailable=missing_buffer_filters");
+        return false;
+    }
+
+    char sourceArgs[512]{};
+    std::snprintf(sourceArgs,
+                  sizeof(sourceArgs),
+                  "video_size=%dx%d:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
+                  frame->width,
+                  frame->height,
+                  format,
+                  timeBase.num,
+                  timeBase.den,
+                  sampleAspect.num,
+                  sampleAspect.den);
+
+    int error = avfilter_graph_create_filter(&state->source, bufferSource, "in", sourceArgs, nullptr, state->graph);
+    if (error < 0) {
+        LogThread(LogLevel::Warning,
+                  L"decoder",
+                  L"dolby_vision_libplacebo unavailable=buffer_source_failed reason=" + FfmpegErrorString(error));
+        return false;
+    }
+
+    AVBufferSrcParameters* params = av_buffersrc_parameters_alloc();
+    if (!params) {
+        LogThread(LogLevel::Warning, L"decoder", L"dolby_vision_libplacebo unavailable=buffer_params_alloc_failed");
+        return false;
+    }
+    params->format = format;
+    params->time_base = timeBase;
+    params->width = frame->width;
+    params->height = frame->height;
+    params->sample_aspect_ratio = sampleAspect;
+    params->color_space = frame->colorspace;
+    params->color_range = frame->color_range;
+    error = av_buffersrc_parameters_set(state->source, params);
+    av_free(params);
+    if (error < 0) {
+        LogThread(LogLevel::Warning,
+                  L"decoder",
+                  L"dolby_vision_libplacebo unavailable=buffer_params_failed reason=" + FfmpegErrorString(error));
+        return false;
+    }
+
+    error = avfilter_graph_create_filter(&state->sink, bufferSink, "out", nullptr, nullptr, state->graph);
+    if (error < 0) {
+        LogThread(LogLevel::Warning,
+                  L"decoder",
+                  L"dolby_vision_libplacebo unavailable=buffer_sink_failed reason=" + FfmpegErrorString(error));
+        return false;
+    }
+
+    AVFilterInOut* inputs = avfilter_inout_alloc();
+    AVFilterInOut* outputs = avfilter_inout_alloc();
+    if (!inputs || !outputs) {
+        avfilter_inout_free(&inputs);
+        avfilter_inout_free(&outputs);
+        LogThread(LogLevel::Warning, L"decoder", L"dolby_vision_libplacebo unavailable=inout_alloc_failed");
+        return false;
+    }
+
+    outputs->name = av_strdup("in");
+    outputs->filter_ctx = state->source;
+    outputs->pad_idx = 0;
+    outputs->next = nullptr;
+
+    inputs->name = av_strdup("out");
+    inputs->filter_ctx = state->sink;
+    inputs->pad_idx = 0;
+    inputs->next = nullptr;
+
+    const char* filterDescription = preferDolbyVisionHdrOutput_
+        ? "libplacebo="
+          "apply_dolbyvision=1:"
+          "colorspace=gbr:"
+          "color_primaries=bt2020:"
+          "color_trc=smpte2084:"
+          "range=pc,"
+          "format=x2bgr10le"
+        : "libplacebo="
+          "apply_dolbyvision=1:"
+          "tonemapping=auto:"
+          "gamut_mode=perceptual:"
+          "peak_detect=1:"
+          "colorspace=bt709:"
+          "color_primaries=bt709:"
+          "color_trc=bt709:"
+          "range=pc,"
+          "format=bgra";
+
+    error = avfilter_graph_parse_ptr(state->graph, filterDescription, &inputs, &outputs, nullptr);
+    avfilter_inout_free(&inputs);
+    avfilter_inout_free(&outputs);
+    if (error < 0) {
+        LogThread(LogLevel::Warning,
+                  L"decoder",
+                  L"dolby_vision_libplacebo unavailable=parse_failed reason=" + FfmpegErrorString(error));
+        return false;
+    }
+
+    error = avfilter_graph_config(state->graph, nullptr);
+    if (error < 0) {
+        LogThread(LogLevel::Warning,
+                  L"decoder",
+                  L"dolby_vision_libplacebo unavailable=config_failed reason=" + FfmpegErrorString(error));
+        return false;
+    }
+
+    doviLibplaceboFilter_ = std::move(state);
+    LogThread(LogLevel::Info,
+              L"decoder",
+              std::wstring(L"dolby_vision_libplacebo active target=") +
+                  (preferDolbyVisionHdrOutput_ ? L"bt2020_pq_hdr format=x2bgr10le"
+                                                : L"bt709_sdr tonemapping=auto gamut=perceptual"));
+    return true;
+}
+
+bool FfmpegVideoDecoder::TryPublishDoviLibplaceboFrame(AVFrame* frame,
+                                                       const AVRational timeBase,
+                                                       const std::chrono::milliseconds pts,
+                                                       uint64_t& serial) {
+    if (!frame || dolbyVisionLibplaceboFailed_) {
+        return false;
+    }
+    if (!EnsureDoviLibplaceboFilter(frame, timeBase)) {
+        dolbyVisionLibplaceboFailed_ = true;
+        return false;
+    }
+
+    int error = av_buffersrc_add_frame_flags(doviLibplaceboFilter_->source, frame, AV_BUFFERSRC_FLAG_KEEP_REF);
+    if (error < 0) {
+        LogThread(LogLevel::Warning,
+                  L"decoder",
+                  L"dolby_vision_libplacebo disabled=push_failed reason=" + FfmpegErrorString(error));
+        dolbyVisionLibplaceboFailed_ = true;
+        return false;
+    }
+
+    bool produced = false;
+    while (!stopping_.load()) {
+        AVFrame* filtered = av_frame_alloc();
+        if (!filtered) {
+            LogThread(LogLevel::Warning, L"decoder", L"dolby_vision_libplacebo disabled=filtered_frame_alloc_failed");
+            dolbyVisionLibplaceboFailed_ = true;
+            return false;
+        }
+
+        error = av_buffersink_get_frame(doviLibplaceboFilter_->sink, filtered);
+        if (error == AVERROR(EAGAIN) || error == AVERROR_EOF) {
+            av_frame_free(&filtered);
+            break;
+        }
+        if (error < 0) {
+            LogThread(LogLevel::Warning,
+                      L"decoder",
+                      L"dolby_vision_libplacebo disabled=pull_failed reason=" + FfmpegErrorString(error));
+            av_frame_free(&filtered);
+            dolbyVisionLibplaceboFailed_ = true;
+            return false;
+        }
+
+        produced = true;
+        const int outW = filtered->width;
+        const int outH = filtered->height;
+        const auto outputFormat = static_cast<AVPixelFormat>(filtered->format);
+        const bool hdrOutput = outputFormat == AV_PIX_FMT_X2BGR10LE;
+        const bool sdrOutput = outputFormat == AV_PIX_FMT_BGRA;
+        if (outW <= 0 || outH <= 0 || (!sdrOutput && !hdrOutput) || !filtered->data[0] || filtered->linesize[0] < outW * 4) {
+            LogThread(LogLevel::Warning,
+                      L"decoder",
+                      L"dolby_vision_libplacebo disabled=unexpected_output format=" +
+                          PixelFormatName(outputFormat));
+            av_frame_free(&filtered);
+            dolbyVisionLibplaceboFailed_ = true;
+            return false;
+        }
+
+        const int stride = outW * 4;
+        const std::size_t needed = static_cast<std::size_t>(stride) * static_cast<std::size_t>(outH);
+        auto pixels = AcquireReusableBgraBuffer(needed);
+        if (!pixels || pixels->size() < needed) {
+            LogThreadError(L"BGRA frame buffer allocation failed");
+            av_frame_free(&filtered);
+            return false;
+        }
+
+        for (int row = 0; row < outH; ++row) {
+            uint8_t* dstRow = pixels->data() + static_cast<std::size_t>(row) * stride;
+            const uint8_t* srcRow = filtered->data[0] + static_cast<std::size_t>(row) * filtered->linesize[0];
+            if (hdrOutput) {
+                for (int x = 0; x < outW; ++x) {
+                    uint32_t packed = 0;
+                    std::memcpy(&packed, srcRow + static_cast<std::size_t>(x) * 4, sizeof(packed));
+                    packed |= 0xC0000000u;  // x2bgr10le -> DXGI R10G10B10A2 with opaque alpha.
+                    std::memcpy(dstRow + static_cast<std::size_t>(x) * 4, &packed, sizeof(packed));
+                }
+            } else {
+                std::memcpy(dstRow, srcRow, stride);
+            }
+        }
+
+        NativeVideoFrame queued;
+        queued.width = outW;
+        queued.height = outH;
+        queued.stride = stride;
+        queued.bgra = std::move(pixels);
+        queued.softwareFormat = outputFormat;
+        queued.color = hdrOutput ? HdrBt2020PqColorMetadata() : SdrBt709ColorMetadata();
+        queued.subtitleText = SubtitleTextForPts(pts);
+        queued.subtitleBitmaps = SubtitleBitmapsForPts(pts, outW, outH);
+        queued.pts = pts;
+        queued.serial = ++serial;
+
+        if (!dolbyVisionLibplaceboFrameLogged_) {
+            dolbyVisionLibplaceboFrameLogged_ = true;
+            LogThread(LogLevel::Info,
+                      L"decoder",
+                      L"dolby_vision_libplacebo_frame w=" + std::to_wstring(outW) +
+                          L" h=" + std::to_wstring(outH) +
+                          L" output=" + (hdrOutput ? L"x2bgr10le_hdr_bt2020_pq" : L"bgra_sdr_bt709"));
+        }
+
+        av_frame_free(&filtered);
+        const bool published = oneShotFrame_ ? PublishImmediateFrame(std::move(queued)) : EnqueueFrame(std::move(queued));
+        if (!published) {
+            return false;
+        }
+    }
+
+    return produced || !dolbyVisionLibplaceboFailed_;
+}
+
 bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, SwsContext*& swsCtx, std::vector<uint8_t>& bgraBuffer,
                                       AVRational timeBase, uint64_t& serial) {
     const auto pts = FramePts(frame, timeBase);
@@ -1419,6 +1828,10 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
     const int srcW = frame->width;
     const int srcH = frame->height;
     if (srcW <= 0 || srcH <= 0) {
+        return true;
+    }
+
+    if (dolbyVisionStream_ && TryPublishDoviLibplaceboFrame(frame, timeBase, pts, serial)) {
         return true;
     }
 
@@ -1867,6 +2280,24 @@ VideoColorMetadata FfmpegVideoDecoder::MergeFrameColorMetadata(const AVFrame* fr
     return metadata;
 }
 
+VideoColorMetadata FfmpegVideoDecoder::SdrBt709ColorMetadata() {
+    VideoColorMetadata metadata;
+    metadata.primaries = VideoColorPrimaries::Bt709;
+    metadata.transfer = VideoTransferCharacteristic::Bt709;
+    metadata.matrix = VideoMatrixCoefficients::Rgb;
+    metadata.range = VideoColorRange::Full;
+    return metadata;
+}
+
+VideoColorMetadata FfmpegVideoDecoder::HdrBt2020PqColorMetadata() {
+    VideoColorMetadata metadata;
+    metadata.primaries = VideoColorPrimaries::Bt2020;
+    metadata.transfer = VideoTransferCharacteristic::Pq;
+    metadata.matrix = VideoMatrixCoefficients::Rgb;
+    metadata.range = VideoColorRange::Full;
+    return metadata;
+}
+
 std::shared_ptr<const DolbyVisionFrameMetadata> FfmpegVideoDecoder::ExtractDolbyVisionMetadata(const AVFrame* frame) {
     if (!frame) {
         return nullptr;
@@ -1947,6 +2378,10 @@ std::shared_ptr<const DolbyVisionFrameMetadata> FfmpegVideoDecoder::ExtractDolby
     for (int i = 0; i < 3; ++i) {
         out->yccOffset[i] = static_cast<float>(RationalToDouble(color->ycc_to_rgb_offset[i]));
     }
+    out->sourceMinPq = color->source_min_pq;
+    out->sourceMaxPq = color->source_max_pq;
+    out->sourceMinNits = Pq12CodeToNits(out->sourceMinPq);
+    out->sourceMaxNits = Pq12CodeToNits(out->sourceMaxPq);
 
     return out;
 }

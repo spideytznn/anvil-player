@@ -38,6 +38,8 @@ extern "C" {
 
 namespace anvil::app {
 
+struct DoviLibplaceboFilterState;
+
 struct NativeSubtitleBitmap {
     int x = 0;
     int y = 0;
@@ -155,11 +157,13 @@ public:
                ClockCallback clockCallback = {},
                bool preferHardwareDecode = false,
                ID3D11Device* sharedD3DDevice = nullptr,
+               int selectedVideoTrackIndex = anvil::playback::kVideoTrackAuto,
                std::wstring preferredSubtitleLanguage = L"Auto",
                int selectedSubtitleTrackIndex = anvil::playback::kSubtitleTrackAuto,
                std::chrono::milliseconds subtitleDelay = std::chrono::milliseconds{0},
                bool autoLoadExternalSubtitles = true,
-               bool oneShotFrame = false);
+               bool oneShotFrame = false,
+               bool preferDolbyVisionHdrOutput = false);
 
     void Stop();
 
@@ -196,6 +200,7 @@ private:
     };
 
     void DecodeLoop();
+    int SelectVideoStream(AVFormatContext* formatCtx) const;
     bool OpenVideoDecoder(const AVCodec* codec,
                           const AVCodecParameters* codecpar,
                           AVCodecContext*& codecCtx,
@@ -219,6 +224,11 @@ private:
                       uint64_t& serial);
     bool PublishFrame(AVFrame* frame, AVFrame* softwareFrame, SwsContext*& swsCtx, std::vector<uint8_t>& bgraBuffer,
                       AVRational timeBase, uint64_t& serial);
+    bool TryPublishDoviLibplaceboFrame(AVFrame* frame,
+                                       AVRational timeBase,
+                                       std::chrono::milliseconds pts,
+                                       uint64_t& serial);
+    bool EnsureDoviLibplaceboFilter(AVFrame* frame, AVRational timeBase);
     bool TryBuildD3DTextureFrame(AVFrame* frame, std::chrono::milliseconds pts, uint64_t& serial, NativeVideoFrame& out);
     bool PublishImmediateFrame(NativeVideoFrame&& frame);
     bool DecodeSubtitlePacket(AVCodecContext* subtitleCodecCtx, const AVPacket* packet, AVRational subtitleTimeBase);
@@ -234,6 +244,8 @@ private:
     static anvil::playback::VideoColorMetadata MergeFrameColorMetadata(
         const AVFrame* frame,
         const anvil::playback::VideoColorMetadata& defaults);
+    static anvil::playback::VideoColorMetadata SdrBt709ColorMetadata();
+    static anvil::playback::VideoColorMetadata HdrBt2020PqColorMetadata();
     // Extracts Dolby Vision reshaping metadata from AV_FRAME_DATA_DOVI_METADATA
     // side data. Returns nullptr if the frame has no DV metadata.
     static std::shared_ptr<const anvil::playback::DolbyVisionFrameMetadata> ExtractDolbyVisionMetadata(const AVFrame* frame);
@@ -281,6 +293,11 @@ private:
     bool dolbyVisionFirstFrameLogged_ = false;
     bool dolbyVisionFirstPackedLogged_ = false;
     bool dolbyVisionFirstQueueLogged_ = false;
+    bool dolbyVisionLibplaceboFailed_ = false;
+    bool dolbyVisionLibplaceboFrameLogged_ = false;
+    bool preferDolbyVisionHdrOutput_ = false;
+    int selectedVideoTrackIndex_ = anvil::playback::kVideoTrackAuto;
+    std::unique_ptr<DoviLibplaceboFilterState> doviLibplaceboFilter_;
     // Stream-level DV configuration (not present in per-frame metadata).
     int dolbyVisionProfile_ = 0;
     int dolbyVisionLevel_ = 0;

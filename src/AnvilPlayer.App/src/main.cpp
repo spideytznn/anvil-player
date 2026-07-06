@@ -7,6 +7,7 @@
 #include <windows.h>
 
 #include <filesystem>
+#include <stdexcept>
 #include <string>
 
 namespace anvil::app {
@@ -20,6 +21,7 @@ struct AppArguments {
     bool autoplay = false;
     LogLevel logLevel = DefaultLogLevel();
     PlaybackBackend backend = PlaybackBackend::NativeFfmpegD3D11;
+    int selectedVideoTrackIndex = anvil::playback::kVideoTrackAuto;
 };
 
 AppArguments ParseArguments(const int argumentCount, wchar_t** arguments) {
@@ -37,6 +39,20 @@ AppArguments ParseArguments(const int argumentCount, wchar_t** arguments) {
         }
         if (argument == L"--debug-log") {
             parsed.logLevel = LogLevel::Debug;
+            continue;
+        }
+        if (argument == L"--video-stream" && index + 1 < argumentCount) {
+            try {
+                const int streamIndex = std::stoi(arguments[++index]);
+                if (streamIndex >= 0) {
+                    parsed.selectedVideoTrackIndex = streamIndex;
+                }
+            } catch (const std::exception&) {
+            }
+            continue;
+        }
+        if (argument == L"--dolby-vision-el" || argument == L"--dv-el") {
+            parsed.selectedVideoTrackIndex = anvil::playback::kVideoTrackDolbyVisionEnhancement;
             continue;
         }
         if (argument == L"--info-log") {
@@ -84,6 +100,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int commandShow) {
     anvil::app::MainWindow window;
     window.ConfigureLogging(appArguments.logLevel);
     window.SetBackend(appArguments.backend);
+    window.SetInitialVideoTrackSelection(appArguments.selectedVideoTrackIndex);
     if (!window.Create(instance)) {
         MessageBoxW(nullptr, L"Unable to create Anvil Player window.", L"Anvil Player", MB_ICONERROR | MB_OK);
         return 1;

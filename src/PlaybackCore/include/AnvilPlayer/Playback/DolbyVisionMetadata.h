@@ -89,6 +89,13 @@ struct DolbyVisionFrameMetadata {
     float yccOffset[3] = {0, 0, 0};                      // neutral offset (pre-reshape)
     float rgbToLms[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};    // row-major 3x3 (CMv4.0)
 
+    // Source display peak metadata from AVDOVIColorMetadata. PQ codes are
+    // 12-bit ST 2084 values; nits are precomputed for renderer tone mapping.
+    uint16_t sourceMinPq = 0;
+    uint16_t sourceMaxPq = 0;
+    float sourceMinNits = 0.0f;
+    float sourceMaxNits = 0.0f;
+
     bool valid = false;                 // true if metadata was successfully extracted for this frame
 };
 
