@@ -106,6 +106,12 @@ private:
     void BeginProgressDrag(int x);
     void CancelProgressDrag();
     void CommitProgressDrag();
+    bool IsHdrToneCurveVisible() const;
+    bool BeginHdrToneCurveDrag(POINT point);
+    void UpdateHdrToneCurveDrag(POINT point);
+    void EndHdrToneCurveDrag();
+    void ApplyLiveHdrToneCurveSettings();
+    void ResetHdrToneCurve();
     void OnKeyDown(WPARAM key);
     void OnDropFiles(HDROP drop);
     void Execute(Command command);
@@ -131,6 +137,7 @@ private:
     void ApplySubtitleSelection(int selectedTrackIndex);
     void CycleSubtitleTrack();
     void ShowSubtitleMenu();
+    void ToggleDolbyVisionHdrOutput();
     void ToggleFullscreen();
 
     // main_window_paint.cpp
@@ -156,6 +163,7 @@ private:
     void DrawDeviceContent(HDC hdc, const anvil::playback::CapabilityReport& capabilities, RECT cursor) const;
     void DrawLogContent(HDC hdc, RECT cursor) const;
     void DrawSettingsContent(HDC hdc, const anvil::playback::PlayerSettings& settings, RECT cursor) const;
+    void DrawHdrToneCurveEditor(HDC hdc, const anvil::playback::PlayerSettings& settings, RECT& cursor) const;
 
     HWND hwnd_ = nullptr;
     HINSTANCE instance_ = nullptr;
@@ -196,6 +204,7 @@ private:
     RECT transportBar_{};
     RECT inspector_{};
     RECT progress_{};
+    RECT hdrToneCurvePlot_{};
     int topControlsLeft_ = 0;
     int transportControlsLeft_ = 0;
     int transportControlsRight_ = 0;
@@ -204,6 +213,7 @@ private:
     bool showTopState_ = true;
     bool showInspectorTabs_ = false;
     bool draggingProgress_ = false;
+    bool draggingHdrToneCurve_ = false;
     bool inspectorCollapsed_ = false;
     bool fullscreenTransportVisible_ = false;
     bool progressHovered_ = false;
@@ -230,6 +240,7 @@ private:
     bool hasLastFullscreenCursorClient_ = false;
     POINT videoPressStart_{};
     std::chrono::milliseconds dragSeekPosition_{0};
+    int draggedHdrToneCurvePoint_ = -1;
     std::vector<UiButton> buttons_;
     mutable HBITMAP previewBitmap_ = nullptr;
     mutable std::filesystem::path previewBitmapPath_;

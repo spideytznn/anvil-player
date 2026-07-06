@@ -20,3 +20,10 @@ third_party/ffmpeg/include/
 third_party/ffmpeg/lib/
 third_party/ffmpeg/*.txt
 third_party/ffmpeg-shared.zip
+
+# Local packaging outputs
+packages/
+dist/AnvilPlayer-*/
+dist/AnvilPlayer-*.zip
+*.DDF
+*.obj

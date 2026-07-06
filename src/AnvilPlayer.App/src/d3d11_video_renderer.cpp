@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <sstream>
@@ -41,9 +42,10 @@ struct VideoColorConstants {
     float sourcePeakNits = 1000.0f;
     float targetPeakNits = 100.0f;
     float displayPeakNits = 0.0f;
+    float hdrCurveEnabled = 0.0f;
+    float hdrCurvePointCount = 0.0f;
     float reserved0 = 0.0f;
-    float reserved1 = 0.0f;
-    float reserved2 = 0.0f;
+    float hdrToneCurve[anvil::playback::kHdrToneCurvePointCount][4] = {};
 };
 
 static_assert(sizeof(VideoColorConstants) % 16 == 0);
@@ -84,7 +86,7 @@ struct DoviShaderConstants {
     float yccToRgb[3][4] = {};       // each row: r,g,b + pad
     float yccOffset[4] = {};
     float rgbToLms[3][4] = {};       // each row: r,g,b + pad (CMv4.0, reserved)
-    float curveMeta[4] = {};         // xyz = num_pivots per component
+    float curveMeta[4] = {};         // xyz = num_pivots per component, w = offset scale
 
     // Scalars.
     int profile = 0;
@@ -189,7 +191,12 @@ int ToneMapType(const anvil::playback::ToneMappingMode mode) {
     return 1;
 }
 
-float SourcePeakNits(const VideoColorMetadata& color, const anvil::playback::VideoSettings& settings) {
+float SourcePeakNits(const VideoColorMetadata& color,
+                     const anvil::playback::VideoSettings& settings,
+                     const anvil::playback::DolbyVisionFrameMetadata* dovi) {
+    if (dovi && dovi->valid && dovi->sourceMaxNits > 1.0f) {
+        return std::clamp(dovi->sourceMaxNits, 100.0f, 10000.0f);
+    }
     if (color.contentLight.hasValues && color.contentLight.maxContentLightLevelNits > 0) {
         return static_cast<float>(color.contentLight.maxContentLightLevelNits);
     }
@@ -197,6 +204,20 @@ float SourcePeakNits(const VideoColorMetadata& color, const anvil::playback::Vid
         return static_cast<float>(color.masteringDisplay.maxLuminanceNits);
     }
     return static_cast<float>(std::max(100, settings.peakBrightnessNits));
+}
+
+float ClampHdrToneCurveNits(const double value) {
+    if (!std::isfinite(value)) {
+        return 0.0f;
+    }
+    return static_cast<float>(std::clamp(value, 0.0, 10000.0));
+}
+
+float HdrToneCurveOutputPeakNits(const anvil::playback::VideoSettings& settings) {
+    if (settings.hdrToneCurve.empty()) {
+        return static_cast<float>(std::max(100, settings.peakBrightnessNits));
+    }
+    return std::max(100.0f, ClampHdrToneCurveNits(settings.hdrToneCurve.back().outputNits));
 }
 
 VideoColorMetadata NormalizeDolbyVisionOutput(VideoColorMetadata color, const bool hasDolbyVision) {
@@ -223,6 +244,10 @@ float DoviTextureSampleScale(const int bitDepth) {
                : 1.0f;
 }
 
+float DoviOffsetScale() {
+    return static_cast<float>(65536.0 / 65535.0);
+}
+
 bool WantsHdrOutput(const VideoColorMetadata& color,
                     const anvil::playback::VideoSettings& settings,
                     const anvil::playback::DisplayCapabilities& display) {
@@ -231,6 +256,9 @@ bool WantsHdrOutput(const VideoColorMetadata& color,
     }
     if (settings.hdrOutput == anvil::playback::HdrOutputMode::ForceHdr) {
         return display.hdrEnabled || display.hdrSupported;
+    }
+    if (settings.dolbyVisionHdrOutput && color.IsHdr()) {
+        return true;
     }
     return color.IsHdr() && display.hdrEnabled;
 }
@@ -580,6 +608,7 @@ void D3D11VideoRenderer::Render(const NativeVideoFrame& frame) {
         context_->VSSetShader(vs_.Get(), nullptr, 0);
         context_->PSSetShader(ps_.Get(), nullptr, 0);
         context_->PSSetShaderResources(0, 1, srv_.GetAddressOf());
+        context_->PSSetConstantBuffers(0, 1, colorConstants_.GetAddressOf());
         context_->PSSetSamplers(0, 1, sampler_.GetAddressOf());
         context_->Draw(3, 0);
         ID3D11ShaderResourceView* nullView[1] = {};
@@ -660,8 +689,66 @@ bool D3D11VideoRenderer::CreatePipeline() {
     const char* psSrc =
         "Texture2D<float4> tex : register(t0);\n"
         "SamplerState samp : register(s0);\n"
+        "cbuffer ColorConstants : register(b0) {\n"
+        "  int matrixType;\n"
+        "  int rangeType;\n"
+        "  int transferType;\n"
+        "  int outputMode;\n"
+        "  int primariesType;\n"
+        "  int toneMapMode;\n"
+        "  float sourcePeakNits;\n"
+        "  float targetPeakNits;\n"
+        "  float displayPeakNits;\n"
+        "  float hdrCurveEnabled;\n"
+        "  float hdrCurvePointCount;\n"
+        "  float reserved0;\n"
+        "  float4 hdrToneCurve[9];\n"
+        "};\n"
+        "float3 pq_to_nits(float3 v) {\n"
+        "  const float m1 = 2610.0 / 16384.0;\n"
+        "  const float m2 = 2523.0 / 32.0;\n"
+        "  const float c1 = 3424.0 / 4096.0;\n"
+        "  const float c2 = 2413.0 / 128.0;\n"
+        "  const float c3 = 2392.0 / 128.0;\n"
+        "  float3 p = pow(saturate(v), 1.0 / m2);\n"
+        "  return 10000.0 * pow(max(p - c1, 0.0) / max(c2 - c3 * p, 0.000001), 1.0 / m1);\n"
+        "}\n"
+        "float3 nits_to_pq(float3 nits) {\n"
+        "  const float m1 = 2610.0 / 16384.0;\n"
+        "  const float m2 = 2523.0 / 32.0;\n"
+        "  const float c1 = 3424.0 / 4096.0;\n"
+        "  const float c2 = 2413.0 / 128.0;\n"
+        "  const float c3 = 2392.0 / 128.0;\n"
+        "  float3 y = pow(max(nits / 10000.0, 0.0), m1);\n"
+        "  return pow((c1 + c2 * y) / (1.0 + c3 * y), m2);\n"
+        "}\n"
+        "float hdr_curve_luma(float lumaNits) {\n"
+        "  if (hdrCurveEnabled < 0.5) return lumaNits;\n"
+        "  int count = clamp((int)(hdrCurvePointCount + 0.5), 2, 9);\n"
+        "  float2 prev = hdrToneCurve[0].xy;\n"
+        "  if (lumaNits <= prev.x) return max(prev.y, 0.0);\n"
+        "  for (int i = 1; i < 9; ++i) {\n"
+        "    if (i >= count) break;\n"
+        "    float2 next = hdrToneCurve[i].xy;\n"
+        "    if (lumaNits <= next.x) {\n"
+        "      float t = saturate((lumaNits - prev.x) / max(next.x - prev.x, 0.0001));\n"
+        "      return max(lerp(prev.y, next.y, t), 0.0);\n"
+        "    }\n"
+        "    prev = next;\n"
+        "  }\n"
+        "  return max(prev.y, 0.0);\n"
+        "}\n"
+        "float3 apply_hdr_tone_curve_pq(float3 pqRgb) {\n"
+        "  if (outputMode != 1 || transferType != 2 || primariesType != 2 || hdrCurveEnabled < 0.5) return pqRgb;\n"
+        "  float3 nits = max(pq_to_nits(pqRgb), 0.0);\n"
+        "  float luma = max(dot(nits, float3(0.2627, 0.6780, 0.0593)), 0.0);\n"
+        "  float mapped = hdr_curve_luma(luma);\n"
+        "  float scale = mapped / max(luma, 0.0001);\n"
+        "  return saturate(nits_to_pq(nits * scale));\n"
+        "}\n"
         "float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_Target {\n"
-        "  return tex.Sample(samp, uv);\n"
+        "  float4 c = tex.Sample(samp, uv);\n"
+        "  return float4(apply_hdr_tone_curve_pq(c.rgb), c.a);\n"
         "}\n";
     const char* psNv12Src =
         "Texture2D<float> texY : register(t0);\n"
@@ -677,9 +764,10 @@ bool D3D11VideoRenderer::CreatePipeline() {
         "  float sourcePeakNits;\n"
         "  float targetPeakNits;\n"
         "  float displayPeakNits;\n"
+        "  float hdrCurveEnabled;\n"
+        "  float hdrCurvePointCount;\n"
         "  float reserved0;\n"
-        "  float reserved1;\n"
-        "  float reserved2;\n"
+        "  float4 hdrToneCurve[9];\n"
         "};\n"
         "float3 ycbcr_to_rgb(float y, float2 cbcr) {\n"
         "  float yOffset = rangeType == 1 ? 0.0 : 16.0 / 255.0;\n"
@@ -717,6 +805,34 @@ bool D3D11VideoRenderer::CreatePipeline() {
         "  float3 y = pow(max(nits / 10000.0, 0.0), m1);\n"
         "  return pow((c1 + c2 * y) / (1.0 + c3 * y), m2);\n"
         "}\n"
+        "float hdr_curve_luma(float lumaNits) {\n"
+        "  if (hdrCurveEnabled < 0.5) return lumaNits;\n"
+        "  int count = clamp((int)(hdrCurvePointCount + 0.5), 2, 9);\n"
+        "  float2 prev = hdrToneCurve[0].xy;\n"
+        "  if (lumaNits <= prev.x) return max(prev.y, 0.0);\n"
+        "  for (int i = 1; i < 9; ++i) {\n"
+        "    if (i >= count) break;\n"
+        "    float2 next = hdrToneCurve[i].xy;\n"
+        "    if (lumaNits <= next.x) {\n"
+        "      float t = saturate((lumaNits - prev.x) / max(next.x - prev.x, 0.0001));\n"
+        "      return max(lerp(prev.y, next.y, t), 0.0);\n"
+        "    }\n"
+        "    prev = next;\n"
+        "  }\n"
+        "  return max(prev.y, 0.0);\n"
+        "}\n"
+        "float3 apply_hdr_tone_curve_nits(float3 bt2020Nits) {\n"
+        "  float3 nits = max(bt2020Nits, 0.0);\n"
+        "  if (hdrCurveEnabled < 0.5) return saturate(nits_to_pq(nits));\n"
+        "  float luma = max(dot(nits, float3(0.2627, 0.6780, 0.0593)), 0.0);\n"
+        "  float mapped = hdr_curve_luma(luma);\n"
+        "  float scale = mapped / max(luma, 0.0001);\n"
+        "  return saturate(nits_to_pq(nits * scale));\n"
+        "}\n"
+        "float3 apply_hdr_tone_curve_pq(float3 pqRgb) {\n"
+        "  if (hdrCurveEnabled < 0.5) return saturate(pqRgb);\n"
+        "  return apply_hdr_tone_curve_nits(pq_to_nits(pqRgb));\n"
+        "}\n"
         "float3 hlg_to_nits(float3 v) {\n"
         "  const float a = 0.17883277;\n"
         "  const float b = 0.28466892;\n"
@@ -746,18 +862,60 @@ bool D3D11VideoRenderer::CreatePipeline() {
         "  if (transferType == 3) return hlg_to_nits(rgb);\n"
         "  return pow(saturate(rgb), 2.2) * 100.0;\n"
         "}\n"
-        "float3 tone_map_to_sdr(float3 nits) {\n"
-        "  float exposure = 1.0;\n"
-        "  if (toneMapMode == 2) exposure = 100.0 / 140.0;\n"
-        "  else if (toneMapMode == 3) exposure = 100.0 / 75.0;\n"
-        "  float3 working = max(nits, 0.0) * exposure;\n"
-        "  // Compress luma and scale RGB together to preserve hue in SDR.\n"
-        "  float luma = max(dot(working, float3(0.2126, 0.7152, 0.0722)), 0.0);\n"
+        "float tone_map_exposure() {\n"
+        "  if (toneMapMode == 2) return 0.72;\n"
+        "  if (toneMapMode == 3) return 0.95;\n"
+        "  return 0.80;\n"
+        "}\n"
+        "float tone_map_knee(float target) {\n"
+        "  if (toneMapMode == 2) return target * 0.40;\n"
+        "  if (toneMapMode == 3) return target * 0.55;\n"
+        "  return target * 0.45;\n"
+        "}\n"
+        "float tone_map_luma_to_target(float lumaNits) {\n"
         "  float target = max(targetPeakNits, 1.0);\n"
-        "  float mappedLuma = luma / (1.0 + luma / target);\n"
+        "  float source = max(sourcePeakNits * tone_map_exposure(), target + 1.0);\n"
+        "  float knee = clamp(tone_map_knee(target), 1.0, target * 0.98);\n"
+        "  float y = max(lumaNits, 0.0);\n"
+        "  if (y <= knee) return y;\n"
+        "  float shoulder = max(target - knee, 0.0001);\n"
+        "  float peak = max(source, y);\n"
+        "  float x = min(y, peak) - knee;\n"
+        "  float mapped = knee + shoulder * log(1.0 + x / shoulder) / log(1.0 + (peak - knee) / shoulder);\n"
+        "  return min(mapped, target);\n"
+        "}\n"
+        "float3 scale_luma_to_sdr(float3 nits, float3 lumaWeights) {\n"
+        "  float exposure = tone_map_exposure();\n"
+        "  float3 working = max(nits, 0.0) * exposure;\n"
+        "  float luma = max(dot(working, lumaWeights), 0.0);\n"
+        "  float mappedLuma = tone_map_luma_to_target(luma);\n"
         "  float scale = mappedLuma / max(luma, 0.0001);\n"
-        "  float3 mapped = working * scale / target;\n"
-        "  return pow(saturate(mapped), 1.0 / 2.2);\n"
+        "  return working * scale / max(targetPeakNits, 1.0);\n"
+        "}\n"
+        "float3 compress_gamut_preserve_luma(float3 linear709) {\n"
+        "  float luma = saturate(dot(linear709, float3(0.2126, 0.7152, 0.0722)));\n"
+        "  float3 chroma = linear709 - float3(luma, luma, luma);\n"
+        "  float scale = 1.0;\n"
+        "  if (chroma.r > 0.0) scale = min(scale, (1.0 - luma) / chroma.r);\n"
+        "  else if (chroma.r < 0.0) scale = min(scale, -luma / chroma.r);\n"
+        "  if (chroma.g > 0.0) scale = min(scale, (1.0 - luma) / chroma.g);\n"
+        "  else if (chroma.g < 0.0) scale = min(scale, -luma / chroma.g);\n"
+        "  if (chroma.b > 0.0) scale = min(scale, (1.0 - luma) / chroma.b);\n"
+        "  else if (chroma.b < 0.0) scale = min(scale, -luma / chroma.b);\n"
+        "  scale = saturate(scale);\n"
+        "  return saturate(float3(luma, luma, luma) + chroma * scale);\n"
+        "}\n"
+        "float3 encode_sdr_g22(float3 linearRgb) {\n"
+        "  return pow(saturate(linearRgb), 1.0 / 2.2);\n"
+        "}\n"
+        "float3 bt2020_nits_to_sdr(float3 bt2020Nits) {\n"
+        "  float3 linear2020 = scale_luma_to_sdr(bt2020Nits, float3(0.2627, 0.6780, 0.0593));\n"
+        "  float3 linear709 = bt2020_to_bt709(linear2020);\n"
+        "  return encode_sdr_g22(compress_gamut_preserve_luma(linear709));\n"
+        "}\n"
+        "float3 bt709_nits_to_sdr(float3 bt709Nits) {\n"
+        "  float3 linear709 = scale_luma_to_sdr(bt709Nits, float3(0.2126, 0.7152, 0.0722));\n"
+        "  return encode_sdr_g22(compress_gamut_preserve_luma(linear709));\n"
         "}\n"
         // ---- Dolby Vision reshaping (register b1) ----
         // Constants packed to match DoviShaderConstants on the C++ side.
@@ -794,6 +952,9 @@ bool D3D11VideoRenderer::CreatePipeline() {
         "}\n"
         "int dovi_num_pivots(int c) {\n"
         "  return clamp((int)(curveMeta[c] + 0.5), 2, 9);\n"
+        "}\n"
+        "float dovi_offset_scale() {\n"
+        "  return curveMeta.w > 0.0 ? curveMeta.w : 1.0;\n"
         "}\n"
         // Read mapping method for piece s of component c. Returns -1 if none.
         "int dovi_method(int c, int s) {\n"
@@ -870,7 +1031,7 @@ bool D3D11VideoRenderer::CreatePipeline() {
         "    }\n"
         "    outRgb[c] = clamp(outRgb[c], dovi_pivot(c, 0), dovi_pivot(c, numPivots - 1));\n"
         "  }\n"
-        "  float3 shifted = outRgb - yccOffset.xyz;\n"
+        "  float3 shifted = outRgb - yccOffset.xyz * dovi_offset_scale();\n"
         "  float3 pqRgb = dovi_ycc_to_rgb(shifted);\n"
         "  return pqRgb;\n"
         "}\n"
@@ -890,25 +1051,25 @@ bool D3D11VideoRenderer::CreatePipeline() {
         "    float3 ipt = saturate(float3(y, cbcr.x, cbcr.y) * doviSampleScale);\n"
         "    float3 bt2020Nits = dovi_to_bt2020_nits(ipt);\n"
         "    if (outputMode == 1) {\n"
-        "      return float4(saturate(nits_to_pq(max(bt2020Nits, 0.0))), 1.0);\n"
+        "      return float4(apply_hdr_tone_curve_nits(bt2020Nits), 1.0);\n"
         "    }\n"
-        "    return float4(tone_map_to_sdr(bt2020_to_bt709(bt2020Nits)), 1.0);\n"
+        "    return float4(bt2020_nits_to_sdr(bt2020Nits), 1.0);\n"
         "  }\n"
         "  float3 rgb = ycbcr_to_rgb(y, cbcr);\n"
         "  if (outputMode == 1) {\n"
-        "    if (transferType == 2 && primariesType == 2) return float4(saturate(rgb), 1.0);\n"
+        "    if (transferType == 2 && primariesType == 2) return float4(apply_hdr_tone_curve_pq(rgb), 1.0);\n"
         "    float3 nits = encoded_to_nits(rgb);\n"
         "    if (primariesType == 1) nits = bt709_to_bt2020(nits);\n"
-        "    return float4(saturate(nits_to_pq(nits)), 1.0);\n"
+        "    return float4(apply_hdr_tone_curve_nits(nits), 1.0);\n"
         "  }\n"
         "  if (transferType == 2 || transferType == 3) {\n"
         "    float3 nits = encoded_to_nits(rgb);\n"
-        "    if (primariesType == 2) nits = bt2020_to_bt709(nits);\n"
-        "    return float4(tone_map_to_sdr(nits), 1.0);\n"
+        "    if (primariesType == 2) return float4(bt2020_nits_to_sdr(nits), 1.0);\n"
+        "    return float4(bt709_nits_to_sdr(nits), 1.0);\n"
         "  }\n"
         "  if (primariesType == 2) {\n"
-        "    float3 linear709 = bt2020_to_bt709(pow(saturate(rgb), 2.2) * 100.0);\n"
-        "    return float4(pow(saturate(linear709 / 100.0), 1.0 / 2.2), 1.0);\n"
+        "    float3 linear709 = bt2020_to_bt709(pow(saturate(rgb), 2.2));\n"
+        "    return float4(encode_sdr_g22(compress_gamut_preserve_luma(linear709)), 1.0);\n"
         "  }\n"
         "  return float4(saturate(rgb), 1.0);\n"
         "}\n";
@@ -1001,10 +1162,35 @@ bool D3D11VideoRenderer::UpdateColorPipeline(const NativeVideoFrame& frame) {
     constants.outputMode = hdrOutput ? 1 : 0;
     constants.primariesType = PrimariesType(color.primaries);
     constants.toneMapMode = ToneMapType(videoSettings_.toneMapping);
-    constants.sourcePeakNits = SourcePeakNits(color, videoSettings_);
-    constants.targetPeakNits = hdrOutput ? std::max(100.0f, static_cast<float>(displayCapabilities_.reportedPeakBrightnessNits))
-                                         : 100.0f;
+    constants.sourcePeakNits = SourcePeakNits(color, videoSettings_, frame.dovi.get());
+    const bool hdrToneCurveEnabled = hdrOutput && videoSettings_.dolbyVisionHdrOutput;
+    constants.targetPeakNits = hdrOutput
+                                    ? (hdrToneCurveEnabled
+                                           ? HdrToneCurveOutputPeakNits(videoSettings_)
+                                           : std::max(100.0f, static_cast<float>(displayCapabilities_.reportedPeakBrightnessNits)))
+                                    : 100.0f;
     constants.displayPeakNits = static_cast<float>(std::max(0, displayCapabilities_.reportedPeakBrightnessNits));
+    constants.hdrCurveEnabled = hdrToneCurveEnabled ? 1.0f : 0.0f;
+    constants.hdrCurvePointCount = static_cast<float>(videoSettings_.hdrToneCurve.size());
+    float previousInput = 0.0f;
+    float previousOutput = 0.0f;
+    for (std::size_t index = 0; index < videoSettings_.hdrToneCurve.size(); ++index) {
+        float input = ClampHdrToneCurveNits(index < anvil::playback::kDefaultHdrToneCurve.size()
+                                                ? anvil::playback::kDefaultHdrToneCurve[index].inputNits
+                                                : videoSettings_.hdrToneCurve[index].inputNits);
+        float output = ClampHdrToneCurveNits(videoSettings_.hdrToneCurve[index].outputNits);
+        if (index == 0) {
+            input = 0.0f;
+            output = 0.0f;
+        } else {
+            input = std::max(input, previousInput + 0.001f);
+            output = std::max(output, previousOutput);
+        }
+        constants.hdrToneCurve[index][0] = input;
+        constants.hdrToneCurve[index][1] = output;
+        previousInput = input;
+        previousOutput = output;
+    }
     context_->UpdateSubresource(colorConstants_.Get(), 0, nullptr, &constants, 0, 0);
     // Only update the (large) DV constants buffer when DV metadata is actually
     // present; non-DV frames keep the previous disabled state.
@@ -1016,6 +1202,7 @@ bool D3D11VideoRenderer::UpdateColorPipeline(const NativeVideoFrame& frame) {
         doviEnabledLastFrame_ = false;
     }
 
+    const bool hasDolbyVision = frame.dovi && frame.dovi->valid;
     const std::wstring label =
         std::wstring(L"input=") + (frame.HasD3DTexture() ? L"d3d11_texture" : (frame.HasYuv() ? L"p010_yuv" : L"bgra")) +
         L" output=" + OutputModeName(hdrOutput) +
@@ -1025,7 +1212,11 @@ bool D3D11VideoRenderer::UpdateColorPipeline(const NativeVideoFrame& frame) {
         L" matrix=" + anvil::playback::ToDisplayString(color.matrix) +
         L" range=" + anvil::playback::ToDisplayString(color.range) +
         L" tone_mapping=" + anvil::playback::ToDisplayString(videoSettings_.toneMapping) +
-        L" dolby_vision=" + (frame.dovi ? L"present" : L"none");
+        (hdrOutput ? L" hdr_curve_peak=" + std::to_wstring(static_cast<int>(std::round(constants.targetPeakNits))) : L"") +
+        L" dolby_vision=" + (hasDolbyVision ? L"present" : L"none") +
+        (hasDolbyVision
+             ? L" dv_reshape=true st2084_correction=true tone_map=luma_log_bt2446_fit gamut=luma_preserving"
+             : L"");
     if (label != activePipelineLabel_) {
         activePipelineLabel_ = label;
         LogInfo(label);
@@ -1039,6 +1230,8 @@ bool D3D11VideoRenderer::UpdateColorPipeline(const NativeVideoFrame& frame) {
            << L" vdr_bit_depth=" << frame.dovi->vdrBitDepth
            << L" full_range=" << (frame.dovi->blVideoFullRange ? 1 : 0)
            << L" coef_log2_denom=" << frame.dovi->coefLog2Denom
+           << L" source_max_pq=" << frame.dovi->sourceMaxPq
+           << L" source_max_nits=" << static_cast<int>(std::round(frame.dovi->sourceMaxNits))
            << L" pivots=";
         for (int c = 0; c < anvil::playback::kDoviNumComponents; ++c) {
             ss << L"[" << frame.dovi->curves[c].numPivots << L"]";
@@ -1146,6 +1339,7 @@ void D3D11VideoRenderer::UpdateDoviConstants(const NativeVideoFrame& frame) {
     dc.compatibilityId = dovi.compatibilityId;
     dc.enabled = 1;
     dc.sampleScale = DoviTextureSampleScale(dovi.blBitDepth);
+    dc.curveMeta[3] = DoviOffsetScale();
 
     context_->UpdateSubresource(doviConstants_.Get(), 0, nullptr, &dc, 0, 0);
     doviEnabledLastFrame_ = true;
@@ -1239,18 +1433,29 @@ void D3D11VideoRenderer::ApplyHdrMetadata(const VideoColorMetadata& color) {
         metadata.WhitePoint[1] = ChromaticityToDxgi(0.3290);
     }
 
-    const double maxMastering = mastering.hasLuminance && mastering.maxLuminanceNits > 0.0
-                                    ? mastering.maxLuminanceNits
-                                    : static_cast<double>(std::max(100, videoSettings_.peakBrightnessNits));
+    const bool curveActive = videoSettings_.dolbyVisionHdrOutput;
+    const double curvePeak = curveActive
+                                 ? static_cast<double>(HdrToneCurveOutputPeakNits(videoSettings_))
+                                 : 10000.0;
+    const double sourceMaxMastering = mastering.hasLuminance && mastering.maxLuminanceNits > 0.0
+                                          ? mastering.maxLuminanceNits
+                                          : static_cast<double>(std::max(100, videoSettings_.peakBrightnessNits));
+    const double maxMastering = curveActive
+                                    ? std::clamp(sourceMaxMastering, 100.0, curvePeak)
+                                    : sourceMaxMastering;
     const double minMastering = mastering.hasLuminance && mastering.minLuminanceNits > 0.0
                                     ? mastering.minLuminanceNits
                                     : 0.0001;
     metadata.MaxMasteringLuminance = LuminanceToDxgi(maxMastering);
     metadata.MinMasteringLuminance = LuminanceToDxgi(minMastering);
-    metadata.MaxContentLightLevel = LightLevelToDxgi(
-        color.contentLight.hasValues ? color.contentLight.maxContentLightLevelNits : static_cast<int>(maxMastering));
-    metadata.MaxFrameAverageLightLevel = LightLevelToDxgi(
-        color.contentLight.hasValues ? color.contentLight.maxFrameAverageLightLevelNits : static_cast<int>(maxMastering / 2.0));
+    metadata.MaxContentLightLevel = LightLevelToDxgi(static_cast<int>(std::round(
+        color.contentLight.hasValues
+            ? std::min(static_cast<double>(color.contentLight.maxContentLightLevelNits), curvePeak)
+            : maxMastering)));
+    metadata.MaxFrameAverageLightLevel = LightLevelToDxgi(static_cast<int>(std::round(
+        color.contentLight.hasValues
+            ? std::min(static_cast<double>(color.contentLight.maxFrameAverageLightLevelNits), curvePeak)
+            : maxMastering / 2.0)));
 
     const HRESULT hr = swapChain4->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_HDR10, sizeof(metadata), &metadata);
     if (SUCCEEDED(hr)) {
@@ -1359,7 +1564,13 @@ bool D3D11VideoRenderer::UpdateHardwareTexture(const NativeVideoFrame& frame) {
 
 void D3D11VideoRenderer::UpdateTexture(const NativeVideoFrame& frame) {
     if (frame.width <= 0 || frame.height <= 0 || frame.stride < frame.width * 4) return;
-    const bool needsRecreate = !texture_ || textureW_ != frame.width || textureH_ != frame.height;
+    const DXGI_FORMAT uploadFormat = frame.softwareFormat == AV_PIX_FMT_X2BGR10LE
+                                         ? DXGI_FORMAT_R10G10B10A2_UNORM
+                                         : DXGI_FORMAT_B8G8R8A8_UNORM;
+    const bool needsRecreate = !texture_ ||
+                               textureW_ != frame.width ||
+                               textureH_ != frame.height ||
+                               textureFormat_ != uploadFormat;
     if (needsRecreate) {
         texture_.Reset();
         srv_.Reset();
@@ -1368,7 +1579,7 @@ void D3D11VideoRenderer::UpdateTexture(const NativeVideoFrame& frame) {
         tdesc.Height = static_cast<UINT>(frame.height);
         tdesc.MipLevels = 1;
         tdesc.ArraySize = 1;
-        tdesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        tdesc.Format = uploadFormat;
         tdesc.SampleDesc.Count = 1;
         tdesc.Usage = D3D11_USAGE_DYNAMIC;
         tdesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -1379,8 +1590,10 @@ void D3D11VideoRenderer::UpdateTexture(const NativeVideoFrame& frame) {
         }
         textureW_ = frame.width;
         textureH_ = frame.height;
+        textureFormat_ = uploadFormat;
         if (FAILED(device_->CreateShaderResourceView(texture_.Get(), nullptr, &srv_))) {
             texture_.Reset();
+            textureFormat_ = DXGI_FORMAT_UNKNOWN;
             return;
         }
     }
@@ -1691,6 +1904,9 @@ void D3D11VideoRenderer::ReleaseAll() {
     yuvTextureH_ = 0;
     srv_.Reset();
     texture_.Reset();
+    textureW_ = 0;
+    textureH_ = 0;
+    textureFormat_ = DXGI_FORMAT_UNKNOWN;
     colorConstants_.Reset();
     doviConstants_.Reset();
     subtitleBlend_.Reset();
