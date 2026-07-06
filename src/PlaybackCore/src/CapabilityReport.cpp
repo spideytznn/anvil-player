@@ -3,6 +3,9 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_6.h>
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mftransform.h>
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -12,6 +15,9 @@
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "dxguid.lib")
+#pragma comment(lib, "mf.lib")
+#pragma comment(lib, "mfplat.lib")
+#pragma comment(lib, "mfuuid.lib")
 
 namespace anvil::playback {
 namespace {
@@ -66,6 +72,12 @@ void AddUnique(std::vector<std::wstring>& values, std::wstring value) {
     if (std::find(values.begin(), values.end(), value) == values.end()) {
         values.push_back(std::move(value));
     }
+}
+
+bool ContainsInsensitive(std::wstring value, std::wstring needle) {
+    std::transform(value.begin(), value.end(), value.begin(), ::towlower);
+    std::transform(needle.begin(), needle.end(), needle.begin(), ::towlower);
+    return value.find(needle) != std::wstring::npos;
 }
 
 std::wstring DecoderProfileName(const GUID& profile) {
@@ -211,6 +223,71 @@ bool TryPopulateD3D11(CapabilityReport& report) {
     return true;
 }
 
+void PopulateMediaFoundationTransforms(CodecCapabilities& codecs) {
+    codecs.mediaFoundationTransforms.clear();
+
+    HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_LITE);
+    if (FAILED(hr)) {
+        codecs.mediaFoundationTransforms = {L"Media Foundation startup failed " + std::to_wstring(static_cast<unsigned long>(hr))};
+        return;
+    }
+
+    MFT_REGISTER_TYPE_INFO inputType{};
+    inputType.guidMajorType = MFMediaType_Video;
+    inputType.guidSubtype = MFVideoFormat_HEVC;
+
+    IMFActivate** activates = nullptr;
+    UINT32 count = 0;
+    const UINT32 flags =
+        MFT_ENUM_FLAG_SYNCMFT |
+        MFT_ENUM_FLAG_ASYNCMFT |
+        MFT_ENUM_FLAG_HARDWARE |
+        MFT_ENUM_FLAG_LOCALMFT |
+        MFT_ENUM_FLAG_SORTANDFILTER;
+    hr = MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER, flags, &inputType, nullptr, &activates, &count);
+    if (FAILED(hr)) {
+        codecs.mediaFoundationTransforms = {L"HEVC decoder MFT enumeration failed " + std::to_wstring(static_cast<unsigned long>(hr))};
+        MFShutdown();
+        return;
+    }
+
+    for (UINT32 index = 0; index < count; ++index) {
+        if (!activates[index]) {
+            continue;
+        }
+
+        wchar_t* name = nullptr;
+        UINT32 nameLength = 0;
+        std::wstring friendlyName = L"Unnamed HEVC decoder MFT";
+        if (SUCCEEDED(activates[index]->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute, &name, &nameLength)) && name) {
+            friendlyName.assign(name, name + nameLength);
+            CoTaskMemFree(name);
+        }
+
+        GUID clsid{};
+        if (SUCCEEDED(activates[index]->GetGUID(MFT_TRANSFORM_CLSID_Attribute, &clsid))) {
+            wchar_t clsidText[64]{};
+            if (StringFromGUID2(clsid, clsidText, static_cast<int>(std::size(clsidText))) > 0) {
+                friendlyName += L" ";
+                friendlyName += clsidText;
+            }
+        }
+
+        if (ContainsInsensitive(friendlyName, L"dolby")) {
+            codecs.dolbyVisionExtensionDetected = true;
+        }
+        AddUnique(codecs.mediaFoundationTransforms, std::move(friendlyName));
+        activates[index]->Release();
+    }
+    CoTaskMemFree(activates);
+
+    if (codecs.mediaFoundationTransforms.empty()) {
+        codecs.mediaFoundationTransforms = {L"No HEVC video decoder MFT reported"};
+    }
+
+    MFShutdown();
+}
+
 }  // namespace
 
 CapabilityReport CapabilityDetector::CollectBasic() {
@@ -222,7 +299,7 @@ CapabilityReport CapabilityDetector::CollectBasic() {
     TryPopulateD3D11(report);
     report.audio.endpointName = L"Default Windows endpoint";
     report.audio.encodedFormats = {L"AC-3", L"E-AC-3", L"TrueHD", L"DTS", L"DTS-HD"};
-    report.codecs.mediaFoundationTransforms = {L"Enumeration pending"};
+    PopulateMediaFoundationTransforms(report.codecs);
     return report;
 }
 

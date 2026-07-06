@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cwctype>
 #include <sstream>
 #include <string>
+#include <system_error>
 
 namespace anvil::app {
 
@@ -39,6 +41,135 @@ std::wstring SubtitleSelectionText(const int selectedTrackIndex) {
     return L"Stream " + std::to_wstring(selectedTrackIndex);
 }
 
+std::wstring LowercaseCopy(std::wstring value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](const wchar_t ch) {
+        return static_cast<wchar_t>(std::towlower(ch));
+    });
+    return value;
+}
+
+std::wstring UppercaseCopy(std::wstring value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](const wchar_t ch) {
+        return static_cast<wchar_t>(std::towupper(ch));
+    });
+    return value;
+}
+
+std::wstring SubtitleLanguageName(const std::wstring& language) {
+    if (language.empty() || language == L"-") {
+        return {};
+    }
+
+    const std::wstring normalized = LowercaseCopy(language);
+    if (normalized == L"chi" || normalized == L"zho" || normalized == L"zh" ||
+        normalized.rfind(L"zh-", 0) == 0 ||
+        normalized == L"chs" || normalized == L"cht" || normalized == L"cmn" || normalized == L"cn" ||
+        normalized.find(L"chinese") != std::wstring::npos) {
+        if (normalized.find(L"trad") != std::wstring::npos ||
+            normalized.find(L"hant") != std::wstring::npos ||
+            normalized.find(L"tw") != std::wstring::npos ||
+            normalized == L"cht") {
+            return L"Chinese Traditional";
+        }
+        if (normalized.find(L"simp") != std::wstring::npos ||
+            normalized.find(L"hans") != std::wstring::npos ||
+            normalized.find(L"cn") != std::wstring::npos ||
+            normalized == L"chs") {
+            return L"Chinese Simplified";
+        }
+        return L"Chinese";
+    }
+    if (normalized == L"eng" || normalized == L"en") {
+        return L"English";
+    }
+    if (normalized == L"jpn" || normalized == L"ja") {
+        return L"Japanese";
+    }
+    if (normalized == L"kor" || normalized == L"ko") {
+        return L"Korean";
+    }
+    if (normalized == L"fre" || normalized == L"fra" || normalized == L"fr") {
+        return L"French";
+    }
+    if (normalized == L"ger" || normalized == L"deu" || normalized == L"de") {
+        return L"German";
+    }
+    if (normalized == L"spa" || normalized == L"es") {
+        return L"Spanish";
+    }
+    return language;
+}
+
+std::wstring SubtitleMenuPrimaryLabel(const int selection, const std::optional<anvil::playback::MediaDescriptor>& media) {
+    if (selection == anvil::playback::kSubtitleTrackAuto) {
+        return L"自动";
+    }
+    if (selection == anvil::playback::kSubtitleTrackOff) {
+        return L"关闭";
+    }
+
+    std::wstring label = L"Stream " + std::to_wstring(selection);
+    if (!media.has_value()) {
+        return label;
+    }
+    for (const auto& stream : media->streams) {
+        if (stream.kind != L"Subtitle" || stream.index != selection) {
+            continue;
+        }
+        const std::wstring language = SubtitleLanguageName(stream.language);
+        if (!language.empty()) {
+            label = language;
+        }
+        break;
+    }
+    return label;
+}
+
+std::wstring SubtitleMenuCodecLabel(const int selection, const std::optional<anvil::playback::MediaDescriptor>& media) {
+    if (selection < 0 || !media.has_value()) {
+        return {};
+    }
+
+    for (const auto& stream : media->streams) {
+        if (stream.kind == L"Subtitle" && stream.index == selection) {
+            return UppercaseCopy(stream.codec);
+        }
+    }
+    return {};
+}
+
+std::wstring SubtitleDelayText(const int delayMs) {
+    std::wostringstream stream;
+    stream.setf(std::ios::fixed);
+    stream.precision(1);
+    stream << static_cast<double>(delayMs) / 1000.0 << L" s";
+    return stream.str();
+}
+
+void DrawCheckMark(HDC hdc, const POINT center, const int size, const COLORREF color) {
+    const int width = std::max(1, size / 7);
+    DrawLine(hdc,
+             center.x - size / 2,
+             center.y,
+             center.x - size / 8,
+             center.y + size / 3,
+             color,
+             width);
+    DrawLine(hdc,
+             center.x - size / 8,
+             center.y + size / 3,
+             center.x + size / 2,
+             center.y - size / 3,
+             color,
+             width);
+}
+
+void DrawPlusMark(HDC hdc, const POINT center, const int size, const COLORREF color) {
+    const int width = std::max(1, size / 8);
+    DrawLine(hdc, center.x - size / 2, center.y, center.x + size / 2, center.y, color, width);
+    DrawLine(hdc, center.x, center.y - size / 2, center.x, center.y + size / 2, color, width);
+}
+
 std::wstring VideoSelectionText(const int selectedTrackIndex) {
     if (selectedTrackIndex == anvil::playback::kVideoTrackAuto) {
         return L"Auto";
@@ -49,11 +180,18 @@ std::wstring VideoSelectionText(const int selectedTrackIndex) {
     return L"Stream " + std::to_wstring(selectedTrackIndex);
 }
 
-constexpr double kHdrToneCurveMaxNits = 10000.0;
+constexpr double kHdrToneCurveMaxNits = 4000.0;
+constexpr double kHdrToneCurveFocusNits = 1000.0;
+constexpr double kHdrToneCurveFocusUnit = 0.72;
 
 double ToneCurveNitsToUnit(const double nits) {
     const double clamped = std::clamp(nits, 0.0, kHdrToneCurveMaxNits);
-    return std::log10(clamped + 1.0) / std::log10(kHdrToneCurveMaxNits + 1.0);
+    if (clamped <= kHdrToneCurveFocusNits) {
+        return (clamped / kHdrToneCurveFocusNits) * kHdrToneCurveFocusUnit;
+    }
+    return kHdrToneCurveFocusUnit +
+           ((clamped - kHdrToneCurveFocusNits) / (kHdrToneCurveMaxNits - kHdrToneCurveFocusNits)) *
+               (1.0 - kHdrToneCurveFocusUnit);
 }
 
 int ToneCurveX(const RECT& plot, const double nits) {
@@ -66,6 +204,19 @@ int ToneCurveY(const RECT& plot, const double nits) {
 
 std::wstring NitsLabel(const double nits) {
     return std::to_wstring(static_cast<int>(std::round(nits))) + L" nits";
+}
+
+std::wstring ToneCurveAxisLabel(const double nits) {
+    if (nits >= 1000.0) {
+        return std::to_wstring(static_cast<int>(nits / 1000.0)) + L"k";
+    }
+    return std::to_wstring(static_cast<int>(nits));
+}
+
+std::filesystem::path ComparablePath(const std::filesystem::path& path) {
+    std::error_code error;
+    const auto absolute = std::filesystem::absolute(path, error);
+    return (error ? path : absolute).lexically_normal();
 }
 
 }  // namespace
@@ -109,7 +260,8 @@ void MainWindow::Paint() {
         DrawInspectorPanel(bufferDc, snapshot, settings, capabilities);
     }
     if (!fullscreen_) {
-        DrawButtons(bufferDc);
+        DrawButtons(bufferDc, snapshot);
+        DrawSubtitleMenu(bufferDc, snapshot);
         DrawTooltip(bufferDc);
     }
 
@@ -138,16 +290,26 @@ void MainWindow::PaintFullscreenOverlay(HWND overlay) {
     SetViewportOrgEx(bufferDc, -paintRect.left, -paintRect.top, &oldPaintOrigin);
     SetBkMode(bufferDc, TRANSPARENT);
 
-    HBRUSH background = CreateSolidBrush(RGB(0, 0, 0));
+    HBRUSH background = CreateSolidBrush(fullscreen_ ? RGB(0, 0, 0) : palette_.background);
     FillRect(bufferDc, &paintRect, background);
     DeleteObject(background);
 
+    POINT overlayOrigin{};
+    RECT overlayWindow{};
+    if (GetWindowRect(overlay, &overlayWindow)) {
+        overlayOrigin = POINT{overlayWindow.left, overlayWindow.top};
+        ScreenToClient(hwnd_, &overlayOrigin);
+    } else {
+        overlayOrigin = POINT{transportBar_.left, transportBar_.top};
+    }
+
     POINT oldOrigin{};
-    SetViewportOrgEx(bufferDc, -transportBar_.left - paintRect.left, -transportBar_.top - paintRect.top, &oldOrigin);
+    SetViewportOrgEx(bufferDc, -overlayOrigin.x - paintRect.left, -overlayOrigin.y - paintRect.top, &oldOrigin);
 
     const auto snapshot = controller_.Snapshot();
     DrawTransport(bufferDc, snapshot);
-    DrawButtons(bufferDc);
+    DrawButtons(bufferDc, snapshot);
+    DrawSubtitleMenu(bufferDc, snapshot);
 
     SetViewportOrgEx(bufferDc, oldOrigin.x, oldOrigin.y, nullptr);
     BitBlt(windowDc, paintRect.left, paintRect.top, RectWidth(paintRect), RectHeight(paintRect), bufferDc, 0, 0, SRCCOPY);
@@ -161,6 +323,34 @@ void MainWindow::PaintFullscreenOverlay(HWND overlay) {
 
 void MainWindow::PaintTransportOverlay(HWND overlay) {
     PaintFullscreenOverlay(overlay);
+}
+
+void MainWindow::PaintHdrToneCurveWindow(HWND window) {
+    PAINTSTRUCT paint{};
+    HDC windowDc = BeginPaint(window, &paint);
+    UpdateHdrToneCurveFloatingLayout();
+
+    RECT paintRect = paint.rcPaint;
+    if (RectWidth(paintRect) <= 0 || RectHeight(paintRect) <= 0) {
+        EndPaint(window, &paint);
+        return;
+    }
+
+    HDC bufferDc = CreateCompatibleDC(windowDc);
+    HBITMAP bufferBitmap = CreateCompatibleBitmap(windowDc, std::max(1, RectWidth(paintRect)), std::max(1, RectHeight(paintRect)));
+    HGDIOBJ oldBitmap = SelectObject(bufferDc, bufferBitmap);
+    POINT oldOrigin{};
+    SetViewportOrgEx(bufferDc, -paintRect.left, -paintRect.top, &oldOrigin);
+    SetBkMode(bufferDc, TRANSPARENT);
+
+    DrawHdrToneCurveExpandedEditor(bufferDc, controller_.Settings());
+
+    BitBlt(windowDc, paintRect.left, paintRect.top, RectWidth(paintRect), RectHeight(paintRect), bufferDc, 0, 0, SRCCOPY);
+    SetViewportOrgEx(bufferDc, oldOrigin.x, oldOrigin.y, nullptr);
+    SelectObject(bufferDc, oldBitmap);
+    DeleteObject(bufferBitmap);
+    DeleteDC(bufferDc);
+    EndPaint(window, &paint);
 }
 
 void MainWindow::DrawTopBar(HDC hdc, const PlaybackSessionSnapshot& snapshot) const {
@@ -250,7 +440,7 @@ void MainWindow::DrawTopBar(HDC hdc, const PlaybackSessionSnapshot& snapshot) co
     DeleteObject(smallFont);
 }
 
-void MainWindow::DrawButtons(HDC hdc) const {
+void MainWindow::DrawButtons(HDC hdc, const PlaybackSessionSnapshot& snapshot) const {
     const double opacity = fullscreen_ ? std::clamp(fullscreenTransportAmount_, 0.0, 1.0) : 1.0;
     if (opacity <= 0.02) {
         return;
@@ -262,46 +452,138 @@ void MainWindow::DrawButtons(HDC hdc) const {
     HFONT buttonFont = CreateUiFont(Scale(11), FW_SEMIBOLD);
     for (std::size_t index = 0; index < buttons_.size(); ++index) {
         const auto& button = buttons_[index];
-        const bool hovered = static_cast<int>(index) == hoveredButton_;
+        const bool hovered = button.enabled && static_cast<int>(index) == hoveredButton_;
+
+        if (button.kind == ButtonKind::TransportIcon || button.kind == ButtonKind::TransportLabel) {
+            const int radius = std::max(Scale(8), std::min(RectWidth(button.bounds), RectHeight(button.bounds)) / 2);
+            if (hovered || button.selected) {
+                const COLORREF fill = button.selected
+                                          ? BlendColor(palette_.accentSoft, palette_.surfaceRaised, 0.12)
+                                          : BlendColor(palette_.surfaceRaised, palette_.text, 0.04);
+                FillRoundRect(hdc, button.bounds, fade(fill), radius);
+            }
+
+            COLORREF contentColor = !button.enabled
+                                        ? palette_.dim
+                                        : (button.selected ? palette_.accent : palette_.text);
+            if (!button.selected && button.kind == ButtonKind::TransportIcon) {
+                contentColor = hovered ? palette_.text : palette_.muted;
+            }
+            if (button.kind == ButtonKind::TransportLabel) {
+                DrawTextInRect(hdc,
+                               button.label,
+                               DeflateRectCopy(button.bounds, Scale(2), 0),
+                               buttonFont,
+                               fade(contentColor),
+                               DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            } else {
+                RECT iconRect = DeflateRectCopy(button.bounds, Scale(7), Scale(7));
+                IconKind icon = button.icon;
+                if (button.command == Command::PlayPause) {
+                    icon = snapshot.state == PlaybackState::Playing ? IconKind::Pause : IconKind::Play;
+                }
+                iconPainter_.Draw(hdc, icon, iconRect, fade(contentColor));
+            }
+            continue;
+        }
+
+        if (button.kind == ButtonKind::InspectorTab) {
+            COLORREF textColor = !button.enabled
+                                     ? palette_.dim
+                                     : (button.selected ? palette_.text : palette_.muted);
+            if (hovered && !button.selected) {
+                FillRoundRect(hdc,
+                              button.bounds,
+                              fade(BlendColor(palette_.surfaceRaised, palette_.text, 0.05)),
+                              Scale(6));
+                textColor = palette_.text;
+            }
+            if (button.selected) {
+                FillRoundRect(hdc,
+                              button.bounds,
+                              fade(BlendColor(palette_.accentSoft, palette_.surfaceRaised, 0.18)),
+                              Scale(6));
+                const int underlineY = button.bounds.bottom - Scale(3);
+                DrawLine(hdc,
+                         button.bounds.left + Scale(8),
+                         underlineY,
+                         button.bounds.right - Scale(8),
+                         underlineY,
+                         fade(palette_.accent),
+                         std::max(1, Scale(2)));
+            }
+            DrawTextInRect(hdc,
+                           button.label,
+                           DeflateRectCopy(button.bounds, Scale(2), 0),
+                           buttonFont,
+                           fade(textColor),
+                           DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            continue;
+        }
 
         if (button.kind == ButtonKind::Tab) {
             COLORREF fill = button.selected ? palette_.surfaceSoft : RGB(11, 13, 17);
+            if (!button.enabled) {
+                fill = BlendColor(fill, palette_.background, 0.35);
+            }
             if (hovered && !button.selected) {
                 fill = BlendColor(fill, palette_.text, 0.06);
             }
             FillRoundRect(hdc, button.bounds, fade(fill), Scale(7));
             StrokeRoundRect(hdc,
                             button.bounds,
-                            fade(button.selected ? BlendColor(palette_.borderStrong, palette_.accent, 0.16) : palette_.border),
+                            fade(!button.enabled
+                                     ? BlendColor(palette_.border, palette_.background, 0.25)
+                                     : (button.selected ? BlendColor(palette_.borderStrong, palette_.accent, 0.16) : palette_.border)),
                             Scale(7));
             DrawTextInRect(hdc,
                            button.label,
                            DeflateRectCopy(button.bounds, Scale(6), 0),
                            buttonFont,
-                           fade(button.selected ? palette_.text : palette_.muted),
+                           fade(!button.enabled ? palette_.dim : (button.selected ? palette_.text : palette_.muted)),
                            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             continue;
         }
 
         COLORREF fill = button.primary ? palette_.accent : palette_.surfaceRaised;
-        if (hovered) {
-            fill = BlendColor(fill, palette_.text, button.primary ? 0.08 : 0.06);
-        }
-        if (button.selected && !button.primary) {
-            fill = BlendColor(fill, palette_.accent, 0.16);
+        if (!button.enabled) {
+            fill = BlendColor(palette_.surface, palette_.background, 0.35);
+        } else {
+            if (hovered) {
+                fill = BlendColor(fill, palette_.text, button.primary ? 0.08 : 0.06);
+            }
+            if (button.selected && !button.primary) {
+                fill = BlendColor(fill, palette_.accent, 0.16);
+            }
         }
 
-        const int radius = button.kind == ButtonKind::TransportPrimary ? Scale(12) : Scale(8);
+        const int radius = button.kind == ButtonKind::TransportPrimary
+                               ? std::max(Scale(12), std::min(RectWidth(button.bounds), RectHeight(button.bounds)) / 2)
+                               : Scale(8);
         FillRoundRect(hdc, button.bounds, fade(fill), radius);
         StrokeRoundRect(hdc,
                         button.bounds,
-                        fade(button.primary ? BlendColor(palette_.accent, palette_.text, 0.14) : BlendColor(palette_.border, palette_.text, 0.03)),
+                        fade(!button.enabled
+                                 ? BlendColor(palette_.border, palette_.background, 0.25)
+                                 : (button.primary
+                                        ? BlendColor(palette_.accent, palette_.text, 0.14)
+                                        : BlendColor(palette_.border, palette_.text, 0.03))),
                         radius);
 
-        const COLORREF iconColor = fade(button.primary ? RGB(255, 250, 248) : (button.selected ? palette_.text : palette_.muted));
-        const int iconInset = button.kind == ButtonKind::TransportPrimary ? Scale(10) : Scale(8);
+        const COLORREF iconColor = fade(!button.enabled
+                                            ? palette_.dim
+                                            : (button.primary ? RGB(255, 250, 248)
+                                                              : (button.selected ? palette_.text : palette_.muted)));
+        const bool wideTextIcon = button.icon == IconKind::HdrColor || button.icon == IconKind::DolbyVisionColor;
+        const int iconInset = wideTextIcon
+                                  ? Scale(3)
+                                  : (button.kind == ButtonKind::TransportPrimary ? Scale(10) : Scale(8));
         RECT iconRect = DeflateRectCopy(button.bounds, iconInset, iconInset);
-        iconPainter_.Draw(hdc, button.icon, iconRect, iconColor);
+        IconKind icon = button.icon;
+        if (button.command == Command::PlayPause) {
+            icon = snapshot.state == PlaybackState::Playing ? IconKind::Pause : IconKind::Play;
+        }
+        iconPainter_.Draw(hdc, icon, iconRect, iconColor);
         if (!button.label.empty()) {
             DrawTextInRect(hdc, button.label, button.bounds, buttonFont, iconColor, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         }
@@ -311,6 +593,9 @@ void MainWindow::DrawButtons(HDC hdc) const {
 
 void MainWindow::DrawTooltip(HDC hdc) const {
     if (fullscreen_ && fullscreenTransportAmount_ < 0.95) {
+        return;
+    }
+    if (subtitleMenuOpen_ || subtitleMenuAmount_ > 0.01 || subtitleMenuTarget_ > 0.0) {
         return;
     }
     if (hoveredButton_ < 0 || hoveredButton_ >= static_cast<int>(buttons_.size())) {
@@ -584,8 +869,6 @@ void MainWindow::DrawTransport(HDC hdc, const PlaybackSessionSnapshot& snapshot)
 
     const bool compactBar = RectHeight(transportBar_) <= Scale(82);
     const int horizontalInset = compactBar ? Scale(18) : Scale(24);
-    HFONT smallFont = CreateUiFont(Scale(11), FW_NORMAL);
-    HFONT labelFont = CreateUiFont(Scale(10), FW_SEMIBOLD);
     HFONT monoFont = CreateMonoFont(Scale(11));
 
     const double progressHover = std::clamp(progressHoverAmount_, 0.0, 1.0);
@@ -609,6 +892,33 @@ void MainWindow::DrawTransport(HDC hdc, const PlaybackSessionSnapshot& snapshot)
         durationText = FormatTimecode(snapshot.media->duration);
     }
 
+    double bufferedRatio = progressRatio;
+    if (backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+        nativeVideoDecoder_ &&
+        snapshot.media.has_value() &&
+        snapshot.media->duration.count() > 0) {
+        const auto stats = nativeVideoDecoder_->Stats();
+        if ((stats.queueDepth > 0 || stats.packetQueueDepth > 0) && stats.bufferedEnd > displayPosition) {
+            bufferedRatio = std::clamp(
+                static_cast<double>(stats.bufferedEnd.count()) / static_cast<double>(snapshot.media->duration.count()),
+                progressRatio,
+                1.0);
+        }
+    }
+    RECT bufferedFill = progressTrack;
+    bufferedFill.right = bufferedFill.left + static_cast<int>(RectWidth(progressTrack) * bufferedRatio);
+    const int progressRight = progressTrack.left + static_cast<int>(RectWidth(progressTrack) * progressRatio);
+    if (bufferedFill.right > progressRight) {
+        const int minVisibleBufferWidth = Scale(6);
+        bufferedFill.right = std::min(static_cast<int>(progressTrack.right),
+                                      std::max(static_cast<int>(bufferedFill.right),
+                                               progressRight + minVisibleBufferWidth));
+        FillRoundRect(hdc,
+                      bufferedFill,
+                      fade(BlendColor(palette_.success, palette_.info, 0.28 + 0.12 * progressHover)),
+                      Scale(3 + static_cast<int>(std::round(2.0 * progressHover))));
+    }
+
     RECT progressFill = progressTrack;
     progressFill.right = progressFill.left + static_cast<int>(RectWidth(progressTrack) * progressRatio);
     if (RectWidth(progressFill) > 0) {
@@ -624,60 +934,348 @@ void MainWindow::DrawTransport(HDC hdc, const PlaybackSessionSnapshot& snapshot)
     FillRoundRect(hdc, knob, fade(RGB(255, 244, 240)), knobRadius);
     StrokeRoundRect(hdc, knob, fade(palette_.accent), knobRadius);
 
-    RECT timeLeft = MakeRect(transportBar_.left + horizontalInset, progress_.bottom + Scale(6), transportBar_.left + horizontalInset + Scale(86), progress_.bottom + Scale(24));
+    RECT timeLeft = MakeRect(transportBar_.left + horizontalInset,
+                             transportBar_.top + Scale(11),
+                             transportBar_.left + horizontalInset + Scale(100),
+                             progress_.top - Scale(6));
     const int transportRightEdge = static_cast<int>(transportBar_.right) - horizontalInset;
-    const int durationRight = fullscreen_ && transportRightControlsLeft_ > 0
-                                  ? std::min(transportRightControlsLeft_ - Scale(12), transportRightEdge)
-                                  : transportRightEdge;
-    RECT timeRight = MakeRect(durationRight - Scale(86), progress_.bottom + Scale(6), durationRight, progress_.bottom + Scale(24));
-    DrawTextInRect(hdc, FormatTimecode(displayPosition), timeLeft, monoFont, fade(draggingProgress_ ? palette_.accent : palette_.muted), DT_LEFT | DT_TOP | DT_SINGLELINE);
+    int durationRight = transportRightEdge;
+    RECT timeRight = MakeRect(durationRight - Scale(110),
+                              transportBar_.top + Scale(11),
+                              durationRight,
+                              progress_.top - Scale(6));
+    DrawTextInRect(hdc, FormatTimecode(displayPosition), timeLeft, monoFont, fade(draggingProgress_ ? palette_.accent : palette_.text), DT_LEFT | DT_TOP | DT_SINGLELINE);
     if (RectWidth(progress_) >= Scale(230) && timeRight.left >= timeLeft.right + Scale(12)) {
         DrawTextInRect(hdc, durationText, timeRight, monoFont, fade(palette_.muted), DT_RIGHT | DT_TOP | DT_SINGLELINE);
     }
 
-    const int metaTop = transportBar_.top + (compactBar ? Scale(50) : Scale(54));
-    const int metaBottom = transportBar_.bottom - (compactBar ? Scale(12) : Scale(16));
-    const int fileLeft = transportBar_.left + horizontalInset;
-    const int fileRight = transportControlsLeft_ - Scale(16);
-    const int fileWidth = fileRight - fileLeft;
-    if (snapshot.media.has_value() && fileWidth >= Scale(210)) {
-        RECT fileLabel = MakeRect(fileLeft, metaTop, fileLeft + Scale(36), metaBottom);
-        DrawTextInRect(hdc, L"FILE", fileLabel, labelFont, fade(palette_.dim), DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        RECT file = MakeRect(fileLabel.right + Scale(8), metaTop, fileRight, metaBottom);
-        DrawTextInRect(hdc,
-                       snapshot.media.has_value() ? snapshot.media->displayName : L"-",
-                       file,
-                       smallFont,
-                       fade(palette_.muted),
-                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-    } else if (snapshot.media.has_value() && fileWidth >= Scale(112)) {
-        RECT file = MakeRect(fileLeft, metaTop, fileRight, metaBottom);
-        DrawTextInRect(hdc,
-                       snapshot.media->displayName,
-                       file,
-                       smallFont,
-                       fade(palette_.muted),
-                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-    }
-
-    const int rightMetaLeft = transportControlsRight_ + Scale(16);
-    const int rightMetaRight = transportRightControlsLeft_ - Scale(12);
-    const int rightMetaWidth = rightMetaRight - rightMetaLeft;
-    if (rightMetaWidth >= Scale(138)) {
-        RECT speed = MakeRect(rightMetaLeft, metaTop, rightMetaLeft + Scale(52), metaBottom);
-        FillRoundRect(hdc, speed, fade(RGB(11, 13, 17)), Scale(7));
-        StrokeRoundRect(hdc, speed, fade(palette_.border), Scale(7));
-        DrawTextInRect(hdc, PlaybackRateText(snapshot.playbackRate), speed, monoFont, fade(snapshot.playbackRate > 1.01 ? palette_.accent : palette_.muted), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
-        RECT volume = MakeRect(speed.right + Scale(10), metaTop, rightMetaRight, metaBottom);
-        DrawTextInRect(hdc, PercentText(snapshot.volume), volume, smallFont, fade(palette_.muted), DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-    } else if (rightMetaWidth >= Scale(58)) {
-        RECT volume = MakeRect(rightMetaLeft, metaTop, rightMetaRight, metaBottom);
-        DrawTextInRect(hdc, PercentText(snapshot.volume), volume, smallFont, fade(palette_.muted), DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-    }
-    DeleteObject(smallFont);
-    DeleteObject(labelFont);
+    DrawVolumeSlider(hdc, snapshot);
     DeleteObject(monoFont);
+}
+
+void MainWindow::DrawVolumeSlider(HDC hdc, const PlaybackSessionSnapshot& snapshot) const {
+    if (RectWidth(volumeSlider_) <= 0 || RectHeight(volumeSlider_) <= 0) {
+        return;
+    }
+
+    const double opacity = fullscreen_ ? std::clamp(fullscreenTransportAmount_, 0.0, 1.0) : 1.0;
+    if (opacity <= 0.02) {
+        return;
+    }
+    const auto fade = [opacity](const COLORREF color) {
+        return FadeForOpacity(color, opacity);
+    };
+
+    const bool active = draggingVolume_ || volumeSliderHovered_;
+
+    const double volume = std::clamp(snapshot.volume, 0.0, 1.0);
+    const int centerY = volumeSlider_.top + RectHeight(volumeSlider_) / 2;
+    RECT iconRect = MakeRect(volumeSlider_.left,
+                             centerY - Scale(12),
+                             volumeSlider_.left + Scale(28),
+                             centerY + Scale(12));
+    iconPainter_.Draw(hdc,
+                      volume < 0.5 ? IconKind::VolumeDown : IconKind::VolumeUp,
+                      iconRect,
+                      fade(volume <= 0.0 ? palette_.dim : palette_.text));
+
+    const RECT track = VolumeSliderTrackRect();
+    if (RectWidth(track) > Scale(12) && RectHeight(track) > 0) {
+        FillRoundRect(hdc, track, fade(BlendColor(palette_.track, RGB(255, 255, 255), active ? 0.24 : 0.12)), Scale(3));
+        RECT fillRect = track;
+        fillRect.right = fillRect.left + static_cast<int>(std::round(RectWidth(track) * volume));
+        if (RectWidth(fillRect) > 0) {
+            FillRoundRect(hdc,
+                          fillRect,
+                          fade(active ? BlendColor(palette_.accent, RGB(255, 255, 255), 0.16) : palette_.text),
+                          Scale(3));
+        }
+
+        const int knobX = track.left + static_cast<int>(std::round(RectWidth(track) * volume));
+        const int knobRadius = active ? Scale(6) : Scale(5);
+        RECT knob = MakeRect(knobX - knobRadius,
+                             centerY - knobRadius,
+                             knobX + knobRadius,
+                             centerY + knobRadius);
+        FillRoundRect(hdc, knob, fade(RGB(255, 255, 255)), knobRadius);
+        StrokeRoundRect(hdc, knob, fade(active ? palette_.accent : RGB(255, 255, 255)), knobRadius);
+
+        if (draggingVolume_) {
+            HFONT tipFont = CreateMonoFont(Scale(10), FW_SEMIBOLD);
+            const std::wstring value = PercentText(volume);
+            HGDIOBJ oldFont = SelectObject(hdc, tipFont);
+            SIZE textSize{};
+            GetTextExtentPoint32W(hdc, value.c_str(), static_cast<int>(value.size()), &textSize);
+            SelectObject(hdc, oldFont);
+
+            const int tipWidth = std::max(Scale(44), static_cast<int>(textSize.cx) + Scale(16));
+            const int tipHeight = Scale(24);
+            int tipLeft = knobX - tipWidth / 2;
+            tipLeft = std::clamp(tipLeft,
+                                 static_cast<int>(volumeSlider_.left),
+                                 static_cast<int>(volumeSlider_.right) - tipWidth);
+            const int tipTop = volumeSlider_.top - tipHeight - Scale(8);
+            RECT tip = MakeRect(tipLeft, tipTop, tipLeft + tipWidth, tipTop + tipHeight);
+            FillRoundRect(hdc, tip, fade(RGB(13, 16, 21)), Scale(7));
+            StrokeRoundRect(hdc, tip, fade(BlendColor(palette_.borderStrong, palette_.accent, 0.18)), Scale(7));
+            DrawTextInRect(hdc,
+                           value,
+                           DeflateRectCopy(tip, Scale(8), Scale(4)),
+                           tipFont,
+                           fade(palette_.text),
+                           DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            DeleteObject(tipFont);
+        }
+    }
+}
+
+void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapshot) const {
+    const double amount = std::clamp(subtitleMenuAmount_, 0.0, 1.0);
+    if (amount <= 0.01 || RectWidth(subtitleMenu_) <= 0 || RectHeight(subtitleMenu_) <= 0) {
+        return;
+    }
+
+    const double opacity = (fullscreen_ ? std::clamp(fullscreenTransportAmount_, 0.0, 1.0) : 1.0) * amount;
+    if (opacity <= 0.02) {
+        return;
+    }
+    const auto fade = [opacity](const COLORREF color) {
+        return FadeForOpacity(color, opacity);
+    };
+
+    RECT visible = subtitleMenu_;
+    if (RectHeight(visible) <= 0) {
+        return;
+    }
+
+    const int savedDc = SaveDC(hdc);
+    HRGN clip = CreateRectRgn(visible.left, visible.top, visible.right + 1, visible.bottom + 1);
+    SelectClipRgn(hdc, clip);
+
+    const COLORREF panel = RGB(43, 43, 42);
+    const COLORREF panelLine = RGB(66, 66, 64);
+    const COLORREF panelRaised = RGB(64, 64, 63);
+    const COLORREF panelHover = RGB(58, 58, 57);
+    const COLORREF panelMuted = RGB(174, 174, 173);
+    const COLORREF panelText = RGB(245, 245, 244);
+    const COLORREF panelAccent = RGB(69, 183, 255);
+
+    FillRoundRect(hdc, subtitleMenu_, fade(panel), Scale(8));
+    StrokeRoundRect(hdc, subtitleMenu_, fade(RGB(83, 83, 81)), Scale(8));
+
+    HFONT tabFont = CreateUiFont(Scale(13), FW_SEMIBOLD);
+    HFONT itemFont = CreateUiFont(Scale(13), FW_NORMAL);
+    HFONT selectedItemFont = CreateUiFont(Scale(13), FW_SEMIBOLD);
+    HFONT metaFont = CreateUiFont(Scale(10), FW_NORMAL);
+    HFONT smallFont = CreateUiFont(Scale(10), FW_SEMIBOLD);
+    HFONT valueFont = CreateUiFont(Scale(13), FW_SEMIBOLD);
+    const auto settings = controller_.Settings();
+    const int headerHeight = Scale(62);
+    const int itemHeight = Scale(42);
+    const int listGap = Scale(8);
+    const int rowInset = Scale(8);
+    const int delayHeight = Scale(56);
+    const int actionHeight = Scale(44);
+    const int count = std::max(1, static_cast<int>(subtitleMenuTracks_.size()));
+    const int visibleItemCount = subtitleMenuVisibleItemCount_ > 0
+                                     ? std::clamp(subtitleMenuVisibleItemCount_, 1, count)
+                                     : count;
+    const int firstItem = std::clamp(subtitleMenuScrollOffset_, 0, std::max(0, count - visibleItemCount));
+
+    const RECT header = MakeRect(subtitleMenu_.left,
+                                 subtitleMenu_.top,
+                                 subtitleMenu_.right,
+                                 subtitleMenu_.top + headerHeight);
+    const int tabGap = Scale(8);
+    const RECT tabRail = MakeRect(header.left + Scale(14),
+                                  header.top + Scale(12),
+                                  header.right - Scale(14),
+                                  header.bottom - Scale(14));
+    const int tabWidth = (RectWidth(tabRail) - tabGap * 2) / 3;
+    const wchar_t* tabLabels[] = {L"音频", L"字幕", L"弹幕"};
+    for (int index = 0; index < 3; ++index) {
+        const RECT tab = MakeRect(tabRail.left + index * (tabWidth + tabGap),
+                                  tabRail.top,
+                                  tabRail.left + index * (tabWidth + tabGap) + tabWidth,
+                                  tabRail.bottom);
+        if (index == 1) {
+            FillRoundRect(hdc, tab, fade(panelRaised), Scale(6));
+        }
+        DrawTextInRect(hdc,
+                       tabLabels[index],
+                       tab,
+                       tabFont,
+                       fade(index == 1 ? panelText : panelMuted),
+                       DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+    DrawLine(hdc,
+             subtitleMenu_.left,
+             header.bottom,
+             subtitleMenu_.right,
+             header.bottom,
+             fade(panelLine));
+
+    const int listTop = header.bottom + listGap;
+    for (int localIndex = 0; localIndex < visibleItemCount; ++localIndex) {
+        const int index = firstItem + localIndex;
+        const RECT item = MakeRect(subtitleMenu_.left + rowInset,
+                                   listTop + itemHeight * localIndex,
+                                   subtitleMenu_.right - rowInset,
+                                   listTop + itemHeight * (localIndex + 1));
+        if (item.bottom < visible.top || item.top > visible.bottom) {
+            continue;
+        }
+
+        const bool hasTrack = index < static_cast<int>(subtitleMenuTracks_.size());
+        const int track = hasTrack ? subtitleMenuTracks_[static_cast<std::size_t>(index)] : anvil::playback::kSubtitleTrackOff;
+        const bool selected = hasTrack && track == settings.subtitles.selectedTrackIndex;
+        const bool hovered = hasTrack && index == hoveredSubtitleMenuItem_;
+        if (selected || hovered) {
+            FillRoundRect(hdc,
+                          item,
+                          fade(selected ? panelRaised : panelHover),
+                          Scale(5));
+        }
+
+        if (selected) {
+            DrawCheckMark(hdc,
+                          POINT{item.left + Scale(26), item.top + RectHeight(item) / 2},
+                          Scale(16),
+                          fade(panelAccent));
+        }
+
+        const std::wstring label = hasTrack ? SubtitleMenuPrimaryLabel(track, snapshot.media) : L"没有可用字幕";
+        const std::wstring codec = hasTrack ? SubtitleMenuCodecLabel(track, snapshot.media) : L"";
+        const RECT codecText = MakeRect(item.right - Scale(76), item.top, item.right - Scale(12), item.bottom);
+        const int labelLeft = hasTrack ? item.left + Scale(50) : item.left + Scale(16);
+        RECT text = MakeRect(labelLeft,
+                             item.top,
+                             codec.empty() ? item.right - Scale(12) : codecText.left - Scale(8),
+                             item.bottom);
+        DrawTextInRect(hdc,
+                       label,
+                       text,
+                       selected ? selectedItemFont : itemFont,
+                       fade(hasTrack ? (selected ? panelText : RGB(226, 226, 225)) : panelMuted),
+                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        if (!codec.empty()) {
+            DrawTextInRect(hdc,
+                           codec,
+                           codecText,
+                           metaFont,
+                           fade(panelMuted),
+                           DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        }
+    }
+
+    const int listContentBottom = listTop + itemHeight * visibleItemCount;
+    if (count > visibleItemCount) {
+        const RECT scrollTrack = MakeRect(subtitleMenu_.right - Scale(8),
+                                          listTop + Scale(5),
+                                          subtitleMenu_.right - Scale(5),
+                                          listContentBottom - Scale(5));
+        if (RectHeight(scrollTrack) > Scale(18)) {
+            FillRoundRect(hdc, scrollTrack, fade(BlendColor(panelLine, panel, 0.35)), Scale(2));
+            const int trackHeight = RectHeight(scrollTrack);
+            const int thumbHeight = std::clamp(static_cast<int>(std::round(
+                                             static_cast<double>(trackHeight) *
+                                             static_cast<double>(visibleItemCount) /
+                                             static_cast<double>(count))),
+                                             Scale(18),
+                                             trackHeight);
+            const int maxOffset = std::max(1, count - visibleItemCount);
+            const int thumbTop = scrollTrack.top +
+                                 static_cast<int>(std::round(
+                                     static_cast<double>(trackHeight - thumbHeight) *
+                                     static_cast<double>(firstItem) /
+                                     static_cast<double>(maxOffset)));
+            const RECT thumb = MakeRect(scrollTrack.left,
+                                        thumbTop,
+                                        scrollTrack.right,
+                                        thumbTop + thumbHeight);
+            FillRoundRect(hdc, thumb, fade(panelMuted), Scale(2));
+        }
+    }
+
+    const int listBottom = listContentBottom + Scale(6);
+    DrawLine(hdc,
+             subtitleMenu_.left,
+             listBottom,
+             subtitleMenu_.right,
+             listBottom,
+             fade(panelLine));
+
+    const RECT delayRow = MakeRect(subtitleMenu_.left,
+                                   listBottom,
+                                   subtitleMenu_.right,
+                                   listBottom + delayHeight);
+    DrawTextInRect(hdc,
+                   L"-",
+                   MakeRect(delayRow.left + Scale(24), delayRow.top, delayRow.left + Scale(58), delayRow.bottom),
+                   valueFont,
+                   fade(panelText),
+                   DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    DrawTextInRect(hdc,
+                   L"字幕延迟",
+                   MakeRect(delayRow.left + Scale(70), delayRow.top + Scale(8), delayRow.right - Scale(70), delayRow.top + Scale(26)),
+                   smallFont,
+                   fade(panelMuted),
+                   DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    DrawTextInRect(hdc,
+                   SubtitleDelayText(settings.subtitles.subtitleDelayMs),
+                   MakeRect(delayRow.left + Scale(70), delayRow.top + Scale(25), delayRow.right - Scale(70), delayRow.bottom - Scale(7)),
+                   valueFont,
+                   fade(panelText),
+                   DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    DrawPlusMark(hdc,
+                 POINT{delayRow.right - Scale(38), delayRow.top + RectHeight(delayRow) / 2},
+                 Scale(13),
+                 fade(panelText));
+    DrawLine(hdc,
+             subtitleMenu_.left,
+             delayRow.bottom,
+             subtitleMenu_.right,
+             delayRow.bottom,
+             fade(panelLine));
+
+    const RECT addRow = MakeRect(subtitleMenu_.left, delayRow.bottom, subtitleMenu_.right, delayRow.bottom + actionHeight);
+    const RECT styleRow = MakeRect(subtitleMenu_.left, addRow.bottom, subtitleMenu_.right, addRow.bottom + actionHeight);
+    const auto drawActionRow = [&](const RECT& row, const IconKind icon, const std::wstring& label, const bool plus) {
+        const RECT iconRect = MakeRect(row.left + Scale(24),
+                                       row.top + RectHeight(row) / 2 - Scale(12),
+                                       row.left + Scale(48),
+                                       row.top + RectHeight(row) / 2 + Scale(12));
+        iconPainter_.Draw(hdc, icon, iconRect, fade(panelMuted));
+        if (plus) {
+            DrawPlusMark(hdc,
+                         POINT{iconRect.right - Scale(2), iconRect.top + Scale(6)},
+                         Scale(7),
+                         fade(panelMuted));
+        }
+        DrawTextInRect(hdc,
+                       label,
+                       MakeRect(row.left + Scale(62), row.top, row.right - Scale(18), row.bottom),
+                       itemFont,
+                       fade(panelMuted),
+                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    };
+    drawActionRow(addRow, IconKind::Folder, L"添加字幕文件...", true);
+    DrawLine(hdc,
+             subtitleMenu_.left,
+             addRow.bottom,
+             subtitleMenu_.right,
+             addRow.bottom,
+             fade(BlendColor(panelLine, panel, 0.25)));
+    drawActionRow(styleRow, IconKind::Cog, L"编辑字幕样式...", false);
+
+    RestoreDC(hdc, savedDc);
+    DeleteObject(clip);
+    DeleteObject(valueFont);
+    DeleteObject(smallFont);
+    DeleteObject(metaFont);
+    DeleteObject(selectedItemFont);
+    DeleteObject(itemFont);
+    DeleteObject(tabFont);
 }
 
 void MainWindow::DrawSectionHeader(HDC hdc, const std::wstring& text, RECT& cursor) const {
@@ -734,32 +1332,173 @@ void MainWindow::DrawInspectorPanel(HDC hdc,
     DeleteObject(titleFont);
 
     RECT cursor = inner;
-    if (showInspectorTabs_) {
-        RECT tabRail = MakeRect(inner.left, inner.top + Scale(38), inner.right, inner.top + Scale(70));
-        FillRoundRect(hdc, tabRail, RGB(10, 12, 16), Scale(8));
-        StrokeRoundRect(hdc, tabRail, palette_.border, Scale(8));
+    if (showInspectorTabs_ && inspectorTab_ != InspectorTab::Settings) {
+        RECT tabRail = MakeRect(inner.left, inner.top + Scale(36), inner.right, inner.top + Scale(68));
+        FillRoundRect(hdc, tabRail, BlendColor(palette_.surfaceRaised, palette_.background, 0.28), Scale(7));
+        DrawLine(hdc,
+                 tabRail.left + Scale(4),
+                 tabRail.bottom - Scale(1),
+                 tabRail.right - Scale(4),
+                 tabRail.bottom - Scale(1),
+                 BlendColor(palette_.border, palette_.background, 0.24));
         cursor.top = tabRail.bottom + Scale(14);
     } else {
         cursor.top = title.bottom + Scale(16);
     }
     switch (inspectorTab_) {
-    case InspectorTab::Media:
-        DrawMediaContent(hdc, snapshot, cursor);
+    case InspectorTab::Recent:
+        DrawRecentContent(hdc, snapshot, cursor);
         break;
-    case InspectorTab::Device:
-        DrawDeviceContent(hdc, capabilities, cursor);
+    case InspectorTab::Folder:
+        DrawFolderContent(hdc, snapshot, cursor);
+        break;
+    case InspectorTab::Media:
+        DrawMediaInfoContent(hdc, snapshot, cursor);
+        break;
+    case InspectorTab::System:
+        DrawSystemContent(hdc, capabilities, cursor);
         break;
     case InspectorTab::Log:
         DrawLogContent(hdc, cursor);
         break;
     case InspectorTab::Settings:
-        DrawSettingsContent(hdc, settings, cursor);
+        DrawSettingsContent(hdc,
+                            settings,
+                            RectWidth(settingsContentViewport_) > 0 ? settingsContentViewport_ : cursor);
         break;
     }
 }
 
-void MainWindow::DrawMediaContent(HDC hdc, const PlaybackSessionSnapshot& snapshot, RECT cursor) const {
-    DrawSectionHeader(hdc, L"Media", cursor);
+void MainWindow::DrawListMessage(HDC hdc, const std::wstring& message, RECT cursor) const {
+    const int height = std::min(Scale(56), RectHeight(cursor));
+    if (height <= 0) {
+        return;
+    }
+
+    RECT box = MakeRect(cursor.left, cursor.top, cursor.right, cursor.top + height);
+    FillRoundRect(hdc, box, BlendColor(palette_.surfaceRaised, palette_.background, 0.16), Scale(7));
+    StrokeRoundRect(hdc, box, BlendColor(palette_.border, palette_.background, 0.18), Scale(7));
+
+    HFONT font = CreateUiFont(Scale(12), FW_SEMIBOLD);
+    DrawTextInRect(hdc,
+                   message,
+                   DeflateRectCopy(box, Scale(10), 0),
+                   font,
+                   palette_.muted,
+                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    DeleteObject(font);
+}
+
+void MainWindow::DrawPathList(HDC hdc,
+                              const std::vector<std::filesystem::path>& paths,
+                              const std::optional<anvil::playback::MediaDescriptor>& media,
+                              RECT& cursor) const {
+    if (paths.empty()) {
+        return;
+    }
+
+    const std::filesystem::path activePath = media.has_value() ? ComparablePath(media->path) : std::filesystem::path{};
+    const int rowHeight = Scale(44);
+    const int rowGap = Scale(5);
+    int visibleRows = 0;
+
+    HFONT titleFont = CreateUiFont(Scale(12), FW_SEMIBOLD);
+    HFONT detailFont = CreateUiFont(Scale(10), FW_NORMAL);
+    for (const auto& path : paths) {
+        if (cursor.top + rowHeight > cursor.bottom) {
+            break;
+        }
+
+        const bool active = !activePath.empty() && ComparablePath(path) == activePath;
+        const bool hovered = visibleRows == hoveredInspectorPathItem_;
+        RECT row = MakeRect(cursor.left, cursor.top, cursor.right, cursor.top + rowHeight);
+        const COLORREF fill = active
+                                  ? BlendColor(palette_.accentSoft, palette_.surfaceRaised, hovered ? 0.12 : 0.20)
+                                  : (hovered
+                                         ? BlendColor(palette_.surfaceRaised, palette_.text, 0.05)
+                                         : BlendColor(palette_.surfaceRaised, palette_.background, 0.10));
+        FillRoundRect(hdc, row, fill, Scale(7));
+        StrokeRoundRect(hdc,
+                        row,
+                        active ? BlendColor(palette_.borderStrong, palette_.accent, 0.18)
+                               : (hovered
+                                      ? BlendColor(palette_.borderStrong, palette_.text, 0.08)
+                                      : BlendColor(palette_.border, palette_.background, 0.16)),
+                        Scale(7));
+        if (active) {
+            RECT mark = MakeRect(row.left + Scale(7), row.top + Scale(10), row.left + Scale(10), row.bottom - Scale(10));
+            FillRoundRect(hdc, mark, palette_.accent, Scale(2));
+        }
+
+        const int textLeft = row.left + (active ? Scale(18) : Scale(12));
+        RECT nameRect = MakeRect(textLeft, row.top + Scale(6), row.right - Scale(10), row.top + Scale(23));
+        RECT pathRect = MakeRect(textLeft, row.top + Scale(24), row.right - Scale(10), row.bottom - Scale(5));
+        const std::wstring filename = path.filename().empty() ? path.wstring() : path.filename().wstring();
+        const std::wstring parent = path.parent_path().empty() ? L"-" : path.parent_path().wstring();
+        DrawTextInRect(hdc,
+                       filename,
+                       nameRect,
+                       titleFont,
+                       (active || hovered) ? palette_.text : palette_.muted,
+                       DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+        DrawTextInRect(hdc,
+                       parent,
+                       pathRect,
+                       detailFont,
+                       active ? BlendColor(palette_.muted, palette_.text, 0.16) : palette_.dim,
+                       DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+        cursor.top += rowHeight + rowGap;
+        ++visibleRows;
+    }
+
+    if (visibleRows < static_cast<int>(paths.size()) && cursor.top + Scale(22) <= cursor.bottom) {
+        const int remaining = static_cast<int>(paths.size()) - visibleRows;
+        RECT moreRect = MakeRect(cursor.left, cursor.top, cursor.right, cursor.top + Scale(20));
+        DrawTextInRect(hdc,
+                       L"+" + std::to_wstring(remaining) + L" more",
+                       moreRect,
+                       detailFont,
+                       palette_.dim,
+                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        cursor.top += Scale(22);
+    }
+
+    DeleteObject(titleFont);
+    DeleteObject(detailFont);
+}
+
+void MainWindow::DrawRecentContent(HDC hdc, const PlaybackSessionSnapshot& snapshot, RECT cursor) const {
+    DrawSectionHeader(hdc, L"Recent", cursor);
+    if (recentMedia_.empty()) {
+        DrawListMessage(hdc, L"No recent media", cursor);
+        return;
+    }
+
+    DrawPathList(hdc, recentMedia_, snapshot.media, cursor);
+}
+
+void MainWindow::DrawFolderContent(HDC hdc, const PlaybackSessionSnapshot& snapshot, RECT cursor) const {
+    DrawSectionHeader(hdc, L"Folder", cursor);
+    if (!snapshot.media.has_value()) {
+        DrawListMessage(hdc, L"No media loaded", cursor);
+        return;
+    }
+
+    const std::filesystem::path folder = snapshot.media->path.parent_path();
+    DrawField(hdc, L"Path", folder.empty() ? L"-" : folder.wstring(), cursor);
+    cursor.top += Scale(8);
+    DrawSectionHeader(hdc, L"Files", cursor);
+    if (currentFolderEntries_.empty()) {
+        DrawListMessage(hdc, L"No media files", cursor);
+        return;
+    }
+
+    DrawPathList(hdc, currentFolderEntries_, snapshot.media, cursor);
+}
+
+void MainWindow::DrawMediaInfoContent(HDC hdc, const PlaybackSessionSnapshot& snapshot, RECT cursor) const {
+    DrawSectionHeader(hdc, L"Media Info", cursor);
     DrawField(hdc, L"File", FileNameOrDash(snapshot), cursor);
     DrawField(hdc, L"State", ToDisplayString(snapshot.state), cursor);
     DrawField(hdc, L"Position", FormatTimecode(snapshot.position), cursor);
@@ -782,9 +1521,24 @@ void MainWindow::DrawMediaContent(HDC hdc, const PlaybackSessionSnapshot& snapsh
     DrawField(hdc, L"Light", FormatContentLight(snapshot.media->videoColor.contentLight), cursor);
     DrawField(hdc, L"Plan", snapshot.media->selectedDecodePath, cursor);
     DrawField(hdc, L"Runtime", RuntimeLabel(), cursor);
+    if (nativeVideoDecoder_) {
+        NativeVideoFrame latest;
+        if (nativeVideoDecoder_->LatestFrame(latest)) {
+            std::wstring dynamicMetadata = latest.dynamicMetadataPath;
+            if (dynamicMetadata.empty() && latest.dovi && latest.dovi->valid) {
+                dynamicMetadata = L"dolby_vision_shader";
+            }
+            if (!dynamicMetadata.empty()) {
+                if (!latest.dynamicMetadataDetails.empty()) {
+                    dynamicMetadata += L" " + latest.dynamicMetadataDetails;
+                }
+                DrawField(hdc, L"Dynamic", dynamicMetadata, cursor);
+            }
+        }
+    }
 }
 
-void MainWindow::DrawDeviceContent(HDC hdc, const CapabilityReport& capabilities, RECT cursor) const {
+void MainWindow::DrawSystemContent(HDC hdc, const CapabilityReport& capabilities, RECT cursor) const {
     DrawSectionHeader(hdc, L"Display", cursor);
     DrawField(hdc, L"HDR", capabilities.display.hdrEnabled ? L"On" : (capabilities.display.hdrSupported ? L"Supported" : L"Off"), cursor);
     DrawField(hdc, L"Color", capabilities.display.colorSpace, cursor);
@@ -822,15 +1576,36 @@ void MainWindow::DrawLogContent(HDC hdc, RECT cursor) const {
 }
 
 void MainWindow::DrawSettingsContent(HDC hdc, const PlayerSettings& settings, RECT cursor) const {
+    const RECT viewport = RectWidth(settingsContentViewport_) > 0 ? settingsContentViewport_ : cursor;
+    HRGN clip = CreateRectRgn(viewport.left, viewport.top, viewport.right + 1, viewport.bottom + 1);
+    SelectClipRgn(hdc, clip);
+
+    cursor = viewport;
+    cursor.top -= settingsScrollOffset_;
+    cursor.bottom = cursor.top + std::max(settingsContentHeight_, RectHeight(viewport));
+
     DrawSectionHeader(hdc, L"Video", cursor);
     DrawField(hdc, L"Decode", ToDisplayString(settings.video.hardwareDecode), cursor);
     DrawField(hdc, L"Track", VideoSelectionText(settings.video.selectedTrackIndex), cursor);
     DrawField(hdc, L"Renderer", settings.video.renderer, cursor);
-    DrawField(hdc, L"HDR", ToDisplayString(settings.video.hdrOutput), cursor);
+    DrawField(hdc, L"HDR mode", ToDisplayString(settings.video.hdrOutput), cursor);
     DrawField(hdc, L"Tone map", ToDisplayString(settings.video.toneMapping), cursor);
     DrawField(hdc, L"Dolby Vision", ToDisplayString(settings.video.dolbyVision), cursor);
-    DrawField(hdc, L"DV HDR", settings.video.dolbyVisionHdrOutput ? L"On" : L"Off", cursor);
-    if (settings.video.dolbyVisionHdrOutput) {
+    if (CurrentMediaHasHdrControls()) {
+        DrawField(hdc,
+                  CurrentMediaHasCmv4Control() ? L"Dolby Vision" : L"HDR Output",
+                  settings.video.dolbyVisionHdrOutput ? L"On" : L"Off",
+                  cursor);
+    }
+    if (CurrentMediaHasCmv4Control()) {
+        DrawField(hdc,
+                  L"CMv4 Approx",
+                  CurrentCmv4ControlEnabled(settings)
+                      ? (settings.video.dolbyVisionCmv4Approx ? L"On" : L"Off")
+                      : L"Disabled",
+                  cursor);
+    }
+    if (HdrToneCurveAvailable(settings)) {
         cursor.top += Scale(8);
         DrawHdrToneCurveEditor(hdc, settings, cursor);
     }
@@ -849,10 +1624,36 @@ void MainWindow::DrawSettingsContent(HDC hdc, const PlayerSettings& settings, RE
     scale << static_cast<int>(settings.subtitles.fontScale * 100.0) << L"%";
     DrawField(hdc, L"Font", scale.str(), cursor);
     DrawField(hdc, L"External", settings.subtitles.externalSubtitleAutoLoad ? L"On" : L"Off", cursor);
+
+    SelectClipRgn(hdc, nullptr);
+    DeleteObject(clip);
+    DrawSettingsScrollbar(hdc);
+}
+
+void MainWindow::DrawSettingsScrollbar(HDC hdc) const {
+    if (settingsScrollMax_ <= 0 ||
+        RectWidth(settingsScrollTrack_) <= 0 ||
+        RectHeight(settingsScrollTrack_) <= 0 ||
+        RectWidth(settingsScrollThumb_) <= 0 ||
+        RectHeight(settingsScrollThumb_) <= 0) {
+        return;
+    }
+
+    FillRoundRect(hdc, settingsScrollTrack_, RGB(10, 12, 16), Scale(3));
+    FillRoundRect(hdc,
+                  settingsScrollThumb_,
+                  draggingSettingsScrollThumb_
+                      ? BlendColor(palette_.accent, palette_.text, 0.16)
+                      : BlendColor(palette_.borderStrong, palette_.muted, 0.24),
+                  Scale(3));
 }
 
 void MainWindow::DrawHdrToneCurveEditor(HDC hdc, const PlayerSettings& settings, RECT& cursor) const {
-    const int editorHeight = Scale(156);
+    const int editorHeight = Scale(190);
+    if (hdrToneCurveExpanded_) {
+        cursor.top += editorHeight + Scale(12);
+        return;
+    }
     if (cursor.top + editorHeight > cursor.bottom ||
         RectWidth(hdrToneCurvePlot_) <= 0 ||
         RectHeight(hdrToneCurvePlot_) <= 0) {
@@ -867,41 +1668,49 @@ void MainWindow::DrawHdrToneCurveEditor(HDC hdc, const PlayerSettings& settings,
     HFONT valueFont = CreateMonoFont(Scale(10), FW_SEMIBOLD);
     HFONT axisFont = CreateUiFont(Scale(9), FW_NORMAL);
 
-    RECT title = MakeRect(editor.left + Scale(10), editor.top + Scale(8), editor.right - Scale(90), editor.top + Scale(28));
-    DrawTextInRect(hdc, L"HDR Tone Curve", title, titleFont, palette_.text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-    RECT peak = MakeRect(editor.right - Scale(178), editor.top + Scale(8), editor.right - Scale(76), editor.top + Scale(28));
+    RECT title = MakeRect(editor.left + Scale(10), editor.top + Scale(8), editor.right - Scale(78), editor.top + Scale(28));
+    DrawTextInRect(hdc, L"HDR Curve", title, titleFont, palette_.text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    RECT peak = MakeRect(editor.left + Scale(10), editor.top + Scale(30), editor.right - Scale(12), editor.top + Scale(46));
     DrawTextInRect(hdc,
-                   NitsLabel(settings.video.hdrToneCurve.back().outputNits),
+                   L"Peak " + NitsLabel(std::clamp(settings.video.hdrToneCurve.back().outputNits, 0.0, kHdrToneCurveMaxNits)),
                    peak,
                    valueFont,
                    palette_.muted,
-                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
     const RECT plot = hdrToneCurvePlot_;
     FillRoundRect(hdc, plot, RGB(6, 8, 11), Scale(5));
     StrokeRoundRect(hdc, plot, BlendColor(palette_.border, palette_.text, 0.05), Scale(5));
 
-    const double gridNits[] = {100.0, 1000.0, 10000.0};
+    const double gridNits[] = {0.0, 250.0, 500.0, 750.0, 1000.0, 2000.0, 4000.0};
     for (const double nits : gridNits) {
         const int x = ToneCurveX(plot, nits);
         const int y = ToneCurveY(plot, nits);
-        DrawLine(hdc, x, plot.top, x, plot.bottom, BlendColor(palette_.border, palette_.background, 0.35));
-        DrawLine(hdc, plot.left, y, plot.right, y, BlendColor(palette_.border, palette_.background, 0.35));
+        const COLORREF gridColor = nits == 0.0 || nits == 1000.0
+                                       ? BlendColor(palette_.borderStrong, palette_.background, 0.18)
+                                       : BlendColor(palette_.border, palette_.background, 0.35);
+        DrawLine(hdc, x, plot.top, x, plot.bottom, gridColor);
+        DrawLine(hdc, plot.left, y, plot.right, y, gridColor);
 
-        RECT xLabel = MakeRect(x - Scale(20), plot.bottom + Scale(3), x + Scale(20), plot.bottom + Scale(18));
-        DrawTextInRect(hdc,
-                       nits >= 1000.0 ? std::to_wstring(static_cast<int>(nits / 1000.0)) + L"k" : std::to_wstring(static_cast<int>(nits)),
-                       xLabel,
-                       axisFont,
-                       palette_.dim,
-                       DT_CENTER | DT_TOP | DT_SINGLELINE);
-        RECT yLabel = MakeRect(editor.left + Scale(8), y - Scale(7), plot.left - Scale(6), y + Scale(8));
-        DrawTextInRect(hdc,
-                       nits >= 1000.0 ? std::to_wstring(static_cast<int>(nits / 1000.0)) + L"k" : std::to_wstring(static_cast<int>(nits)),
-                       yLabel,
-                       axisFont,
-                       palette_.dim,
-                       DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        RECT xLabel = MakeRect(x - Scale(20), plot.bottom + Scale(5), x + Scale(20), plot.bottom + Scale(20));
+        DrawTextInRect(hdc, ToneCurveAxisLabel(nits), xLabel, axisFont, palette_.dim, DT_CENTER | DT_TOP | DT_SINGLELINE);
+        RECT yLabel = MakeRect(editor.left + Scale(8), y - Scale(7), plot.left - Scale(7), y + Scale(8));
+        DrawTextInRect(hdc, ToneCurveAxisLabel(nits), yLabel, axisFont, palette_.dim, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    if (selectingHdrToneCurveRange_) {
+        const int left = std::clamp(std::min(hdrToneCurveSelectionStartX_, hdrToneCurveSelectionCurrentX_),
+                                    static_cast<int>(plot.left),
+                                    static_cast<int>(plot.right));
+        const int right = std::clamp(std::max(hdrToneCurveSelectionStartX_, hdrToneCurveSelectionCurrentX_),
+                                     static_cast<int>(plot.left),
+                                     static_cast<int>(plot.right));
+        if (right > left) {
+            RECT selection = MakeRect(left, plot.top, right, plot.bottom);
+            FillRectColor(hdc, selection, BlendColor(RGB(6, 8, 11), palette_.accent, 0.16));
+            DrawLine(hdc, left, plot.top, left, plot.bottom, BlendColor(palette_.accent, palette_.text, 0.22));
+            DrawLine(hdc, right, plot.top, right, plot.bottom, BlendColor(palette_.accent, palette_.text, 0.22));
+        }
     }
 
     HPEN referencePen = CreatePen(PS_SOLID, Scale(1), BlendColor(palette_.info, palette_.muted, 0.35));
@@ -947,12 +1756,16 @@ void MainWindow::DrawHdrToneCurveEditor(HDC hdc, const PlayerSettings& settings,
                                      : curvePoint.inputNits;
         const int x = ToneCurveX(plot, inputNits);
         const int y = ToneCurveY(plot, curvePoint.outputNits);
-        const bool selected = draggingHdrToneCurve_ && draggedHdrToneCurvePoint_ == static_cast<int>(index);
-        const int radius = selected ? Scale(5) : Scale(4);
-        const COLORREF fill = index == 0 ? palette_.dim : (selected ? palette_.text : palette_.accent);
+        const bool selected = index < selectedHdrToneCurvePoints_.size() && selectedHdrToneCurvePoints_[index];
+        const bool active = hoveredHdrToneCurvePoint_ == static_cast<int>(index) ||
+                            (draggingHdrToneCurve_ && draggedHdrToneCurvePoint_ == static_cast<int>(index));
+        const int radius = active ? Scale(6) : (selected ? Scale(5) : Scale(4));
+        const COLORREF fill = index == 0
+                                  ? palette_.dim
+                                  : (selected ? BlendColor(palette_.accent, palette_.text, 0.36) : (active ? palette_.text : palette_.accent));
         HBRUSH brush = CreateSolidBrush(fill);
         HGDIOBJ oldBrush = SelectObject(hdc, brush);
-        HPEN pen = CreatePen(PS_SOLID, Scale(1), BlendColor(fill, RGB(0, 0, 0), 0.22));
+        HPEN pen = CreatePen(PS_SOLID, selected || active ? Scale(2) : Scale(1), BlendColor(fill, RGB(0, 0, 0), 0.22));
         oldPen = SelectObject(hdc, pen);
         Ellipse(hdc, x - radius, y - radius, x + radius + 1, y + radius + 1);
         SelectObject(hdc, oldPen);
@@ -961,10 +1774,242 @@ void MainWindow::DrawHdrToneCurveEditor(HDC hdc, const PlayerSettings& settings,
         DeleteObject(brush);
     }
 
+    const int valuePoint = draggingHdrToneCurve_ && draggedHdrToneCurvePoint_ > 0
+                               ? draggedHdrToneCurvePoint_
+                               : hoveredHdrToneCurvePoint_;
+    if (valuePoint > 0 && valuePoint < static_cast<int>(settings.video.hdrToneCurve.size())) {
+        const std::size_t index = static_cast<std::size_t>(valuePoint);
+        const double inputNits = index < anvil::playback::kDefaultHdrToneCurve.size()
+                                     ? anvil::playback::kDefaultHdrToneCurve[index].inputNits
+                                     : settings.video.hdrToneCurve[index].inputNits;
+        const int x = ToneCurveX(plot, inputNits);
+        const int y = ToneCurveY(plot, settings.video.hdrToneCurve[index].outputNits);
+        const std::wstring valueText = NitsLabel(settings.video.hdrToneCurve[index].outputNits);
+
+        HGDIOBJ oldFont = SelectObject(hdc, valueFont);
+        SIZE textSize{};
+        GetTextExtentPoint32W(hdc, valueText.c_str(), static_cast<int>(valueText.size()), &textSize);
+        SelectObject(hdc, oldFont);
+
+        const int tipWidth = textSize.cx + Scale(14);
+        const int tipHeight = textSize.cy + Scale(8);
+        int tipLeft = x - tipWidth / 2;
+        int tipTop = y - tipHeight - Scale(10);
+        tipLeft = std::clamp(tipLeft,
+                             static_cast<int>(editor.left) + Scale(6),
+                             static_cast<int>(editor.right) - tipWidth - Scale(6));
+        if (tipTop < editor.top + Scale(6)) {
+            tipTop = y + Scale(10);
+        }
+        RECT tip = MakeRect(tipLeft, tipTop, tipLeft + tipWidth, tipTop + tipHeight);
+        FillRoundRect(hdc, tip, RGB(13, 16, 21), Scale(6));
+        StrokeRoundRect(hdc, tip, BlendColor(palette_.borderStrong, palette_.accent, 0.18), Scale(6));
+        DrawTextInRect(hdc,
+                       valueText,
+                       DeflateRectCopy(tip, Scale(7), Scale(4)),
+                       valueFont,
+                       palette_.text,
+                       DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+
     DeleteObject(titleFont);
     DeleteObject(valueFont);
     DeleteObject(axisFont);
     cursor.top = editor.bottom + Scale(12);
+}
+
+void MainWindow::DrawHdrToneCurveExpandedEditor(HDC hdc, const PlayerSettings& settings) const {
+    if (RectWidth(hdrToneCurveExpandedEditor_) <= 0 ||
+        RectHeight(hdrToneCurveExpandedEditor_) <= 0 ||
+        RectWidth(hdrToneCurvePlot_) <= 0 ||
+        RectHeight(hdrToneCurvePlot_) <= 0) {
+        return;
+    }
+
+    RECT client{};
+    GetClientRect(hdrToneCurveWindow_ ? hdrToneCurveWindow_ : hwnd_, &client);
+    FillRectColor(hdc, client, RGB(5, 7, 10));
+
+    const RECT editor = hdrToneCurveExpandedEditor_;
+    FillRoundRect(hdc, editor, palette_.surface, Scale(10));
+    StrokeRoundRect(hdc, editor, palette_.borderStrong, Scale(10));
+
+    HFONT titleFont = CreateUiFont(Scale(17), FW_SEMIBOLD);
+    HFONT valueFont = CreateMonoFont(Scale(11), FW_SEMIBOLD);
+    HFONT axisFont = CreateUiFont(Scale(9), FW_NORMAL);
+
+    RECT title = MakeRect(editor.left + Scale(22), editor.top + Scale(16), editor.right - Scale(180), editor.top + Scale(42));
+    DrawTextInRect(hdc, L"HDR Curve Editor", title, titleFont, palette_.text, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    RECT peak = MakeRect(editor.left + Scale(22), editor.top + Scale(44), editor.right - Scale(30), editor.top + Scale(62));
+    DrawTextInRect(hdc,
+                   L"Peak " + NitsLabel(std::clamp(settings.video.hdrToneCurve.back().outputNits, 0.0, kHdrToneCurveMaxNits)),
+                   peak,
+                   valueFont,
+                   palette_.muted,
+                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    if (RectWidth(hdrToneCurveFloatingReset_) > 0 && RectHeight(hdrToneCurveFloatingReset_) > 0) {
+        FillRoundRect(hdc, hdrToneCurveFloatingReset_, RGB(10, 12, 16), Scale(7));
+        StrokeRoundRect(hdc, hdrToneCurveFloatingReset_, palette_.border, Scale(7));
+        DrawTextInRect(hdc,
+                       L"Reset",
+                       hdrToneCurveFloatingReset_,
+                       valueFont,
+                       palette_.muted,
+                       DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    const RECT plot = hdrToneCurvePlot_;
+    FillRoundRect(hdc, plot, RGB(6, 8, 11), Scale(6));
+    StrokeRoundRect(hdc, plot, BlendColor(palette_.borderStrong, palette_.text, 0.08), Scale(6));
+
+    for (int nits = 0; nits <= 1000; nits += 50) {
+        const bool major = nits % 250 == 0;
+        const COLORREF gridColor = major
+                                       ? BlendColor(palette_.borderStrong, palette_.background, 0.18)
+                                       : BlendColor(palette_.border, palette_.background, 0.58);
+        const int x = ToneCurveX(plot, static_cast<double>(nits));
+        const int y = ToneCurveY(plot, static_cast<double>(nits));
+        DrawLine(hdc, x, plot.top, x, plot.bottom, gridColor);
+        DrawLine(hdc, plot.left, y, plot.right, y, gridColor);
+        if (major) {
+            RECT xLabel = MakeRect(x - Scale(22), plot.bottom + Scale(6), x + Scale(22), plot.bottom + Scale(22));
+            DrawTextInRect(hdc, ToneCurveAxisLabel(nits), xLabel, axisFont, palette_.dim, DT_CENTER | DT_TOP | DT_SINGLELINE);
+            RECT yLabel = MakeRect(editor.left + Scale(16), y - Scale(7), plot.left - Scale(8), y + Scale(8));
+            DrawTextInRect(hdc, ToneCurveAxisLabel(nits), yLabel, axisFont, palette_.dim, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        }
+    }
+
+    const double highTicks[] = {1500.0, 2000.0, 3000.0, 4000.0};
+    for (const double nits : highTicks) {
+        const int x = ToneCurveX(plot, nits);
+        const int y = ToneCurveY(plot, nits);
+        const COLORREF gridColor = BlendColor(palette_.border, palette_.background, 0.42);
+        DrawLine(hdc, x, plot.top, x, plot.bottom, gridColor);
+        DrawLine(hdc, plot.left, y, plot.right, y, gridColor);
+        RECT xLabel = MakeRect(x - Scale(24), plot.bottom + Scale(6), x + Scale(24), plot.bottom + Scale(22));
+        DrawTextInRect(hdc, ToneCurveAxisLabel(nits), xLabel, axisFont, palette_.dim, DT_CENTER | DT_TOP | DT_SINGLELINE);
+        RECT yLabel = MakeRect(editor.left + Scale(16), y - Scale(7), plot.left - Scale(8), y + Scale(8));
+        DrawTextInRect(hdc, ToneCurveAxisLabel(nits), yLabel, axisFont, palette_.dim, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    if (selectingHdrToneCurveRange_) {
+        const int left = std::clamp(std::min(hdrToneCurveSelectionStartX_, hdrToneCurveSelectionCurrentX_),
+                                    static_cast<int>(plot.left),
+                                    static_cast<int>(plot.right));
+        const int right = std::clamp(std::max(hdrToneCurveSelectionStartX_, hdrToneCurveSelectionCurrentX_),
+                                     static_cast<int>(plot.left),
+                                     static_cast<int>(plot.right));
+        if (right > left) {
+            RECT selection = MakeRect(left, plot.top, right, plot.bottom);
+            FillRectColor(hdc, selection, BlendColor(RGB(6, 8, 11), palette_.accent, 0.18));
+            DrawLine(hdc, left, plot.top, left, plot.bottom, BlendColor(palette_.accent, palette_.text, 0.22));
+            DrawLine(hdc, right, plot.top, right, plot.bottom, BlendColor(palette_.accent, palette_.text, 0.22));
+        }
+    }
+
+    HPEN referencePen = CreatePen(PS_SOLID, Scale(1), BlendColor(palette_.info, palette_.muted, 0.35));
+    HGDIOBJ oldPen = SelectObject(hdc, referencePen);
+    bool first = true;
+    for (const auto& curvePoint : anvil::playback::kDefaultHdrToneCurve) {
+        const int x = ToneCurveX(plot, curvePoint.inputNits);
+        const int y = ToneCurveY(plot, curvePoint.outputNits);
+        if (first) {
+            MoveToEx(hdc, x, y, nullptr);
+            first = false;
+        } else {
+            LineTo(hdc, x, y);
+        }
+    }
+    SelectObject(hdc, oldPen);
+    DeleteObject(referencePen);
+
+    HPEN curvePen = CreatePen(PS_SOLID, Scale(2), palette_.accent);
+    oldPen = SelectObject(hdc, curvePen);
+    first = true;
+    for (std::size_t index = 0; index < settings.video.hdrToneCurve.size(); ++index) {
+        const auto& curvePoint = settings.video.hdrToneCurve[index];
+        const double inputNits = index < anvil::playback::kDefaultHdrToneCurve.size()
+                                     ? anvil::playback::kDefaultHdrToneCurve[index].inputNits
+                                     : curvePoint.inputNits;
+        const int x = ToneCurveX(plot, inputNits);
+        const int y = ToneCurveY(plot, curvePoint.outputNits);
+        if (first) {
+            MoveToEx(hdc, x, y, nullptr);
+            first = false;
+        } else {
+            LineTo(hdc, x, y);
+        }
+    }
+    SelectObject(hdc, oldPen);
+    DeleteObject(curvePen);
+
+    for (std::size_t index = 0; index < settings.video.hdrToneCurve.size(); ++index) {
+        const auto& curvePoint = settings.video.hdrToneCurve[index];
+        const double inputNits = index < anvil::playback::kDefaultHdrToneCurve.size()
+                                     ? anvil::playback::kDefaultHdrToneCurve[index].inputNits
+                                     : curvePoint.inputNits;
+        const int x = ToneCurveX(plot, inputNits);
+        const int y = ToneCurveY(plot, curvePoint.outputNits);
+        const bool selected = index < selectedHdrToneCurvePoints_.size() && selectedHdrToneCurvePoints_[index];
+        const bool active = hoveredHdrToneCurvePoint_ == static_cast<int>(index) ||
+                            (draggingHdrToneCurve_ && draggedHdrToneCurvePoint_ == static_cast<int>(index));
+        const int radius = active ? Scale(7) : (selected ? Scale(6) : Scale(5));
+        const COLORREF fill = index == 0
+                                  ? palette_.dim
+                                  : (selected ? BlendColor(palette_.accent, palette_.text, 0.36) : (active ? palette_.text : palette_.accent));
+        HBRUSH brush = CreateSolidBrush(fill);
+        HGDIOBJ oldBrush = SelectObject(hdc, brush);
+        HPEN pen = CreatePen(PS_SOLID, selected || active ? Scale(2) : Scale(1), BlendColor(fill, RGB(0, 0, 0), 0.22));
+        oldPen = SelectObject(hdc, pen);
+        Ellipse(hdc, x - radius, y - radius, x + radius + 1, y + radius + 1);
+        SelectObject(hdc, oldPen);
+        SelectObject(hdc, oldBrush);
+        DeleteObject(pen);
+        DeleteObject(brush);
+    }
+
+    const int valuePoint = draggingHdrToneCurve_ && draggedHdrToneCurvePoint_ > 0
+                               ? draggedHdrToneCurvePoint_
+                               : hoveredHdrToneCurvePoint_;
+    if (valuePoint > 0 && valuePoint < static_cast<int>(settings.video.hdrToneCurve.size())) {
+        const std::size_t index = static_cast<std::size_t>(valuePoint);
+        const double inputNits = index < anvil::playback::kDefaultHdrToneCurve.size()
+                                     ? anvil::playback::kDefaultHdrToneCurve[index].inputNits
+                                     : settings.video.hdrToneCurve[index].inputNits;
+        const int x = ToneCurveX(plot, inputNits);
+        const int y = ToneCurveY(plot, settings.video.hdrToneCurve[index].outputNits);
+        const std::wstring valueText = NitsLabel(settings.video.hdrToneCurve[index].outputNits);
+
+        HGDIOBJ oldFont = SelectObject(hdc, valueFont);
+        SIZE textSize{};
+        GetTextExtentPoint32W(hdc, valueText.c_str(), static_cast<int>(valueText.size()), &textSize);
+        SelectObject(hdc, oldFont);
+
+        const int tipWidth = textSize.cx + Scale(16);
+        const int tipHeight = textSize.cy + Scale(10);
+        int tipLeft = x - tipWidth / 2;
+        int tipTop = y - tipHeight - Scale(12);
+        tipLeft = std::clamp(tipLeft,
+                             static_cast<int>(editor.left) + Scale(8),
+                             static_cast<int>(editor.right) - tipWidth - Scale(8));
+        if (tipTop < editor.top + Scale(8)) {
+            tipTop = y + Scale(12);
+        }
+        RECT tip = MakeRect(tipLeft, tipTop, tipLeft + tipWidth, tipTop + tipHeight);
+        FillRoundRect(hdc, tip, RGB(13, 16, 21), Scale(6));
+        StrokeRoundRect(hdc, tip, BlendColor(palette_.borderStrong, palette_.accent, 0.18), Scale(6));
+        DrawTextInRect(hdc,
+                       valueText,
+                       DeflateRectCopy(tip, Scale(8), Scale(5)),
+                       valueFont,
+                       palette_.text,
+                       DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    DeleteObject(titleFont);
+    DeleteObject(valueFont);
+    DeleteObject(axisFont);
 }
 
 }  // namespace anvil::app

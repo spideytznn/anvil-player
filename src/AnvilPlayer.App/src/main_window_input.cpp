@@ -3,9 +3,11 @@
 #include <windowsx.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cmath>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -15,17 +17,28 @@ using anvil::playback::PlaybackState;
 
 namespace {
 
-constexpr UINT kSubtitleMenuCommandBase = 0x5000;
-constexpr double kHdrToneCurveMaxNits = 10000.0;
+constexpr double kHdrToneCurveMaxNits = 4000.0;
+constexpr double kHdrToneCurveFocusNits = 1000.0;
+constexpr double kHdrToneCurveFocusUnit = 0.72;
 
 double ToneCurveNitsToUnit(const double nits) {
     const double clamped = std::clamp(nits, 0.0, kHdrToneCurveMaxNits);
-    return std::log10(clamped + 1.0) / std::log10(kHdrToneCurveMaxNits + 1.0);
+    if (clamped <= kHdrToneCurveFocusNits) {
+        return (clamped / kHdrToneCurveFocusNits) * kHdrToneCurveFocusUnit;
+    }
+    return kHdrToneCurveFocusUnit +
+           ((clamped - kHdrToneCurveFocusNits) / (kHdrToneCurveMaxNits - kHdrToneCurveFocusNits)) *
+               (1.0 - kHdrToneCurveFocusUnit);
 }
 
 double UnitToToneCurveNits(const double unit) {
     const double clamped = std::clamp(unit, 0.0, 1.0);
-    return std::pow(10.0, clamped * std::log10(kHdrToneCurveMaxNits + 1.0)) - 1.0;
+    if (clamped <= kHdrToneCurveFocusUnit) {
+        return (clamped / kHdrToneCurveFocusUnit) * kHdrToneCurveFocusNits;
+    }
+    return kHdrToneCurveFocusNits +
+           ((clamped - kHdrToneCurveFocusUnit) / (1.0 - kHdrToneCurveFocusUnit)) *
+               (kHdrToneCurveMaxNits - kHdrToneCurveFocusNits);
 }
 
 int ToneCurveX(const RECT& plot, const double nits) {
@@ -38,8 +51,51 @@ int ToneCurveY(const RECT& plot, const double nits) {
 
 double RoundToneCurveNits(const double nits) {
     const double clamped = std::clamp(nits, 0.0, kHdrToneCurveMaxNits);
-    const double step = clamped < 100.0 ? 5.0 : (clamped < 1000.0 ? 10.0 : (clamped < 4000.0 ? 50.0 : 100.0));
-    return std::round(clamped / step) * step;
+    return std::round(clamped);
+}
+
+double ToneCurveYToNits(const RECT& plot, const int y) {
+    if (RectHeight(plot) <= 0) {
+        return 0.0;
+    }
+    const double unitY = 1.0 - static_cast<double>(y - plot.top) / static_cast<double>(RectHeight(plot));
+    return UnitToToneCurveNits(unitY);
+}
+
+void NormalizeHdrToneCurveForEditing(std::array<anvil::playback::HdrToneCurvePoint,
+                                                anvil::playback::kHdrToneCurvePointCount>& curve) {
+    for (std::size_t i = 0; i < curve.size() && i < anvil::playback::kDefaultHdrToneCurve.size(); ++i) {
+        curve[i].inputNits = anvil::playback::kDefaultHdrToneCurve[i].inputNits;
+    }
+
+    curve[0].outputNits = 0.0;
+    for (std::size_t i = 1; i < curve.size(); ++i) {
+        curve[i].outputNits = std::clamp(RoundToneCurveNits(curve[i].outputNits),
+                                         curve[i - 1].outputNits,
+                                         kHdrToneCurveMaxNits);
+    }
+}
+
+double ClampHdrToneCurveSelectionDelta(
+    const std::array<anvil::playback::HdrToneCurvePoint, anvil::playback::kHdrToneCurvePointCount>& curve,
+    const std::array<bool, anvil::playback::kHdrToneCurvePointCount>& selected,
+    const std::array<double, anvil::playback::kHdrToneCurvePointCount>& startOutputs,
+    const double desiredDelta) {
+    double minDelta = -kHdrToneCurveMaxNits;
+    double maxDelta = kHdrToneCurveMaxNits;
+
+    for (std::size_t i = 1; i < curve.size(); ++i) {
+        if (!selected[i]) {
+            continue;
+        }
+
+        const double lower = (i > 0 && !selected[i - 1]) ? curve[i - 1].outputNits : 0.0;
+        const double upper = (i + 1 < curve.size() && !selected[i + 1]) ? curve[i + 1].outputNits : kHdrToneCurveMaxNits;
+        minDelta = std::max(minDelta, lower - startOutputs[i]);
+        maxDelta = std::min(maxDelta, upper - startOutputs[i]);
+    }
+
+    return std::clamp(desiredDelta, minDelta, std::max(minDelta, maxDelta));
 }
 
 std::vector<int> SubtitleTrackCycle(const std::optional<anvil::playback::MediaDescriptor>& media) {
@@ -56,6 +112,22 @@ std::vector<int> SubtitleTrackCycle(const std::optional<anvil::playback::MediaDe
     return tracks;
 }
 
+std::vector<int> SubtitleTrackMenuItems(const std::optional<anvil::playback::MediaDescriptor>& media) {
+    std::vector<int> tracks;
+    if (!media.has_value()) {
+        return tracks;
+    }
+
+    tracks.push_back(anvil::playback::kSubtitleTrackOff);
+    tracks.push_back(anvil::playback::kSubtitleTrackAuto);
+    for (const auto& stream : media->streams) {
+        if (stream.kind == L"Subtitle") {
+            tracks.push_back(stream.index);
+        }
+    }
+    return tracks;
+}
+
 std::wstring SubtitleSelectionLogLabel(const int selection) {
     if (selection == anvil::playback::kSubtitleTrackAuto) {
         return L"auto";
@@ -64,33 +136,6 @@ std::wstring SubtitleSelectionLogLabel(const int selection) {
         return L"off";
     }
     return L"stream=" + std::to_wstring(selection);
-}
-
-std::wstring SubtitleMenuLabel(const int selection, const std::optional<anvil::playback::MediaDescriptor>& media) {
-    if (selection == anvil::playback::kSubtitleTrackAuto) {
-        return L"Auto";
-    }
-    if (selection == anvil::playback::kSubtitleTrackOff) {
-        return L"Off";
-    }
-
-    std::wstring label = L"Stream " + std::to_wstring(selection);
-    if (!media.has_value()) {
-        return label;
-    }
-    for (const auto& stream : media->streams) {
-        if (stream.kind != L"Subtitle" || stream.index != selection) {
-            continue;
-        }
-        if (!stream.language.empty() && stream.language != L"-") {
-            label += L" - " + stream.language;
-        }
-        if (!stream.codec.empty()) {
-            label += L" - " + stream.codec;
-        }
-        break;
-    }
-    return label;
 }
 
 }  // namespace
@@ -110,6 +155,18 @@ void MainWindow::OnMouseMove(const int x, const int y) {
         ShowFullscreenTransport();
     }
 
+    if (draggingSettingsScrollThumb_) {
+        UpdateSettingsScrollDrag(point);
+        return;
+    }
+    if (draggingVolume_) {
+        UpdateVolumeDrag(point);
+        if (fullscreen_) {
+            ShowFullscreenTransport();
+        }
+        return;
+    }
+
     if (videoPressActive_) {
         const int dx = point.x - videoPressStart_.x;
         const int dy = point.y - videoPressStart_.y;
@@ -124,7 +181,12 @@ void MainWindow::OnMouseMove(const int x, const int y) {
         InvalidateTransportArea();
         return;
     }
+    if (selectingHdrToneCurveRange_) {
+        UpdateHdrToneCurveRangeSelection(point);
+        return;
+    }
     if (draggingHdrToneCurve_) {
+        hdrToneCurveDragMoved_ = true;
         UpdateHdrToneCurveDrag(point);
         return;
     }
@@ -139,11 +201,31 @@ void MainWindow::OnMouseMove(const int x, const int y) {
     }
 
     SetProgressHover(ContainsPoint(ProgressHitRect(), point));
+    const bool volumeHovered = ContainsPoint(VolumeSliderHitRect(), point);
+    if (volumeSliderHovered_ != volumeHovered) {
+        volumeSliderHovered_ = volumeHovered;
+        InvalidateTransportArea();
+    }
+    const int subtitleHit = HitSubtitleMenuItem(point);
+    if (subtitleHit != hoveredSubtitleMenuItem_) {
+        hoveredSubtitleMenuItem_ = subtitleHit;
+        InvalidateTransportArea();
+        InvalidateFullscreenOverlay();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+    if (!hdrToneCurveExpanded_) {
+        UpdateHdrToneCurveHover(point);
+    }
 
-    const int hit = HitButton(point);
+    int hit = HitButton(point);
     if (hit != hoveredButton_) {
         hoveredButton_ = hit;
         InvalidateFullscreenOverlay();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+    const int pathHit = HitInspectorPathItem(point);
+    if (pathHit != hoveredInspectorPathItem_) {
+        hoveredInspectorPathItem_ = pathHit;
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
 }
@@ -163,13 +245,61 @@ void MainWindow::OnLeftButtonDown(const int x, const int y) {
         }
     }
 
+    if (BeginSettingsScrollDrag(point)) {
+        return;
+    }
+    if (BeginVolumeDrag(point)) {
+        return;
+    }
+
+    if (subtitleMenuAmount_ > 0.01 || subtitleMenuTarget_ > 0.0) {
+        const int item = HitSubtitleMenuItem(point);
+        if (item >= 0) {
+            if (item < static_cast<int>(subtitleMenuTracks_.size())) {
+                const int selectedTrack = subtitleMenuTracks_[static_cast<std::size_t>(item)];
+                HideSubtitleMenu();
+                ApplySubtitleSelection(selectedTrack);
+            }
+            return;
+        }
+        if (IsPointInSubtitleMenu(point)) {
+            return;
+        }
+
+        const int buttonHit = HitButton(point);
+        const bool subtitleButtonHit = buttonHit >= 0 &&
+                                       buttons_[static_cast<std::size_t>(buttonHit)].command == Command::SubtitleMenu;
+        if (!subtitleButtonHit) {
+            HideSubtitleMenu();
+            return;
+        }
+    }
+
+    const bool hdrToneCurveVisible = !hdrToneCurveExpanded_ && IsHdrToneCurveVisible();
+    if (hdrToneCurveVisible && !ContainsPoint(hdrToneCurvePlot_, point) && HasHdrToneCurveSelection()) {
+        ClearHdrToneCurveSelection();
+    }
+
     const int hit = HitButton(point);
     if (hit >= 0) {
         Execute(buttons_[static_cast<std::size_t>(hit)].command);
         return;
     }
-    if (BeginHdrToneCurveDrag(point)) {
+    const int pathHit = HitInspectorPathItem(point);
+    if (pathHit >= 0) {
+        OpenInspectorPathItem(pathHit);
         return;
+    }
+    if (hdrToneCurveVisible) {
+        if ((GetKeyState(VK_SHIFT) & 0x8000) != 0 && BeginHdrToneCurveRangeSelection(point)) {
+            return;
+        }
+        if (BeginHdrToneCurveDrag(point)) {
+            return;
+        }
+        if (ContainsPoint(hdrToneCurvePlot_, point)) {
+            return;
+        }
     }
     if (ContainsPoint(ProgressHitRect(), point)) {
         BeginProgressDrag(point.x);
@@ -183,8 +313,26 @@ void MainWindow::OnLeftButtonDown(const int x, const int y) {
 }
 
 void MainWindow::OnLeftButtonUp(const int x, const int y) {
+    if (draggingSettingsScrollThumb_) {
+        EndSettingsScrollDrag();
+        return;
+    }
+    if (draggingVolume_) {
+        EndVolumeDrag(POINT{x, y});
+        if (fullscreen_) {
+            ShowFullscreenTransport();
+        }
+        return;
+    }
+    if (selectingHdrToneCurveRange_) {
+        UpdateHdrToneCurveRangeSelection(POINT{x, y});
+        EndHdrToneCurveRangeSelection();
+        return;
+    }
     if (draggingHdrToneCurve_) {
-        UpdateHdrToneCurveDrag(POINT{x, y});
+        if (hdrToneCurveDragMoved_) {
+            UpdateHdrToneCurveDrag(POINT{x, y});
+        }
         EndHdrToneCurveDrag();
         return;
     }
@@ -201,12 +349,299 @@ void MainWindow::OnLeftButtonUp(const int x, const int y) {
     }
 }
 
+void MainWindow::OnMouseWheel(const int delta, POINT screenPoint) {
+    ScreenToClient(hwnd_, &screenPoint);
+    EnsureLayout();
+    if ((subtitleMenuAmount_ > 0.01 || subtitleMenuTarget_ > 0.0) &&
+        IsPointInSubtitleMenu(screenPoint) &&
+        subtitleMenuVisibleItemCount_ > 0 &&
+        static_cast<int>(subtitleMenuTracks_.size()) > subtitleMenuVisibleItemCount_) {
+        const int direction = delta > 0 ? -1 : 1;
+        const int maxOffset = std::max(0, static_cast<int>(subtitleMenuTracks_.size()) - subtitleMenuVisibleItemCount_);
+        const int nextOffset = std::clamp(subtitleMenuScrollOffset_ + direction, 0, maxOffset);
+        if (nextOffset != subtitleMenuScrollOffset_) {
+            subtitleMenuScrollOffset_ = nextOffset;
+            hoveredSubtitleMenuItem_ = HitSubtitleMenuItem(screenPoint);
+            InvalidateTransportArea();
+            InvalidateFullscreenOverlay();
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        }
+        return;
+    }
+    if (ContainsPoint(VolumeSliderHitRect(), screenPoint)) {
+        const auto snapshot = controller_.Snapshot();
+        const double steps = std::clamp(static_cast<double>(delta) / static_cast<double>(WHEEL_DELTA), -3.0, 3.0);
+        if (std::abs(steps) > 0.001) {
+            ApplyVolume(snapshot.volume + steps * 0.05, true);
+        }
+        volumeSliderHovered_ = true;
+        if (fullscreen_) {
+            ShowFullscreenTransport();
+        }
+        InvalidateTransportArea();
+        return;
+    }
+    if (inspectorTab_ != InspectorTab::Settings ||
+        settingsScrollMax_ <= 0 ||
+        (!ContainsPoint(inspector_, screenPoint) && !ContainsPoint(settingsContentViewport_, screenPoint))) {
+        return;
+    }
+
+    const int scrollDelta = -delta * Scale(96) / WHEEL_DELTA;
+    ScrollSettingsBy(scrollDelta);
+}
+
+bool MainWindow::ScrollSettingsBy(const int delta) {
+    if (inspectorTab_ != InspectorTab::Settings || settingsScrollMax_ <= 0 || delta == 0) {
+        return false;
+    }
+
+    const int next = std::clamp(settingsScrollOffset_ + delta, 0, settingsScrollMax_);
+    if (next == settingsScrollOffset_) {
+        return true;
+    }
+
+    settingsScrollOffset_ = next;
+    MarkLayoutDirty();
+    EnsureLayout();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    return true;
+}
+
+bool MainWindow::BeginSettingsScrollDrag(const POINT point) {
+    if (inspectorTab_ != InspectorTab::Settings ||
+        settingsScrollMax_ <= 0 ||
+        RectHeight(settingsScrollTrack_) <= 0 ||
+        !ContainsPoint(settingsScrollTrack_, point)) {
+        return false;
+    }
+
+    if (!ContainsPoint(settingsScrollThumb_, point)) {
+        const int travel = std::max(1, RectHeight(settingsScrollTrack_) - RectHeight(settingsScrollThumb_));
+        const int desiredTop = std::clamp(static_cast<int>(point.y) - RectHeight(settingsScrollThumb_) / 2,
+                                          static_cast<int>(settingsScrollTrack_.top),
+                                          static_cast<int>(settingsScrollTrack_.bottom) - RectHeight(settingsScrollThumb_));
+        settingsScrollOffset_ = std::clamp(
+            static_cast<int>(std::round(static_cast<double>(desiredTop - settingsScrollTrack_.top) *
+                                        static_cast<double>(settingsScrollMax_) /
+                                        static_cast<double>(travel))),
+            0,
+            settingsScrollMax_);
+        MarkLayoutDirty();
+        EnsureLayout();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
+    draggingSettingsScrollThumb_ = true;
+    settingsScrollDragStartY_ = point.y;
+    settingsScrollDragStartOffset_ = settingsScrollOffset_;
+    SetCapture(hwnd_);
+    return true;
+}
+
+void MainWindow::UpdateSettingsScrollDrag(const POINT point) {
+    if (!draggingSettingsScrollThumb_ ||
+        settingsScrollMax_ <= 0 ||
+        RectHeight(settingsScrollTrack_) <= 0 ||
+        RectHeight(settingsScrollThumb_) <= 0) {
+        return;
+    }
+
+    const int travel = std::max(1, RectHeight(settingsScrollTrack_) - RectHeight(settingsScrollThumb_));
+    const int dy = point.y - settingsScrollDragStartY_;
+    const int next = std::clamp(
+        settingsScrollDragStartOffset_ +
+            static_cast<int>(std::round(static_cast<double>(dy) *
+                                        static_cast<double>(settingsScrollMax_) /
+                                        static_cast<double>(travel))),
+        0,
+        settingsScrollMax_);
+    if (next == settingsScrollOffset_) {
+        return;
+    }
+
+    settingsScrollOffset_ = next;
+    MarkLayoutDirty();
+    EnsureLayout();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::EndSettingsScrollDrag() {
+    if (!draggingSettingsScrollThumb_) {
+        return;
+    }
+
+    draggingSettingsScrollThumb_ = false;
+    if (GetCapture() == HdrToneCurveInteractionWindow()) {
+        ReleaseCapture();
+    }
+    InvalidateHdrToneCurveEditor();
+}
+
+void MainWindow::CancelSettingsScrollDrag() {
+    if (!draggingSettingsScrollThumb_) {
+        return;
+    }
+
+    draggingSettingsScrollThumb_ = false;
+    if (GetCapture() == HdrToneCurveInteractionWindow()) {
+        ReleaseCapture();
+    }
+    InvalidateHdrToneCurveEditor();
+}
+
 RECT MainWindow::ProgressHitRect() const {
     RECT hit = progress_;
     const int padY = Scale(10);
     hit.top -= padY;
     hit.bottom += padY;
     return hit;
+}
+
+RECT MainWindow::VolumeSliderTrackRect() const {
+    if (RectWidth(volumeSlider_) <= 0 || RectHeight(volumeSlider_) <= 0) {
+        return RECT{};
+    }
+
+    const int centerY = volumeSlider_.top + RectHeight(volumeSlider_) / 2;
+    const int trackLeft = volumeSlider_.left + Scale(36);
+    const int trackRight = volumeSlider_.right - Scale(8);
+    if (trackRight <= trackLeft) {
+        return RECT{};
+    }
+    return MakeRect(trackLeft, centerY - Scale(2), trackRight, centerY + Scale(2));
+}
+
+RECT MainWindow::VolumeSliderHitRect() const {
+    if (RectWidth(volumeSlider_) <= 0 || RectHeight(volumeSlider_) <= 0) {
+        return RECT{};
+    }
+
+    RECT hit = volumeSlider_;
+    InflateRect(&hit, Scale(4), Scale(8));
+    return hit;
+}
+
+bool MainWindow::IsPointInSubtitleMenu(const POINT point) const {
+    if (subtitleMenuAmount_ <= 0.01 || RectWidth(subtitleMenu_) <= 0 || RectHeight(subtitleMenu_) <= 0) {
+        return false;
+    }
+    return ContainsPoint(subtitleMenu_, point);
+}
+
+int MainWindow::HitSubtitleMenuItem(const POINT point) const {
+    if (!IsPointInSubtitleMenu(point)) {
+        return -1;
+    }
+
+    const int count = static_cast<int>(subtitleMenuTracks_.size());
+    if (count <= 0) {
+        return -1;
+    }
+
+    const int headerHeight = Scale(62);
+    const int listGap = Scale(8);
+    const int itemHeight = Scale(42);
+    const int y = point.y - subtitleMenu_.top - headerHeight - listGap;
+    if (y < 0) {
+        return -1;
+    }
+    const int localIndex = y / itemHeight;
+    const int visibleCount = subtitleMenuVisibleItemCount_ > 0
+                                 ? std::clamp(subtitleMenuVisibleItemCount_, 1, count)
+                                 : count;
+    if (localIndex < 0 || localIndex >= visibleCount) {
+        return -1;
+    }
+    const int index = std::clamp(subtitleMenuScrollOffset_, 0, std::max(0, count - visibleCount)) + localIndex;
+    if (index < 0 || index >= count) {
+        return -1;
+    }
+    return index;
+}
+
+double MainWindow::VolumeFromSliderX(const int x) const {
+    const RECT track = VolumeSliderTrackRect();
+    if (RectWidth(track) <= 0) {
+        return controller_.Snapshot().volume;
+    }
+
+    return std::clamp(static_cast<double>(x - track.left) / static_cast<double>(RectWidth(track)), 0.0, 1.0);
+}
+
+bool MainWindow::ApplyVolume(const double volume, const bool restartExternalNow) {
+    const int nextPercent = std::clamp(static_cast<int>(std::round(volume * 100.0)), 0, 100);
+    const auto snapshot = controller_.Snapshot();
+    const int currentPercent = std::clamp(static_cast<int>(std::round(snapshot.volume * 100.0)), 0, 100);
+    if (nextPercent == currentPercent) {
+        return false;
+    }
+
+    controller_.SetVolume(static_cast<double>(nextPercent) / 100.0);
+    const auto updated = controller_.Snapshot();
+    if (backend_ == PlaybackBackend::NativeFfmpegD3D11 ||
+        backend_ == PlaybackBackend::RawFrameBridge) {
+        audioPlayer_.SetVolume(updated.volume);
+    } else if (restartExternalNow) {
+        RestartPlaybackIfPlaying();
+    }
+
+    if (draggingVolume_) {
+        volumeDragChanged_ = true;
+    }
+    InvalidateTransportArea();
+    return true;
+}
+
+bool MainWindow::BeginVolumeDrag(const POINT point) {
+    if (!ContainsPoint(VolumeSliderHitRect(), point)) {
+        return false;
+    }
+
+    draggingVolume_ = true;
+    volumeDragChanged_ = false;
+    volumeSliderHovered_ = true;
+    SetCapture(hwnd_);
+    UpdateVolumeDrag(point);
+    InvalidateTransportArea();
+    return true;
+}
+
+void MainWindow::UpdateVolumeDrag(const POINT point) {
+    if (!draggingVolume_ || RectWidth(volumeSlider_) <= 0) {
+        return;
+    }
+
+    ApplyVolume(VolumeFromSliderX(point.x), false);
+}
+
+void MainWindow::EndVolumeDrag(const POINT point) {
+    if (!draggingVolume_) {
+        return;
+    }
+
+    UpdateVolumeDrag(point);
+    draggingVolume_ = false;
+    if (GetCapture() == hwnd_) {
+        ReleaseCapture();
+    }
+    if (volumeDragChanged_ &&
+        backend_ != PlaybackBackend::NativeFfmpegD3D11 &&
+        backend_ != PlaybackBackend::RawFrameBridge) {
+        RestartPlaybackIfPlaying();
+    }
+    volumeDragChanged_ = false;
+    InvalidateTransportArea();
+}
+
+void MainWindow::CancelVolumeDrag() {
+    if (!draggingVolume_) {
+        return;
+    }
+
+    draggingVolume_ = false;
+    volumeDragChanged_ = false;
+    InvalidateTransportArea();
 }
 
 std::chrono::milliseconds MainWindow::PositionFromProgressX(const int x) const {
@@ -255,25 +690,23 @@ void MainWindow::CommitProgressDrag() {
 bool MainWindow::IsHdrToneCurveVisible() const {
     const auto settings = controller_.Settings();
     return inspectorTab_ == InspectorTab::Settings &&
-           settings.video.dolbyVisionHdrOutput &&
+           HdrToneCurveAvailable(settings) &&
            RectWidth(hdrToneCurvePlot_) > 0 &&
            RectHeight(hdrToneCurvePlot_) > 0;
 }
 
-bool MainWindow::BeginHdrToneCurveDrag(const POINT point) {
-    if (!IsHdrToneCurveVisible()) {
-        return false;
-    }
+HWND MainWindow::HdrToneCurveInteractionWindow() const {
+    return hdrToneCurveExpanded_ && hdrToneCurveWindow_ ? hdrToneCurveWindow_ : hwnd_;
+}
 
-    RECT hitRect = hdrToneCurvePlot_;
-    InflateRect(&hitRect, Scale(18), Scale(18));
-    if (!ContainsPoint(hitRect, point)) {
-        return false;
+int MainWindow::HitHdrToneCurvePoint(const POINT point, const int maxDistancePx) const {
+    if (!IsHdrToneCurveVisible()) {
+        return -1;
     }
 
     const auto settings = controller_.Settings();
     int nearest = -1;
-    int nearestDistanceSq = Scale(24) * Scale(24);
+    int nearestDistanceSq = maxDistancePx * maxDistancePx;
     for (std::size_t index = 1; index < settings.video.hdrToneCurve.size(); ++index) {
         const auto& curvePoint = settings.video.hdrToneCurve[index];
         const double inputNits = index < anvil::playback::kDefaultHdrToneCurve.size()
@@ -288,15 +721,192 @@ bool MainWindow::BeginHdrToneCurveDrag(const POINT point) {
         }
     }
 
-    if (nearest < 0) {
+    return nearest;
+}
+
+void MainWindow::UpdateHdrToneCurveHover(const POINT point) {
+    const int previous = hoveredHdrToneCurvePoint_;
+    hoveredHdrToneCurvePoint_ = HitHdrToneCurvePoint(point, Scale(18));
+    if (previous != hoveredHdrToneCurvePoint_) {
+        InvalidateHdrToneCurveEditor();
+    }
+}
+
+bool MainWindow::HasHdrToneCurveSelection() const {
+    for (std::size_t index = 1; index < selectedHdrToneCurvePoints_.size(); ++index) {
+        if (selectedHdrToneCurvePoints_[index]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int MainWindow::HdrToneCurveSelectionCount() const {
+    int count = 0;
+    for (std::size_t index = 1; index < selectedHdrToneCurvePoints_.size(); ++index) {
+        if (selectedHdrToneCurvePoints_[index]) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+void MainWindow::ClearHdrToneCurveSelection() {
+    if (!HasHdrToneCurveSelection()) {
+        return;
+    }
+    selectedHdrToneCurvePoints_.fill(false);
+    draggedHdrToneCurvePoint_ = -1;
+    InvalidateHdrToneCurveEditor();
+}
+
+void MainWindow::SelectHdrToneCurvePoint(const int pointIndex) {
+    selectedHdrToneCurvePoints_.fill(false);
+    if (pointIndex > 0 && pointIndex < static_cast<int>(selectedHdrToneCurvePoints_.size())) {
+        selectedHdrToneCurvePoints_[static_cast<std::size_t>(pointIndex)] = true;
+        draggedHdrToneCurvePoint_ = pointIndex;
+    } else {
+        draggedHdrToneCurvePoint_ = -1;
+    }
+    InvalidateHdrToneCurveEditor();
+}
+
+void MainWindow::SelectHdrToneCurveRange(const int leftX, const int rightX) {
+    if (!IsHdrToneCurveVisible()) {
+        return;
+    }
+
+    const int rangeLeft = std::min(leftX, rightX) - Scale(4);
+    const int rangeRight = std::max(leftX, rightX) + Scale(4);
+    selectedHdrToneCurvePoints_.fill(false);
+    draggedHdrToneCurvePoint_ = -1;
+
+    const auto settings = controller_.Settings();
+    for (std::size_t index = 1; index < settings.video.hdrToneCurve.size(); ++index) {
+        const auto& curvePoint = settings.video.hdrToneCurve[index];
+        const double inputNits = index < anvil::playback::kDefaultHdrToneCurve.size()
+                                     ? anvil::playback::kDefaultHdrToneCurve[index].inputNits
+                                     : curvePoint.inputNits;
+        const int x = ToneCurveX(hdrToneCurvePlot_, inputNits);
+        if (x >= rangeLeft && x <= rangeRight) {
+            selectedHdrToneCurvePoints_[index] = true;
+            if (draggedHdrToneCurvePoint_ < 0) {
+                draggedHdrToneCurvePoint_ = static_cast<int>(index);
+            }
+        }
+    }
+
+    InvalidateHdrToneCurveEditor();
+}
+
+bool MainWindow::BeginHdrToneCurveRangeSelection(const POINT point) {
+    if (!IsHdrToneCurveVisible() || !ContainsPoint(hdrToneCurvePlot_, point)) {
         return false;
     }
 
-    draggingHdrToneCurve_ = true;
-    draggedHdrToneCurvePoint_ = nearest;
-    SetCapture(hwnd_);
-    UpdateHdrToneCurveDrag(point);
+    selectingHdrToneCurveRange_ = true;
+    hdrToneCurveSelectionStartX_ = std::clamp(static_cast<int>(point.x),
+                                              static_cast<int>(hdrToneCurvePlot_.left),
+                                              static_cast<int>(hdrToneCurvePlot_.right));
+    hdrToneCurveSelectionCurrentX_ = hdrToneCurveSelectionStartX_;
+    SelectHdrToneCurveRange(hdrToneCurveSelectionStartX_, hdrToneCurveSelectionCurrentX_);
+    SetCapture(HdrToneCurveInteractionWindow());
     return true;
+}
+
+void MainWindow::UpdateHdrToneCurveRangeSelection(const POINT point) {
+    if (!selectingHdrToneCurveRange_ || !IsHdrToneCurveVisible()) {
+        return;
+    }
+
+    hdrToneCurveSelectionCurrentX_ = std::clamp(static_cast<int>(point.x),
+                                                static_cast<int>(hdrToneCurvePlot_.left),
+                                                static_cast<int>(hdrToneCurvePlot_.right));
+    SelectHdrToneCurveRange(hdrToneCurveSelectionStartX_, hdrToneCurveSelectionCurrentX_);
+}
+
+void MainWindow::EndHdrToneCurveRangeSelection() {
+    if (!selectingHdrToneCurveRange_) {
+        return;
+    }
+
+    selectingHdrToneCurveRange_ = false;
+    if (!HasHdrToneCurveSelection()) {
+        draggedHdrToneCurvePoint_ = -1;
+    }
+    if (GetCapture() == HdrToneCurveInteractionWindow()) {
+        ReleaseCapture();
+    }
+    InvalidateHdrToneCurveEditor();
+}
+
+bool MainWindow::BeginHdrToneCurveDrag(const POINT point) {
+    if (!IsHdrToneCurveVisible()) {
+        return false;
+    }
+
+    RECT hitRect = hdrToneCurvePlot_;
+    InflateRect(&hitRect, Scale(18), Scale(18));
+    if (!ContainsPoint(hitRect, point)) {
+        return false;
+    }
+
+    const int nearest = HitHdrToneCurvePoint(point, Scale(24));
+    if (nearest > 0) {
+        const bool clickedSelected = nearest < static_cast<int>(selectedHdrToneCurvePoints_.size()) &&
+                                     selectedHdrToneCurvePoints_[static_cast<std::size_t>(nearest)];
+        const bool groupDrag = clickedSelected && HdrToneCurveSelectionCount() > 1;
+        if (!clickedSelected) {
+            SelectHdrToneCurvePoint(nearest);
+        }
+        StartHdrToneCurveDrag(nearest, groupDrag, point);
+        return true;
+    }
+
+    if (HasHdrToneCurveSelection() && ContainsPoint(hdrToneCurvePlot_, point)) {
+        int anchor = -1;
+        for (std::size_t index = 1; index < selectedHdrToneCurvePoints_.size(); ++index) {
+            if (selectedHdrToneCurvePoints_[index]) {
+                anchor = static_cast<int>(index);
+                break;
+            }
+        }
+        if (anchor > 0) {
+            StartHdrToneCurveDrag(anchor, true, point);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void MainWindow::StartHdrToneCurveDrag(const int pointIndex, const bool groupDrag, const POINT point) {
+    if (pointIndex <= 0 || pointIndex >= static_cast<int>(selectedHdrToneCurvePoints_.size())) {
+        return;
+    }
+
+    if (!groupDrag) {
+        SelectHdrToneCurvePoint(pointIndex);
+    } else if (!HasHdrToneCurveSelection()) {
+        selectedHdrToneCurvePoints_[static_cast<std::size_t>(pointIndex)] = true;
+    }
+
+    auto settings = controller_.Settings();
+    auto curve = settings.video.hdrToneCurve;
+    NormalizeHdrToneCurveForEditing(curve);
+    for (std::size_t index = 0; index < curve.size(); ++index) {
+        hdrToneCurveDragStartOutputs_[index] = curve[index].outputNits;
+    }
+
+    draggingHdrToneCurve_ = true;
+    draggingHdrToneCurveSelection_ = groupDrag;
+    hdrToneCurveDragMoved_ = false;
+    draggedHdrToneCurvePoint_ = pointIndex;
+    hoveredHdrToneCurvePoint_ = pointIndex;
+    hdrToneCurveDragStart_ = point;
+    hdrToneCurveDragStartPointerNits_ = ToneCurveYToNits(hdrToneCurvePlot_, point.y);
+    SetCapture(HdrToneCurveInteractionWindow());
+    InvalidateHdrToneCurveEditor();
 }
 
 void MainWindow::UpdateHdrToneCurveDrag(const POINT point) {
@@ -310,26 +920,34 @@ void MainWindow::UpdateHdrToneCurveDrag(const POINT point) {
 
     auto settings = controller_.Settings();
     auto& curve = settings.video.hdrToneCurve;
-    const std::size_t index = static_cast<std::size_t>(draggedHdrToneCurvePoint_);
-    if (index >= curve.size()) {
-        return;
+    NormalizeHdrToneCurveForEditing(curve);
+
+    if (draggingHdrToneCurveSelection_) {
+        const double currentPointerNits = ToneCurveYToNits(hdrToneCurvePlot_, point.y);
+        const double desiredDelta = std::round(currentPointerNits - hdrToneCurveDragStartPointerNits_);
+        const double delta = ClampHdrToneCurveSelectionDelta(curve, selectedHdrToneCurvePoints_, hdrToneCurveDragStartOutputs_, desiredDelta);
+        for (std::size_t index = 1; index < curve.size(); ++index) {
+            if (selectedHdrToneCurvePoints_[index]) {
+                curve[index].outputNits = RoundToneCurveNits(hdrToneCurveDragStartOutputs_[index] + delta);
+            }
+        }
+    } else {
+        const std::size_t index = static_cast<std::size_t>(draggedHdrToneCurvePoint_);
+        if (index >= curve.size()) {
+            return;
+        }
+
+        const double minOutput = curve[index - 1].outputNits;
+        const double maxOutput = index + 1 < curve.size()
+                                     ? curve[index + 1].outputNits
+                                     : kHdrToneCurveMaxNits;
+        const double outputNits = std::clamp(RoundToneCurveNits(ToneCurveYToNits(hdrToneCurvePlot_, point.y)),
+                                             minOutput,
+                                             std::max(minOutput, maxOutput));
+        curve[index].outputNits = outputNits;
     }
 
-    const double unitY = 1.0 - static_cast<double>(point.y - hdrToneCurvePlot_.top) / static_cast<double>(RectHeight(hdrToneCurvePlot_));
-    double outputNits = RoundToneCurveNits(UnitToToneCurveNits(unitY));
-
-    for (std::size_t i = 0; i < curve.size() && i < anvil::playback::kDefaultHdrToneCurve.size(); ++i) {
-        curve[i].inputNits = anvil::playback::kDefaultHdrToneCurve[i].inputNits;
-    }
-
-    const double minOutput = curve[index - 1].outputNits;
-    const double maxOutput = index + 1 < curve.size()
-                                 ? curve[index + 1].outputNits
-                                 : kHdrToneCurveMaxNits;
-
-    outputNits = std::clamp(outputNits, minOutput, std::max(minOutput, maxOutput));
-    curve[index].outputNits = outputNits;
-    settings.video.peakBrightnessNits = static_cast<int>(std::clamp(curve.back().outputNits, 100.0, 10000.0));
+    settings.video.peakBrightnessNits = static_cast<int>(std::clamp(curve.back().outputNits, 100.0, kHdrToneCurveMaxNits));
 
     controller_.ApplySettings(settings);
     ApplyLiveHdrToneCurveSettings();
@@ -341,25 +959,113 @@ void MainWindow::EndHdrToneCurveDrag() {
     }
 
     draggingHdrToneCurve_ = false;
+    draggingHdrToneCurveSelection_ = false;
+    hdrToneCurveDragMoved_ = false;
     draggedHdrToneCurvePoint_ = -1;
-    if (GetCapture() == hwnd_) {
+    if (GetCapture() == HdrToneCurveInteractionWindow()) {
         ReleaseCapture();
     }
 
     const auto settings = controller_.Settings();
     LogApp(anvil::playback::LogLevel::Info,
            L"hdr tone curve peak=" + std::to_wstring(settings.video.peakBrightnessNits) + L" nits");
-    InvalidateRect(hwnd_, nullptr, FALSE);
+    InvalidateHdrToneCurveEditor();
+}
+
+void MainWindow::CancelHdrToneCurveInteraction() {
+    if (!draggingHdrToneCurve_ && !selectingHdrToneCurveRange_) {
+        return;
+    }
+
+    draggingHdrToneCurve_ = false;
+    draggingHdrToneCurveSelection_ = false;
+    selectingHdrToneCurveRange_ = false;
+    hdrToneCurveDragMoved_ = false;
+    draggedHdrToneCurvePoint_ = -1;
+    if (GetCapture() == HdrToneCurveInteractionWindow()) {
+        ReleaseCapture();
+    }
+    InvalidateHdrToneCurveEditor();
+}
+
+bool MainWindow::NudgeHdrToneCurveSelection(const double deltaNits) {
+    if (!IsHdrToneCurveVisible() || !HasHdrToneCurveSelection()) {
+        return false;
+    }
+
+    auto settings = controller_.Settings();
+    auto& curve = settings.video.hdrToneCurve;
+    NormalizeHdrToneCurveForEditing(curve);
+
+    std::array<double, anvil::playback::kHdrToneCurvePointCount> startOutputs{};
+    for (std::size_t index = 0; index < curve.size(); ++index) {
+        startOutputs[index] = curve[index].outputNits;
+    }
+
+    const double delta = ClampHdrToneCurveSelectionDelta(curve, selectedHdrToneCurvePoints_, startOutputs, deltaNits);
+    if (std::abs(delta) < 0.5) {
+        return true;
+    }
+
+    for (std::size_t index = 1; index < curve.size(); ++index) {
+        if (selectedHdrToneCurvePoints_[index]) {
+            curve[index].outputNits = RoundToneCurveNits(startOutputs[index] + delta);
+        }
+    }
+    settings.video.peakBrightnessNits = static_cast<int>(std::clamp(curve.back().outputNits, 100.0, kHdrToneCurveMaxNits));
+    controller_.ApplySettings(settings);
+    ApplyLiveHdrToneCurveSettings();
+    return true;
 }
 
 void MainWindow::ResetHdrToneCurve() {
+    ClearHdrToneCurveSelection();
     auto settings = controller_.Settings();
     settings.video.hdrToneCurve = anvil::playback::kDefaultHdrToneCurve;
     settings.video.peakBrightnessNits =
-        static_cast<int>(std::clamp(settings.video.hdrToneCurve.back().outputNits, 100.0, 10000.0));
+        static_cast<int>(std::clamp(settings.video.hdrToneCurve.back().outputNits, 100.0, kHdrToneCurveMaxNits));
     controller_.ApplySettings(settings);
     ApplyLiveHdrToneCurveSettings();
     LogApp(anvil::playback::LogLevel::Info, L"hdr tone curve reset");
+}
+
+void MainWindow::ShowHdrToneCurveWindow() {
+    const auto settings = controller_.Settings();
+    if (!HdrToneCurveAvailable(settings)) {
+        return;
+    }
+
+    hdrToneCurveExpanded_ = true;
+    EnsureHdrToneCurveWindow();
+    UpdateHdrToneCurveFloatingLayout();
+    if (hdrToneCurveWindow_) {
+        ShowWindow(hdrToneCurveWindow_, SW_SHOWNORMAL);
+        SetWindowPos(hdrToneCurveWindow_, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        SetForegroundWindow(hdrToneCurveWindow_);
+        InvalidateRect(hdrToneCurveWindow_, nullptr, FALSE);
+    }
+    MarkLayoutDirty();
+    EnsureLayout();
+    InvalidateTransportArea();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::HideHdrToneCurveWindow() {
+    const bool wasExpanded = hdrToneCurveExpanded_;
+    const bool wasVisible = hdrToneCurveWindow_ && IsWindowVisible(hdrToneCurveWindow_);
+    hdrToneCurveExpanded_ = false;
+    ClearHdrToneCurveSelection();
+    if (hdrToneCurveWindow_) {
+        ShowWindow(hdrToneCurveWindow_, SW_HIDE);
+    }
+    if (!wasExpanded && !wasVisible) {
+        return;
+    }
+    MarkLayoutDirty();
+    EnsureLayout();
+    InvalidateTransportArea();
+    InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
 void MainWindow::ApplyLiveHdrToneCurveSettings() {
@@ -375,6 +1081,7 @@ void MainWindow::ApplyLiveHdrToneCurveSettings() {
     }
     MarkLayoutDirty();
     EnsureLayout();
+    InvalidateTransportArea();
     InvalidateFullscreenOverlay();
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
@@ -462,6 +1169,16 @@ void MainWindow::OnKeyDown(const WPARAM key) {
     case VK_RIGHT:
         SeekRelative(std::chrono::seconds{10});
         break;
+    case VK_UP:
+        if (NudgeHdrToneCurveSelection(1.0)) {
+            break;
+        }
+        break;
+    case VK_DOWN:
+        if (NudgeHdrToneCurveSelection(-1.0)) {
+            break;
+        }
+        break;
     case 'O':
         OpenFileDialog();
         break;
@@ -475,7 +1192,11 @@ void MainWindow::OnKeyDown(const WPARAM key) {
         CycleSubtitleTrack();
         break;
     case VK_ESCAPE:
-        if (fullscreen_) {
+        if (subtitleMenuTarget_ > 0.0 || subtitleMenuAmount_ > 0.01) {
+            HideSubtitleMenu();
+        } else if (hdrToneCurveExpanded_) {
+            HideHdrToneCurveWindow();
+        } else if (fullscreen_) {
             ToggleFullscreen();
         }
         break;
@@ -511,6 +1232,7 @@ void MainWindow::ApplySubtitleSelection(const int selectedTrackIndex) {
     }
     MarkLayoutDirty();
     EnsureLayout();
+    InvalidateTransportArea();
     InvalidateFullscreenOverlay();
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
@@ -527,80 +1249,111 @@ void MainWindow::CycleSubtitleTrack() {
 }
 
 void MainWindow::ToggleDolbyVisionHdrOutput() {
+    if (!CurrentMediaHasHdrControls()) {
+        return;
+    }
+
     auto settings = controller_.Settings();
     settings.video.dolbyVisionHdrOutput = !settings.video.dolbyVisionHdrOutput;
+    if (!settings.video.dolbyVisionHdrOutput) {
+        HideHdrToneCurveWindow();
+    }
     controller_.ApplySettings(settings);
     LogApp(anvil::playback::LogLevel::Info,
            L"dolby vision hdr output=" +
                std::wstring(settings.video.dolbyVisionHdrOutput ? L"on" : L"off"));
 
     const auto snapshot = controller_.Snapshot();
-    if (snapshot.state == PlaybackState::Paused &&
+    bool handledLive = false;
+    if (backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
         snapshot.media.has_value() &&
         snapshot.media->hasVideo &&
-        backend_ == PlaybackBackend::NativeFfmpegD3D11) {
-        RefreshPausedNativeFrame(snapshot);
-    } else {
-        RestartPlaybackIfPlaying();
+        !NativeHdrOutputToggleRequiresDecoderRestart(snapshot)) {
+        handledLive = ApplyNativeColorSettingsLive(snapshot);
+    }
+    if (!handledLive) {
+        if (snapshot.state == PlaybackState::Paused &&
+            snapshot.media.has_value() &&
+            snapshot.media->hasVideo &&
+            backend_ == PlaybackBackend::NativeFfmpegD3D11) {
+            RefreshPausedNativeFrame(snapshot);
+        } else {
+            RestartPlaybackIfPlaying();
+        }
     }
     MarkLayoutDirty();
     EnsureLayout();
+    InvalidateTransportArea();
     InvalidateFullscreenOverlay();
     InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::ToggleDolbyVisionCmv4Approx() {
+    auto settings = controller_.Settings();
+    if (!CurrentCmv4ControlEnabled(settings)) {
+        return;
+    }
+
+    settings.video.dolbyVisionCmv4Approx = !settings.video.dolbyVisionCmv4Approx;
+    if (settings.video.dolbyVisionCmv4Approx) {
+        HideHdrToneCurveWindow();
+    }
+    controller_.ApplySettings(settings);
+    LogApp(anvil::playback::LogLevel::Info,
+           L"dolby vision cmv4 approx=" +
+               std::wstring(settings.video.dolbyVisionCmv4Approx ? L"on" : L"off"));
+
+    const auto snapshot = controller_.Snapshot();
+    bool handledLive = false;
+    if (backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+        snapshot.media.has_value() &&
+        snapshot.media->hasVideo &&
+        !NativeCmv4ToggleRequiresDecoderRestart(snapshot)) {
+        handledLive = ApplyNativeColorSettingsLive(snapshot);
+    }
+    if (!handledLive) {
+        if (snapshot.state == PlaybackState::Paused &&
+            snapshot.media.has_value() &&
+            snapshot.media->hasVideo &&
+            backend_ == PlaybackBackend::NativeFfmpegD3D11) {
+            RefreshPausedNativeFrame(snapshot);
+        } else {
+            RestartPlaybackIfPlaying();
+        }
+    }
+    MarkLayoutDirty();
+    EnsureLayout();
+    InvalidateTransportArea();
+    InvalidateFullscreenOverlay();
+    InvalidateHdrToneCurveEditor();
 }
 
 void MainWindow::ShowSubtitleMenu() {
     EnsureLayout();
 
     const auto snapshot = controller_.Snapshot();
-    const auto settings = controller_.Settings();
-    HMENU menu = CreatePopupMenu();
-    if (!menu) {
+    if (subtitleMenuTarget_ > 0.0 || subtitleMenuAmount_ > 0.01) {
+        HideSubtitleMenu();
         return;
     }
 
-    std::vector<int> tracks;
+    subtitleMenuTracks_.clear();
     if (snapshot.media.has_value()) {
-        tracks = SubtitleTrackCycle(snapshot.media);
-        for (std::size_t index = 0; index < tracks.size(); ++index) {
-            const UINT id = kSubtitleMenuCommandBase + static_cast<UINT>(index);
-            UINT flags = MF_STRING;
-            if (tracks[index] == settings.subtitles.selectedTrackIndex) {
-                flags |= MF_CHECKED;
-            }
-            const auto label = SubtitleMenuLabel(tracks[index], snapshot.media);
-            AppendMenuW(menu, flags, id, label.c_str());
-        }
-    } else {
-        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, L"No media loaded");
+        subtitleMenuTracks_ = SubtitleTrackMenuItems(snapshot.media);
     }
-
-    RECT anchor = transportBar_;
-    for (const auto& button : buttons_) {
-        if (button.command == Command::SubtitleMenu) {
-            anchor = button.bounds;
-            break;
-        }
+    subtitleMenuVisibleItemCount_ = 0;
+    subtitleMenuScrollOffset_ = 0;
+    const auto settings = controller_.Settings();
+    const auto selected = std::find(subtitleMenuTracks_.begin(),
+                                    subtitleMenuTracks_.end(),
+                                    settings.subtitles.selectedTrackIndex);
+    if (selected != subtitleMenuTracks_.end()) {
+        subtitleMenuScrollOffset_ = std::max(0, static_cast<int>(std::distance(subtitleMenuTracks_.begin(), selected)) - 1);
     }
-
-    POINT popupPoint{anchor.right, fullscreen_ ? anchor.top : anchor.bottom};
-    ClientToScreen(hwnd_, &popupPoint);
-    SetForegroundWindow(hwnd_);
-    const UINT align = fullscreen_ ? TPM_BOTTOMALIGN : TPM_TOPALIGN;
-    const UINT selected = TrackPopupMenuEx(menu,
-                                           TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_RIGHTALIGN | align,
-                                           popupPoint.x,
-                                           popupPoint.y,
-                                           hwnd_,
-                                           nullptr);
-    DestroyMenu(menu);
-    PostMessageW(hwnd_, WM_NULL, 0, 0);
-
-    if (selected >= kSubtitleMenuCommandBase) {
-        const std::size_t index = static_cast<std::size_t>(selected - kSubtitleMenuCommandBase);
-        if (index < tracks.size()) {
-            ApplySubtitleSelection(tracks[index]);
-        }
+    hoveredSubtitleMenuItem_ = -1;
+    SetSubtitleMenuTarget(true);
+    if (fullscreen_) {
+        ShowFullscreenTransport();
     }
 }
 
@@ -613,6 +1366,18 @@ void MainWindow::OnDropFiles(HDROP drop) {
         }
     }
     DragFinish(drop);
+}
+
+void MainWindow::OpenInspectorPathItem(const int itemIndex) {
+    if (itemIndex < 0 || itemIndex >= static_cast<int>(inspectorPathItems_.size())) {
+        return;
+    }
+
+    const std::filesystem::path path = inspectorPathItems_[static_cast<std::size_t>(itemIndex)].path;
+    if (path.empty()) {
+        return;
+    }
+    OpenPath(path, true);
 }
 
 void MainWindow::Execute(const Command command) {
@@ -634,14 +1399,12 @@ void MainWindow::Execute(const Command command) {
         break;
     case Command::VolumeDown: {
         const auto snapshot = controller_.Snapshot();
-        controller_.SetVolume(snapshot.volume - 0.05);
-        RestartPlaybackIfPlaying();
+        ApplyVolume(snapshot.volume - 0.05, true);
         break;
     }
     case Command::VolumeUp: {
         const auto snapshot = controller_.Snapshot();
-        controller_.SetVolume(snapshot.volume + 0.05);
-        RestartPlaybackIfPlaying();
+        ApplyVolume(snapshot.volume + 0.05, true);
         break;
     }
     case Command::SubtitleMenu:
@@ -651,29 +1414,45 @@ void MainWindow::Execute(const Command command) {
         ToggleFullscreen();
         break;
     case Command::Settings:
+        HideHdrToneCurveWindow();
         if (inspectorCollapsed_) {
             inspectorTab_ = InspectorTab::Settings;
             ToggleSidebar();
             break;
         }
-        inspectorTab_ = inspectorTab_ == InspectorTab::Settings ? InspectorTab::Media : InspectorTab::Settings;
+        inspectorTab_ = inspectorTab_ == InspectorTab::Settings ? InspectorTab::Recent : InspectorTab::Settings;
         MarkLayoutDirty();
         EnsureLayout();
         break;
     case Command::ToggleSidebar:
         ToggleSidebar();
         break;
+    case Command::InspectorRecent:
+        HideHdrToneCurveWindow();
+        inspectorTab_ = InspectorTab::Recent;
+        MarkLayoutDirty();
+        EnsureLayout();
+        break;
+    case Command::InspectorFolder:
+        HideHdrToneCurveWindow();
+        inspectorTab_ = InspectorTab::Folder;
+        MarkLayoutDirty();
+        EnsureLayout();
+        break;
     case Command::InspectorMedia:
+        HideHdrToneCurveWindow();
         inspectorTab_ = InspectorTab::Media;
         MarkLayoutDirty();
         EnsureLayout();
         break;
-    case Command::InspectorDevice:
-        inspectorTab_ = InspectorTab::Device;
+    case Command::InspectorSystem:
+        HideHdrToneCurveWindow();
+        inspectorTab_ = InspectorTab::System;
         MarkLayoutDirty();
         EnsureLayout();
         break;
     case Command::InspectorLog:
+        HideHdrToneCurveWindow();
         inspectorTab_ = InspectorTab::Log;
         MarkLayoutDirty();
         EnsureLayout();
@@ -681,10 +1460,21 @@ void MainWindow::Execute(const Command command) {
     case Command::ToggleDolbyVisionHdr:
         ToggleDolbyVisionHdrOutput();
         break;
+    case Command::ToggleDolbyVisionCmv4Approx:
+        ToggleDolbyVisionCmv4Approx();
+        break;
     case Command::ResetHdrToneCurve:
         ResetHdrToneCurve();
         break;
+    case Command::ToggleHdrToneCurveExpanded:
+        if (hdrToneCurveExpanded_) {
+            HideHdrToneCurveWindow();
+        } else {
+            ShowHdrToneCurveWindow();
+        }
+        break;
     }
+    InvalidateTransportArea();
     InvalidateFullscreenOverlay();
     InvalidateRect(hwnd_, nullptr, FALSE);
 }

@@ -39,6 +39,7 @@ struct VideoSettings {
     ToneMappingMode toneMapping = ToneMappingMode::Balanced;
     DolbyVisionMode dolbyVision = DolbyVisionMode::FallbackOnly;
     bool dolbyVisionHdrOutput = false;
+    bool dolbyVisionCmv4Approx = false;
     int peakBrightnessNits = 1000;
     std::array<HdrToneCurvePoint, kHdrToneCurvePointCount> hdrToneCurve = kDefaultHdrToneCurve;
 };

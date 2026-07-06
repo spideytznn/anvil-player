@@ -236,6 +236,10 @@ const wchar_t* IconAssetFileName(const IconKind icon) {
     case IconKind::ChevronLeft:
     case IconKind::ChevronRight:
         return L"";
+    case IconKind::HdrColor:
+        return L"hdr-color.png";
+    case IconKind::DolbyVisionColor:
+        return L"dolby-vision-color.png";
     case IconKind::None:
         return L"";
     }

@@ -2,11 +2,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <initializer_list>
 #include <string>
 
 namespace anvil::app {
 
 using anvil::playback::PlaybackState;
+using anvil::playback::PlaybackSessionSnapshot;
 
 void MainWindow::MarkLayoutDirty() {
     layoutDirty_ = true;
@@ -15,6 +17,144 @@ void MainWindow::MarkLayoutDirty() {
 void MainWindow::EnsureLayout() {
     if (layoutDirty_) {
         UpdateLayout();
+    }
+}
+
+RECT MainWindow::SettingsContentViewport() const {
+    if (RectWidth(inspector_) <= 0 || RectHeight(inspector_) <= 0 || inspectorTab_ != InspectorTab::Settings) {
+        return RECT{};
+    }
+
+    RECT inner = DeflateRectCopy(inspector_, Scale(16), Scale(16));
+    RECT viewport = inner;
+    if (showInspectorTabs_ && inspectorTab_ != InspectorTab::Settings) {
+        viewport.top = inner.top + Scale(70) + Scale(14);
+    } else {
+        viewport.top = inner.top + Scale(22) + Scale(16);
+    }
+    if (RectWidth(viewport) > Scale(180)) {
+        viewport.right -= Scale(10);
+    }
+    return viewport;
+}
+
+int MainWindow::SettingsContentHeight(const anvil::playback::PlayerSettings& settings, const RECT viewport) const {
+    if (RectWidth(viewport) <= 0) {
+        return 0;
+    }
+
+    const int fieldHeight = RectWidth(viewport) < Scale(250) ? Scale(40) : Scale(28);
+    int height = 0;
+    height += Scale(24);                         // Video header
+    height += fieldHeight * SettingsVideoFieldCount();
+    if (HdrToneCurveAvailable(settings)) {
+        height += Scale(8) + Scale(190) + Scale(12);
+    }
+    height += Scale(8) + Scale(24) + fieldHeight * 3;  // Audio
+    height += Scale(8) + Scale(24) + fieldHeight * 4;  // Subtitles
+    return height;
+}
+
+void MainWindow::UpdateSettingsScrollLayout(const anvil::playback::PlayerSettings& settings) {
+    settingsContentViewport_ = SettingsContentViewport();
+    settingsScrollTrack_ = RECT{};
+    settingsScrollThumb_ = RECT{};
+    settingsContentHeight_ = SettingsContentHeight(settings, settingsContentViewport_);
+    settingsScrollMax_ = std::max(0, settingsContentHeight_ - RectHeight(settingsContentViewport_));
+    settingsScrollOffset_ = std::clamp(settingsScrollOffset_, 0, settingsScrollMax_);
+
+    if (settingsScrollMax_ <= 0 || RectHeight(settingsContentViewport_) <= Scale(40)) {
+        settingsScrollOffset_ = 0;
+        return;
+    }
+
+    RECT inner = DeflateRectCopy(inspector_, Scale(16), Scale(16));
+    settingsScrollTrack_ = MakeRect(settingsContentViewport_.right + Scale(4),
+                                    settingsContentViewport_.top,
+                                    inner.right - Scale(2),
+                                    settingsContentViewport_.bottom);
+    if (RectWidth(settingsScrollTrack_) <= 0 || RectHeight(settingsScrollTrack_) <= 0) {
+        settingsScrollTrack_ = RECT{};
+        return;
+    }
+
+    const int trackHeight = RectHeight(settingsScrollTrack_);
+    const int thumbHeight = std::clamp(
+        static_cast<int>(std::round(static_cast<double>(trackHeight) *
+                                    static_cast<double>(RectHeight(settingsContentViewport_)) /
+                                    static_cast<double>(std::max(settingsContentHeight_, 1)))),
+        Scale(28),
+        trackHeight);
+    const int travel = std::max(0, trackHeight - thumbHeight);
+    const int thumbTop = settingsScrollTrack_.top +
+                         (settingsScrollMax_ > 0
+                              ? static_cast<int>(std::round(static_cast<double>(travel) *
+                                                            static_cast<double>(settingsScrollOffset_) /
+                                                            static_cast<double>(settingsScrollMax_)))
+                              : 0);
+    settingsScrollThumb_ = MakeRect(settingsScrollTrack_.left,
+                                    thumbTop,
+                                    settingsScrollTrack_.right,
+                                    thumbTop + thumbHeight);
+}
+
+void MainWindow::UpdateInspectorPathItems(const PlaybackSessionSnapshot& snapshot) {
+    inspectorPathItems_.clear();
+    if (!showInspectorTabs_ ||
+        inspectorTab_ == InspectorTab::Settings ||
+        RectWidth(inspector_) <= 0 ||
+        RectHeight(inspector_) <= 0) {
+        hoveredInspectorPathItem_ = -1;
+        return;
+    }
+
+    RECT inner = DeflateRectCopy(inspector_, Scale(16), Scale(16));
+    RECT cursor = inner;
+    cursor.top = inner.top + Scale(68) + Scale(14);
+
+    const auto advanceSectionHeader = [this](RECT& target) {
+        target.top += Scale(24);
+    };
+    const auto advanceField = [this](RECT& target) {
+        const bool stacked = RectWidth(target) < Scale(250);
+        const int requiredHeight = stacked ? Scale(38) : Scale(24);
+        if (target.top + requiredHeight <= target.bottom) {
+            target.top += stacked ? Scale(40) : Scale(28);
+        }
+    };
+    const auto appendRows = [this](const std::vector<std::filesystem::path>& paths, RECT& target) {
+        const int rowHeight = Scale(44);
+        const int rowGap = Scale(5);
+        for (const auto& path : paths) {
+            if (target.top + rowHeight > target.bottom) {
+                break;
+            }
+            const RECT row = MakeRect(target.left, target.top, target.right, target.top + rowHeight);
+            inspectorPathItems_.push_back(InspectorPathItem{row, path});
+            target.top += rowHeight + rowGap;
+        }
+    };
+
+    switch (inspectorTab_) {
+    case InspectorTab::Recent:
+        advanceSectionHeader(cursor);
+        appendRows(recentMedia_, cursor);
+        break;
+    case InspectorTab::Folder:
+        advanceSectionHeader(cursor);
+        if (snapshot.media.has_value()) {
+            advanceField(cursor);
+            cursor.top += Scale(8);
+            advanceSectionHeader(cursor);
+            appendRows(currentFolderEntries_, cursor);
+        }
+        break;
+    default:
+        break;
+    }
+
+    if (hoveredInspectorPathItem_ >= static_cast<int>(inspectorPathItems_.size())) {
+        hoveredInspectorPathItem_ = -1;
     }
 }
 
@@ -29,34 +169,83 @@ void MainWindow::UpdateLayout() {
     const int margin = compact ? Scale(10) : Scale(16);
     const int gap = compact ? Scale(8) : Scale(12);
     const int topHeight = compact ? Scale(48) : Scale(56);
-    const int bottomHeight = compact ? Scale(80) : Scale(88);
+    const int bottomHeight = compact ? Scale(112) : Scale(128);
     const int topButtonSize = compact ? Scale(30) : Scale(32);
-    const int transportButtonSize = compact ? Scale(32) : Scale(36);
-    const int playButtonSize = compact ? Scale(40) : Scale(44);
-    const int buttonGap = compact ? Scale(8) : Scale(10);
+    const int transportButtonSize = compact ? Scale(34) : Scale(38);
+    const int playButtonSize = compact ? Scale(42) : Scale(48);
+    const int buttonGap = compact ? Scale(10) : Scale(14);
+    const int rightButtonSize = compact ? Scale(28) : Scale(32);
+    const int rightButtonGap = compact ? Scale(10) : Scale(16);
+    const int volumeSliderWidth = compact ? Scale(158) : Scale(202);
     const auto snapshot = controller_.Snapshot();
     const bool playing = snapshot.state == PlaybackState::Playing;
     const auto settings = controller_.Settings();
     const bool subtitlesEnabled = settings.subtitles.selectedTrackIndex != anvil::playback::kSubtitleTrackOff;
     const bool showSubtitleButton = snapshot.media.has_value();
-    const auto rightClusterWidthFor = [transportButtonSize, buttonGap](const int buttonCount) {
-        return buttonCount > 0 ? transportButtonSize * buttonCount + buttonGap * (buttonCount - 1) : 0;
+    if (hdrToneCurveExpanded_ &&
+        (inspectorTab_ != InspectorTab::Settings || !HdrToneCurveAvailable(settings))) {
+        hdrToneCurveExpanded_ = false;
+        if (hdrToneCurveWindow_) {
+            ShowWindow(hdrToneCurveWindow_, SW_HIDE);
+        }
+    }
+    const auto rightClusterWidthFor = [rightButtonGap](std::initializer_list<int> widths) {
+        int total = 0;
+        int count = 0;
+        for (const int width : widths) {
+            if (width <= 0) {
+                continue;
+            }
+            total += width;
+            ++count;
+        }
+        return count > 0 ? total + rightButtonGap * (count - 1) : 0;
     };
 
     buttons_.clear();
+    inspectorPathItems_.clear();
+    volumeSlider_ = RECT{};
     hdrToneCurvePlot_ = RECT{};
-    const std::wstring dolbyVisionHdrTooltip = settings.video.dolbyVisionHdrOutput
-                                                   ? L"Disable Dolby Vision HDR output"
-                                                   : L"Enable Dolby Vision HDR output";
+    hdrToneCurveExpandedEditor_ = RECT{};
+    settingsContentViewport_ = RECT{};
+    settingsScrollTrack_ = RECT{};
+    settingsScrollThumb_ = RECT{};
+    settingsContentHeight_ = 0;
+    settingsScrollMax_ = 0;
+    const bool showHdrButton = CurrentMediaHasHdrControls();
+    const bool showCmv4Button = CurrentMediaHasCmv4Control();
+    const bool cmv4ButtonEnabled = CurrentCmv4ControlEnabled(settings);
+    const bool dolbyVisionButton = showCmv4Button;
+    const int hdrButtonWidth = showHdrButton ? (dolbyVisionButton ? Scale(42) : Scale(48)) : 0;
+    const int cmv4ButtonWidth = showCmv4Button ? Scale(46) : 0;
+    const std::wstring hdrOutputTooltip =
+        dolbyVisionButton
+            ? (settings.video.dolbyVisionHdrOutput ? L"Disable Dolby Vision HDR output"
+                                                    : L"Enable Dolby Vision HDR output")
+            : (settings.video.dolbyVisionHdrOutput ? L"Disable HDR output" : L"Enable HDR output");
+    const std::wstring cmv4Tooltip = settings.video.dolbyVisionCmv4Approx
+                                         ? L"Disable CMv4 mapping"
+                                         : L"Enable CMv4 mapping";
     const auto addDolbyVisionHdrButton = [&](const int left, const int top) {
         buttons_.push_back(UiButton{Command::ToggleDolbyVisionHdr,
-                                    MakeRect(left, top, left + transportButtonSize, top + transportButtonSize),
-                                    L"HDR",
-                                    dolbyVisionHdrTooltip,
+                                    MakeRect(left, top, left + hdrButtonWidth, top + rightButtonSize),
+                                    dolbyVisionButton ? L"DV" : L"HDR",
+                                    hdrOutputTooltip,
                                     IconKind::None,
-                                    ButtonKind::Icon,
+                                    ButtonKind::TransportLabel,
                                     false,
                                     settings.video.dolbyVisionHdrOutput});
+    };
+    const auto addDolbyVisionCmv4Button = [&](const int left, const int top) {
+        buttons_.push_back(UiButton{Command::ToggleDolbyVisionCmv4Approx,
+                                    MakeRect(left, top, left + cmv4ButtonWidth, top + rightButtonSize),
+                                    L"CM4",
+                                    cmv4Tooltip,
+                                    IconKind::None,
+                                    ButtonKind::TransportLabel,
+                                    false,
+                                    settings.video.dolbyVisionCmv4Approx && cmv4ButtonEnabled,
+                                    cmv4ButtonEnabled});
     };
 
     if (fullscreen_) {
@@ -67,7 +256,7 @@ void MainWindow::UpdateLayout() {
 
         const bool showTransport = ShouldShowFullscreenTransport(snapshot);
         const int fullscreenInset = Scale(18);
-        const int fullscreenBottomHeight = compact ? Scale(76) : Scale(84);
+        const int fullscreenBottomHeight = compact ? Scale(112) : Scale(128);
         transportBar_ = showTransport
                             ? MakeRect(client.left + fullscreenInset,
                                        client.bottom - fullscreenInset - fullscreenBottomHeight,
@@ -77,18 +266,15 @@ void MainWindow::UpdateLayout() {
         const int progressInset = compact ? Scale(18) : Scale(24);
         progress_ = showTransport
                         ? MakeRect(transportBar_.left + progressInset,
-                                   transportBar_.top + (compact ? Scale(12) : Scale(14)),
+                                   transportBar_.top + (compact ? Scale(36) : Scale(42)),
                                    transportBar_.right - progressInset,
-                                   transportBar_.top + (compact ? Scale(18) : Scale(20)))
+                                   transportBar_.top + (compact ? Scale(42) : Scale(48)))
                         : RECT{};
 
         if (showTransport) {
-            const int controlCenterY = transportBar_.top + (compact ? Scale(50) : Scale(54));
-            const int centerX = (transportBar_.left + transportBar_.right) / 2;
-            const int clusterWidth = transportButtonSize * 3 + playButtonSize + buttonGap * 3;
-            const int clusterMinLeft = static_cast<int>(transportBar_.left) + Scale(18);
-            const int clusterMaxLeft = std::max(clusterMinLeft, static_cast<int>(transportBar_.right) - Scale(18) - clusterWidth);
-            int x = std::clamp(centerX - clusterWidth / 2, clusterMinLeft, clusterMaxLeft);
+            const int controlCenterY = transportBar_.bottom - (compact ? Scale(36) : Scale(42));
+            const int controlLeft = static_cast<int>(transportBar_.left) + (compact ? Scale(18) : Scale(24));
+            int x = controlLeft;
             transportControlsLeft_ = x;
             const int smallTop = controlCenterY - transportButtonSize / 2;
             const int playTop = controlCenterY - playButtonSize / 2;
@@ -97,7 +283,7 @@ void MainWindow::UpdateLayout() {
                                         L"",
                                         L"Back 10 seconds",
                                         IconKind::Back10,
-                                        ButtonKind::Icon,
+                                        ButtonKind::TransportIcon,
                                         false,
                                         false});
             x += transportButtonSize + buttonGap;
@@ -110,66 +296,90 @@ void MainWindow::UpdateLayout() {
                                         true,
                                         false});
             x += playButtonSize + buttonGap;
-            buttons_.push_back(UiButton{Command::Stop,
-                                        MakeRect(x, smallTop, x + transportButtonSize, smallTop + transportButtonSize),
-                                        L"",
-                                        L"Stop",
-                                        IconKind::Stop,
-                                        ButtonKind::Icon,
-                                        false,
-                                        false});
-            x += transportButtonSize + buttonGap;
             buttons_.push_back(UiButton{Command::Forward,
                                         MakeRect(x, smallTop, x + transportButtonSize, smallTop + transportButtonSize),
                                         L"",
                                         L"Forward 10 seconds",
                                         IconKind::Forward10,
-                                        ButtonKind::Icon,
+                                        ButtonKind::TransportIcon,
                                         false,
                                         false});
-            x += transportButtonSize;
-            transportControlsRight_ = x;
+            x += transportButtonSize + buttonGap;
+            buttons_.push_back(UiButton{Command::Stop,
+                                        MakeRect(x, smallTop, x + transportButtonSize, smallTop + transportButtonSize),
+                                        L"",
+                                        L"Stop",
+                                        IconKind::Stop,
+                                        ButtonKind::TransportIcon,
+                                        false,
+                                        false});
+            x += transportButtonSize + buttonGap;
 
+            const int rightTop = controlCenterY - rightButtonSize / 2;
+            bool showFullscreenVolumeSlider = true;
             bool showFullscreenSubtitleButton = showSubtitleButton;
-            bool showFullscreenDolbyVisionHdrButton = true;
-            int rightButtonCount = 2 + (showFullscreenSubtitleButton ? 1 : 0);
-            int rightX = transportBar_.right - Scale(22) - rightClusterWidthFor(rightButtonCount);
-            if (rightX < transportControlsRight_ + Scale(12)) {
+            bool showFullscreenHdrButton = showHdrButton;
+            bool showFullscreenCmv4Button = showCmv4Button;
+            const auto fullscreenRightClusterWidth = [&]() {
+                return rightClusterWidthFor({showFullscreenHdrButton ? hdrButtonWidth : 0,
+                                             showFullscreenCmv4Button ? cmv4ButtonWidth : 0,
+                                             showFullscreenSubtitleButton ? rightButtonSize : 0,
+                                             rightButtonSize});
+            };
+            int rightX = transportBar_.right - Scale(22) - fullscreenRightClusterWidth();
+            if (rightX < x + Scale(12) && showFullscreenSubtitleButton) {
                 showFullscreenSubtitleButton = false;
-                rightButtonCount = 2;
-                rightX = transportBar_.right - Scale(22) - rightClusterWidthFor(rightButtonCount);
+                rightX = transportBar_.right - Scale(22) - fullscreenRightClusterWidth();
             }
-            if (rightX < transportControlsRight_ + Scale(12)) {
-                showFullscreenDolbyVisionHdrButton = false;
-                rightButtonCount = 1;
-                rightX = transportBar_.right - Scale(22) - rightClusterWidthFor(rightButtonCount);
+            if (rightX < x + Scale(12) && showFullscreenCmv4Button) {
+                showFullscreenCmv4Button = false;
+                rightX = transportBar_.right - Scale(22) - fullscreenRightClusterWidth();
             }
+            if (rightX < x + Scale(12) && showFullscreenHdrButton) {
+                showFullscreenHdrButton = false;
+                rightX = transportBar_.right - Scale(22) - fullscreenRightClusterWidth();
+            }
+            if (showFullscreenVolumeSlider) {
+                volumeSlider_ = MakeRect(x, rightTop, x + volumeSliderWidth, rightTop + rightButtonSize);
+                if (volumeSlider_.right > rightX - Scale(22)) {
+                    volumeSlider_ = RECT{};
+                    showFullscreenVolumeSlider = false;
+                } else {
+                    x += volumeSliderWidth + buttonGap;
+                }
+            }
+            transportControlsRight_ = x;
             transportRightControlsLeft_ = rightX;
-            if (showFullscreenDolbyVisionHdrButton) {
-                addDolbyVisionHdrButton(rightX, smallTop);
-                rightX += transportButtonSize + buttonGap;
+            if (showFullscreenHdrButton) {
+                addDolbyVisionHdrButton(rightX, rightTop);
+                rightX += hdrButtonWidth + rightButtonGap;
+            }
+            if (showFullscreenCmv4Button) {
+                addDolbyVisionCmv4Button(rightX, rightTop);
+                rightX += cmv4ButtonWidth + rightButtonGap;
             }
             if (showFullscreenSubtitleButton) {
                 buttons_.push_back(UiButton{Command::SubtitleMenu,
-                                            MakeRect(rightX, smallTop, rightX + transportButtonSize, smallTop + transportButtonSize),
+                                            MakeRect(rightX, rightTop, rightX + rightButtonSize, rightTop + rightButtonSize),
                                             L"",
                                             L"Subtitles",
                                             IconKind::Subtitles,
-                                            ButtonKind::Icon,
+                                            ButtonKind::TransportIcon,
                                             false,
                                             subtitlesEnabled});
-                rightX += transportButtonSize + buttonGap;
+                rightX += rightButtonSize + rightButtonGap;
             }
             buttons_.push_back(UiButton{Command::Fullscreen,
-                                        MakeRect(rightX, smallTop, rightX + transportButtonSize, smallTop + transportButtonSize),
+                                        MakeRect(rightX, rightTop, rightX + rightButtonSize, rightTop + rightButtonSize),
                                         L"",
                                         L"Exit fullscreen",
                                         IconKind::Windowed,
-                                        ButtonKind::Icon,
+                                        ButtonKind::TransportIcon,
                                         false,
                                         false});
         }
 
+        UpdateSubtitleMenuLayout();
         playbackPlayer_.SetBounds(PlaybackSurfaceBounds());
         UpdateVideoHost();
         UpdateTransportOverlay();
@@ -185,7 +395,7 @@ void MainWindow::UpdateLayout() {
     showInspectorTabs_ = false;
 
     if (sideInspector) {
-        const int expandedInspectorWidth = std::clamp(clientWidth / 4, compact ? Scale(246) : Scale(286), Scale(324));
+        const int expandedInspectorWidth = std::clamp(clientWidth / 4, compact ? Scale(286) : Scale(304), Scale(360));
         const double collapse = std::clamp(inspectorCollapseAmount_, 0.0, 1.0);
         const int inspectorWidth = static_cast<int>(std::round(expandedInspectorWidth * (1.0 - collapse)));
         const int animatedGap = static_cast<int>(std::round(gap * (1.0 - collapse)));
@@ -206,9 +416,9 @@ void MainWindow::UpdateLayout() {
     }
     const int progressInset = compact ? Scale(18) : Scale(24);
     progress_ = MakeRect(transportBar_.left + progressInset,
-                         transportBar_.top + (compact ? Scale(12) : Scale(14)),
+                         transportBar_.top + (compact ? Scale(36) : Scale(42)),
                          transportBar_.right - progressInset,
-                         transportBar_.top + (compact ? Scale(18) : Scale(20)));
+                         transportBar_.top + (compact ? Scale(42) : Scale(48)));
     const int topButtonY = topBar_.top + (RectHeight(topBar_) - topButtonSize) / 2;
     int topButtonX = topBar_.right - (compact ? Scale(10) : Scale(12)) - topButtonSize;
     const bool settingsOpen = inspectorTab_ == InspectorTab::Settings;
@@ -244,87 +454,117 @@ void MainWindow::UpdateLayout() {
     showTopBrand_ = RectWidth(topBar_) >= Scale(420);
     showTopState_ = RectWidth(topBar_) >= Scale(680);
 
-    if (showInspectorTabs_) {
+    if (showInspectorTabs_ && !settingsOpen) {
         const RECT inner = DeflateRectCopy(inspector_, Scale(16), Scale(16));
         const int tabTop = inner.top + Scale(38);
-        const int tabHeight = Scale(30);
-        const int tabGap = Scale(4);
-        const int tabWidth = (RectWidth(inner) - tabGap * 2) / 3;
-        int tabX = inner.left;
-        buttons_.push_back(UiButton{Command::InspectorMedia,
-                                    MakeRect(tabX, tabTop, tabX + tabWidth, tabTop + tabHeight),
-                                    L"Media",
-                                    L"",
-                                    IconKind::None,
-                                    ButtonKind::Tab,
-                                    false,
-                                    inspectorTab_ == InspectorTab::Media});
-        tabX += tabWidth + tabGap;
-        buttons_.push_back(UiButton{Command::InspectorDevice,
-                                    MakeRect(tabX, tabTop, tabX + tabWidth, tabTop + tabHeight),
-                                    L"Device",
-                                    L"",
-                                    IconKind::None,
-                                    ButtonKind::Tab,
-                                    false,
-                                    inspectorTab_ == InspectorTab::Device});
-        tabX += tabWidth + tabGap;
-        buttons_.push_back(UiButton{Command::InspectorLog,
-                                    MakeRect(tabX, tabTop, inner.right, tabTop + tabHeight),
-                                    L"Log",
-                                    L"",
-                                    IconKind::None,
-                                    ButtonKind::Tab,
-                                    false,
-                                    inspectorTab_ == InspectorTab::Log});
-    }
-    if (inspectorTab_ == InspectorTab::Settings &&
-        settings.video.dolbyVisionHdrOutput &&
-        RectWidth(inspector_) > 0) {
-        const RECT inner = DeflateRectCopy(inspector_, Scale(16), Scale(16));
-        RECT cursor = inner;
-        if (showInspectorTabs_) {
-            cursor.top = inner.top + Scale(70) + Scale(14);
-        } else {
-            cursor.top = inner.top + Scale(22) + Scale(16);
+        const int tabHeight = Scale(28);
+        const int tabGap = Scale(3);
+        struct InspectorTabSpec {
+            Command command;
+            InspectorTab tab;
+            const wchar_t* label;
+            const wchar_t* tooltip;
+            int preferredWidth;
+        };
+        const InspectorTabSpec tabs[] = {
+            {Command::InspectorRecent, InspectorTab::Recent, L"Recent", L"Recent playback", 54},
+            {Command::InspectorFolder, InspectorTab::Folder, L"Folder", L"Current folder", 54},
+            {Command::InspectorMedia, InspectorTab::Media, L"Media", L"Media info", 44},
+            {Command::InspectorSystem, InspectorTab::System, L"System", L"System info", 56},
+            {Command::InspectorLog, InspectorTab::Log, L"Log", L"Playback log", 32},
+        };
+        constexpr int tabCount = static_cast<int>(sizeof(tabs) / sizeof(tabs[0]));
+        int preferredWidth = tabGap * (tabCount - 1);
+        for (const auto& tab : tabs) {
+            preferredWidth += Scale(tab.preferredWidth);
         }
+        const int availableWidth = RectWidth(inner);
+        const bool squeezeTabs = preferredWidth > availableWidth;
+        const int uniformWidth = squeezeTabs
+                                     ? std::max(Scale(32), (availableWidth - tabGap * (tabCount - 1)) / tabCount)
+                                     : 0;
+        const int spareWidth = squeezeTabs ? 0 : std::max(0, availableWidth - preferredWidth);
+        int tabX = inner.left;
+        for (int index = 0; index < tabCount; ++index) {
+            const int extra = squeezeTabs ? 0 : spareWidth / tabCount + (index < spareWidth % tabCount ? 1 : 0);
+            const int tabWidth = squeezeTabs ? uniformWidth : Scale(tabs[index].preferredWidth) + extra;
+            const int tabRight = index + 1 == tabCount ? inner.right : tabX + tabWidth;
+            buttons_.push_back(UiButton{tabs[index].command,
+                                        MakeRect(tabX, tabTop, tabRight, tabTop + tabHeight),
+                                        tabs[index].label,
+                                        tabs[index].tooltip,
+                                        IconKind::None,
+                                        ButtonKind::InspectorTab,
+                                        false,
+                                        inspectorTab_ == tabs[index].tab});
+            tabX = tabRight + tabGap;
+        }
+    }
+
+    UpdateInspectorPathItems(snapshot);
+    UpdateSettingsScrollLayout(settings);
+
+    if (inspectorTab_ == InspectorTab::Settings &&
+        HdrToneCurveAvailable(settings) &&
+        RectWidth(settingsContentViewport_) > 0 &&
+        RectHeight(settingsContentViewport_) > 0) {
+        RECT cursor = settingsContentViewport_;
+        cursor.top -= settingsScrollOffset_;
+        cursor.bottom = cursor.top + std::max(settingsContentHeight_, RectHeight(settingsContentViewport_));
+        const int settingsVideoFieldCount = SettingsVideoFieldCount();
         const bool stackedFields = RectWidth(cursor) < Scale(250);
         cursor.top += Scale(24);
-        cursor.top += (stackedFields ? Scale(40) : Scale(28)) * 6;
+        cursor.top += (stackedFields ? Scale(40) : Scale(28)) * settingsVideoFieldCount;
         cursor.top += Scale(8);
 
-        const int editorHeight = Scale(156);
+        const int editorHeight = Scale(190);
         const RECT editor = MakeRect(cursor.left, cursor.top, cursor.right, cursor.top + editorHeight);
-        const RECT plot = MakeRect(editor.left + Scale(42),
-                                   editor.top + Scale(38),
-                                   editor.right - Scale(12),
-                                   editor.bottom - Scale(24));
-        if (editor.bottom <= cursor.bottom && RectWidth(plot) >= Scale(120) && RectHeight(plot) >= Scale(64)) {
+        const RECT plot = MakeRect(editor.left + Scale(50),
+                                   editor.top + Scale(56),
+                                   editor.right - Scale(16),
+                                   editor.bottom - Scale(34));
+        const bool editorVisible = !hdrToneCurveExpanded_ &&
+                                   editor.bottom > settingsContentViewport_.top &&
+                                   editor.top < settingsContentViewport_.bottom;
+        if (editorVisible && RectWidth(plot) >= Scale(120) && RectHeight(plot) >= Scale(64)) {
             hdrToneCurvePlot_ = plot;
             const int resetWidth = Scale(58);
             const int resetHeight = Scale(24);
-            buttons_.push_back(UiButton{Command::ResetHdrToneCurve,
-                                        MakeRect(editor.right - Scale(10) - resetWidth,
-                                                 editor.top + Scale(7),
-                                                 editor.right - Scale(10),
-                                                 editor.top + Scale(7) + resetHeight),
-                                        L"Reset",
-                                        L"Reset HDR tone curve",
-                                        IconKind::None,
-                                        ButtonKind::Tab,
-                                        false,
-                                        false});
+            const int zoomWidth = Scale(58);
+            const int buttonGap = Scale(6);
+            const RECT zoomButton = MakeRect(editor.right - Scale(10) - zoomWidth,
+                                             editor.top + Scale(7),
+                                             editor.right - Scale(10),
+                                             editor.top + Scale(7) + resetHeight);
+            const RECT resetButton = MakeRect(zoomButton.left - buttonGap - resetWidth,
+                                              editor.top + Scale(7),
+                                              zoomButton.left - buttonGap,
+                                              editor.top + Scale(7) + resetHeight);
+            if (resetButton.top >= settingsContentViewport_.top &&
+                resetButton.bottom <= settingsContentViewport_.bottom &&
+                zoomButton.bottom <= settingsContentViewport_.bottom) {
+                buttons_.push_back(UiButton{Command::ResetHdrToneCurve,
+                                            resetButton,
+                                            L"Reset",
+                                            L"Reset HDR tone curve",
+                                            IconKind::None,
+                                            ButtonKind::Tab,
+                                            false,
+                                            false});
+                buttons_.push_back(UiButton{Command::ToggleHdrToneCurveExpanded,
+                                            zoomButton,
+                                            L"Zoom",
+                                            L"Open large HDR curve editor",
+                                            IconKind::None,
+                                            ButtonKind::Tab,
+                                            false,
+                                            false});
+            }
         }
     }
 
-    const int controlCenterY = transportBar_.top + (compact ? Scale(54) : Scale(58));
-    const int centerX = (transportBar_.left + transportBar_.right) / 2;
-    const int clusterWidth = transportButtonSize * 3 + playButtonSize + buttonGap * 3;
-    const int clusterMinLeft = static_cast<int>(transportBar_.left) + Scale(18);
-    const int clusterMaxLeft = static_cast<int>(transportBar_.right) - Scale(18) - clusterWidth;
-    int x = clusterMaxLeft >= clusterMinLeft
-                ? std::clamp(centerX - clusterWidth / 2, clusterMinLeft, clusterMaxLeft)
-                : clusterMinLeft;
+    const int controlCenterY = transportBar_.bottom - (compact ? Scale(36) : Scale(42));
+    int x = static_cast<int>(transportBar_.left) + (compact ? Scale(18) : Scale(24));
     transportControlsLeft_ = x;
     const int smallTop = controlCenterY - transportButtonSize / 2;
     const int playTop = controlCenterY - playButtonSize / 2;
@@ -333,7 +573,7 @@ void MainWindow::UpdateLayout() {
                                 L"",
                                 L"Back 10 seconds",
                                 IconKind::Back10,
-                                ButtonKind::Icon,
+                                ButtonKind::TransportIcon,
                                 false,
                                 false});
     x += transportButtonSize + buttonGap;
@@ -346,91 +586,100 @@ void MainWindow::UpdateLayout() {
                                 true,
                                 false});
     x += playButtonSize + buttonGap;
-    buttons_.push_back(UiButton{Command::Stop,
-                                MakeRect(x, smallTop, x + transportButtonSize, smallTop + transportButtonSize),
-                                L"",
-                                L"Stop",
-                                IconKind::Stop,
-                                ButtonKind::Icon,
-                                false,
-                                false});
-    x += transportButtonSize + buttonGap;
     buttons_.push_back(UiButton{Command::Forward,
                                 MakeRect(x, smallTop, x + transportButtonSize, smallTop + transportButtonSize),
                                 L"",
                                 L"Forward 10 seconds",
                                 IconKind::Forward10,
-                                ButtonKind::Icon,
+                                ButtonKind::TransportIcon,
                                 false,
                                 false});
-    x += transportButtonSize;
-    transportControlsRight_ = x;
+    x += transportButtonSize + buttonGap;
+    buttons_.push_back(UiButton{Command::Stop,
+                                MakeRect(x, smallTop, x + transportButtonSize, smallTop + transportButtonSize),
+                                L"",
+                                L"Stop",
+                                IconKind::Stop,
+                                ButtonKind::TransportIcon,
+                                false,
+                                false});
+    x += transportButtonSize + buttonGap;
 
-    const int rightTop = smallTop;
+    const int rightTop = controlCenterY - rightButtonSize / 2;
     const int rightEdge = transportBar_.right - Scale(22);
-    const int essentialRightButtonCount = 2 + (showSubtitleButton ? 1 : 0);
-    bool showVolumeButtons = rightEdge - rightClusterWidthFor(essentialRightButtonCount + 2) >= transportControlsRight_ + Scale(16);
-    bool showTransportDolbyVisionHdrButton = true;
+    bool showVolumeSlider = true;
+    bool showTransportHdrButton = showHdrButton;
+    bool showTransportCmv4Button = showCmv4Button;
     bool showTransportSubtitleButton = showSubtitleButton;
-    int rightButtonCount = essentialRightButtonCount + (showVolumeButtons ? 2 : 0);
-    if (rightEdge - rightClusterWidthFor(rightButtonCount) < transportControlsRight_ + Scale(12)) {
-        showVolumeButtons = false;
-        showTransportSubtitleButton = showSubtitleButton &&
-                                      rightEdge - rightClusterWidthFor(3) >= transportControlsRight_ + Scale(12);
-        rightButtonCount = 2 + (showTransportSubtitleButton ? 1 : 0);
+    const auto transportRightClusterWidth = [&]() {
+        return rightClusterWidthFor({showTransportHdrButton ? hdrButtonWidth : 0,
+                                     showTransportCmv4Button ? cmv4ButtonWidth : 0,
+                                     showTransportSubtitleButton ? rightButtonSize : 0,
+                                     rightButtonSize});
+    };
+    int rightWidth = transportRightClusterWidth();
+    if (rightEdge - rightWidth < x + Scale(12) &&
+        showTransportSubtitleButton) {
+        showTransportSubtitleButton = false;
+        rightWidth = transportRightClusterWidth();
     }
-    if (rightEdge - rightClusterWidthFor(rightButtonCount) < transportControlsRight_ + Scale(12)) {
-        showTransportDolbyVisionHdrButton = false;
-        showTransportSubtitleButton = showSubtitleButton &&
-                                      rightEdge - rightClusterWidthFor(2) >= transportControlsRight_ + Scale(12);
-        rightButtonCount = showTransportSubtitleButton ? 2 : 1;
+    if (rightEdge - rightWidth < x + Scale(12) &&
+        showTransportCmv4Button) {
+        showTransportCmv4Button = false;
+        rightWidth = transportRightClusterWidth();
     }
-    int rightX = rightEdge - rightClusterWidthFor(rightButtonCount);
+    if (rightEdge - rightWidth < x + Scale(12) &&
+        showTransportHdrButton) {
+        showTransportHdrButton = false;
+        rightWidth = transportRightClusterWidth();
+    }
+    int rightX = rightEdge - rightWidth;
     transportRightControlsLeft_ = rightX;
 
-    if (showVolumeButtons) {
-        buttons_.push_back(UiButton{Command::VolumeDown,
-                                    MakeRect(rightX, rightTop, rightX + transportButtonSize, rightTop + transportButtonSize),
-                                    L"",
-                                    L"Volume down",
-                                    IconKind::VolumeDown,
-                                    ButtonKind::Icon,
-                                    false,
-                                    false});
-        rightX += transportButtonSize + buttonGap;
-        buttons_.push_back(UiButton{Command::VolumeUp,
-                                    MakeRect(rightX, rightTop, rightX + transportButtonSize, rightTop + transportButtonSize),
-                                    L"",
-                                    L"Volume up",
-                                    IconKind::VolumeUp,
-                                    ButtonKind::Icon,
-                                    false,
-                                    false});
-        rightX += transportButtonSize + buttonGap;
+    if (showVolumeSlider) {
+        volumeSlider_ = MakeRect(x, rightTop, x + volumeSliderWidth, rightTop + rightButtonSize);
+        if (volumeSlider_.right > rightX - Scale(22)) {
+            volumeSlider_ = RECT{};
+            showVolumeSlider = false;
+        } else {
+            x += volumeSliderWidth + buttonGap;
+        }
     }
-    if (showTransportDolbyVisionHdrButton) {
+    transportControlsRight_ = x;
+    if (showTransportHdrButton) {
         addDolbyVisionHdrButton(rightX, rightTop);
-        rightX += transportButtonSize + buttonGap;
+        rightX += hdrButtonWidth + rightButtonGap;
+    }
+    if (showTransportCmv4Button) {
+        addDolbyVisionCmv4Button(rightX, rightTop);
+        rightX += cmv4ButtonWidth + rightButtonGap;
     }
     if (showTransportSubtitleButton) {
         buttons_.push_back(UiButton{Command::SubtitleMenu,
-                                    MakeRect(rightX, rightTop, rightX + transportButtonSize, rightTop + transportButtonSize),
+                                    MakeRect(rightX, rightTop, rightX + rightButtonSize, rightTop + rightButtonSize),
                                     L"",
                                     L"Subtitles",
                                     IconKind::Subtitles,
-                                    ButtonKind::Icon,
+                                    ButtonKind::TransportIcon,
                                     false,
                                     subtitlesEnabled});
-        rightX += transportButtonSize + buttonGap;
+        rightX += rightButtonSize + rightButtonGap;
     }
     buttons_.push_back(UiButton{Command::Fullscreen,
-                                MakeRect(rightX, rightTop, rightX + transportButtonSize, rightTop + transportButtonSize),
+                                MakeRect(rightX, rightTop, rightX + rightButtonSize, rightTop + rightButtonSize),
                                 L"",
                                 fullscreen_ ? L"Exit fullscreen" : L"Fullscreen",
                                 fullscreen_ ? IconKind::Windowed : IconKind::Fullscreen,
-                                ButtonKind::Icon,
+                                ButtonKind::TransportIcon,
                                 false,
                                 false});
+
+    UpdateSubtitleMenuLayout();
+
+    if (hdrToneCurveExpanded_ && hdrToneCurveWindow_) {
+        UpdateHdrToneCurveFloatingLayout();
+    }
+
     playbackPlayer_.SetBounds(PlaybackSurfaceBounds());
     UpdateVideoHost();
     UpdateTransportOverlay();
@@ -540,6 +789,7 @@ void MainWindow::UpdateTransportOverlay() {
             ShowWindow(transportOverlay_, SW_HIDE);
         }
         lastTransportOverlayBounds_ = RECT{};
+        lastTransportOverlayIncludesSubtitleMenu_ = false;
         return;
     }
 
@@ -548,18 +798,29 @@ void MainWindow::UpdateTransportOverlay() {
         return;
     }
 
-    const int w = RectWidth(transportBar_);
-    const int h = RectHeight(transportBar_);
+    RECT overlayBounds = transportBar_;
+    const bool includeSubtitleMenu = (subtitleMenuOpen_ ||
+                                      subtitleMenuTarget_ > 0.0 ||
+                                      subtitleMenuAmount_ > 0.001) &&
+                                     RectWidth(subtitleMenu_) > 0 &&
+                                     RectHeight(subtitleMenu_) > 0;
+    if (includeSubtitleMenu) {
+        UnionRect(&overlayBounds, &overlayBounds, &subtitleMenu_);
+    }
+
+    const int w = RectWidth(overlayBounds);
+    const int h = RectHeight(overlayBounds);
     const bool wasVisible = IsWindowVisible(transportOverlay_) != FALSE;
-    const bool moved = transportBar_.left != lastTransportOverlayBounds_.left ||
-                       transportBar_.top != lastTransportOverlayBounds_.top ||
+    const bool moved = overlayBounds.left != lastTransportOverlayBounds_.left ||
+                       overlayBounds.top != lastTransportOverlayBounds_.top ||
                        w != RectWidth(lastTransportOverlayBounds_) ||
                        h != RectHeight(lastTransportOverlayBounds_);
+    const bool regionChanged = moved || includeSubtitleMenu != lastTransportOverlayIncludesSubtitleMenu_;
     if (moved || !wasVisible) {
         SetWindowPos(transportOverlay_,
                      HWND_TOP,
-                     transportBar_.left,
-                     transportBar_.top,
+                     overlayBounds.left,
+                     overlayBounds.top,
                      w,
                      h,
                      SWP_NOACTIVATE);
@@ -573,16 +834,35 @@ void MainWindow::UpdateTransportOverlay() {
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW);
     }
 
-    if (moved) {
-        HRGN region = CreateRoundRectRgn(0, 0, w + 1, h + 1, Scale(12), Scale(12));
+    if (regionChanged) {
+        HRGN region = CreateRectRgn(0, 0, 0, 0);
+        HRGN transportRegion = CreateRoundRectRgn(transportBar_.left - overlayBounds.left,
+                                                  transportBar_.top - overlayBounds.top,
+                                                  transportBar_.right - overlayBounds.left + 1,
+                                                  transportBar_.bottom - overlayBounds.top + 1,
+                                                  Scale(12),
+                                                  Scale(12));
+        CombineRgn(region, region, transportRegion, RGN_OR);
+        DeleteObject(transportRegion);
+        if (includeSubtitleMenu) {
+            HRGN menuRegion = CreateRoundRectRgn(subtitleMenu_.left - overlayBounds.left,
+                                                 subtitleMenu_.top - overlayBounds.top,
+                                                 subtitleMenu_.right - overlayBounds.left + 1,
+                                                 subtitleMenu_.bottom - overlayBounds.top + 1,
+                                                 Scale(9),
+                                                 Scale(9));
+            CombineRgn(region, region, menuRegion, RGN_OR);
+            DeleteObject(menuRegion);
+        }
         SetWindowRgn(transportOverlay_, region, TRUE);
-        lastTransportOverlayBounds_ = transportBar_;
+        lastTransportOverlayBounds_ = overlayBounds;
+        lastTransportOverlayIncludesSubtitleMenu_ = includeSubtitleMenu;
     }
     if (!wasVisible) {
         ShowWindow(transportOverlay_, SW_SHOWNOACTIVATE);
     }
-    if (moved || !wasVisible) {
-        RedrawWindow(transportOverlay_, nullptr, nullptr, RDW_INVALIDATE | RDW_NOERASE | RDW_UPDATENOW);
+    if (moved || regionChanged || !wasVisible || includeSubtitleMenu) {
+        InvalidateRect(transportOverlay_, nullptr, FALSE);
     }
 }
 
@@ -593,6 +873,7 @@ void MainWindow::UpdateFullscreenOverlay() {
             ShowWindow(fullscreenOverlay_, SW_HIDE);
         }
         lastFullscreenOverlayBounds_ = RECT{};
+        lastFullscreenOverlayIncludesSubtitleMenu_ = false;
         return;
     }
 
@@ -601,18 +882,29 @@ void MainWindow::UpdateFullscreenOverlay() {
         return;
     }
 
-    const int w = RectWidth(transportBar_);
-    const int h = RectHeight(transportBar_);
+    RECT overlayBounds = transportBar_;
+    const bool includeSubtitleMenu = (subtitleMenuOpen_ ||
+                                      subtitleMenuTarget_ > 0.0 ||
+                                      subtitleMenuAmount_ > 0.001) &&
+                                     RectWidth(subtitleMenu_) > 0 &&
+                                     RectHeight(subtitleMenu_) > 0;
+    if (includeSubtitleMenu) {
+        UnionRect(&overlayBounds, &overlayBounds, &subtitleMenu_);
+    }
+
+    const int w = RectWidth(overlayBounds);
+    const int h = RectHeight(overlayBounds);
     const bool wasVisible = IsWindowVisible(fullscreenOverlay_) != FALSE;
-    const bool moved = transportBar_.left != lastFullscreenOverlayBounds_.left ||
-                       transportBar_.top != lastFullscreenOverlayBounds_.top ||
+    const bool moved = overlayBounds.left != lastFullscreenOverlayBounds_.left ||
+                       overlayBounds.top != lastFullscreenOverlayBounds_.top ||
                        w != RectWidth(lastFullscreenOverlayBounds_) ||
                        h != RectHeight(lastFullscreenOverlayBounds_);
+    const bool regionChanged = moved || includeSubtitleMenu != lastFullscreenOverlayIncludesSubtitleMenu_;
     if (moved || !wasVisible) {
         SetWindowPos(fullscreenOverlay_,
                      HWND_TOP,
-                     transportBar_.left,
-                     transportBar_.top,
+                     overlayBounds.left,
+                     overlayBounds.top,
                      w,
                      h,
                      SWP_NOACTIVATE);
@@ -626,22 +918,211 @@ void MainWindow::UpdateFullscreenOverlay() {
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW);
     }
 
-    if (moved) {
-        HRGN region = CreateRoundRectRgn(0, 0, w + 1, h + 1, Scale(12), Scale(12));
+    if (regionChanged) {
+        HRGN region = CreateRectRgn(0, 0, 0, 0);
+        HRGN transportRegion = CreateRoundRectRgn(transportBar_.left - overlayBounds.left,
+                                                  transportBar_.top - overlayBounds.top,
+                                                  transportBar_.right - overlayBounds.left + 1,
+                                                  transportBar_.bottom - overlayBounds.top + 1,
+                                                  Scale(12),
+                                                  Scale(12));
+        CombineRgn(region, region, transportRegion, RGN_OR);
+        DeleteObject(transportRegion);
+        if (includeSubtitleMenu) {
+            HRGN menuRegion = CreateRoundRectRgn(subtitleMenu_.left - overlayBounds.left,
+                                                 subtitleMenu_.top - overlayBounds.top,
+                                                 subtitleMenu_.right - overlayBounds.left + 1,
+                                                 subtitleMenu_.bottom - overlayBounds.top + 1,
+                                                 Scale(9),
+                                                 Scale(9));
+            CombineRgn(region, region, menuRegion, RGN_OR);
+            DeleteObject(menuRegion);
+        }
         SetWindowRgn(fullscreenOverlay_, region, TRUE);
-        lastFullscreenOverlayBounds_ = transportBar_;
+        lastFullscreenOverlayBounds_ = overlayBounds;
+        lastFullscreenOverlayIncludesSubtitleMenu_ = includeSubtitleMenu;
     }
     if (!wasVisible) {
         ShowWindow(fullscreenOverlay_, SW_SHOWNOACTIVATE);
     }
-    if (moved || !wasVisible) {
-        RedrawWindow(fullscreenOverlay_, nullptr, nullptr, RDW_INVALIDATE | RDW_NOERASE | RDW_UPDATENOW);
+    if (moved || regionChanged || !wasVisible || includeSubtitleMenu) {
+        InvalidateRect(fullscreenOverlay_, nullptr, FALSE);
     }
 }
 
+void MainWindow::EnsureHdrToneCurveWindow() {
+    if (hdrToneCurveWindow_) {
+        return;
+    }
+
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.hInstance = instance_;
+        wc.lpfnWndProc = &MainWindow::HdrToneCurveWindowProc;
+        wc.lpszClassName = kHdrToneCurveWindowClassName;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hIcon = LoadIconW(instance_, MAKEINTRESOURCEW(IDI_APP_ICON));
+        wc.hIconSm = LoadIconW(instance_, MAKEINTRESOURCEW(IDI_APP_ICON));
+        wc.hbrBackground = nullptr;
+        registered = RegisterClassExW(&wc) != FALSE || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+    }
+
+    constexpr DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_CLIPCHILDREN;
+    constexpr DWORD exStyle = WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
+    RECT rect = MakeRect(0, 0, Scale(900), Scale(620));
+    if (!AdjustWindowRectExForDpi(&rect, style, FALSE, exStyle, dpi_)) {
+        AdjustWindowRectEx(&rect, style, FALSE, exStyle);
+    }
+    const int windowWidth = RectWidth(rect);
+    const int windowHeight = RectHeight(rect);
+
+    RECT owner{};
+    GetWindowRect(hwnd_, &owner);
+    RECT workArea{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+    int x = owner.right + Scale(16);
+    int y = owner.top + Scale(60);
+    if (x + windowWidth > workArea.right - Scale(12)) {
+        x = owner.left + Scale(52);
+        y = owner.top + Scale(72);
+    }
+    x = std::clamp(x, static_cast<int>(workArea.left) + Scale(8), static_cast<int>(workArea.right) - windowWidth - Scale(8));
+    y = std::clamp(y, static_cast<int>(workArea.top) + Scale(8), static_cast<int>(workArea.bottom) - windowHeight - Scale(8));
+
+    hdrToneCurveWindow_ = CreateWindowExW(
+        exStyle,
+        kHdrToneCurveWindowClassName,
+        L"HDR Curve Editor",
+        style,
+        x,
+        y,
+        windowWidth,
+        windowHeight,
+        hwnd_,
+        nullptr,
+        instance_,
+        this);
+    UpdateHdrToneCurveFloatingLayout();
+}
+
+void MainWindow::UpdateHdrToneCurveFloatingLayout() {
+    if (!hdrToneCurveWindow_) {
+        if (hdrToneCurveExpanded_) {
+            return;
+        }
+        hdrToneCurveExpandedEditor_ = RECT{};
+        hdrToneCurveFloatingReset_ = RECT{};
+        return;
+    }
+
+    RECT client{};
+    GetClientRect(hdrToneCurveWindow_, &client);
+    if (RectWidth(client) <= 0 || RectHeight(client) <= 0) {
+        hdrToneCurveExpandedEditor_ = RECT{};
+        hdrToneCurvePlot_ = RECT{};
+        hdrToneCurveFloatingReset_ = RECT{};
+        return;
+    }
+
+    hdrToneCurveExpandedEditor_ = DeflateRectCopy(client, Scale(14), Scale(14));
+    const int resetWidth = Scale(72);
+    const int resetHeight = Scale(28);
+    hdrToneCurveFloatingReset_ = MakeRect(hdrToneCurveExpandedEditor_.right - Scale(24) - resetWidth,
+                                          hdrToneCurveExpandedEditor_.top + Scale(14),
+                                          hdrToneCurveExpandedEditor_.right - Scale(24),
+                                          hdrToneCurveExpandedEditor_.top + Scale(14) + resetHeight);
+    hdrToneCurvePlot_ = MakeRect(hdrToneCurveExpandedEditor_.left + Scale(64),
+                                 hdrToneCurveExpandedEditor_.top + Scale(82),
+                                 hdrToneCurveExpandedEditor_.right - Scale(30),
+                                 hdrToneCurveExpandedEditor_.bottom - Scale(48));
+}
+
+void MainWindow::UpdateSubtitleMenuLayout() {
+    subtitleMenu_ = RECT{};
+    if (subtitleMenuTarget_ <= 0.0 && subtitleMenuAmount_ <= 0.001) {
+        return;
+    }
+
+    RECT anchor{};
+    bool found = false;
+    for (const auto& button : buttons_) {
+        if (button.command == Command::SubtitleMenu) {
+            anchor = button.bounds;
+            found = true;
+            break;
+        }
+    }
+    if (!found || RectWidth(anchor) <= 0 || RectHeight(anchor) <= 0) {
+        return;
+    }
+
+    const int itemCount = std::max(1, static_cast<int>(subtitleMenuTracks_.size()));
+    const int headerHeight = Scale(62);
+    const int listGap = Scale(8);
+    const int itemHeight = Scale(42);
+    const int listBottomGap = Scale(6);
+    const int delayHeight = Scale(56);
+    const int actionHeight = Scale(44);
+    const int desiredPanelWidth = Scale(366);
+    const int fixedPanelHeight = headerHeight + listGap + listBottomGap + delayHeight + actionHeight * 2;
+
+    RECT client{};
+    GetClientRect(hwnd_, &client);
+    int maxRight = std::min(static_cast<int>(transportBar_.right) - Scale(18), static_cast<int>(client.right) - Scale(10));
+    const int minLeft = std::max(static_cast<int>(transportBar_.left) + Scale(18),
+                                 static_cast<int>(client.left) + Scale(10));
+    const int availableWidth = std::max(Scale(280), maxRight - minLeft);
+    const int panelWidth = std::min(desiredPanelWidth, availableWidth);
+    int right = std::min(maxRight, static_cast<int>(anchor.right) + Scale(6));
+    int left = right - panelWidth;
+    if (left < minLeft) {
+        left = minLeft;
+        right = left + panelWidth;
+    }
+    if (right > maxRight) {
+        right = maxRight;
+        left = right - panelWidth;
+    }
+    if (left < client.left + Scale(10)) {
+        left = static_cast<int>(client.left) + Scale(10);
+        right = std::min(left + panelWidth, static_cast<int>(client.right) - Scale(10));
+    }
+
+    int bottom = anchor.top - Scale(12);
+    const int minTop = (!fullscreen_ && RectHeight(topBar_) > 0)
+                           ? static_cast<int>(topBar_.bottom) + Scale(10)
+                           : static_cast<int>(client.top) + Scale(10);
+    const int availableHeight = std::max(fixedPanelHeight + itemHeight,
+                                         bottom - minTop);
+    const int maxVisibleRowsBySpace = std::max(1, (availableHeight - fixedPanelHeight) / itemHeight);
+    subtitleMenuVisibleItemCount_ = std::clamp(std::min(itemCount, maxVisibleRowsBySpace), 1, 6);
+    const int panelHeight = fixedPanelHeight + itemHeight * subtitleMenuVisibleItemCount_;
+    subtitleMenuScrollOffset_ = std::clamp(subtitleMenuScrollOffset_,
+                                           0,
+                                           std::max(0, itemCount - subtitleMenuVisibleItemCount_));
+    int top = bottom - panelHeight;
+    if (top < minTop) {
+        top = minTop;
+        bottom = top + panelHeight;
+    }
+    subtitleMenu_ = MakeRect(left, top, right, bottom);
+}
+
 int MainWindow::HitButton(const POINT point) const {
-    for (std::size_t index = 0; index < buttons_.size(); ++index) {
-        if (ContainsPoint(buttons_[index].bounds, point)) {
+    for (std::size_t index = buttons_.size(); index > 0; --index) {
+        const std::size_t buttonIndex = index - 1;
+        if (buttons_[buttonIndex].enabled && ContainsPoint(buttons_[buttonIndex].bounds, point)) {
+            return static_cast<int>(buttonIndex);
+        }
+    }
+    return -1;
+}
+
+int MainWindow::HitInspectorPathItem(const POINT point) const {
+    for (std::size_t index = 0; index < inspectorPathItems_.size(); ++index) {
+        if (ContainsPoint(inspectorPathItems_[index].bounds, point)) {
             return static_cast<int>(index);
         }
     }

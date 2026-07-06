@@ -43,6 +43,7 @@ struct UiButton {
     ButtonKind kind = ButtonKind::Icon;
     bool primary = false;
     bool selected = false;
+    bool enabled = true;
 };
 
 // RECT extent helpers.

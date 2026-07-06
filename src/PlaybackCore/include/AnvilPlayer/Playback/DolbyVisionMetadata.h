@@ -17,12 +17,18 @@ constexpr int kDoviNumComponents = 3;    // I, Ct, Cp
 constexpr int kDoviMaxPivots = kDoviMaxPieces + 1;          // 9
 constexpr int kDoviMmrCoeffsPerOrder = 7;                    // 7 coefficients per MMR order term
 constexpr int kDoviMmrMaxTerms = 3;                          // order - 1, i.e. up to 3 terms
+constexpr int kDoviMaxTrimTargets = 4;                       // compact L2 target trims kept for display mapping
 
 // Reshaping method for a single piece-wise segment of one component.
 enum class DoviMappingMethod {
     None = -1,
     Polynomial = 0,   // AV_DOVI_MAPPING_POLYNOMIAL
     Mmr = 1,          // AV_DOVI_MAPPING_MMR
+};
+
+enum class DoviNlqMethod {
+    None = -1,
+    LinearDeadzone = 0,  // AV_DOVI_NLQ_LINEAR_DZ
 };
 
 // One piece-wise segment of a reshaping curve. Spans the value range between
@@ -77,9 +83,23 @@ struct DolbyVisionFrameMetadata {
     bool blVideoFullRange = false;      // bl_video_full_range_flag (overrides container color_range for DV)
     bool vdrRpuNormalizedIdc = false;   // vdr_rpu_normalized_idc == 1
     int coefLog2Denom = 0;              // original fixed-point denominator (informational; coefs already real)
+    bool residualDisabled = true;       // disable_residual_flag
+    bool elSpatialResampling = false;   // el_spatial_resampling_filter_flag
 
     // Data mapping: 3 per-component piece-wise reshaping curves.
     DoviReshapingCurve curves[kDoviNumComponents] = {};
+
+    // Profile 7 enhancement-layer residual metadata. NLQ values are kept in
+    // their FFmpeg/bitstream fixed-point domain so the renderer can mirror the
+    // composer arithmetic before normalizing back to shader floats.
+    DoviNlqMethod nlqMethod = DoviNlqMethod::None;
+    uint32_t nlqNumXPartitions = 0;
+    uint32_t nlqNumYPartitions = 0;
+    uint16_t nlqOffset[kDoviNumComponents] = {};
+    uint64_t nlqVdrInMax[kDoviNumComponents] = {};
+    uint64_t nlqLinearDeadzoneSlope[kDoviNumComponents] = {};
+    uint64_t nlqLinearDeadzoneThreshold[kDoviNumComponents] = {};
+    uint16_t nlqPivots[2] = {};
 
     // Color metadata (from AVDOVIColorMetadata).
     // ycc_to_rgb: applied to the reshaped YCC signal to recover RGB.
@@ -95,6 +115,52 @@ struct DolbyVisionFrameMetadata {
     uint16_t sourceMaxPq = 0;
     float sourceMinNits = 0.0f;
     float sourceMaxNits = 0.0f;
+
+    // Dolby display-management extension blocks. These carry the dynamic trim
+    // metadata (for example CMv4 L3/L8) that is distinct from the BL reshaping
+    // curve above. The renderer fallback does not consume every field yet, but
+    // the decoder logs these values so we can verify that frame-varying dynamic
+    // metadata is present and changing.
+    int dmMetadataId = 0;
+    int sceneRefreshFlag = 0;
+    int dmExtensionBlockCount = 0;
+    uint64_t dmLevelMaskLow = 0;         // Levels 0..63 when present.
+    bool dmLevel1Present = false;
+    bool dmLevel2Present = false;
+    bool dmLevel3Present = false;
+    bool dmLevel5Present = false;
+    bool dmLevel8Present = false;
+    bool dmLevel254Present = false;
+    bool dmLevel255Present = false;
+    int dmLevel2Count = 0;
+    int dmLevel8Count = 0;
+    uint16_t dmLevel1MinPq = 0;
+    uint16_t dmLevel1MaxPq = 0;
+    uint16_t dmLevel1AvgPq = 0;
+    uint16_t dmLevel2TargetMaxPq[kDoviMaxTrimTargets] = {};
+    uint16_t dmLevel2TrimSlope[kDoviMaxTrimTargets] = {};
+    uint16_t dmLevel2TrimOffset[kDoviMaxTrimTargets] = {};
+    uint16_t dmLevel2TrimPower[kDoviMaxTrimTargets] = {};
+    uint16_t dmLevel2TrimChromaWeight[kDoviMaxTrimTargets] = {};
+    uint16_t dmLevel2TrimSaturationGain[kDoviMaxTrimTargets] = {};
+    int16_t dmLevel2MsWeight[kDoviMaxTrimTargets] = {};
+    uint16_t dmLevel3MinPqOffset = 0;
+    uint16_t dmLevel3MaxPqOffset = 0;
+    uint16_t dmLevel3AvgPqOffset = 0;
+    uint16_t dmLevel5LeftOffset = 0;
+    uint16_t dmLevel5RightOffset = 0;
+    uint16_t dmLevel5TopOffset = 0;
+    uint16_t dmLevel5BottomOffset = 0;
+    uint8_t dmLevel8TargetDisplayIndex = 0;
+    uint16_t dmLevel8TrimSlope = 0;
+    uint16_t dmLevel8TrimOffset = 0;
+    uint16_t dmLevel8TrimPower = 0;
+    uint16_t dmLevel8TrimChromaWeight = 0;
+    uint16_t dmLevel8TrimSaturationGain = 0;
+    uint16_t dmLevel8MsWeight = 0;
+    uint16_t dmLevel8TargetMidContrast = 0;
+    uint16_t dmLevel8ClipTrim = 0;
+    uint64_t dynamicMetadataFingerprint = 0;
 
     bool valid = false;                 // true if metadata was successfully extracted for this frame
 };

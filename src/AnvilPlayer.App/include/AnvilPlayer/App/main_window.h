@@ -16,6 +16,7 @@
 #include <shellapi.h>
 #include <windows.h>
 
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <optional>
@@ -45,8 +46,10 @@ private:
     static LRESULT CALLBACK VideoHostProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK FullscreenOverlayProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK TransportOverlayProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK HdrToneCurveWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     static void CALLBACK PlaybackTimerQueueProc(PVOID context, BOOLEAN timerOrWaitFired);
     LRESULT HandleMessage(UINT message, WPARAM wParam, LPARAM lParam);
+    LRESULT HandleHdrToneCurveWindowMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
 
     static std::filesystem::path DefaultLogPath();
     void LogApp(anvil::playback::LogLevel level, const std::wstring& message) const;
@@ -57,6 +60,8 @@ private:
     bool IsPointInteractive(POINT point) const;
     void SetProgressHover(bool hovered);
     void ToggleSidebar();
+    void SetSubtitleMenuTarget(bool visible);
+    void HideSubtitleMenu();
     bool ShouldShowFullscreenTransport(const anvil::playback::PlaybackSessionSnapshot& snapshot) const;
     bool IsFullscreenTransportActivationPoint(POINT point) const;
     void UpdateFullscreenTransportCursorPolling();
@@ -78,10 +83,22 @@ private:
     void InvalidateVideoSurface() const;
     void InvalidateTransportArea() const;
     void InvalidateFullscreenOverlay() const;
+    void InvalidateHdrToneCurveEditor() const;
 
     const anvil::playback::CapabilityReport& CachedCapabilities();
     void RefreshCapabilityCache();
     void RenderPlaybackTick(const anvil::playback::PlaybackSessionSnapshot& snapshot, bool forceRefresh = true);
+    bool CurrentMediaHasHdrControls() const;
+    bool CurrentMediaHasCmv4Control() const;
+    bool CurrentCmv4ControlEnabled(const anvil::playback::PlayerSettings& settings) const;
+    bool HdrToneCurveAvailable(const anvil::playback::PlayerSettings& settings) const;
+    bool Cmv4ApproxActiveForPlayback(const anvil::playback::PlaybackSessionSnapshot& snapshot,
+                                     const anvil::playback::VideoSettings& settings) const;
+    bool ApplyNativeColorSettingsLive(const anvil::playback::PlaybackSessionSnapshot& snapshot);
+    bool NativeHdrOutputToggleRequiresDecoderRestart(const anvil::playback::PlaybackSessionSnapshot& snapshot) const;
+    bool NativeCmv4ToggleRequiresDecoderRestart(const anvil::playback::PlaybackSessionSnapshot& snapshot) const;
+    int SettingsVideoFieldCount() const;
+    void ApplyDefaultHdrControlsForCurrentMedia();
 
     int Scale(int value) const;
     RECT PlaybackSurfaceBounds() const;
@@ -90,32 +107,73 @@ private:
     // main_window_layout.cpp
     void MarkLayoutDirty();
     void EnsureLayout();
+    RECT SettingsContentViewport() const;
+    int SettingsContentHeight(const anvil::playback::PlayerSettings& settings, RECT viewport) const;
+    void UpdateSettingsScrollLayout(const anvil::playback::PlayerSettings& settings);
     void UpdateLayout();
+    void UpdateInspectorPathItems(const anvil::playback::PlaybackSessionSnapshot& snapshot);
     void UpdateVideoHost();
     void EnsureFullscreenOverlay();
     void UpdateFullscreenOverlay();
     void EnsureTransportOverlay();
     void UpdateTransportOverlay();
+    void EnsureHdrToneCurveWindow();
+    void UpdateHdrToneCurveFloatingLayout();
+    void UpdateSubtitleMenuLayout();
     int HitButton(POINT point) const;
+    int HitInspectorPathItem(POINT point) const;
 
     // main_window_input.cpp
     void OnMouseMove(int x, int y);
     void OnLeftButtonDown(int x, int y);
     void OnLeftButtonUp(int x, int /*y*/);
+    void OnMouseWheel(int delta, POINT screenPoint);
+    bool ScrollSettingsBy(int delta);
+    bool BeginSettingsScrollDrag(POINT point);
+    void UpdateSettingsScrollDrag(POINT point);
+    void EndSettingsScrollDrag();
+    void CancelSettingsScrollDrag();
     RECT ProgressHitRect() const;
+    RECT VolumeSliderTrackRect() const;
+    RECT VolumeSliderHitRect() const;
+    double VolumeFromSliderX(int x) const;
+    bool ApplyVolume(double volume, bool restartExternalNow);
+    bool BeginVolumeDrag(POINT point);
+    void UpdateVolumeDrag(POINT point);
+    void EndVolumeDrag(POINT point);
+    void CancelVolumeDrag();
+    int HitSubtitleMenuItem(POINT point) const;
+    bool IsPointInSubtitleMenu(POINT point) const;
+    HWND HdrToneCurveInteractionWindow() const;
     std::chrono::milliseconds PositionFromProgressX(int x) const;
     void BeginProgressDrag(int x);
     void CancelProgressDrag();
     void CommitProgressDrag();
     bool IsHdrToneCurveVisible() const;
+    int HitHdrToneCurvePoint(POINT point, int maxDistancePx) const;
+    void UpdateHdrToneCurveHover(POINT point);
+    bool HasHdrToneCurveSelection() const;
+    int HdrToneCurveSelectionCount() const;
+    void ClearHdrToneCurveSelection();
+    void SelectHdrToneCurvePoint(int pointIndex);
+    void SelectHdrToneCurveRange(int leftX, int rightX);
+    bool BeginHdrToneCurveRangeSelection(POINT point);
+    void UpdateHdrToneCurveRangeSelection(POINT point);
+    void EndHdrToneCurveRangeSelection();
     bool BeginHdrToneCurveDrag(POINT point);
+    void StartHdrToneCurveDrag(int pointIndex, bool groupDrag, POINT point);
     void UpdateHdrToneCurveDrag(POINT point);
     void EndHdrToneCurveDrag();
+    void CancelHdrToneCurveInteraction();
+    bool NudgeHdrToneCurveSelection(double deltaNits);
     void ApplyLiveHdrToneCurveSettings();
     void ResetHdrToneCurve();
+    void ShowHdrToneCurveWindow();
+    void HideHdrToneCurveWindow();
     void OnKeyDown(WPARAM key);
     void OnDropFiles(HDROP drop);
     void Execute(Command command);
+    void OpenInspectorPathItem(int itemIndex);
     void OpenFileDialog();
 
     // main_window.cpp runtime + transport
@@ -123,6 +181,7 @@ private:
     void StartRuntime(const anvil::playback::PlaybackSessionSnapshot& snapshot, bool restart);
     void EnsureVideoHost();
     void StartNativeRuntime(const anvil::playback::PlaybackSessionSnapshot& snapshot, bool restart);
+    bool SeekNativeRuntime(const anvil::playback::PlaybackSessionSnapshot& snapshot);
     bool CaptureLatestNativeFrame();
     void RenderHeldNativeFrame();
     void RefreshPausedNativeFrame(const anvil::playback::PlaybackSessionSnapshot& snapshot);
@@ -139,14 +198,17 @@ private:
     void CycleSubtitleTrack();
     void ShowSubtitleMenu();
     void ToggleDolbyVisionHdrOutput();
+    void ToggleDolbyVisionCmv4Approx();
     void ToggleFullscreen();
+    void UpdateInspectorMediaLists(const std::filesystem::path& path);
 
     // main_window_paint.cpp
     void Paint();
     void PaintFullscreenOverlay(HWND overlay);
     void PaintTransportOverlay(HWND overlay);
+    void PaintHdrToneCurveWindow(HWND window);
     void DrawTopBar(HDC hdc, const anvil::playback::PlaybackSessionSnapshot& snapshot) const;
-    void DrawButtons(HDC hdc) const;
+    void DrawButtons(HDC hdc, const anvil::playback::PlaybackSessionSnapshot& snapshot) const;
     void DrawTooltip(HDC hdc) const;
     void ClearPreviewBitmap() const;
     HBITMAP LoadPreviewBitmap(const std::filesystem::path& imagePath) const;
@@ -154,17 +216,33 @@ private:
     void DrawDecodedVideoFrame(HDC hdc, RECT target, const VideoFrame& frame) const;
     void DrawVideoSurface(HDC hdc, const anvil::playback::PlaybackSessionSnapshot& snapshot) const;
     void DrawTransport(HDC hdc, const anvil::playback::PlaybackSessionSnapshot& snapshot) const;
+    void DrawVolumeSlider(HDC hdc, const anvil::playback::PlaybackSessionSnapshot& snapshot) const;
+    void DrawSubtitleMenu(HDC hdc, const anvil::playback::PlaybackSessionSnapshot& snapshot) const;
     void DrawSectionHeader(HDC hdc, const std::wstring& text, RECT& cursor) const;
     void DrawField(HDC hdc, const std::wstring& label, const std::wstring& value, RECT& cursor) const;
     void DrawInspectorPanel(HDC hdc,
                             const anvil::playback::PlaybackSessionSnapshot& snapshot,
                             const anvil::playback::PlayerSettings& settings,
                             const anvil::playback::CapabilityReport& capabilities) const;
-    void DrawMediaContent(HDC hdc, const anvil::playback::PlaybackSessionSnapshot& snapshot, RECT cursor) const;
-    void DrawDeviceContent(HDC hdc, const anvil::playback::CapabilityReport& capabilities, RECT cursor) const;
+    void DrawListMessage(HDC hdc, const std::wstring& message, RECT cursor) const;
+    void DrawPathList(HDC hdc,
+                      const std::vector<std::filesystem::path>& paths,
+                      const std::optional<anvil::playback::MediaDescriptor>& media,
+                      RECT& cursor) const;
+    void DrawRecentContent(HDC hdc, const anvil::playback::PlaybackSessionSnapshot& snapshot, RECT cursor) const;
+    void DrawFolderContent(HDC hdc, const anvil::playback::PlaybackSessionSnapshot& snapshot, RECT cursor) const;
+    void DrawMediaInfoContent(HDC hdc, const anvil::playback::PlaybackSessionSnapshot& snapshot, RECT cursor) const;
+    void DrawSystemContent(HDC hdc, const anvil::playback::CapabilityReport& capabilities, RECT cursor) const;
     void DrawLogContent(HDC hdc, RECT cursor) const;
     void DrawSettingsContent(HDC hdc, const anvil::playback::PlayerSettings& settings, RECT cursor) const;
+    void DrawSettingsScrollbar(HDC hdc) const;
     void DrawHdrToneCurveEditor(HDC hdc, const anvil::playback::PlayerSettings& settings, RECT& cursor) const;
+    void DrawHdrToneCurveExpandedEditor(HDC hdc, const anvil::playback::PlayerSettings& settings) const;
+
+    struct InspectorPathItem {
+        RECT bounds{};
+        std::filesystem::path path;
+    };
 
     HWND hwnd_ = nullptr;
     HINSTANCE instance_ = nullptr;
@@ -182,6 +260,7 @@ private:
     HWND videoHost_ = nullptr;
     HWND fullscreenOverlay_ = nullptr;
     HWND transportOverlay_ = nullptr;
+    HWND hdrToneCurveWindow_ = nullptr;
     bool videoHostReady_ = false;
     bool layoutDirty_ = true;
     bool nativeFrameHoldVisible_ = false;
@@ -191,9 +270,13 @@ private:
     RECT lastVideoHostBounds_{};
     RECT lastFullscreenOverlayBounds_{};
     RECT lastTransportOverlayBounds_{};
+    bool lastTransportOverlayIncludesSubtitleMenu_ = false;
+    bool lastFullscreenOverlayIncludesSubtitleMenu_ = false;
     bool trackingMouseLeave_ = false;
+    bool hdrToneCurveWindowTrackingMouseLeave_ = false;
     int hoveredButton_ = -1;
-    InspectorTab inspectorTab_ = InspectorTab::Media;
+    int hoveredInspectorPathItem_ = -1;
+    InspectorTab inspectorTab_ = InspectorTab::Recent;
     PlaybackBackend backend_ = PlaybackBackend::NativeFfmpegD3D11;
     bool fullscreen_ = false;
     LONG previousStyle_ = 0;
@@ -205,7 +288,14 @@ private:
     RECT transportBar_{};
     RECT inspector_{};
     RECT progress_{};
+    RECT volumeSlider_{};
+    RECT subtitleMenu_{};
     RECT hdrToneCurvePlot_{};
+    RECT hdrToneCurveExpandedEditor_{};
+    RECT hdrToneCurveFloatingReset_{};
+    RECT settingsContentViewport_{};
+    RECT settingsScrollTrack_{};
+    RECT settingsScrollThumb_{};
     int topControlsLeft_ = 0;
     int transportControlsLeft_ = 0;
     int transportControlsRight_ = 0;
@@ -214,10 +304,19 @@ private:
     bool showTopState_ = true;
     bool showInspectorTabs_ = false;
     bool draggingProgress_ = false;
+    bool draggingVolume_ = false;
     bool draggingHdrToneCurve_ = false;
+    bool draggingHdrToneCurveSelection_ = false;
+    bool selectingHdrToneCurveRange_ = false;
+    bool hdrToneCurveDragMoved_ = false;
+    bool draggingSettingsScrollThumb_ = false;
+    bool hdrToneCurveExpanded_ = false;
     bool inspectorCollapsed_ = false;
     bool fullscreenTransportVisible_ = false;
+    bool subtitleMenuOpen_ = false;
     bool progressHovered_ = false;
+    bool volumeSliderHovered_ = false;
+    bool volumeDragChanged_ = false;
     bool videoPressActive_ = false;
     bool videoPressLongActive_ = false;
     bool videoPressMoved_ = false;
@@ -231,6 +330,13 @@ private:
     double fullscreenTransportAmount_ = 0.0;
     double fullscreenTransportStartAmount_ = 0.0;
     double fullscreenTransportTarget_ = 0.0;
+    double subtitleMenuAmount_ = 0.0;
+    double subtitleMenuTarget_ = 0.0;
+    int settingsScrollOffset_ = 0;
+    int settingsScrollMax_ = 0;
+    int settingsContentHeight_ = 0;
+    int settingsScrollDragStartY_ = 0;
+    int settingsScrollDragStartOffset_ = 0;
     std::chrono::steady_clock::time_point inspectorAnimationStartedAt_{};
     std::chrono::steady_clock::time_point progressHoverAnimationStartedAt_{};
     std::chrono::steady_clock::time_point fullscreenTransportAnimationStartedAt_{};
@@ -242,6 +348,20 @@ private:
     POINT videoPressStart_{};
     std::chrono::milliseconds dragSeekPosition_{0};
     int draggedHdrToneCurvePoint_ = -1;
+    int hoveredSubtitleMenuItem_ = -1;
+    int subtitleMenuScrollOffset_ = 0;
+    int subtitleMenuVisibleItemCount_ = 0;
+    int hoveredHdrToneCurvePoint_ = -1;
+    int hdrToneCurveSelectionStartX_ = 0;
+    int hdrToneCurveSelectionCurrentX_ = 0;
+    POINT hdrToneCurveDragStart_{};
+    double hdrToneCurveDragStartPointerNits_ = 0.0;
+    std::array<double, anvil::playback::kHdrToneCurvePointCount> hdrToneCurveDragStartOutputs_{};
+    std::array<bool, anvil::playback::kHdrToneCurvePointCount> selectedHdrToneCurvePoints_{};
+    std::vector<int> subtitleMenuTracks_;
+    std::vector<std::filesystem::path> recentMedia_;
+    std::vector<std::filesystem::path> currentFolderEntries_;
+    std::vector<InspectorPathItem> inspectorPathItems_;
     std::vector<UiButton> buttons_;
     mutable HBITMAP previewBitmap_ = nullptr;
     mutable std::filesystem::path previewBitmapPath_;

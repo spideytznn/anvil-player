@@ -9,6 +9,7 @@
 #include <d3d10.h>
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
+#include <dcomp.h>
 #include <windows.h>
 
 #include <wrl/client.h>
@@ -74,6 +75,7 @@ private:
     void EnableMultithreadProtection();
     bool CreateRenderTarget();
     bool CreatePipeline();
+    bool CreateComposition();
     bool UpdateColorPipeline(const NativeVideoFrame& frame);
     void UpdateDoviConstants(const NativeVideoFrame& frame);
     bool ApplySwapChainColorSpace(DXGI_COLOR_SPACE_TYPE colorSpace, const anvil::playback::VideoColorMetadata& color);
@@ -81,6 +83,7 @@ private:
     bool UpdateHardwareTexture(const NativeVideoFrame& frame);
     void UpdateTexture(const NativeVideoFrame& frame);
     bool UpdateYuvTexture(const NativeVideoFrame& frame);
+    bool UpdateEnhancementYuvTexture(const NativeVideoFrame& frame);
     bool UpdateSubtitleOverlay(const NativeVideoFrame& frame, const D3D11_VIEWPORT& videoViewport);
     void DrawSubtitleOverlay();
     void ReleaseAll();
@@ -104,6 +107,14 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
     Microsoft::WRL::ComPtr<IDXGISwapChain1> swapChain_;
+    // DirectComposition visual tree that binds the composition swap chain to
+    // the host HWND. This lets DWM composite the video surface so that GDI
+    // sibling overlay windows (e.g. the subtitle menu popup) render correctly
+    // on top of it, which a HWND-bound flip-model swap chain would occlude.
+    bool useComposition_ = false;
+    Microsoft::WRL::ComPtr<IDCompositionDevice> dcompDevice_;
+    Microsoft::WRL::ComPtr<IDCompositionTarget> dcompTarget_;
+    Microsoft::WRL::ComPtr<IDCompositionVisual> dcompVisual_;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> backBuffer_;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> rtv_;
     Microsoft::WRL::ComPtr<ID3D11VertexShader> vs_;
@@ -124,6 +135,11 @@ private:
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> yuvSrvUV_;
     int yuvTextureW_ = 0;
     int yuvTextureH_ = 0;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> enhancementYuvTexture_;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> enhancementYuvSrvY_;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> enhancementYuvSrvUV_;
+    int enhancementYuvTextureW_ = 0;
+    int enhancementYuvTextureH_ = 0;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> subtitleTexture_;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> subtitleSrv_;
     std::vector<HardwareSrvCacheEntry> hardwareSrvCache_;
@@ -146,8 +162,10 @@ private:
     bool hdrMetadataApplied_ = false;
     bool hdrColorSpaceFailureLogged_ = false;
     bool dolbyVisionMetadataLogged_ = false;
+    bool felOverlayLogged_ = false;
     bool doviEnabledLastFrame_ = false;  // tracks DV state to skip non-DV updates
     std::wstring activePipelineLabel_;
+    uint64_t activePipelineSignature_ = 0;
     bool diagnosticsEnabled_ = false;
     D3D11RenderStats renderStats_;
 };

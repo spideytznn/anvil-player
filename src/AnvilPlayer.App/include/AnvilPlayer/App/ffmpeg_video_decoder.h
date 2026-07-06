@@ -86,6 +86,9 @@ struct NativeVideoFrame {
     // Raw 10-bit YUV for the DV software path (reshaped on the GPU).
     // Mutually exclusive with bgra in the DV path.
     NativeYuvPlanes yuv;
+    // Experimental Dolby Vision Profile 7 enhancement/FEL layer, packed as a
+    // second P010 texture and sampled by the renderer as an overlay.
+    NativeYuvPlanes enhancementYuv;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> d3dTexture;
     UINT d3dArraySlice = 0;
     DXGI_FORMAT d3dFormat = DXGI_FORMAT_UNKNOWN;
@@ -95,6 +98,12 @@ struct NativeVideoFrame {
     // nullptr for non-DV streams. When present, the renderer must apply the
     // IPTPQc2 reshaping before treating the pixels as BT.2020 PQ.
     std::shared_ptr<const anvil::playback::DolbyVisionFrameMetadata> dovi;
+    std::shared_ptr<const anvil::playback::DolbyVisionFrameMetadata> enhancementDovi;
+    // Non-empty when dynamic metadata has already been consumed before the
+    // renderer sees the frame, e.g. Dolby Vision processed by libplacebo.
+    std::wstring dynamicMetadataPath;
+    std::wstring dynamicMetadataDetails;
+    std::wstring enhancementMetadataDetails;
     std::wstring subtitleText;
     std::vector<NativeSubtitleBitmap> subtitleBitmaps;
     std::shared_ptr<AVFrame> hardwareFrameRef;
@@ -109,6 +118,10 @@ struct NativeVideoFrame {
         return yuv.HasData();
     }
 
+    bool HasEnhancementYuv() const {
+        return enhancementYuv.HasData();
+    }
+
     bool HasD3DTexture() const {
         return d3dTexture && width > 0 && height > 0 && d3dFormat != DXGI_FORMAT_UNKNOWN;
     }
@@ -121,6 +134,12 @@ struct NativeVideoFrame {
 // Queue/scheduler telemetry surfaced to the inspector and logs.
 struct NativeVideoQueueStats {
     std::size_t queueDepth = 0;
+    std::size_t packetQueueDepth = 0;
+    std::size_t packetQueueBytes = 0;
+    std::chrono::milliseconds bufferedEnd{0};
+    std::chrono::milliseconds bufferedDuration{0};
+    std::chrono::milliseconds readAheadEnd{0};
+    std::chrono::milliseconds readAheadDuration{0};
     uint64_t rendered = 0;
     uint64_t droppedLate = 0;
     uint64_t droppedQueueFull = 0;
@@ -163,9 +182,12 @@ public:
                std::chrono::milliseconds subtitleDelay = std::chrono::milliseconds{0},
                bool autoLoadExternalSubtitles = true,
                bool oneShotFrame = false,
-               bool preferDolbyVisionHdrOutput = false);
+               bool preferDolbyVisionHdrOutput = false,
+               bool enableDolbyVisionEnhancementDecode = false);
 
     void Stop();
+    bool Seek(std::chrono::milliseconds position);
+    void SetPaused(bool paused, std::chrono::milliseconds position);
 
     bool IsRunning() const {
         return running_.load();
@@ -178,17 +200,31 @@ public:
     void AcknowledgeFrameNotification();
 
     NativeVideoQueueStats Stats() const;
+    bool WaitForPreroll(std::chrono::milliseconds targetDuration, std::chrono::milliseconds timeout) const;
 
     const std::filesystem::path& Path() const { return path_; }
 
 private:
-    // Decoded-frame queue depth. Larger = more resilience to IO/decode jitter
-    // at the cost of memory (each entry holds a BGRA buffer or D3D11 texture
-    // ref). 48 frames ≈ 2 s at 24 fps. For 4K BGRA this is ~1.5 GB worst case,
-    // but the hardware path uses zero-copy textures (GPU memory only).
-    // Decoded-frame queue depth.
-    static constexpr std::size_t kMaxQueuedFrames = 6;
+    // Queue depth is selected per frame type: hardware texture refs are cheap,
+    // while CPU BGRA/YUV frames can be tens of MB each for 4K+ sources.
+    static constexpr std::size_t kMaxHardwareQueuedFrames = 16;
+    static constexpr std::size_t kMaxYuvQueuedFrames = 10;
+    static constexpr std::size_t kMaxSmallBgraQueuedFrames = 12;
+    static constexpr std::size_t kMaxLargeBgraQueuedFrames = 6;
+    static constexpr std::size_t kMaxCpuQueuedFrameBytes = 256ull * 1024ull * 1024ull;
+    static constexpr std::size_t kMinPacketReadAheadBytes = 128ull * 1024ull * 1024ull;
+    static constexpr std::size_t kMaxPacketReadAheadBytes = 1024ull * 1024ull * 1024ull;
     static constexpr std::size_t kMaxReusableBgraBuffers = 12;
+    static constexpr int kStartupPacketReadAheadBatch = 4;
+    static constexpr int kPlayingPacketReadAheadBatch = 12;
+    static constexpr int kPausedPacketReadAheadBatch = 256;
+    static constexpr std::chrono::milliseconds kPlayingPacketReadAheadTarget{15000};
+    static constexpr int kDolbyVisionEnhancementStartupPacketReadAheadBatch = 1;
+    static constexpr int kDolbyVisionEnhancementPlayingPacketReadAheadBatch = 2;
+    static constexpr int kDolbyVisionEnhancementPausedPacketReadAheadBatch = 24;
+    static constexpr std::chrono::milliseconds kDolbyVisionEnhancementPacketReadAheadTarget{1500};
+    static constexpr std::size_t kMaxDolbyVisionEnhancementQueuedFrames = 160;
+    static constexpr std::size_t kMaxDolbyVisionEnhancementQueuedBytes = 768ull * 1024ull * 1024ull;
     static constexpr std::chrono::milliseconds kFrameEarlyTolerance{12};
     static constexpr std::chrono::milliseconds kFrameLateDropThreshold{120};
 
@@ -199,12 +235,23 @@ private:
         std::vector<NativeSubtitleBitmap> bitmaps;
     };
 
+    struct DolbyVisionEnhancementFrame {
+        std::chrono::milliseconds pts{0};
+        NativeYuvPlanes yuv;
+        std::shared_ptr<const anvil::playback::DolbyVisionFrameMetadata> dovi;
+        std::wstring details;
+    };
+
     void DecodeLoop();
     int SelectVideoStream(AVFormatContext* formatCtx) const;
     bool OpenVideoDecoder(const AVCodec* codec,
                           const AVCodecParameters* codecpar,
                           AVCodecContext*& codecCtx,
                           AVBufferRef*& hwDeviceCtx);
+    bool OpenDolbyVisionEnhancementDecoder(AVFormatContext* formatCtx,
+                                           int primaryStreamIndex,
+                                           AVCodecContext*& codecCtx,
+                                           AVRational& timeBase);
     bool OpenSubtitleDecoder(AVFormatContext* formatCtx,
                              int& subtitleStreamIndex,
                              AVRational& subtitleTimeBase,
@@ -222,8 +269,16 @@ private:
     bool DrainDecoder(AVCodecContext* codecCtx, SwsContext*& swsCtx, AVFrame* frame, AVFrame* softwareFrame,
                       std::vector<uint8_t>& bgraBuffer, AVRational timeBase,
                       uint64_t& serial);
+    bool DecodeDolbyVisionEnhancementPacket(AVCodecContext* codecCtx,
+                                            const AVPacket* packet,
+                                            AVFrame* frame,
+                                            AVRational timeBase);
+    bool ReceiveDolbyVisionEnhancementFrames(AVCodecContext* codecCtx, AVFrame* frame, AVRational timeBase);
     bool PublishFrame(AVFrame* frame, AVFrame* softwareFrame, SwsContext*& swsCtx, std::vector<uint8_t>& bgraBuffer,
                       AVRational timeBase, uint64_t& serial);
+    void AttachDolbyVisionEnhancementFrame(NativeVideoFrame& frame, std::chrono::milliseconds pts);
+    void LogDolbyVisionCpuReferenceSample(const NativeVideoFrame& frame);
+    bool ShouldUsePrimaryDoviLibplacebo() const;
     bool TryPublishDoviLibplaceboFrame(AVFrame* frame,
                                        AVRational timeBase,
                                        std::chrono::milliseconds pts,
@@ -232,6 +287,12 @@ private:
     bool TryBuildD3DTextureFrame(AVFrame* frame, std::chrono::milliseconds pts, uint64_t& serial, NativeVideoFrame& out);
     bool PublishImmediateFrame(NativeVideoFrame&& frame);
     bool DecodeSubtitlePacket(AVCodecContext* subtitleCodecCtx, const AVPacket* packet, AVRational subtitleTimeBase);
+    bool ApplyPendingSeek(AVFormatContext* formatCtx,
+                          AVCodecContext* codecCtx,
+                          AVCodecContext* subtitleCodecCtx,
+                          AVCodecContext* enhancementCodecCtx);
+    std::optional<std::chrono::milliseconds> TakePendingSeek();
+    bool HasPendingSeek() const;
     void TrimActiveBitmapSubtitleCues(std::chrono::milliseconds time);
     std::wstring SubtitleTextForPts(std::chrono::milliseconds pts);
     std::vector<NativeSubtitleBitmap> SubtitleBitmapsForPts(std::chrono::milliseconds pts, int frameWidth, int frameHeight);
@@ -253,12 +314,17 @@ private:
     // (profile/level/compat_id/el/bl flags from AV_PKT_DATA_DOVI_CONF, which
     // are not present in per-frame AV_FRAME_DATA_DOVI_METADATA).
     std::shared_ptr<const anvil::playback::DolbyVisionFrameMetadata> ExtractFrameDolbyVisionMetadata(const AVFrame* frame);
+    std::shared_ptr<const anvil::playback::DolbyVisionFrameMetadata> ExtractEnhancementDolbyVisionMetadata(const AVFrame* frame);
     static bool IsSupportedHardwareTextureFormat(DXGI_FORMAT format);
     static std::wstring DxgiFormatName(DXGI_FORMAT format);
     static std::wstring PixelFormatName(AVPixelFormat format);
 
     void LogZeroCopyFallbackOnce(const std::wstring& reason);
     std::shared_ptr<std::vector<uint8_t>> AcquireReusableBgraBuffer(std::size_t needed);
+    static std::size_t FrameQueueCostBytes(const NativeVideoFrame& frame);
+    static std::size_t MaxQueueDepthForFrame(const NativeVideoFrame& frame);
+    bool HasQueueCapacityLocked(const NativeVideoFrame& frame) const;
+    void UpdateBufferedStatsLocked();
 
     bool EnqueueFrame(NativeVideoFrame&& frame);
     void DrainQueuedFrames();
@@ -295,7 +361,10 @@ private:
     bool dolbyVisionFirstQueueLogged_ = false;
     bool dolbyVisionLibplaceboFailed_ = false;
     bool dolbyVisionLibplaceboFrameLogged_ = false;
+    bool dolbyVisionDynamicMetadataLogged_ = false;
+    uint64_t dolbyVisionLastDynamicMetadataFingerprint_ = 0;
     bool preferDolbyVisionHdrOutput_ = false;
+    bool enableDolbyVisionEnhancementDecode_ = false;
     int selectedVideoTrackIndex_ = anvil::playback::kVideoTrackAuto;
     std::unique_ptr<DoviLibplaceboFilterState> doviLibplaceboFilter_;
     // Stream-level DV configuration (not present in per-frame metadata).
@@ -304,6 +373,26 @@ private:
     int dolbyVisionCompatId_ = 0;
     bool dolbyVisionElPresent_ = false;
     bool dolbyVisionBlPresent_ = false;
+    bool dolbyVisionEnhancementActive_ = false;
+    bool dolbyVisionEnhancementFirstFrameLogged_ = false;
+    bool dolbyVisionEnhancementDynamicMetadataLogged_ = false;
+    bool dolbyVisionEnhancementFailureLogged_ = false;
+    bool dolbyVisionEnhancementOverlayLogged_ = false;
+    bool dolbyVisionEnhancementNoMatchLogged_ = false;
+    bool dolbyVisionEnhancementFirstPackedLogged_ = false;
+    bool dolbyVisionCpuReferenceLogged_ = false;
+    bool dolbyVisionMultiPartitionFallbackLogged_ = false;
+    uint64_t dolbyVisionEnhancementLastDynamicMetadataFingerprint_ = 0;
+    uint64_t dolbyVisionEnhancementFramesDecoded_ = 0;
+    int dolbyVisionEnhancementStreamIndex_ = -1;
+    int dolbyVisionEnhancementProfile_ = 0;
+    int dolbyVisionEnhancementLevel_ = 0;
+    int dolbyVisionEnhancementCompatId_ = 0;
+    bool dolbyVisionEnhancementElPresent_ = false;
+    bool dolbyVisionEnhancementBlPresent_ = false;
+    std::shared_ptr<const anvil::playback::DolbyVisionFrameMetadata> latestDolbyVisionEnhancementMetadata_;
+    std::chrono::milliseconds latestDolbyVisionEnhancementMetadataPts_{0};
+    std::deque<DolbyVisionEnhancementFrame> dolbyVisionEnhancementFrames_;
     std::wstring preferredSubtitleLanguage_ = L"Auto";
     int selectedSubtitleTrackIndex_ = anvil::playback::kSubtitleTrackAuto;
     std::chrono::milliseconds subtitleDelay_{0};
@@ -314,7 +403,9 @@ private:
     bool subtitleCanvasLogged_ = false;
     uint64_t subtitleBitmapSerial_ = 0;
     bool schedulePrimed_ = false;   // startup warm-up gate for the scheduler
+    bool externalSubtitlesActive_ = false;
     std::deque<NativeSubtitleCue> subtitleCues_;
+    std::deque<NativeSubtitleCue> externalSubtitleCues_;
     std::optional<std::chrono::steady_clock::time_point> fallbackClockAnchor_;
     std::chrono::milliseconds fallbackClockBasePts_{0};
     mutable std::mutex mutex_;
@@ -327,6 +418,9 @@ private:
     std::atomic<HWND> notificationWindow_{nullptr};
     std::atomic_uint notificationMessage_{0};
     std::atomic_bool frameMessagePending_{false};
+    std::atomic<int64_t> pendingSeekMs_{-1};
+    std::atomic_bool playbackPaused_{false};
+    std::atomic<int64_t> pausedPositionMs_{0};
     std::thread decodeThread_;
 };
 

@@ -529,13 +529,19 @@ MediaProbeResult ProbeWithAvformat(const std::filesystem::path& path) {
 
         if (parameters->codec_type == AVMEDIA_TYPE_VIDEO) {
             result.descriptor.hasVideo = true;
+            if (const auto dovi = DolbyVisionProfile(parameters); !dovi.empty()) {
+                result.descriptor.dolbyVisionDetected = true;
+                result.descriptor.hdrFormat = dovi;
+            }
             if (result.descriptor.videoCodec.empty()) {
                 const auto color = BuildColorMetadata(parameters);
                 result.descriptor.videoCodec = codec;
                 result.descriptor.videoColor = color;
-                result.descriptor.hdrFormat = DetectHdrFormat(parameters, color);
-                result.descriptor.dolbyVisionDetected =
-                    result.descriptor.hdrFormat.find(L"Dolby Vision") != std::wstring::npos;
+                if (!result.descriptor.dolbyVisionDetected) {
+                    result.descriptor.hdrFormat = DetectHdrFormat(parameters, color);
+                    result.descriptor.dolbyVisionDetected =
+                        result.descriptor.hdrFormat.find(L"Dolby Vision") != std::wstring::npos;
+                }
                 result.descriptor.videoWidth = parameters->width;
                 result.descriptor.videoHeight = parameters->height;
                 result.descriptor.videoFrameRate = ProbeFrameRate(stream, parameters);

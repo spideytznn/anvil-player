@@ -46,6 +46,8 @@ public:
                double volume);
 
     void Stop();
+    bool Seek(std::chrono::milliseconds position);
+    void SetVolume(double volume);
     void SetPlaybackRate(double rate);
 
     bool IsRunning() const {
@@ -95,6 +97,16 @@ private:
     };
 
     void PlaybackLoop();
+    std::optional<std::chrono::milliseconds> TakePendingSeek();
+    bool HasPendingSeek() const;
+    bool ApplyPendingSeek(AVFormatContext* formatCtx,
+                          AVCodecContext* codecCtx,
+                          SwrContext*& swrCtx,
+                          ResamplerState& resamplerState,
+                          IAudioClient* audioClient,
+                          const WasapiFormat& outputFormat,
+                          uint64_t& submittedFrames,
+                          bool& audioClientStarted);
 
     bool InitializeWasapi(Microsoft::WRL::ComPtr<IAudioClient>& audioClient,
                           Microsoft::WRL::ComPtr<IAudioRenderClient>& renderClient,
@@ -106,6 +118,7 @@ private:
     bool ReceiveFrames(AVCodecContext* codecCtx,
                        SwrContext*& swrCtx,
                        AVFrame* frame,
+                       AVRational timeBase,
                        ResamplerState& resamplerState,
                        const WasapiFormat& outputFormat,
                        IAudioRenderClient* renderClient,
@@ -115,6 +128,7 @@ private:
     void DrainDecoder(AVCodecContext* codecCtx,
                       SwrContext*& swrCtx,
                       AVFrame* frame,
+                      AVRational timeBase,
                       ResamplerState& resamplerState,
                       const WasapiFormat& outputFormat,
                       IAudioRenderClient* renderClient,
@@ -122,6 +136,7 @@ private:
                       uint64_t& submittedFrames);
 
     bool RenderFrame(AVFrame* frame,
+                     AVRational timeBase,
                      SwrContext*& swrCtx,
                      ResamplerState& resamplerState,
                      const WasapiFormat& outputFormat,
@@ -137,10 +152,14 @@ private:
                   uint64_t& submittedFrames);
 
     void ApplyVolume(std::vector<uint8_t>& pcm, AVSampleFormat format) const;
+    bool ShouldDropSeekPreroll(const AVFrame* frame, AVRational timeBase, const WasapiFormat& outputFormat) const;
+    static std::chrono::milliseconds FramePts(const AVFrame* frame, AVRational timeBase);
+    static std::chrono::milliseconds FrameDuration(const AVFrame* frame, const WasapiFormat& outputFormat);
 
     void DrainWasapi(IAudioClient* audioClient) const;
 
     void ResetPlaybackClock();
+    void ResetPlaybackClock(std::chrono::milliseconds position);
     void SetPlaybackClockRunning(bool running);
     void UpdatePlaybackClock(const WasapiFormat& outputFormat,
                              uint64_t submittedFrames,
@@ -160,6 +179,7 @@ private:
     std::atomic<double> playbackRate_{1.0};
     std::atomic_bool stopping_{false};
     std::atomic_bool running_{false};
+    std::atomic<int64_t> pendingSeekMs_{-1};
     mutable std::mutex stateMutex_;
     std::condition_variable startCv_;
     bool startResolved_ = false;

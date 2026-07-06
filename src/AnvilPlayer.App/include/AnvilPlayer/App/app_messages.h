@@ -9,6 +9,7 @@ constexpr wchar_t kWindowClassName[] = L"AnvilPlayerWindow";
 constexpr wchar_t kVideoHostClassName[] = L"AnvilVideoHostWindow";
 constexpr wchar_t kFullscreenOverlayClassName[] = L"AnvilFullscreenOverlayWindow";
 constexpr wchar_t kTransportOverlayClassName[] = L"AnvilTransportOverlayWindow";
+constexpr wchar_t kHdrToneCurveWindowClassName[] = L"AnvilHdrToneCurveWindow";
 
 // Playback UI timer.
 constexpr UINT_PTR kPlaybackTimer = 1001;

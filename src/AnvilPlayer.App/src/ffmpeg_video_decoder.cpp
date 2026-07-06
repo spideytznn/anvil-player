@@ -21,6 +21,8 @@ extern "C" {
 #include <cstring>
 #include <cwctype>
 #include <filesystem>
+#include <iomanip>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <system_error>
@@ -50,6 +52,7 @@ struct DoviLibplaceboFilterState {
 using anvil::playback::LogLevel;
 using anvil::playback::DolbyVisionFrameMetadata;
 using anvil::playback::DoviMappingMethod;
+using anvil::playback::DoviNlqMethod;
 using anvil::playback::DoviReshapingCurve;
 using anvil::playback::DoviReshapingPiece;
 using anvil::playback::kDoviMaxPieces;
@@ -90,6 +93,125 @@ float Pq12CodeToNits(const uint16_t code) {
     const double denominator = std::max(c2 - c3 * p, 0.000001);
     const double nits = 10000.0 * std::pow(numerator / denominator, 1.0 / m1);
     return std::isfinite(nits) ? static_cast<float>(nits) : 0.0f;
+}
+
+uint64_t HashBytes(uint64_t hash, const void* data, const std::size_t size) {
+    constexpr uint64_t kFnvPrime = 1099511628211ull;
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    for (std::size_t index = 0; index < size; ++index) {
+        hash ^= bytes[index];
+        hash *= kFnvPrime;
+    }
+    return hash;
+}
+
+template <typename T>
+uint64_t HashValue(uint64_t hash, const T& value) {
+    return HashBytes(hash, &value, sizeof(value));
+}
+
+std::wstring Hex64(const uint64_t value) {
+    std::wostringstream stream;
+    stream << std::hex << std::setw(16) << std::setfill(L'0') << value;
+    return stream.str();
+}
+
+std::wstring DoviDmLevelsSummary(const DolbyVisionFrameMetadata& metadata) {
+    std::wstring levels;
+    const auto append = [&levels](const std::wstring& value) {
+        if (!levels.empty()) {
+            levels += L",";
+        }
+        levels += value;
+    };
+
+    for (int level = 0; level < 64; ++level) {
+        if ((metadata.dmLevelMaskLow & (uint64_t{1} << level)) == 0) {
+            continue;
+        }
+        switch (level) {
+        case 1:
+            append(L"L1");
+            break;
+        case 2:
+            append(metadata.dmLevel2Count > 1
+                       ? L"L2x" + std::to_wstring(metadata.dmLevel2Count)
+                       : L"L2");
+            break;
+        case 3:
+            append(L"L3");
+            break;
+        case 5:
+            append(L"L5");
+            break;
+        case 8:
+            append(metadata.dmLevel8Count > 1
+                       ? L"L8x" + std::to_wstring(metadata.dmLevel8Count)
+                       : L"L8");
+            break;
+        default:
+            append(L"L" + std::to_wstring(level));
+            break;
+        }
+    }
+    if (metadata.dmLevel254Present) append(L"L254");
+    if (metadata.dmLevel255Present) append(L"L255");
+    return levels.empty() ? L"none" : levels;
+}
+
+std::wstring DoviFrameSummary(const DolbyVisionFrameMetadata* metadata) {
+    if (!metadata || !metadata->valid) {
+        return L"none";
+    }
+
+    std::wostringstream stream;
+    stream << L"profile=" << metadata->profile
+           << L" compat=" << metadata->compatibilityId
+           << L" source_max_pq=" << metadata->sourceMaxPq
+           << L" dm_ext=" << metadata->dmExtensionBlockCount
+           << L" dm_levels=" << DoviDmLevelsSummary(*metadata);
+    return stream.str();
+}
+
+std::wstring DoviDynamicLogSummary(const DolbyVisionFrameMetadata& metadata) {
+    std::wostringstream stream;
+    stream << DoviFrameSummary(&metadata)
+           << L" scene_refresh=" << metadata.sceneRefreshFlag
+           << L" dm_hash=" << Hex64(metadata.dynamicMetadataFingerprint);
+    if (metadata.nlqNumXPartitions > 0 || metadata.nlqNumYPartitions > 0) {
+        stream << L" partitions=" << metadata.nlqNumXPartitions << L"x" << metadata.nlqNumYPartitions;
+    }
+    if (metadata.dmLevel1Present) {
+        stream << L" L1(min=" << metadata.dmLevel1MinPq
+               << L" max=" << metadata.dmLevel1MaxPq
+               << L" avg=" << metadata.dmLevel1AvgPq << L")";
+    }
+    if (metadata.dmLevel2Present && metadata.dmLevel2Count > 0) {
+        stream << L" L2(target=" << metadata.dmLevel2TargetMaxPq[0]
+               << L" slope=" << metadata.dmLevel2TrimSlope[0]
+               << L" offset=" << metadata.dmLevel2TrimOffset[0]
+               << L" power=" << metadata.dmLevel2TrimPower[0]
+               << L" sat=" << metadata.dmLevel2TrimSaturationGain[0] << L")";
+    }
+    if (metadata.dmLevel3Present) {
+        stream << L" L3(min_off=" << metadata.dmLevel3MinPqOffset
+               << L" max_off=" << metadata.dmLevel3MaxPqOffset
+               << L" avg_off=" << metadata.dmLevel3AvgPqOffset << L")";
+    }
+    if (metadata.dmLevel5Present) {
+        stream << L" L5(active_area left=" << metadata.dmLevel5LeftOffset
+               << L" right=" << metadata.dmLevel5RightOffset
+               << L" top=" << metadata.dmLevel5TopOffset
+               << L" bottom=" << metadata.dmLevel5BottomOffset << L")";
+    }
+    if (metadata.dmLevel8Present) {
+        stream << L" L8(target=" << static_cast<int>(metadata.dmLevel8TargetDisplayIndex)
+               << L" slope=" << metadata.dmLevel8TrimSlope
+               << L" offset=" << metadata.dmLevel8TrimOffset
+               << L" power=" << metadata.dmLevel8TrimPower
+               << L" sat=" << metadata.dmLevel8TrimSaturationGain << L")";
+    }
+    return stream.str();
 }
 
 uint16_t ReadLe16(const uint8_t* value) {
@@ -148,6 +270,457 @@ void InterleaveYuv420P10RowToP010Uv(uint8_t* destination,
         WriteLe16(destination + static_cast<std::size_t>(x) * 4 + 2,
                   Yuv420P10SampleToP010(sourceV + static_cast<std::size_t>(x) * 2));
     }
+}
+
+bool PackYuv420P10FrameToP010(const AVFrame* frame, NativeYuvPlanes& out) {
+    if (!frame ||
+        frame->format != AV_PIX_FMT_YUV420P10LE ||
+        frame->width <= 0 ||
+        frame->height <= 0 ||
+        (frame->width % 2) != 0 ||
+        (frame->height % 2) != 0 ||
+        !frame->data[0] ||
+        !frame->data[1] ||
+        !frame->data[2]) {
+        return false;
+    }
+
+    const int width = frame->width;
+    const int height = frame->height;
+    const int yStride = width * 2;
+    const int uvStride = (width / 2) * 4;
+    const int uvHeight = height / 2;
+    const std::size_t totalBytes = static_cast<std::size_t>(yStride) * height +
+                                   static_cast<std::size_t>(uvStride) * uvHeight;
+    auto buffer = std::make_shared<std::vector<uint8_t>>();
+    buffer->resize(totalBytes);
+
+    const uint8_t* srcY = frame->data[0];
+    const int srcYStride = frame->linesize[0];
+    for (int row = 0; row < height; ++row) {
+        const uint8_t* srcRow = srcY + static_cast<std::size_t>(row) * srcYStride;
+        uint8_t* dstRow = buffer->data() + static_cast<std::size_t>(row) * yStride;
+        ConvertYuv420P10RowToP010(dstRow, srcRow, width);
+    }
+
+    const uint8_t* srcU = frame->data[1];
+    const uint8_t* srcV = frame->data[2];
+    const int srcUStride = frame->linesize[1];
+    const int srcVStride = frame->linesize[2];
+    uint8_t* uvDst = buffer->data() + static_cast<std::size_t>(yStride) * height;
+    for (int row = 0; row < uvHeight; ++row) {
+        const uint8_t* uRow = srcU + static_cast<std::size_t>(row) * srcUStride;
+        const uint8_t* vRow = srcV + static_cast<std::size_t>(row) * srcVStride;
+        uint8_t* dstRow = uvDst + static_cast<std::size_t>(row) * uvStride;
+        InterleaveYuv420P10RowToP010Uv(dstRow, uRow, vRow, width / 2);
+    }
+
+    out.width = width;
+    out.height = height;
+    out.yStride = yStride;
+    out.uvStride = uvStride;
+    out.bitDepth = 10;
+    out.data = std::move(buffer);
+    return true;
+}
+
+bool DoviSingleNlqPartition(const DolbyVisionFrameMetadata& metadata) {
+    return metadata.nlqNumXPartitions <= 1 && metadata.nlqNumYPartitions <= 1;
+}
+
+int DoviBitDepthMax(const int bitDepth) {
+    const int depth = std::clamp(bitDepth, 1, 16);
+    return static_cast<int>((uint32_t{1} << depth) - 1u);
+}
+
+uint16_t ReadP010PackedCode(const NativeYuvPlanes& planes, const std::size_t offset) {
+    if (!planes.data || offset + 2 > planes.data->size()) {
+        return 0;
+    }
+    const int depth = std::clamp(planes.bitDepth, 8, 16);
+    return static_cast<uint16_t>(ReadLe16(planes.data->data() + offset) >> (16 - depth));
+}
+
+uint16_t ReadP010YCode(const NativeYuvPlanes& planes, const int x, const int y) {
+    if (!planes.HasData()) {
+        return 0;
+    }
+    const int clampedX = std::clamp(x, 0, planes.width - 1);
+    const int clampedY = std::clamp(y, 0, planes.height - 1);
+    const std::size_t offset = static_cast<std::size_t>(clampedY) * planes.yStride +
+                               static_cast<std::size_t>(clampedX) * 2;
+    return ReadP010PackedCode(planes, offset);
+}
+
+uint16_t ReadP010UvCode(const NativeYuvPlanes& planes, const int chromaX, const int chromaY, const int component) {
+    if (!planes.HasData()) {
+        return 0;
+    }
+    const int chromaWidth = std::max(1, planes.width / 2);
+    const int chromaHeight = std::max(1, planes.height / 2);
+    const int clampedX = std::clamp(chromaX, 0, chromaWidth - 1);
+    const int clampedY = std::clamp(chromaY, 0, chromaHeight - 1);
+    const int uvComponent = component == 2 ? 1 : 0;
+    const std::size_t uvBase = static_cast<std::size_t>(planes.yStride) * planes.height;
+    const std::size_t offset = uvBase +
+                               static_cast<std::size_t>(clampedY) * planes.uvStride +
+                               static_cast<std::size_t>(clampedX) * 4 +
+                               static_cast<std::size_t>(uvComponent) * 2;
+    return ReadP010PackedCode(planes, offset);
+}
+
+double P010YCodeNorm(const NativeYuvPlanes& planes, const int x, const int y) {
+    return static_cast<double>(ReadP010YCode(planes, x, y)) /
+           static_cast<double>(std::max(1, DoviBitDepthMax(planes.bitDepth)));
+}
+
+double P010UvCodeNorm(const NativeYuvPlanes& planes, const int chromaX, const int chromaY, const int component) {
+    return static_cast<double>(ReadP010UvCode(planes, chromaX, chromaY, component)) /
+           static_cast<double>(std::max(1, DoviBitDepthMax(planes.bitDepth)));
+}
+
+double DoviCubicWeight(double x) {
+    x = std::abs(x);
+    if (x <= 1.0) {
+        return ((1.5 * x - 2.5) * x * x + 1.0);
+    }
+    if (x < 2.0) {
+        return (((-0.5 * x + 2.5) * x - 4.0) * x + 2.0);
+    }
+    return 0.0;
+}
+
+double SampleP010YCodeLinear(const NativeYuvPlanes& planes, const double uvX, const double uvY) {
+    const double coordX = std::clamp(uvX, 0.0, 1.0) * planes.width - 0.5;
+    const double coordY = std::clamp(uvY, 0.0, 1.0) * planes.height - 0.5;
+    const int baseX = static_cast<int>(std::floor(coordX));
+    const int baseY = static_cast<int>(std::floor(coordY));
+    const double fracX = coordX - std::floor(coordX);
+    const double fracY = coordY - std::floor(coordY);
+    const double s00 = ReadP010YCode(planes, baseX, baseY);
+    const double s10 = ReadP010YCode(planes, baseX + 1, baseY);
+    const double s01 = ReadP010YCode(planes, baseX, baseY + 1);
+    const double s11 = ReadP010YCode(planes, baseX + 1, baseY + 1);
+    const double top = s00 + (s10 - s00) * fracX;
+    const double bottom = s01 + (s11 - s01) * fracX;
+    return top + (bottom - top) * fracY;
+}
+
+double SampleP010YCodeCubic(const NativeYuvPlanes& planes, const double uvX, const double uvY) {
+    const double coordX = std::clamp(uvX, 0.0, 1.0) * planes.width - 0.5;
+    const double coordY = std::clamp(uvY, 0.0, 1.0) * planes.height - 0.5;
+    const int baseX = static_cast<int>(std::floor(coordX));
+    const int baseY = static_cast<int>(std::floor(coordY));
+    const double fracX = coordX - std::floor(coordX);
+    const double fracY = coordY - std::floor(coordY);
+    double sum = 0.0;
+    double weightSum = 0.0;
+    for (int j = -1; j <= 2; ++j) {
+        const double wy = DoviCubicWeight(static_cast<double>(j) - fracY);
+        for (int i = -1; i <= 2; ++i) {
+            const double wx = DoviCubicWeight(static_cast<double>(i) - fracX);
+            const double weight = wx * wy;
+            sum += static_cast<double>(ReadP010YCode(planes, baseX + i, baseY + j)) * weight;
+            weightSum += weight;
+        }
+    }
+    return weightSum > 0.0 ? sum / weightSum : 0.0;
+}
+
+double SampleP010UvCodeLinear(const NativeYuvPlanes& planes, const double uvX, const double uvY, const int component) {
+    const int chromaWidth = std::max(1, planes.width / 2);
+    const int chromaHeight = std::max(1, planes.height / 2);
+    const double coordX = std::clamp(uvX, 0.0, 1.0) * chromaWidth - 0.5;
+    const double coordY = std::clamp(uvY, 0.0, 1.0) * chromaHeight - 0.5;
+    const int baseX = static_cast<int>(std::floor(coordX));
+    const int baseY = static_cast<int>(std::floor(coordY));
+    const double fracX = coordX - std::floor(coordX);
+    const double fracY = coordY - std::floor(coordY);
+    const double s00 = ReadP010UvCode(planes, baseX, baseY, component);
+    const double s10 = ReadP010UvCode(planes, baseX + 1, baseY, component);
+    const double s01 = ReadP010UvCode(planes, baseX, baseY + 1, component);
+    const double s11 = ReadP010UvCode(planes, baseX + 1, baseY + 1, component);
+    const double top = s00 + (s10 - s00) * fracX;
+    const double bottom = s01 + (s11 - s01) * fracX;
+    return top + (bottom - top) * fracY;
+}
+
+double SampleP010UvCodeCubic(const NativeYuvPlanes& planes, const double uvX, const double uvY, const int component) {
+    const int chromaWidth = std::max(1, planes.width / 2);
+    const int chromaHeight = std::max(1, planes.height / 2);
+    const double coordX = std::clamp(uvX, 0.0, 1.0) * chromaWidth - 0.5;
+    const double coordY = std::clamp(uvY, 0.0, 1.0) * chromaHeight - 0.5;
+    const int baseX = static_cast<int>(std::floor(coordX));
+    const int baseY = static_cast<int>(std::floor(coordY));
+    const double fracX = coordX - std::floor(coordX);
+    const double fracY = coordY - std::floor(coordY);
+    double sum = 0.0;
+    double weightSum = 0.0;
+    for (int j = -1; j <= 2; ++j) {
+        const double wy = DoviCubicWeight(static_cast<double>(j) - fracY);
+        for (int i = -1; i <= 2; ++i) {
+            const double wx = DoviCubicWeight(static_cast<double>(i) - fracX);
+            const double weight = wx * wy;
+            sum += static_cast<double>(ReadP010UvCode(planes, baseX + i, baseY + j, component)) * weight;
+            weightSum += weight;
+        }
+    }
+    return weightSum > 0.0 ? sum / weightSum : 0.0;
+}
+
+uint16_t ClampRoundCode(const double value, const int maxCode) {
+    const double clamped = std::clamp(value, 0.0, static_cast<double>(maxCode));
+    return static_cast<uint16_t>(std::floor(clamped + 0.5));
+}
+
+uint16_t SampleFelYCodeReference(const NativeYuvPlanes& planes,
+                                 const DolbyVisionFrameMetadata& metadata,
+                                 const double uvX,
+                                 const double uvY) {
+    const int maxCode = DoviBitDepthMax(planes.bitDepth);
+    const double sample = metadata.elSpatialResampling
+                              ? SampleP010YCodeCubic(planes, uvX, uvY)
+                              : SampleP010YCodeLinear(planes, uvX, uvY);
+    return ClampRoundCode(sample, maxCode);
+}
+
+uint16_t SampleFelUvCodeReference(const NativeYuvPlanes& planes,
+                                  const DolbyVisionFrameMetadata& metadata,
+                                  const double uvX,
+                                  const double uvY,
+                                  const int component) {
+    const int maxCode = DoviBitDepthMax(planes.bitDepth);
+    const double sample = metadata.elSpatialResampling
+                              ? SampleP010UvCodeCubic(planes, uvX, uvY, component)
+                              : SampleP010UvCodeLinear(planes, uvX, uvY, component);
+    return ClampRoundCode(sample, maxCode);
+}
+
+double DoviChromaSiteLumaNormReference(const NativeYuvPlanes& planes, const int x, const int y) {
+    constexpr int weights[4] = {1, 3, 3, 1};
+    double sum = 0.0;
+    for (int j = 0; j < 4; ++j) {
+        for (int i = 0; i < 4; ++i) {
+            sum += P010YCodeNorm(planes, x + i - 1, y + j - 1) *
+                   static_cast<double>(weights[i] * weights[j]);
+        }
+    }
+    return std::clamp(sum / 64.0, 0.0, 1.0);
+}
+
+int64_t DoviRoundSigned(const long double value) {
+    if (value < 0.0L) {
+        return -static_cast<int64_t>(std::floor(-value + 0.5L));
+    }
+    return static_cast<int64_t>(std::floor(value + 0.5L));
+}
+
+uint16_t ClampCode16(const int64_t value) {
+    return static_cast<uint16_t>(std::clamp<int64_t>(value, 0, 65535));
+}
+
+int DoviFindPieceReference(const DoviReshapingCurve& curve, const double value) {
+    const int numPivots = std::clamp(curve.numPivots, 2, kDoviMaxPivots);
+    const int lastPiece = std::max(0, numPivots - 2);
+    for (int piece = 0; piece < lastPiece; ++piece) {
+        if (value < curve.pivots[piece + 1]) {
+            return piece;
+        }
+    }
+    return lastPiece;
+}
+
+double DoviMmrReference(const DoviReshapingPiece& piece, const double signal[3]) {
+    double m[24] = {};
+    m[0] = piece.mmrConstant;
+    int index = 1;
+    const int order = std::clamp(piece.mmrOrder, 1, kDoviMmrMaxTerms);
+    for (int term = 0; term < order; ++term) {
+        for (int coefficient = 0; coefficient < kDoviMmrCoeffsPerOrder; ++coefficient) {
+            if (index < 24) {
+                m[index] = piece.mmrCoef[term][coefficient];
+            }
+            ++index;
+        }
+    }
+
+    const double x = signal[0];
+    const double y = signal[1];
+    const double z = signal[2];
+    const double sigX[4] = {x * y, x * z, y * z, x * y * z};
+    double result = m[0] + m[1] * x + m[2] * y + m[3] * z;
+    result += m[4] * sigX[0] + m[5] * sigX[1] + m[6] * sigX[2] + m[7] * sigX[3];
+    if (order >= 2) {
+        const double x2 = x * x;
+        const double y2 = y * y;
+        const double z2 = z * z;
+        const double sigX2[4] = {sigX[0] * sigX[0], sigX[1] * sigX[1], sigX[2] * sigX[2], sigX[3] * sigX[3]};
+        result += m[8] * x2 + m[9] * y2 + m[10] * z2;
+        result += m[11] * sigX2[0] + m[12] * sigX2[1] + m[13] * sigX2[2] + m[14] * sigX2[3];
+        if (order >= 3) {
+            result += m[15] * x2 * x + m[16] * y2 * y + m[17] * z2 * z;
+            result += m[18] * sigX2[0] * sigX[0] +
+                      m[19] * sigX2[1] * sigX[1] +
+                      m[20] * sigX2[2] * sigX[2] +
+                      m[21] * sigX2[3] * sigX[3];
+        }
+    }
+    return std::isfinite(result) ? result : signal[0];
+}
+
+uint16_t DoviMapComponentCode16Reference(const DolbyVisionFrameMetadata& metadata,
+                                         const int component,
+                                         const double signal[3]) {
+    const DoviReshapingCurve& curve = metadata.curves[component];
+    const int pieceIndex = DoviFindPieceReference(curve, signal[component]);
+    const DoviReshapingPiece& piece = curve.pieces[pieceIndex];
+    if (piece.method == DoviMappingMethod::Polynomial) {
+        const int blBits = std::clamp(metadata.blBitDepth, 8, 16);
+        const double sCode = std::clamp(signal[component], 0.0, 1.0) *
+                             static_cast<double>(DoviBitDepthMax(blBits));
+        const double v16 = static_cast<double>(piece.polyCoef[0]) * static_cast<double>(1u << 20) +
+                           static_cast<double>(piece.polyCoef[1]) * sCode * std::ldexp(1.0, 20 - blBits) +
+                           static_cast<double>(piece.polyCoef[2]) * sCode * sCode * std::ldexp(1.0, 20 - 2 * blBits);
+        return ClampCode16(static_cast<int64_t>(std::floor(std::clamp(v16 / 16.0, 0.0, 65535.0) + 0.5)));
+    }
+    if (piece.method == DoviMappingMethod::Mmr) {
+        return ClampCode16(static_cast<int64_t>(std::floor(std::clamp(DoviMmrReference(piece, signal), 0.0, 1.0) *
+                                                           65535.0 + 0.5)));
+    }
+    return ClampCode16(static_cast<int64_t>(std::floor(std::clamp(signal[component], 0.0, 1.0) * 65535.0 + 0.5)));
+}
+
+int64_t DoviInverseNlqResidualCodeReference(const DolbyVisionFrameMetadata& metadata,
+                                            const int component,
+                                            const uint16_t enhancementCode) {
+    if (metadata.residualDisabled || metadata.nlqMethod != DoviNlqMethod::LinearDeadzone) {
+        return 0;
+    }
+    const long double rr = static_cast<long double>(enhancementCode) -
+                           static_cast<long double>(metadata.nlqOffset[component]);
+    if (std::abs(rr) < 0.5L) {
+        return 0;
+    }
+    const long double sign = rr < 0.0L ? -1.0L : 1.0L;
+    const int elBits = std::clamp(metadata.elBitDepth, 8, 16);
+    const long double bitScale = std::ldexp(1.0L, 10 - elBits);
+    const long double rrLinear = sign * std::max(std::abs(rr) * 2.0L - 1.0L, 0.0L) * bitScale;
+    long double dq = rrLinear * static_cast<long double>(metadata.nlqLinearDeadzoneSlope[component]) +
+                     static_cast<long double>(metadata.nlqLinearDeadzoneThreshold[component]) *
+                         std::ldexp(1.0L, 10 - elBits + 1) * sign;
+    const long double limit = std::max(static_cast<long double>(metadata.nlqVdrInMax[component]) *
+                                           std::ldexp(1.0L, 10 - elBits + 1),
+                                       0.0L);
+    dq = std::clamp(dq, -limit, limit);
+    const int exponent = std::max(0, metadata.coefLog2Denom) - 5 - elBits;
+    const long double residual16 = dq / std::ldexp(1.0L, exponent);
+    return DoviRoundSigned(residual16);
+}
+
+uint16_t DoviVdrOutputCodeReference(const int64_t code16, const int vdrBitDepth) {
+    const int bits = std::clamp(vdrBitDepth, 8, 16);
+    const int maxCode = DoviBitDepthMax(bits);
+    const long double quantStep = std::ldexp(1.0L, 16 - bits);
+    const long double clamped = static_cast<long double>(std::clamp<int64_t>(code16, 0, 65535));
+    const int64_t code = DoviRoundSigned(clamped / quantStep);
+    return static_cast<uint16_t>(std::clamp<int64_t>(code, 0, maxCode));
+}
+
+struct DoviCpuReferenceStats {
+    int gridWidth = 0;
+    int gridHeight = 0;
+    int vdrBitDepth = 0;
+    uint64_t sampleCount = 0;
+    uint64_t hash = 14695981039346656037ull;
+    uint16_t minCode[3] = {
+        std::numeric_limits<uint16_t>::max(),
+        std::numeric_limits<uint16_t>::max(),
+        std::numeric_limits<uint16_t>::max(),
+    };
+    uint16_t maxCode[3] = {};
+    uint64_t sumCode[3] = {};
+};
+
+void AccumulateDoviReferenceStats(DoviCpuReferenceStats& stats,
+                                  const uint16_t y,
+                                  const uint16_t cb,
+                                  const uint16_t cr) {
+    const uint16_t values[3] = {y, cb, cr};
+    for (int component = 0; component < 3; ++component) {
+        stats.minCode[component] = std::min(stats.minCode[component], values[component]);
+        stats.maxCode[component] = std::max(stats.maxCode[component], values[component]);
+        stats.sumCode[component] += values[component];
+        stats.hash = HashValue(stats.hash, values[component]);
+    }
+    ++stats.sampleCount;
+}
+
+bool BuildDolbyVisionCpuReferenceSample(const NativeVideoFrame& frame, DoviCpuReferenceStats& stats) {
+    if (!frame.HasYuv() ||
+        !frame.HasEnhancementYuv() ||
+        !frame.enhancementDovi ||
+        !frame.enhancementDovi->valid) {
+        return false;
+    }
+    const DolbyVisionFrameMetadata& metadata = *frame.enhancementDovi;
+    if (!DoviSingleNlqPartition(metadata) ||
+        frame.yuv.width <= 0 ||
+        frame.yuv.height <= 0 ||
+        frame.enhancementYuv.width <= 0 ||
+        frame.enhancementYuv.height <= 0) {
+        return false;
+    }
+
+    constexpr int kReferenceGridWidth = 64;
+    constexpr int kReferenceGridHeight = 36;
+    stats.gridWidth = std::min(kReferenceGridWidth, frame.yuv.width);
+    stats.gridHeight = std::min(kReferenceGridHeight, frame.yuv.height);
+    stats.vdrBitDepth = std::clamp(metadata.vdrBitDepth, 8, 16);
+    if (stats.gridWidth <= 0 || stats.gridHeight <= 0) {
+        return false;
+    }
+
+    for (int gy = 0; gy < stats.gridHeight; ++gy) {
+        const int y = stats.gridHeight == 1
+                          ? frame.yuv.height / 2
+                          : static_cast<int>((static_cast<int64_t>(gy) * (frame.yuv.height - 1)) / (stats.gridHeight - 1));
+        for (int gx = 0; gx < stats.gridWidth; ++gx) {
+            const int x = stats.gridWidth == 1
+                              ? frame.yuv.width / 2
+                              : static_cast<int>((static_cast<int64_t>(gx) * (frame.yuv.width - 1)) / (stats.gridWidth - 1));
+            const double uvX = (static_cast<double>(x) + 0.5) / static_cast<double>(frame.yuv.width);
+            const double uvY = (static_cast<double>(y) + 0.5) / static_cast<double>(frame.yuv.height);
+            const int chromaX = x / 2;
+            const int chromaY = y / 2;
+
+            const double blPixel[3] = {
+                P010YCodeNorm(frame.yuv, x, y),
+                P010UvCodeNorm(frame.yuv, chromaX, chromaY, 1),
+                P010UvCodeNorm(frame.yuv, chromaX, chromaY, 2),
+            };
+            const double blChroma[3] = {
+                DoviChromaSiteLumaNormReference(frame.yuv, x, y),
+                blPixel[1],
+                blPixel[2],
+            };
+
+            const uint16_t mappedY = DoviMapComponentCode16Reference(metadata, 0, blPixel);
+            const uint16_t mappedCb = DoviMapComponentCode16Reference(metadata, 1, blChroma);
+            const uint16_t mappedCr = DoviMapComponentCode16Reference(metadata, 2, blChroma);
+            const uint16_t elY = SampleFelYCodeReference(frame.enhancementYuv, metadata, uvX, uvY);
+            const uint16_t elCb = SampleFelUvCodeReference(frame.enhancementYuv, metadata, uvX, uvY, 1);
+            const uint16_t elCr = SampleFelUvCodeReference(frame.enhancementYuv, metadata, uvX, uvY, 2);
+
+            const int64_t mergedY = static_cast<int64_t>(mappedY) + DoviInverseNlqResidualCodeReference(metadata, 0, elY);
+            const int64_t mergedCb = static_cast<int64_t>(mappedCb) + DoviInverseNlqResidualCodeReference(metadata, 1, elCb);
+            const int64_t mergedCr = static_cast<int64_t>(mappedCr) + DoviInverseNlqResidualCodeReference(metadata, 2, elCr);
+            AccumulateDoviReferenceStats(stats,
+                                         DoviVdrOutputCodeReference(mergedY, metadata.vdrBitDepth),
+                                         DoviVdrOutputCodeReference(mergedCb, metadata.vdrBitDepth),
+                                         DoviVdrOutputCodeReference(mergedCr, metadata.vdrBitDepth));
+        }
+    }
+    return stats.sampleCount > 0;
 }
 
 VideoColorPrimaries MapColorPrimaries(const AVColorPrimaries value) {
@@ -686,6 +1259,133 @@ std::optional<std::chrono::milliseconds> PacketDuration(const AVPacket* packet, 
         av_rescale_q(packet->duration, streamTimeBase, AVRational{1, 1000})};
 }
 
+std::optional<std::chrono::milliseconds> PacketTimestamp(const AVPacket* packet, const AVRational streamTimeBase) {
+    if (!packet) {
+        return std::nullopt;
+    }
+    const int64_t ticks = packet->pts != AV_NOPTS_VALUE ? packet->pts : packet->dts;
+    if (ticks == AV_NOPTS_VALUE) {
+        return std::nullopt;
+    }
+    return std::chrono::milliseconds{
+        av_rescale_q(ticks, streamTimeBase, AVRational{1, 1000})};
+}
+
+std::chrono::milliseconds EstimatedVideoPacketDuration(const AVStream* stream) {
+    if (stream) {
+        const AVRational rate = stream->avg_frame_rate.num > 0 && stream->avg_frame_rate.den > 0
+                                    ? stream->avg_frame_rate
+                                    : stream->r_frame_rate;
+        if (rate.num > 0 && rate.den > 0) {
+            const auto duration = std::chrono::milliseconds{
+                av_rescale_q(1, AVRational{rate.den, rate.num}, AVRational{1, 1000})};
+            if (duration > std::chrono::milliseconds{0} && duration < std::chrono::milliseconds{1000}) {
+                return duration;
+            }
+        }
+    }
+    return std::chrono::milliseconds{40};
+}
+
+std::size_t PacketCacheCostBytes(const AVPacket* packet) {
+    if (!packet) {
+        return 0;
+    }
+    std::size_t bytes = sizeof(AVPacket) + 256;
+    if (packet->size > 0) {
+        bytes += static_cast<std::size_t>(packet->size);
+    }
+    for (int index = 0; index < packet->side_data_elems; ++index) {
+        bytes += sizeof(AVPacketSideData);
+        if (packet->side_data[index].size > 0) {
+            bytes += static_cast<std::size_t>(packet->side_data[index].size);
+        }
+    }
+    return bytes;
+}
+
+std::size_t PacketReadAheadBudgetBytes(const std::size_t minBudget, const std::size_t maxBudget) {
+    MEMORYSTATUSEX memory{};
+    memory.dwLength = sizeof(memory);
+    if (GlobalMemoryStatusEx(&memory)) {
+        const auto adaptive = static_cast<std::uint64_t>(memory.ullAvailPhys / 6);
+        const auto clamped = std::clamp(adaptive,
+                                        static_cast<std::uint64_t>(minBudget),
+                                        static_cast<std::uint64_t>(maxBudget));
+        return static_cast<std::size_t>(clamped);
+    }
+    return maxBudget;
+}
+
+struct CachedVideoPacket {
+    AVPacket* packet = nullptr;
+    std::chrono::milliseconds pts{0};
+    std::chrono::milliseconds end{0};
+    std::size_t bytes = 0;
+
+    CachedVideoPacket() = default;
+    CachedVideoPacket(const CachedVideoPacket&) = delete;
+    CachedVideoPacket& operator=(const CachedVideoPacket&) = delete;
+
+    CachedVideoPacket(CachedVideoPacket&& other) noexcept
+        : packet(std::exchange(other.packet, nullptr)),
+          pts(other.pts),
+          end(other.end),
+          bytes(std::exchange(other.bytes, 0)) {}
+
+    CachedVideoPacket& operator=(CachedVideoPacket&& other) noexcept {
+        if (this != &other) {
+            Reset();
+            packet = std::exchange(other.packet, nullptr);
+            pts = other.pts;
+            end = other.end;
+            bytes = std::exchange(other.bytes, 0);
+        }
+        return *this;
+    }
+
+    ~CachedVideoPacket() {
+        Reset();
+    }
+
+    void Reset() {
+        if (packet) {
+            av_packet_free(&packet);
+        }
+        bytes = 0;
+    }
+
+    static std::optional<CachedVideoPacket> MoveFrom(AVPacket* source,
+                                                     const AVRational timeBase,
+                                                     const std::chrono::milliseconds fallbackStart,
+                                                     const std::chrono::milliseconds fallbackDuration) {
+        if (!source) {
+            return std::nullopt;
+        }
+
+        AVPacket* owned = av_packet_alloc();
+        if (!owned) {
+            return std::nullopt;
+        }
+
+        CachedVideoPacket cached;
+        cached.bytes = PacketCacheCostBytes(source);
+        auto start = PacketTimestamp(source, timeBase).value_or(fallbackStart);
+        if (start < fallbackStart) {
+            start = fallbackStart;
+        }
+        auto duration = PacketDuration(source, timeBase).value_or(fallbackDuration);
+        if (duration <= std::chrono::milliseconds{0}) {
+            duration = fallbackDuration;
+        }
+        cached.pts = start;
+        cached.end = std::max(start + duration, start + std::chrono::milliseconds{1});
+        av_packet_move_ref(owned, source);
+        cached.packet = owned;
+        return cached;
+    }
+};
+
 const AVDOVIDecoderConfigurationRecord* DolbyVisionConfig(const AVCodecParameters* parameters) {
     if (!parameters) {
         return nullptr;
@@ -705,6 +1405,44 @@ bool IsDolbyVisionEnhancementLayer(const AVCodecParameters* parameters) {
     return dovi &&
            dovi->el_present_flag != 0 &&
            dovi->bl_present_flag == 0;
+}
+
+std::wstring DoviNlqMethodName(const AVDOVINLQMethod method) {
+    switch (method) {
+    case AV_DOVI_NLQ_NONE:
+        return L"none";
+    case AV_DOVI_NLQ_LINEAR_DZ:
+        return L"linear_dz";
+    default:
+        return L"unknown(" + std::to_wstring(static_cast<int>(method)) + L")";
+    }
+}
+
+std::wstring DoviResidualSummary(const AVFrame* frame) {
+    const AVFrameSideData* sideData = frame ? av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_METADATA) : nullptr;
+    if (!sideData || sideData->size < sizeof(AVDOVIMetadata)) {
+        return L" residual=unknown";
+    }
+
+    const auto* dovi = reinterpret_cast<const AVDOVIMetadata*>(sideData->data);
+    const AVDOVIRpuDataHeader* header = av_dovi_get_header(dovi);
+    const AVDOVIDataMapping* mapping = av_dovi_get_mapping(dovi);
+    if (!header || !mapping) {
+        return L" residual=unknown";
+    }
+
+    std::wostringstream stream;
+    stream << L" residual=" << (header->disable_residual_flag ? L"disabled" : L"enabled")
+           << L" el_spatial=" << static_cast<int>(header->el_spatial_resampling_filter_flag)
+           << L" nlq=" << DoviNlqMethodName(mapping->nlq_method_idc)
+           << L" partitions=" << mapping->num_x_partitions << L"x" << mapping->num_y_partitions;
+    if (mapping->nlq_method_idc != AV_DOVI_NLQ_NONE) {
+        stream << L" nlq0(offset=" << mapping->nlq[0].nlq_offset
+               << L" vdr_max=" << mapping->nlq[0].vdr_in_max
+               << L" slope=" << mapping->nlq[0].linear_deadzone_slope
+               << L" threshold=" << mapping->nlq[0].linear_deadzone_threshold << L")";
+    }
+    return stream.str();
 }
 
 std::wstring VideoStreamDescription(const AVStream* stream) {
@@ -746,7 +1484,8 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
                                const std::chrono::milliseconds subtitleDelay,
                                const bool autoLoadExternalSubtitles,
                                const bool oneShotFrame,
-                               const bool preferDolbyVisionHdrOutput) {
+                               const bool preferDolbyVisionHdrOutput,
+                               const bool enableDolbyVisionEnhancementDecode) {
     Stop();
     if (mediaPath.empty()) {
         return false;
@@ -766,6 +1505,8 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
     bitmapSubtitleLogged_ = false;
     dolbyVisionLibplaceboFailed_ = false;
     dolbyVisionLibplaceboFrameLogged_ = false;
+    dolbyVisionDynamicMetadataLogged_ = false;
+    dolbyVisionLastDynamicMetadataFingerprint_ = 0;
     doviLibplaceboFilter_.reset();
     streamColorMetadata_ = {};
     preferredSubtitleLanguage_ = std::move(preferredSubtitleLanguage);
@@ -775,17 +1516,43 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
     autoLoadExternalSubtitles_ = autoLoadExternalSubtitles;
     oneShotFrame_ = oneShotFrame;
     preferDolbyVisionHdrOutput_ = preferDolbyVisionHdrOutput;
+    enableDolbyVisionEnhancementDecode_ = enableDolbyVisionEnhancementDecode;
+    dolbyVisionEnhancementActive_ = false;
+    dolbyVisionEnhancementFirstFrameLogged_ = false;
+    dolbyVisionEnhancementDynamicMetadataLogged_ = false;
+    dolbyVisionEnhancementFailureLogged_ = false;
+    dolbyVisionEnhancementOverlayLogged_ = false;
+    dolbyVisionEnhancementNoMatchLogged_ = false;
+    dolbyVisionEnhancementFirstPackedLogged_ = false;
+    dolbyVisionCpuReferenceLogged_ = false;
+    dolbyVisionMultiPartitionFallbackLogged_ = false;
+    dolbyVisionEnhancementLastDynamicMetadataFingerprint_ = 0;
+    dolbyVisionEnhancementFramesDecoded_ = 0;
+    dolbyVisionEnhancementStreamIndex_ = -1;
+    dolbyVisionEnhancementProfile_ = 0;
+    dolbyVisionEnhancementLevel_ = 0;
+    dolbyVisionEnhancementCompatId_ = 0;
+    dolbyVisionEnhancementElPresent_ = false;
+    dolbyVisionEnhancementBlPresent_ = false;
+    latestDolbyVisionEnhancementMetadata_.reset();
+    latestDolbyVisionEnhancementMetadataPts_ = std::chrono::milliseconds{0};
+    dolbyVisionEnhancementFrames_.clear();
     subtitleCanvasWidth_ = 0;
     subtitleCanvasHeight_ = 0;
     subtitleCanvasLogged_ = false;
     subtitleBitmapSerial_ = 0;
+    externalSubtitlesActive_ = false;
     subtitleCues_.clear();
+    externalSubtitleCues_.clear();
     clockCallback_ = std::move(clockCallback);
     fallbackClockAnchor_.reset();
     fallbackClockBasePts_ = std::chrono::milliseconds{0};
     notificationWindow_.store(notificationWindow);
     notificationMessage_.store(notificationMessage);
     frameMessagePending_.store(false);
+    pendingSeekMs_.store(-1);
+    playbackPaused_.store(false);
+    pausedPositionMs_.store(startPosition.count());
     stopping_.store(false);
     schedulePrimed_ = false;
     {
@@ -800,6 +1567,8 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
         latestFrame_.d3dFormat = DXGI_FORMAT_UNKNOWN;
         latestFrame_.softwareFormat = AV_PIX_FMT_NONE;
         latestFrame_.color = {};
+        latestFrame_.dynamicMetadataPath.clear();
+        latestFrame_.dynamicMetadataDetails.clear();
         latestFrame_.subtitleText.clear();
         latestFrame_.subtitleBitmaps.clear();
         frameQueue_.clear();
@@ -813,6 +1582,8 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
 
 void FfmpegVideoDecoder::Stop() {
     stopping_.store(true);
+    pendingSeekMs_.store(-1);
+    playbackPaused_.store(false);
     notificationWindow_.store(nullptr);
     notificationMessage_.store(0);
     frameMessagePending_.store(false);
@@ -824,9 +1595,49 @@ void FfmpegVideoDecoder::Stop() {
     sharedD3DDevice_.Reset();
 }
 
+bool FfmpegVideoDecoder::Seek(const std::chrono::milliseconds position) {
+    if (!running_.load() || oneShotFrame_) {
+        return false;
+    }
+
+    const auto clamped = std::max(position, std::chrono::milliseconds{0});
+    pendingSeekMs_.store(clamped.count());
+    frameMessagePending_.store(false);
+    {
+        std::scoped_lock lock(mutex_);
+        latestFrame_ = {};
+        frameQueue_.clear();
+        schedulePrimed_ = false;
+        fallbackClockAnchor_.reset();
+        fallbackClockBasePts_ = clamped;
+        const auto decoder = stats_.decoder;
+        const auto fallbackReason = stats_.fallbackReason;
+        const bool usingHardware = stats_.usingHardwareDecode;
+        stats_ = {};
+        stats_.decoder = decoder;
+        stats_.fallbackReason = fallbackReason;
+        stats_.usingHardwareDecode = usingHardware;
+        UpdateBufferedStatsLocked();
+    }
+    return true;
+}
+
+void FfmpegVideoDecoder::SetPaused(const bool paused, const std::chrono::milliseconds position) {
+    const auto clamped = std::max(position, std::chrono::milliseconds{0});
+    pausedPositionMs_.store(clamped.count());
+    playbackPaused_.store(paused);
+    {
+        std::scoped_lock lock(mutex_);
+        fallbackClockAnchor_.reset();
+        fallbackClockBasePts_ = clamped;
+        stats_.clockPosition = clamped;
+        UpdateBufferedStatsLocked();
+    }
+}
+
 int FfmpegVideoDecoder::InterruptCallback(void* opaque) {
     const auto* decoder = static_cast<const FfmpegVideoDecoder*>(opaque);
-    return decoder && decoder->stopping_.load() ? 1 : 0;
+    return decoder && (decoder->stopping_.load() || decoder->HasPendingSeek()) ? 1 : 0;
 }
 
 bool FfmpegVideoDecoder::LatestFrame(NativeVideoFrame& frame) const {
@@ -850,10 +1661,17 @@ void FfmpegVideoDecoder::ClearFrame() {
     latestFrame_.d3dFormat = DXGI_FORMAT_UNKNOWN;
     latestFrame_.softwareFormat = AV_PIX_FMT_NONE;
     latestFrame_.color = {};
+    latestFrame_.dynamicMetadataPath.clear();
+    latestFrame_.dynamicMetadataDetails.clear();
     latestFrame_.subtitleText.clear();
     latestFrame_.subtitleBitmaps.clear();
     frameQueue_.clear();
     stats_.queueDepth = 0;
+    stats_.packetQueueDepth = 0;
+    stats_.packetQueueBytes = 0;
+    stats_.readAheadEnd = std::chrono::milliseconds{0};
+    stats_.readAheadDuration = std::chrono::milliseconds{0};
+    UpdateBufferedStatsLocked();
 }
 
 void FfmpegVideoDecoder::AcknowledgeFrameNotification() {
@@ -863,6 +1681,23 @@ void FfmpegVideoDecoder::AcknowledgeFrameNotification() {
 NativeVideoQueueStats FfmpegVideoDecoder::Stats() const {
     std::scoped_lock lock(mutex_);
     return stats_;
+}
+
+bool FfmpegVideoDecoder::WaitForPreroll(const std::chrono::milliseconds targetDuration,
+                                        const std::chrono::milliseconds timeout) const {
+    if (oneShotFrame_ || timeout.count() <= 0) {
+        return false;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!stopping_.load() && running_.load() && !HasPendingSeek() && std::chrono::steady_clock::now() < deadline) {
+        const auto stats = Stats();
+        if (stats.queueDepth > 0 && (stats.bufferedDuration >= targetDuration || stats.queueDepth >= 2)) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    return false;
 }
 
 int FfmpegVideoDecoder::SelectVideoStream(AVFormatContext* formatCtx) const {
@@ -914,16 +1749,20 @@ int FfmpegVideoDecoder::SelectVideoStream(AVFormatContext* formatCtx) const {
 void FfmpegVideoDecoder::DecodeLoop() {
     AVFormatContext* formatCtx = nullptr;
     AVCodecContext* codecCtx = nullptr;
+    AVCodecContext* enhancementCodecCtx = nullptr;
     AVCodecContext* subtitleCodecCtx = nullptr;
     AVBufferRef* hwDeviceCtx = nullptr;
     SwsContext* swsCtx = nullptr;
     AVFrame* frame = nullptr;
     AVFrame* softwareFrame = nullptr;
+    AVFrame* enhancementFrame = nullptr;
     AVPacket* packet = nullptr;
     std::vector<uint8_t> bgraBuffer;
     int videoStreamIndex = -1;
+    int enhancementStreamIndex = -1;
     int subtitleStreamIndex = -1;
     AVRational streamTimeBase{1, 1};
+    AVRational enhancementTimeBase{1, 1};
     AVRational subtitleTimeBase{1, 1};
     uint64_t serial = 0;
     bool firstPacketSeen = false;
@@ -970,6 +1809,10 @@ void FfmpegVideoDecoder::DecodeLoop() {
             const auto externalSubtitle = FindExternalSubtitleFile(path_, preferredSubtitleLanguage_);
             if (externalSubtitle.has_value()) {
                 externalSubtitlesLoaded = DecodeExternalSubtitleFile(*externalSubtitle);
+                if (externalSubtitlesLoaded) {
+                    externalSubtitlesActive_ = true;
+                    externalSubtitleCues_ = subtitleCues_;
+                }
             } else {
                 LogThread(LogLevel::Debug, L"subtitle", L"external=none");
             }
@@ -998,6 +1841,8 @@ void FfmpegVideoDecoder::DecodeLoop() {
         dolbyVisionFirstQueueLogged_ = false;
         dolbyVisionLibplaceboFailed_ = false;
         dolbyVisionLibplaceboFrameLogged_ = false;
+        dolbyVisionDynamicMetadataLogged_ = false;
+        dolbyVisionLastDynamicMetadataFingerprint_ = 0;
         doviLibplaceboFilter_.reset();
         dolbyVisionProfile_ = 0;
         dolbyVisionLevel_ = 0;
@@ -1024,6 +1869,26 @@ void FfmpegVideoDecoder::DecodeLoop() {
                 break;
             }
         }
+        if (dolbyVisionStream_) {
+            LogThread(LogLevel::Info,
+                      L"decoder",
+                      std::wstring(L"dolby_vision_processing primary=") +
+                          (ShouldUsePrimaryDoviLibplacebo() ? L"libplacebo" : L"renderer_fallback") +
+                          L" reason=" +
+                          (ShouldUsePrimaryDoviLibplacebo()
+                               ? L"single_layer_profile_5_or_8"
+                               : L"profile_or_enhancement_layer_requires_future_merge"));
+        }
+
+        if (enableDolbyVisionEnhancementDecode_ &&
+            selectedVideoTrackIndex_ != anvil::playback::kVideoTrackDolbyVisionEnhancement) {
+            OpenDolbyVisionEnhancementDecoder(formatCtx, videoStreamIndex, enhancementCodecCtx, enhancementTimeBase);
+            enhancementStreamIndex = dolbyVisionEnhancementStreamIndex_;
+        } else if (enableDolbyVisionEnhancementDecode_) {
+            LogThread(LogLevel::Info,
+                      L"decoder",
+                      L"dolby_vision_el disabled reason=primary_stream_is_enhancement_layer");
+        }
 
         if (!OpenVideoDecoder(codec, codecpar, codecCtx, hwDeviceCtx)) {
             break;
@@ -1035,6 +1900,17 @@ void FfmpegVideoDecoder::DecodeLoop() {
         if (!frame || !softwareFrame || !packet) {
             break;
         }
+        if (enhancementCodecCtx) {
+            enhancementFrame = av_frame_alloc();
+            if (!enhancementFrame) {
+                LogThread(LogLevel::Warning,
+                          L"decoder",
+                          L"dolby_vision_el disabled reason=frame_alloc_failed");
+                avcodec_free_context(&enhancementCodecCtx);
+                enhancementStreamIndex = -1;
+                dolbyVisionEnhancementActive_ = false;
+            }
+        }
 
         if (startPosition_.count() > 0) {
             const int64_t seekTarget = static_cast<int64_t>(startPosition_.count()) *
@@ -1043,50 +1919,263 @@ void FfmpegVideoDecoder::DecodeLoop() {
             if (subtitleCodecCtx) {
                 avcodec_flush_buffers(subtitleCodecCtx);
             }
+            if (enhancementCodecCtx) {
+                avcodec_flush_buffers(enhancementCodecCtx);
+            }
         }
 
+        std::deque<CachedVideoPacket> packetQueue;
+        std::size_t packetQueueBytes = 0;
+        std::chrono::milliseconds packetTimelineEnd = startPosition_;
+        bool inputEof = false;
+        const auto fallbackPacketDuration = EstimatedVideoPacketDuration(formatCtx->streams[videoStreamIndex]);
+        const std::size_t packetCacheBudgetBytes =
+            PacketReadAheadBudgetBytes(kMinPacketReadAheadBytes, kMaxPacketReadAheadBytes);
+        auto enhancementOverlayReadAheadActive = [&]() {
+            return enableDolbyVisionEnhancementDecode_ &&
+                   enhancementCodecCtx &&
+                   enhancementFrame &&
+                   dolbyVisionEnhancementActive_;
+        };
+        auto activePacketReadAheadTarget = [&]() {
+            return enhancementOverlayReadAheadActive()
+                       ? kDolbyVisionEnhancementPacketReadAheadTarget
+                       : kPlayingPacketReadAheadTarget;
+        };
+        LogThread(LogLevel::Info,
+                  L"decoder",
+                  L"packet_read_ahead mode=adaptive budget_mb=" + std::to_wstring(packetCacheBudgetBytes / (1024 * 1024)) +
+                      L" playing_target_ms=" + std::to_wstring(activePacketReadAheadTarget().count()) +
+                      (enhancementOverlayReadAheadActive() ? L" el_overlay=low_latency" : L"") +
+                      L" estimated_packet_ms=" + std::to_wstring(fallbackPacketDuration.count()));
+
+        auto packetQueueEnd = [&]() {
+            std::chrono::milliseconds end{0};
+            for (const auto& cached : packetQueue) {
+                end = std::max(end, cached.end);
+            }
+            return end;
+        };
+
+        auto updatePacketStats = [&]() {
+            std::scoped_lock lock(mutex_);
+            stats_.packetQueueDepth = packetQueue.size();
+            stats_.packetQueueBytes = packetQueueBytes;
+            if (packetQueue.empty()) {
+                stats_.readAheadEnd = std::chrono::milliseconds{0};
+                stats_.readAheadDuration = std::chrono::milliseconds{0};
+            } else {
+                stats_.readAheadEnd = packetQueueEnd();
+                stats_.readAheadDuration =
+                    std::max(std::chrono::milliseconds{0}, stats_.readAheadEnd - packetQueue.front().pts);
+            }
+            UpdateBufferedStatsLocked();
+        };
+
+        auto clearPacketQueue = [&]() {
+            packetQueue.clear();
+            packetQueueBytes = 0;
+            updatePacketStats();
+        };
+
+        auto packetQueueAtTarget = [&]() {
+            return packetQueueBytes >= packetCacheBudgetBytes;
+        };
+
+        auto packetQueueDuration = [&]() {
+            if (packetQueue.empty()) {
+                return std::chrono::milliseconds{0};
+            }
+            return std::max(std::chrono::milliseconds{0}, packetQueueEnd() - packetQueue.front().pts);
+        };
+
+        auto shouldReadPlayingPackets = [&]() {
+            return !inputEof &&
+                   !packetQueueAtTarget() &&
+                   packetQueueDuration() < activePacketReadAheadTarget();
+        };
+
+        auto hasDecodedPreroll = [&]() {
+            std::scoped_lock lock(mutex_);
+            return latestFrame_.HasContent() || !frameQueue_.empty() || stats_.rendered > 0;
+        };
+
+        auto decodedQueueNearCapacity = [&]() {
+            std::scoped_lock lock(mutex_);
+            if (frameQueue_.empty()) {
+                return false;
+            }
+            const std::size_t capacity = MaxQueueDepthForFrame(frameQueue_.back());
+            return frameQueue_.size() + 1 >= capacity;
+        };
+
+        auto cacheVideoPacket = [&](AVPacket* source) {
+            const auto fallbackStart = packetQueue.empty() ? packetTimelineEnd : packetQueue.back().end;
+            auto cached = CachedVideoPacket::MoveFrom(source, streamTimeBase, fallbackStart, fallbackPacketDuration);
+            if (!cached.has_value()) {
+                av_packet_unref(source);
+                return false;
+            }
+            packetTimelineEnd = std::max(packetTimelineEnd, cached->end);
+            packetQueueBytes += cached->bytes;
+            packetQueue.push_back(std::move(*cached));
+            updatePacketStats();
+            return true;
+        };
+
+        auto readAheadPackets = [&](const int maxVideoPackets) {
+            int videoPacketsRead = 0;
+            while (!stopping_.load() &&
+                   !HasPendingSeek() &&
+                   !inputEof &&
+                   !packetQueueAtTarget() &&
+                   videoPacketsRead < maxVideoPackets) {
+                const int readResult = av_read_frame(formatCtx, packet);
+                if (readResult < 0) {
+                    if (!HasPendingSeek()) {
+                        inputEof = true;
+                    }
+                    break;
+                }
+
+                if (packet->stream_index == enhancementStreamIndex &&
+                    enhancementCodecCtx &&
+                    enhancementFrame &&
+                    dolbyVisionEnhancementActive_) {
+                    DecodeDolbyVisionEnhancementPacket(enhancementCodecCtx, packet, enhancementFrame, enhancementTimeBase);
+                    av_packet_unref(packet);
+                    continue;
+                }
+
+                if (packet->stream_index == subtitleStreamIndex && subtitleCodecCtx) {
+                    DecodeSubtitlePacket(subtitleCodecCtx, packet, subtitleTimeBase);
+                    av_packet_unref(packet);
+                    continue;
+                }
+
+                if (packet->stream_index != videoStreamIndex) {
+                    av_packet_unref(packet);
+                    continue;
+                }
+
+                if (!cacheVideoPacket(packet)) {
+                    break;
+                }
+                ++videoPacketsRead;
+            }
+        };
+
+        auto decodeNextCachedPacket = [&]() {
+            if (packetQueue.empty()) {
+                return true;
+            }
+
+            CachedVideoPacket cached = std::move(packetQueue.front());
+            if (packetQueueBytes >= cached.bytes) {
+                packetQueueBytes -= cached.bytes;
+            } else {
+                packetQueueBytes = 0;
+            }
+            packetQueue.pop_front();
+            updatePacketStats();
+
+            firstPacketSeen = true;
+            int eagainCount = 0;
+            while (!stopping_.load() && !HasPendingSeek()) {
+                const int sendResult = avcodec_send_packet(codecCtx, cached.packet);
+                if (sendResult == AVERROR(EAGAIN)) {
+                    if (!ReceiveFrames(codecCtx, swsCtx, frame, softwareFrame, bgraBuffer, streamTimeBase, serial)) {
+                        return false;
+                    }
+                    if (++eagainCount > 8) {
+                        return true;
+                    }
+                    continue;
+                }
+                if (sendResult < 0) {
+                    return true;
+                }
+                break;
+            }
+
+            if (!ReceiveFrames(codecCtx, swsCtx, frame, softwareFrame, bgraBuffer, streamTimeBase, serial)) {
+                return false;
+            }
+            return true;
+        };
+
         while (!stopping_.load()) {
-            const int readResult = av_read_frame(formatCtx, packet);
-            if (readResult < 0) {
+            if (HasPendingSeek()) {
+                clearPacketQueue();
+                inputEof = false;
+                if (!ApplyPendingSeek(formatCtx, codecCtx, subtitleCodecCtx, enhancementCodecCtx)) {
+                    break;
+                }
+                packetTimelineEnd = startPosition_;
+                continue;
+            }
+
+            ScheduleDueFrames();
+            const bool paused = playbackPaused_.load();
+            const bool hasPreroll = hasDecodedPreroll();
+            const bool elOverlay = enhancementOverlayReadAheadActive();
+            if (paused) {
+                readAheadPackets(elOverlay ? kDolbyVisionEnhancementPausedPacketReadAheadBatch
+                                           : kPausedPacketReadAheadBatch);
+            } else if (!hasPreroll) {
+                readAheadPackets(elOverlay ? kDolbyVisionEnhancementStartupPacketReadAheadBatch
+                                           : kStartupPacketReadAheadBatch);
+            } else if (shouldReadPlayingPackets()) {
+                readAheadPackets(elOverlay ? kDolbyVisionEnhancementPlayingPacketReadAheadBatch
+                                           : kPlayingPacketReadAheadBatch);
+            }
+            if (HasPendingSeek()) {
+                continue;
+            }
+
+            if (paused && hasPreroll) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{1});
+                continue;
+            }
+
+            if (!paused && hasPreroll && decodedQueueNearCapacity() && shouldReadPlayingPackets()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{1});
+                continue;
+            }
+
+            if (!packetQueue.empty()) {
+                if (!decodeNextCachedPacket()) {
+                    break;
+                }
+                continue;
+            }
+
+            if (inputEof) {
                 // EOF or error: drain decoder then stop.
+                if (enhancementCodecCtx && enhancementFrame && dolbyVisionEnhancementActive_) {
+                    avcodec_send_packet(enhancementCodecCtx, nullptr);
+                    ReceiveDolbyVisionEnhancementFrames(enhancementCodecCtx, enhancementFrame, enhancementTimeBase);
+                }
                 avcodec_send_packet(codecCtx, nullptr);
                 if (DrainDecoder(codecCtx, swsCtx, frame, softwareFrame, bgraBuffer, streamTimeBase, serial)) {
                     // swsCtx may have been allocated inside DrainDecoder.
                 }
                 break;
             }
-
-            if (packet->stream_index == subtitleStreamIndex && subtitleCodecCtx) {
-                DecodeSubtitlePacket(subtitleCodecCtx, packet, subtitleTimeBase);
-                av_packet_unref(packet);
-                continue;
-            }
-
-            if (packet->stream_index != videoStreamIndex) {
-                av_packet_unref(packet);
-                continue;
-            }
-
-            firstPacketSeen = true;
-            const int sendResult = avcodec_send_packet(codecCtx, packet);
-            av_packet_unref(packet);
-            if (sendResult < 0 && sendResult != AVERROR(EAGAIN)) {
-                continue;
-            }
-
-            if (!ReceiveFrames(codecCtx, swsCtx, frame, softwareFrame, bgraBuffer, streamTimeBase, serial)) {
-                break;
-            }
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
         }
+        clearPacketQueue();
         (void)firstPacketSeen;
     } while (false);
 
     if (swsCtx) sws_freeContext(swsCtx);
     if (frame) av_frame_free(&frame);
     if (softwareFrame) av_frame_free(&softwareFrame);
+    if (enhancementFrame) av_frame_free(&enhancementFrame);
     if (packet) av_packet_free(&packet);
     if (hwDeviceCtx) av_buffer_unref(&hwDeviceCtx);
     if (subtitleCodecCtx) avcodec_free_context(&subtitleCodecCtx);
+    if (enhancementCodecCtx) avcodec_free_context(&enhancementCodecCtx);
     if (codecCtx) avcodec_free_context(&codecCtx);
     if (formatCtx) avformat_close_input(&formatCtx);
     doviLibplaceboFilter_.reset();
@@ -1104,14 +2193,17 @@ bool FfmpegVideoDecoder::OpenVideoDecoder(const AVCodec* codec,
         return false;
     }
 
-    if (preferHardwareDecode_ && !dolbyVisionStream_) {
+    if (preferHardwareDecode_ && !dolbyVisionStream_ && !enableDolbyVisionEnhancementDecode_) {
         hardwareConfigured = ConfigureD3D11VA(codec, codecCtx, hwDeviceCtx);
     } else {
         SetDecodeBackend(L"ffmpeg_software", false, {});
         LogThread(LogLevel::Info, L"decoder",
                   L"selected=ffmpeg_software reason=" +
-                      std::wstring(dolbyVisionStream_ ? L"dolby_vision_software_decode_for_reshape"
-                                                       : L"hardware_decode_not_requested"));
+                      std::wstring(dolbyVisionStream_
+                                       ? L"dolby_vision_software_decode_for_reshape"
+                                       : (enableDolbyVisionEnhancementDecode_
+                                              ? L"dolby_vision_el_overlay_requires_software_decode"
+                                              : L"hardware_decode_not_requested")));
     }
 
     int openError = avcodec_open2(codecCtx, codec, nullptr);
@@ -1152,6 +2244,92 @@ bool FfmpegVideoDecoder::OpenVideoDecoder(const AVCodec* codec,
         return false;
     }
     LogThread(LogLevel::Info, L"decoder", L"selected=ffmpeg_software fallback_from=d3d11va");
+    return true;
+}
+
+bool FfmpegVideoDecoder::OpenDolbyVisionEnhancementDecoder(AVFormatContext* formatCtx,
+                                                           const int primaryStreamIndex,
+                                                           AVCodecContext*& codecCtx,
+                                                           AVRational& timeBase) {
+    codecCtx = nullptr;
+    timeBase = AVRational{1, 1};
+    dolbyVisionEnhancementActive_ = false;
+    dolbyVisionEnhancementStreamIndex_ = -1;
+    dolbyVisionEnhancementProfile_ = 0;
+    dolbyVisionEnhancementLevel_ = 0;
+    dolbyVisionEnhancementCompatId_ = 0;
+    dolbyVisionEnhancementElPresent_ = false;
+    dolbyVisionEnhancementBlPresent_ = false;
+
+    if (!formatCtx) {
+        return false;
+    }
+
+    AVStream* enhancementStream = nullptr;
+    for (unsigned int index = 0; index < formatCtx->nb_streams; ++index) {
+        AVStream* stream = formatCtx->streams[index];
+        if (!stream || !stream->codecpar ||
+            stream->codecpar->codec_type != AVMEDIA_TYPE_VIDEO ||
+            stream->index == primaryStreamIndex ||
+            !IsDolbyVisionEnhancementLayer(stream->codecpar)) {
+            continue;
+        }
+        enhancementStream = stream;
+        break;
+    }
+
+    if (!enhancementStream || !enhancementStream->codecpar) {
+        LogThread(LogLevel::Info, L"decoder", L"dolby_vision_el unavailable reason=no_el_only_stream");
+        return false;
+    }
+
+    AVCodecParameters* codecpar = enhancementStream->codecpar;
+    const auto* dovi = DolbyVisionConfig(codecpar);
+    if (!dovi) {
+        return false;
+    }
+
+    const AVCodec* codec = avcodec_find_decoder(codecpar->codec_id);
+    if (!codec) {
+        LogThread(LogLevel::Warning,
+                  L"decoder",
+                  L"dolby_vision_el unavailable reason=decoder_missing codec=" +
+                      Utf8ToWide(avcodec_get_name(codecpar->codec_id)));
+        return false;
+    }
+
+    AVCodecContext* context = AllocateVideoCodecContext(codec, codecpar);
+    if (!context) {
+        LogThread(LogLevel::Warning, L"decoder", L"dolby_vision_el unavailable reason=context_alloc_failed");
+        return false;
+    }
+    context->pkt_timebase = enhancementStream->time_base;
+
+    const int openError = avcodec_open2(context, codec, nullptr);
+    if (openError < 0) {
+        LogThread(LogLevel::Warning,
+                  L"decoder",
+                  L"dolby_vision_el unavailable reason=open_failed detail=" + FfmpegErrorString(openError));
+        avcodec_free_context(&context);
+        return false;
+    }
+
+    codecCtx = context;
+    timeBase = enhancementStream->time_base;
+    dolbyVisionEnhancementActive_ = true;
+    dolbyVisionEnhancementStreamIndex_ = enhancementStream->index;
+    dolbyVisionEnhancementProfile_ = dovi->dv_profile;
+    dolbyVisionEnhancementLevel_ = dovi->dv_level;
+    dolbyVisionEnhancementCompatId_ = dovi->dv_bl_signal_compatibility_id;
+    dolbyVisionEnhancementElPresent_ = dovi->el_present_flag != 0;
+    dolbyVisionEnhancementBlPresent_ = dovi->bl_present_flag != 0;
+
+    LogThread(LogLevel::Info,
+              L"decoder",
+              L"dolby_vision_el active " + VideoStreamDescription(enhancementStream) +
+                  L" level=" + std::to_wstring(dovi->dv_level) +
+                  L" rpu=" + std::to_wstring(dovi->rpu_present_flag) +
+                  L" compat_id=" + std::to_wstring(dovi->dv_bl_signal_compatibility_id));
     return true;
 }
 
@@ -1357,6 +2535,8 @@ AVCodecContext* FfmpegVideoDecoder::AllocateVideoCodecContext(const AVCodec* cod
         avcodec_free_context(&context);
         return nullptr;
     }
+    context->thread_count = 0;
+    context->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
     return context;
 }
 
@@ -1477,7 +2657,31 @@ AVPixelFormat FfmpegVideoDecoder::ChooseHardwarePixelFormat(AVCodecContext* code
 bool FfmpegVideoDecoder::ReceiveFrames(AVCodecContext* codecCtx, SwsContext*& swsCtx, AVFrame* frame, AVFrame* softwareFrame,
                                        std::vector<uint8_t>& bgraBuffer, AVRational timeBase,
                                        uint64_t& serial) {
-    while (!stopping_.load()) {
+    while (!stopping_.load() && !HasPendingSeek()) {
+        const int ret = avcodec_receive_frame(codecCtx, frame);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+            return true;
+        }
+        if (ret < 0) {
+            return false;
+        }
+        if (!PublishFrame(frame, softwareFrame, swsCtx, bgraBuffer, timeBase, serial)) {
+            av_frame_unref(frame);
+            return false;
+        }
+        av_frame_unref(frame);
+        if (playbackPaused_.load()) {
+            return true;
+        }
+    }
+    return true;
+}
+
+// Drain decoder after EOF (no more packets).
+bool FfmpegVideoDecoder::DrainDecoder(AVCodecContext* codecCtx, SwsContext*& swsCtx, AVFrame* frame, AVFrame* softwareFrame,
+                                      std::vector<uint8_t>& bgraBuffer, AVRational timeBase,
+                                      uint64_t& serial) {
+    while (!stopping_.load() && !HasPendingSeek()) {
         const int ret = avcodec_receive_frame(codecCtx, frame);
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
             return true;
@@ -1494,25 +2698,164 @@ bool FfmpegVideoDecoder::ReceiveFrames(AVCodecContext* codecCtx, SwsContext*& sw
     return true;
 }
 
-// Drain decoder after EOF (no more packets).
-bool FfmpegVideoDecoder::DrainDecoder(AVCodecContext* codecCtx, SwsContext*& swsCtx, AVFrame* frame, AVFrame* softwareFrame,
-                                      std::vector<uint8_t>& bgraBuffer, AVRational timeBase,
-                                      uint64_t& serial) {
-    while (!stopping_.load()) {
+bool FfmpegVideoDecoder::DecodeDolbyVisionEnhancementPacket(AVCodecContext* codecCtx,
+                                                            const AVPacket* packet,
+                                                            AVFrame* frame,
+                                                            const AVRational timeBase) {
+    if (!codecCtx || !packet || !frame || !dolbyVisionEnhancementActive_) {
+        return true;
+    }
+
+    int eagainCount = 0;
+    while (!stopping_.load() && !HasPendingSeek()) {
+        const int sendResult = avcodec_send_packet(codecCtx, packet);
+        if (sendResult == AVERROR(EAGAIN)) {
+            if (!ReceiveDolbyVisionEnhancementFrames(codecCtx, frame, timeBase)) {
+                return true;
+            }
+            if (++eagainCount > 8) {
+                return true;
+            }
+            continue;
+        }
+        if (sendResult < 0) {
+            if (!dolbyVisionEnhancementFailureLogged_) {
+                dolbyVisionEnhancementFailureLogged_ = true;
+                LogThread(LogLevel::Warning,
+                          L"decoder",
+                          L"dolby_vision_el disabled reason=send_packet_failed detail=" +
+                              FfmpegErrorString(sendResult));
+            }
+            dolbyVisionEnhancementActive_ = false;
+            return true;
+        }
+        break;
+    }
+
+    ReceiveDolbyVisionEnhancementFrames(codecCtx, frame, timeBase);
+    return true;
+}
+
+bool FfmpegVideoDecoder::ReceiveDolbyVisionEnhancementFrames(AVCodecContext* codecCtx,
+                                                             AVFrame* frame,
+                                                             const AVRational timeBase) {
+    if (!codecCtx || !frame || !dolbyVisionEnhancementActive_) {
+        return true;
+    }
+
+    while (!stopping_.load() && !HasPendingSeek()) {
         const int ret = avcodec_receive_frame(codecCtx, frame);
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
             return true;
         }
         if (ret < 0) {
-            return false;
+            if (!dolbyVisionEnhancementFailureLogged_) {
+                dolbyVisionEnhancementFailureLogged_ = true;
+                LogThread(LogLevel::Warning,
+                          L"decoder",
+                          L"dolby_vision_el disabled reason=receive_frame_failed detail=" +
+                              FfmpegErrorString(ret));
+            }
+            dolbyVisionEnhancementActive_ = false;
+            return true;
         }
-        if (!PublishFrame(frame, softwareFrame, swsCtx, bgraBuffer, timeBase, serial)) {
-            av_frame_unref(frame);
-            return false;
+
+        const auto pts = FramePts(frame, timeBase);
+        auto metadata = ExtractEnhancementDolbyVisionMetadata(frame);
+        if (metadata && metadata->valid) {
+            latestDolbyVisionEnhancementMetadata_ = metadata;
+            latestDolbyVisionEnhancementMetadataPts_ = pts;
+            const bool metadataChanged =
+                !dolbyVisionEnhancementDynamicMetadataLogged_ ||
+                metadata->dynamicMetadataFingerprint != dolbyVisionEnhancementLastDynamicMetadataFingerprint_;
+            if (metadataChanged) {
+                LogThread(dolbyVisionEnhancementDynamicMetadataLogged_ ? LogLevel::Debug : LogLevel::Info,
+                          L"decoder",
+                          L"dolby_vision_dynamic_metadata path=enhancement_layer " +
+                              DoviDynamicLogSummary(*metadata));
+                dolbyVisionEnhancementDynamicMetadataLogged_ = true;
+                dolbyVisionEnhancementLastDynamicMetadataFingerprint_ = metadata->dynamicMetadataFingerprint;
+            }
+        } else if (!dolbyVisionEnhancementDynamicMetadataLogged_) {
+            LogThread(LogLevel::Warning,
+                      L"decoder",
+                      L"dolby_vision_dynamic_metadata path=enhancement_layer frame_side_data=missing");
+            dolbyVisionEnhancementDynamicMetadataLogged_ = true;
         }
+
+        NativeYuvPlanes enhancementYuv;
+        const auto packStart = std::chrono::steady_clock::now();
+        if (PackYuv420P10FrameToP010(frame, enhancementYuv)) {
+            DolbyVisionEnhancementFrame queued;
+            queued.pts = pts;
+            queued.yuv = std::move(enhancementYuv);
+            queued.dovi = (metadata && metadata->valid) ? metadata : latestDolbyVisionEnhancementMetadata_;
+            queued.details = DoviFrameSummary(queued.dovi.get());
+            dolbyVisionEnhancementFrames_.push_back(std::move(queued));
+            std::size_t queuedBytes = 0;
+            for (const auto& queuedFrame : dolbyVisionEnhancementFrames_) {
+                if (queuedFrame.yuv.data) {
+                    queuedBytes += queuedFrame.yuv.data->size();
+                }
+            }
+            while (dolbyVisionEnhancementFrames_.size() > kMaxDolbyVisionEnhancementQueuedFrames ||
+                   queuedBytes > kMaxDolbyVisionEnhancementQueuedBytes) {
+                if (dolbyVisionEnhancementFrames_.front().yuv.data &&
+                    queuedBytes >= dolbyVisionEnhancementFrames_.front().yuv.data->size()) {
+                    queuedBytes -= dolbyVisionEnhancementFrames_.front().yuv.data->size();
+                }
+                dolbyVisionEnhancementFrames_.pop_front();
+            }
+            if (!dolbyVisionEnhancementFirstPackedLogged_) {
+                dolbyVisionEnhancementFirstPackedLogged_ = true;
+                const auto packMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - packStart).count();
+                LogThread(LogLevel::Debug,
+                          L"decoder",
+                          L"dolby_vision_el_packed bytes=" +
+                              std::to_wstring(dolbyVisionEnhancementFrames_.back().yuv.data
+                                                  ? dolbyVisionEnhancementFrames_.back().yuv.data->size()
+                                                  : 0) +
+                              L" pack_ms=" + std::to_wstring(packMs));
+            }
+        } else if (!dolbyVisionEnhancementFailureLogged_) {
+            dolbyVisionEnhancementFailureLogged_ = true;
+            LogThread(LogLevel::Warning,
+                      L"decoder",
+                      L"dolby_vision_el_overlay unavailable reason=unsupported_el_format format=" +
+                          PixelFormatName(static_cast<AVPixelFormat>(frame->format)));
+        }
+
+        ++dolbyVisionEnhancementFramesDecoded_;
+        if (!dolbyVisionEnhancementFirstFrameLogged_) {
+            dolbyVisionEnhancementFirstFrameLogged_ = true;
+            LogThread(LogLevel::Info,
+                      L"decoder",
+                      L"dolby_vision_el_frame w=" + std::to_wstring(frame->width) +
+                          L" h=" + std::to_wstring(frame->height) +
+                          L" format=" + PixelFormatName(static_cast<AVPixelFormat>(frame->format)) +
+                          L" pts_ms=" + std::to_wstring(pts.count()) +
+                          L" dovi=" + std::wstring(metadata && metadata->valid ? L"yes" : L"no") +
+                          DoviResidualSummary(frame) +
+                          L" merge=nlq_merge_pending");
+        }
+
         av_frame_unref(frame);
     }
     return true;
+}
+
+bool FfmpegVideoDecoder::ShouldUsePrimaryDoviLibplacebo() const {
+    if (!dolbyVisionStream_) {
+        return false;
+    }
+
+    // Profiles 5 and 8 are the practical single-layer fallback targets:
+    // libplacebo can consume the per-frame RPU and output display-ready SDR or
+    // HDR10/PQ. Profile 7 with EL/FEL stays on the explicit fallback path until
+    // BL+EL composition is implemented.
+    const bool singleLayer = dolbyVisionBlPresent_ && !dolbyVisionElPresent_;
+    return singleLayer && (dolbyVisionProfile_ == 5 || dolbyVisionProfile_ == 8);
 }
 
 bool FfmpegVideoDecoder::EnsureDoviLibplaceboFilter(AVFrame* frame, const AVRational timeBase) {
@@ -1682,6 +3025,26 @@ bool FfmpegVideoDecoder::TryPublishDoviLibplaceboFrame(AVFrame* frame,
         return false;
     }
 
+    const auto inputDovi = ExtractFrameDolbyVisionMetadata(frame);
+    if (inputDovi && inputDovi->valid) {
+        const bool metadataChanged =
+            !dolbyVisionDynamicMetadataLogged_ ||
+            inputDovi->dynamicMetadataFingerprint != dolbyVisionLastDynamicMetadataFingerprint_;
+        if (metadataChanged) {
+            LogThread(dolbyVisionDynamicMetadataLogged_ ? LogLevel::Debug : LogLevel::Info,
+                      L"decoder",
+                      L"dolby_vision_dynamic_metadata path=libplacebo " +
+                          DoviDynamicLogSummary(*inputDovi));
+            dolbyVisionDynamicMetadataLogged_ = true;
+            dolbyVisionLastDynamicMetadataFingerprint_ = inputDovi->dynamicMetadataFingerprint;
+        }
+    } else if (!dolbyVisionDynamicMetadataLogged_) {
+        LogThread(LogLevel::Warning,
+                  L"decoder",
+                  L"dolby_vision_dynamic_metadata path=libplacebo frame_side_data=missing");
+        dolbyVisionDynamicMetadataLogged_ = true;
+    }
+
     int error = av_buffersrc_add_frame_flags(doviLibplaceboFilter_->source, frame, AV_BUFFERSRC_FLAG_KEEP_REF);
     if (error < 0) {
         LogThread(LogLevel::Warning,
@@ -1761,6 +3124,12 @@ bool FfmpegVideoDecoder::TryPublishDoviLibplaceboFrame(AVFrame* frame,
         queued.bgra = std::move(pixels);
         queued.softwareFormat = outputFormat;
         queued.color = hdrOutput ? HdrBt2020PqColorMetadata() : SdrBt709ColorMetadata();
+        queued.dovi = inputDovi;
+        queued.dynamicMetadataPath =
+            inputDovi && inputDovi->valid && (inputDovi->dmLevel2Present || inputDovi->dmLevel3Present || inputDovi->dmLevel8Present)
+                ? L"dolby_vision_libplacebo+trim"
+                : L"dolby_vision_libplacebo";
+        queued.dynamicMetadataDetails = DoviFrameSummary(inputDovi.get());
         queued.subtitleText = SubtitleTextForPts(pts);
         queued.subtitleBitmaps = SubtitleBitmapsForPts(pts, outW, outH);
         queued.pts = pts;
@@ -1783,6 +3152,145 @@ bool FfmpegVideoDecoder::TryPublishDoviLibplaceboFrame(AVFrame* frame,
     }
 
     return produced || !dolbyVisionLibplaceboFailed_;
+}
+
+void FfmpegVideoDecoder::AttachDolbyVisionEnhancementFrame(NativeVideoFrame& frame,
+                                                           const std::chrono::milliseconds pts) {
+    if (!enableDolbyVisionEnhancementDecode_ ||
+        !dolbyVisionEnhancementActive_ ||
+        dolbyVisionEnhancementFrames_.empty()) {
+        return;
+    }
+
+    constexpr std::chrono::milliseconds kMaxEnhancementDelta{80};
+    auto absDelta = [](const std::chrono::milliseconds lhs, const std::chrono::milliseconds rhs) {
+        return lhs >= rhs ? lhs - rhs : rhs - lhs;
+    };
+
+    std::size_t bestIndex = 0;
+    auto bestDelta = absDelta(dolbyVisionEnhancementFrames_.front().pts, pts);
+    for (std::size_t index = 1; index < dolbyVisionEnhancementFrames_.size(); ++index) {
+        const auto delta = absDelta(dolbyVisionEnhancementFrames_[index].pts, pts);
+        if (delta < bestDelta) {
+            bestDelta = delta;
+            bestIndex = index;
+        }
+    }
+
+    if (bestDelta > kMaxEnhancementDelta) {
+        while (!dolbyVisionEnhancementFrames_.empty() &&
+               dolbyVisionEnhancementFrames_.front().pts + kMaxEnhancementDelta < pts) {
+            dolbyVisionEnhancementFrames_.pop_front();
+        }
+        if (!dolbyVisionEnhancementNoMatchLogged_) {
+            dolbyVisionEnhancementNoMatchLogged_ = true;
+            const auto frontPts = dolbyVisionEnhancementFrames_.empty()
+                                      ? std::chrono::milliseconds{-1}
+                                      : dolbyVisionEnhancementFrames_.front().pts;
+            LogThread(LogLevel::Debug,
+                      L"decoder",
+                      L"dolby_vision_el_overlay wait_for_match bl_pts_ms=" + std::to_wstring(pts.count()) +
+                          L" el_front_pts_ms=" + std::to_wstring(frontPts.count()) +
+                          L" best_delta_ms=" + std::to_wstring(bestDelta.count()));
+        }
+        return;
+    }
+
+    for (std::size_t index = 0; index < bestIndex; ++index) {
+        dolbyVisionEnhancementFrames_.pop_front();
+    }
+    DolbyVisionEnhancementFrame matched = std::move(dolbyVisionEnhancementFrames_.front());
+    dolbyVisionEnhancementFrames_.pop_front();
+
+    frame.enhancementYuv = std::move(matched.yuv);
+    frame.enhancementDovi = std::move(matched.dovi);
+    frame.enhancementMetadataDetails = std::move(matched.details);
+    const bool enhancementMetadataValid = frame.enhancementDovi && frame.enhancementDovi->valid;
+    const bool enhancementSinglePartition =
+        enhancementMetadataValid && DoviSingleNlqPartition(*frame.enhancementDovi);
+    if (frame.dynamicMetadataPath.empty()) {
+        frame.dynamicMetadataPath = enhancementSinglePartition
+                                        ? L"dolby_vision_p7_fel_nlq_merge"
+                                        : L"dolby_vision_p7_fel_mapping_only_multi_partition";
+    } else if (frame.dynamicMetadataPath.find(L"fel_") == std::wstring::npos) {
+        frame.dynamicMetadataPath += enhancementSinglePartition
+                                         ? L"+fel_nlq_merge"
+                                         : L"+fel_mapping_only_multi_partition";
+    }
+    if (!frame.enhancementMetadataDetails.empty()) {
+        if (!frame.dynamicMetadataDetails.empty()) {
+            frame.dynamicMetadataDetails += L" | ";
+        }
+        frame.dynamicMetadataDetails += L"el=" + frame.enhancementMetadataDetails;
+    }
+
+    if (frame.enhancementDovi && frame.enhancementDovi->valid &&
+        !DoviSingleNlqPartition(*frame.enhancementDovi) &&
+        !dolbyVisionMultiPartitionFallbackLogged_) {
+        dolbyVisionMultiPartitionFallbackLogged_ = true;
+        LogThread(LogLevel::Warning,
+                  L"decoder",
+                  L"dolby_vision_fel_multi_partition unsupported_via_ffmpeg_public_metadata partitions=" +
+                      std::to_wstring(frame.enhancementDovi->nlqNumXPartitions) +
+                      L"x" + std::to_wstring(frame.enhancementDovi->nlqNumYPartitions) +
+                      L" fallback=mapping_only residual=disabled");
+    }
+
+    LogDolbyVisionCpuReferenceSample(frame);
+
+    if (!dolbyVisionEnhancementOverlayLogged_) {
+        dolbyVisionEnhancementOverlayLogged_ = true;
+        const bool singlePartition = frame.enhancementDovi &&
+                                     frame.enhancementDovi->valid &&
+                                     DoviSingleNlqPartition(*frame.enhancementDovi);
+        const std::wstring mergeMode =
+            frame.enhancementDovi && frame.enhancementDovi->valid
+                ? (singlePartition ? L"nlq_merge" : L"mapping_only_multi_partition")
+                : L"experimental_overlay";
+        LogThread(LogLevel::Info,
+                  L"decoder",
+                  L"dolby_vision_el_overlay active mode=" + mergeMode +
+                      L" bl_pts_ms=" +
+                      std::to_wstring(pts.count()) +
+                      L" el_pts_ms=" + std::to_wstring(matched.pts.count()) +
+                      L" delta_ms=" + std::to_wstring(bestDelta.count()) +
+                      L" size=" + std::to_wstring(frame.enhancementYuv.width) +
+                      L"x" + std::to_wstring(frame.enhancementYuv.height));
+    }
+}
+
+void FfmpegVideoDecoder::LogDolbyVisionCpuReferenceSample(const NativeVideoFrame& frame) {
+    if (dolbyVisionCpuReferenceLogged_ ||
+        !frame.enhancementDovi ||
+        !frame.enhancementDovi->valid ||
+        !DoviSingleNlqPartition(*frame.enhancementDovi)) {
+        return;
+    }
+
+    DoviCpuReferenceStats stats;
+    if (!BuildDolbyVisionCpuReferenceSample(frame, stats)) {
+        return;
+    }
+
+    dolbyVisionCpuReferenceLogged_ = true;
+    const auto average = [&stats](const int component) {
+        return stats.sampleCount > 0
+                   ? static_cast<double>(stats.sumCode[component]) / static_cast<double>(stats.sampleCount)
+                   : 0.0;
+    };
+    std::wostringstream stream;
+    stream << std::fixed << std::setprecision(1)
+           << L"dolby_vision_cpu_reference active mode=sampled_grid"
+           << L" grid=" << stats.gridWidth << L"x" << stats.gridHeight
+           << L" samples=" << stats.sampleCount
+           << L" hash=" << Hex64(stats.hash)
+           << L" vdr_bit_depth=" << stats.vdrBitDepth
+           << L" composer=code_merge+fixed16_poly+vdr_quant+chroma_site_luma+el_"
+           << (frame.enhancementDovi->elSpatialResampling ? L"bicubic" : L"linear")
+           << L" y(min=" << stats.minCode[0] << L" max=" << stats.maxCode[0] << L" avg=" << average(0) << L")"
+           << L" cb(min=" << stats.minCode[1] << L" max=" << stats.maxCode[1] << L" avg=" << average(1) << L")"
+           << L" cr(min=" << stats.minCode[2] << L" max=" << stats.maxCode[2] << L" avg=" << average(2) << L")";
+    LogThread(LogLevel::Info, L"decoder", stream.str());
 }
 
 bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, SwsContext*& swsCtx, std::vector<uint8_t>& bgraBuffer,
@@ -1831,7 +3339,7 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
         return true;
     }
 
-    if (dolbyVisionStream_ && TryPublishDoviLibplaceboFrame(frame, timeBase, pts, serial)) {
+    if (ShouldUsePrimaryDoviLibplacebo() && TryPublishDoviLibplaceboFrame(frame, timeBase, pts, serial)) {
         return true;
     }
 
@@ -1840,91 +3348,71 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
     // structure that the renderer must reshape. We pack Y + interleaved UV
     // (NV12/P010 layout) into a single buffer the renderer uploads as a
     // P010 texture.
-    if (dolbyVisionStream_ && frame->format == AV_PIX_FMT_YUV420P10LE) {
+    const bool enhancementOverlayPath = enableDolbyVisionEnhancementDecode_ && dolbyVisionEnhancementActive_;
+    if ((dolbyVisionStream_ || enhancementOverlayPath) && frame->format == AV_PIX_FMT_YUV420P10LE) {
         NativeVideoFrame queued;
         queued.width = srcW;
         queued.height = srcH;
         queued.color = MergeFrameColorMetadata(frame, streamColorMetadata_);
-        queued.dovi = ExtractFrameDolbyVisionMetadata(frame);
+        queued.dovi = dolbyVisionStream_ ? ExtractFrameDolbyVisionMetadata(frame) : nullptr;
+        if (queued.dovi && queued.dovi->valid) {
+            queued.dynamicMetadataPath = L"dolby_vision_shader";
+            queued.dynamicMetadataDetails = DoviFrameSummary(queued.dovi.get());
+        }
         if (!dolbyVisionFirstFrameLogged_) {
             dolbyVisionFirstFrameLogged_ = true;
             LogThread(LogLevel::Info, L"decoder",
                       L"dolby_vision_yuv_path w=" + std::to_wstring(srcW) + L" h=" + std::to_wstring(srcH) +
-                          L" dovi=" + (queued.dovi ? L"yes" : L"no"));
+                          L" dovi=" + (queued.dovi ? L"yes" : L"no") +
+                          L" fel_overlay=" + (enhancementOverlayPath ? L"enabled" : L"disabled"));
         }
 
-        const int yStride = srcW * 2;                    // 10-bit Y: 2 bytes/sample
-        const int uvStride = (srcW / 2) * 4;             // P010 UV: 2 bytes/U + 2 bytes/V per sample
-        const int uvHeight = srcH / 2;
+        NativeYuvPlanes packedYuv;
         const auto packStart = std::chrono::steady_clock::now();
-        // Use the actual luma linesize from FFmpeg for the source copy, but
-        // pack tightly into yStride for upload.
-        auto buffer = std::make_shared<std::vector<uint8_t>>();
-        const std::size_t totalBytes = static_cast<std::size_t>(yStride) * srcH +
-                                       static_cast<std::size_t>(uvStride) * uvHeight;
-        buffer->resize(totalBytes);
+        if (!PackYuv420P10FrameToP010(frame, packedYuv)) {
+            LogThread(LogLevel::Warning,
+                      L"decoder",
+                      L"dolby_vision_yuv_path fallback=bgra reason=pack_p010_failed");
+        } else {
+            if (!dolbyVisionFirstPackedLogged_) {
+                dolbyVisionFirstPackedLogged_ = true;
+                const auto packMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - packStart).count();
+                LogThread(LogLevel::Debug,
+                          L"decoder",
+                          L"dolby_vision_yuv_packed bytes=" +
+                              std::to_wstring(packedYuv.data ? packedYuv.data->size() : 0) +
+                              L" pack_ms=" + std::to_wstring(packMs));
+            }
 
-        // Copy Y plane (tighten to yStride) while converting yuv420p10le's
-        // low-bit 10-bit samples into DXGI P010's high-bit 10-bit layout.
-        const uint8_t* srcY = frame->data[0];
-        const int srcYStride = frame->linesize[0];
-        for (int row = 0; row < srcH; ++row) {
-            const uint8_t* srcRow = srcY + static_cast<std::size_t>(row) * srcYStride;
-            uint8_t* dstRow = buffer->data() + static_cast<std::size_t>(row) * yStride;
-            ConvertYuv420P10RowToP010(dstRow, srcRow, srcW);
+            queued.yuv = std::move(packedYuv);
+            AttachDolbyVisionEnhancementFrame(queued, pts);
+            queued.subtitleText = SubtitleTextForPts(pts);
+            queued.subtitleBitmaps = SubtitleBitmapsForPts(pts, srcW, srcH);
+            queued.pts = pts;
+            queued.serial = ++serial;
+            const bool logFirstDoviQueue = !dolbyVisionFirstQueueLogged_;
+            if (logFirstDoviQueue) {
+                LogThread(LogLevel::Debug,
+                          L"decoder",
+                          L"dolby_vision_yuv_queue_ready serial=" + std::to_wstring(queued.serial) +
+                              L" pts_ms=" + std::to_wstring(queued.pts.count()) +
+                              L" fel_overlay=" + (queued.HasEnhancementYuv() ? L"yes" : L"no") +
+                              L" subtitles_text=" + (queued.subtitleText.empty() ? L"no" : L"yes") +
+                              L" subtitles_bitmap=" + (queued.subtitleBitmaps.empty() ? L"no" : L"yes"));
+            }
+            if (oneShotFrame_) {
+                return PublishImmediateFrame(std::move(queued));
+            }
+            const bool enqueued = EnqueueFrame(std::move(queued));
+            if (logFirstDoviQueue) {
+                dolbyVisionFirstQueueLogged_ = true;
+                LogThread(LogLevel::Debug,
+                          L"decoder",
+                          L"dolby_vision_yuv_queue_result enqueued=" + std::wstring(enqueued ? L"true" : L"false"));
+            }
+            return enqueued;
         }
-        // Interleave U and V planes into a single UV plane (P010 layout).
-        const uint8_t* srcU = frame->data[1];
-        const uint8_t* srcV = frame->data[2];
-        const int srcUStride = frame->linesize[1];
-        const int srcVStride = frame->linesize[2];
-        uint8_t* uvDst = buffer->data() + static_cast<std::size_t>(yStride) * srcH;
-        for (int row = 0; row < uvHeight; ++row) {
-            const uint8_t* uRow = srcU + static_cast<std::size_t>(row) * srcUStride;
-            const uint8_t* vRow = srcV + static_cast<std::size_t>(row) * srcVStride;
-            uint8_t* dstRow = uvDst + static_cast<std::size_t>(row) * uvStride;
-            InterleaveYuv420P10RowToP010Uv(dstRow, uRow, vRow, srcW / 2);
-        }
-        if (!dolbyVisionFirstPackedLogged_) {
-            dolbyVisionFirstPackedLogged_ = true;
-            const auto packMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - packStart).count();
-            LogThread(LogLevel::Debug,
-                      L"decoder",
-                      L"dolby_vision_yuv_packed bytes=" + std::to_wstring(totalBytes) +
-                          L" pack_ms=" + std::to_wstring(packMs));
-        }
-
-        queued.yuv.width = srcW;
-        queued.yuv.height = srcH;
-        queued.yuv.yStride = yStride;
-        queued.yuv.uvStride = uvStride;
-        queued.yuv.bitDepth = 10;
-        queued.yuv.data = std::move(buffer);
-        queued.subtitleText = SubtitleTextForPts(pts);
-        queued.subtitleBitmaps = SubtitleBitmapsForPts(pts, srcW, srcH);
-        queued.pts = pts;
-        queued.serial = ++serial;
-        const bool logFirstDoviQueue = !dolbyVisionFirstQueueLogged_;
-        if (logFirstDoviQueue) {
-            LogThread(LogLevel::Debug,
-                      L"decoder",
-                      L"dolby_vision_yuv_queue_ready serial=" + std::to_wstring(queued.serial) +
-                          L" pts_ms=" + std::to_wstring(queued.pts.count()) +
-                          L" subtitles_text=" + (queued.subtitleText.empty() ? L"no" : L"yes") +
-                          L" subtitles_bitmap=" + (queued.subtitleBitmaps.empty() ? L"no" : L"yes"));
-        }
-        if (oneShotFrame_) {
-            return PublishImmediateFrame(std::move(queued));
-        }
-        const bool enqueued = EnqueueFrame(std::move(queued));
-        if (logFirstDoviQueue) {
-            dolbyVisionFirstQueueLogged_ = true;
-            LogThread(LogLevel::Debug,
-                      L"decoder",
-                      L"dolby_vision_yuv_queue_result enqueued=" + std::wstring(enqueued ? L"true" : L"false"));
-        }
-        return enqueued;
     }
 
 
@@ -1965,6 +3453,10 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
     queued.color = MergeFrameColorMetadata(frame, streamColorMetadata_);
     if (dolbyVisionStream_) {
         queued.dovi = ExtractFrameDolbyVisionMetadata(frame);
+        if (queued.dovi && queued.dovi->valid) {
+            queued.dynamicMetadataPath = L"dolby_vision_shader";
+            queued.dynamicMetadataDetails = DoviFrameSummary(queued.dovi.get());
+        }
     }
     queued.subtitleText = SubtitleTextForPts(pts);
     queued.subtitleBitmaps = SubtitleBitmapsForPts(pts, srcW, srcH);
@@ -2026,6 +3518,10 @@ bool FfmpegVideoDecoder::TryBuildD3DTextureFrame(AVFrame* frame, std::chrono::mi
     out.color = MergeFrameColorMetadata(frame, streamColorMetadata_);
     if (dolbyVisionStream_) {
         out.dovi = ExtractFrameDolbyVisionMetadata(frame);
+        if (out.dovi && out.dovi->valid) {
+            out.dynamicMetadataPath = L"dolby_vision_shader";
+            out.dynamicMetadataDetails = DoviFrameSummary(out.dovi.get());
+        }
     }
     out.subtitleText = SubtitleTextForPts(pts);
     out.subtitleBitmaps = SubtitleBitmapsForPts(pts, out.width, out.height);
@@ -2059,6 +3555,92 @@ bool FfmpegVideoDecoder::PublishImmediateFrame(NativeVideoFrame&& frame) {
     }
     NotifyFrameReady();
     stopping_.store(true);
+    return true;
+}
+
+std::optional<std::chrono::milliseconds> FfmpegVideoDecoder::TakePendingSeek() {
+    const int64_t ms = pendingSeekMs_.exchange(-1);
+    if (ms < 0) {
+        return std::nullopt;
+    }
+    return std::chrono::milliseconds{ms};
+}
+
+bool FfmpegVideoDecoder::HasPendingSeek() const {
+    return pendingSeekMs_.load() >= 0;
+}
+
+bool FfmpegVideoDecoder::ApplyPendingSeek(AVFormatContext* formatCtx,
+                                          AVCodecContext* codecCtx,
+                                          AVCodecContext* subtitleCodecCtx,
+                                          AVCodecContext* enhancementCodecCtx) {
+    const auto target = TakePendingSeek();
+    if (!target.has_value()) {
+        return true;
+    }
+    if (!formatCtx || !codecCtx) {
+        return false;
+    }
+
+    startPosition_ = *target;
+    if (playbackPaused_.load()) {
+        pausedPositionMs_.store(target->count());
+    }
+    const int64_t seekTarget = static_cast<int64_t>(target->count()) * AV_TIME_BASE / 1000;
+    LogThread(LogLevel::Info, L"decoder", L"runtime_seek target=" + anvil::playback::FormatTimecode(*target));
+    int seekError = av_seek_frame(formatCtx, -1, seekTarget, AVSEEK_FLAG_BACKWARD);
+    if (seekError < 0) {
+        seekError = avformat_seek_file(formatCtx, -1, INT64_MIN, seekTarget, INT64_MAX, 0);
+    }
+    if (seekError < 0) {
+        LogThread(LogLevel::Warning, L"decoder", L"runtime_seek failed reason=" + FfmpegErrorString(seekError));
+        return true;
+    }
+
+    avformat_flush(formatCtx);
+    avcodec_flush_buffers(codecCtx);
+    if (subtitleCodecCtx) {
+        avcodec_flush_buffers(subtitleCodecCtx);
+    }
+    if (enhancementCodecCtx) {
+        avcodec_flush_buffers(enhancementCodecCtx);
+    }
+    doviLibplaceboFilter_.reset();
+    dolbyVisionEnhancementFirstFrameLogged_ = false;
+    dolbyVisionEnhancementDynamicMetadataLogged_ = false;
+    dolbyVisionEnhancementFailureLogged_ = false;
+    dolbyVisionEnhancementNoMatchLogged_ = false;
+    dolbyVisionEnhancementFirstPackedLogged_ = false;
+    dolbyVisionCpuReferenceLogged_ = false;
+    dolbyVisionMultiPartitionFallbackLogged_ = false;
+    dolbyVisionEnhancementLastDynamicMetadataFingerprint_ = 0;
+    dolbyVisionEnhancementFramesDecoded_ = 0;
+    latestDolbyVisionEnhancementMetadata_.reset();
+    latestDolbyVisionEnhancementMetadataPts_ = std::chrono::milliseconds{0};
+    dolbyVisionEnhancementFrames_.clear();
+    if (externalSubtitlesActive_) {
+        subtitleCues_ = externalSubtitleCues_;
+    } else {
+        subtitleCues_.clear();
+    }
+
+    {
+        std::scoped_lock lock(mutex_);
+        latestFrame_ = {};
+        frameQueue_.clear();
+        schedulePrimed_ = false;
+        fallbackClockAnchor_.reset();
+        fallbackClockBasePts_ = *target;
+        stats_.queueDepth = 0;
+        stats_.packetQueueDepth = 0;
+        stats_.packetQueueBytes = 0;
+        stats_.readAheadEnd = std::chrono::milliseconds{0};
+        stats_.readAheadDuration = std::chrono::milliseconds{0};
+        stats_.clockPosition = *target;
+        stats_.driftMs = 0;
+        stats_.rendered = 0;
+        UpdateBufferedStatsLocked();
+    }
     return true;
 }
 
@@ -2325,6 +3907,8 @@ std::shared_ptr<const DolbyVisionFrameMetadata> FfmpegVideoDecoder::ExtractDolby
     out->blVideoFullRange = header->bl_video_full_range_flag != 0;
     out->vdrRpuNormalizedIdc = header->vdr_rpu_normalized_idc == 1;
     out->coefLog2Denom = header->coef_log2_denom;
+    out->residualDisabled = header->disable_residual_flag != 0;
+    out->elSpatialResampling = header->el_spatial_resampling_filter_flag != 0;
     if (out->coefLog2Denom <= 0) {
         out->coefLog2Denom = 0;  // signals "no fixed-point" — coefficients already real
     }
@@ -2370,6 +3954,20 @@ std::shared_ptr<const DolbyVisionFrameMetadata> FfmpegVideoDecoder::ExtractDolby
         }
     }
 
+    out->nlqMethod = mapping->nlq_method_idc == AV_DOVI_NLQ_LINEAR_DZ
+                         ? DoviNlqMethod::LinearDeadzone
+                         : DoviNlqMethod::None;
+    out->nlqNumXPartitions = mapping->num_x_partitions;
+    out->nlqNumYPartitions = mapping->num_y_partitions;
+    for (int c = 0; c < kDoviNumComponents; ++c) {
+        out->nlqOffset[c] = mapping->nlq[c].nlq_offset;
+        out->nlqVdrInMax[c] = mapping->nlq[c].vdr_in_max;
+        out->nlqLinearDeadzoneSlope[c] = mapping->nlq[c].linear_deadzone_slope;
+        out->nlqLinearDeadzoneThreshold[c] = mapping->nlq[c].linear_deadzone_threshold;
+    }
+    out->nlqPivots[0] = mapping->nlq_pivots[0];
+    out->nlqPivots[1] = mapping->nlq_pivots[1];
+
     // Color matrices (YCC<->RGB and RGB->LMS, both row-major 3x3).
     for (int i = 0; i < 9; ++i) {
         out->yccToRgb[i] = static_cast<float>(RationalToDouble(color->ycc_to_rgb_matrix[i]));
@@ -2382,6 +3980,94 @@ std::shared_ptr<const DolbyVisionFrameMetadata> FfmpegVideoDecoder::ExtractDolby
     out->sourceMaxPq = color->source_max_pq;
     out->sourceMinNits = Pq12CodeToNits(out->sourceMinPq);
     out->sourceMaxNits = Pq12CodeToNits(out->sourceMaxPq);
+
+    out->dmMetadataId = color->dm_metadata_id;
+    out->sceneRefreshFlag = color->scene_refresh_flag;
+    uint64_t fingerprint = 14695981039346656037ull;
+    fingerprint = HashValue(fingerprint, out->dmMetadataId);
+    fingerprint = HashValue(fingerprint, out->sceneRefreshFlag);
+    fingerprint = HashValue(fingerprint, out->sourceMinPq);
+    fingerprint = HashValue(fingerprint, out->sourceMaxPq);
+
+    const int extBlockCount = std::clamp(dovi->num_ext_blocks, 0, AV_DOVI_MAX_EXT_BLOCKS);
+    for (int index = 0; index < extBlockCount; ++index) {
+        const AVDOVIDmData* ext = av_dovi_get_ext(dovi, index);
+        if (!ext) {
+            continue;
+        }
+        ++out->dmExtensionBlockCount;
+        if (ext->level < 64) {
+            out->dmLevelMaskLow |= uint64_t{1} << ext->level;
+        }
+        if (dovi->ext_block_size > 0) {
+            fingerprint = HashBytes(fingerprint, ext, dovi->ext_block_size);
+        } else {
+            fingerprint = HashValue(fingerprint, ext->level);
+        }
+
+        switch (ext->level) {
+        case 1:
+            out->dmLevel1Present = true;
+            out->dmLevel1MinPq = ext->l1.min_pq;
+            out->dmLevel1MaxPq = ext->l1.max_pq;
+            out->dmLevel1AvgPq = ext->l1.avg_pq;
+            break;
+        case 2: {
+            out->dmLevel2Present = true;
+            const int targetIndex = out->dmLevel2Count;
+            ++out->dmLevel2Count;
+            if (targetIndex >= 0 && targetIndex < anvil::playback::kDoviMaxTrimTargets) {
+                out->dmLevel2TargetMaxPq[targetIndex] = ext->l2.target_max_pq;
+                out->dmLevel2TrimSlope[targetIndex] = ext->l2.trim_slope;
+                out->dmLevel2TrimOffset[targetIndex] = ext->l2.trim_offset;
+                out->dmLevel2TrimPower[targetIndex] = ext->l2.trim_power;
+                out->dmLevel2TrimChromaWeight[targetIndex] = ext->l2.trim_chroma_weight;
+                out->dmLevel2TrimSaturationGain[targetIndex] = ext->l2.trim_saturation_gain;
+                out->dmLevel2MsWeight[targetIndex] = ext->l2.ms_weight;
+            }
+            break;
+        }
+        case 3:
+            out->dmLevel3Present = true;
+            out->dmLevel3MinPqOffset = ext->l3.min_pq_offset;
+            out->dmLevel3MaxPqOffset = ext->l3.max_pq_offset;
+            out->dmLevel3AvgPqOffset = ext->l3.avg_pq_offset;
+            break;
+        case 5:
+            out->dmLevel5Present = true;
+            out->dmLevel5LeftOffset = ext->l5.left_offset;
+            out->dmLevel5RightOffset = ext->l5.right_offset;
+            out->dmLevel5TopOffset = ext->l5.top_offset;
+            out->dmLevel5BottomOffset = ext->l5.bottom_offset;
+            break;
+        case 8:
+            out->dmLevel8Present = true;
+            ++out->dmLevel8Count;
+            // Keep the first L8 block in the compact summary; the level count
+            // still tells us when multiple target-display trims are present.
+            if (out->dmLevel8Count == 1) {
+                out->dmLevel8TargetDisplayIndex = ext->l8.target_display_index;
+                out->dmLevel8TrimSlope = ext->l8.trim_slope;
+                out->dmLevel8TrimOffset = ext->l8.trim_offset;
+                out->dmLevel8TrimPower = ext->l8.trim_power;
+                out->dmLevel8TrimChromaWeight = ext->l8.trim_chroma_weight;
+                out->dmLevel8TrimSaturationGain = ext->l8.trim_saturation_gain;
+                out->dmLevel8MsWeight = ext->l8.ms_weight;
+                out->dmLevel8TargetMidContrast = ext->l8.target_mid_contrast;
+                out->dmLevel8ClipTrim = ext->l8.clip_trim;
+            }
+            break;
+        case 254:
+            out->dmLevel254Present = true;
+            break;
+        case 255:
+            out->dmLevel255Present = true;
+            break;
+        default:
+            break;
+        }
+    }
+    out->dynamicMetadataFingerprint = fingerprint;
 
     return out;
 }
@@ -2400,6 +4086,21 @@ std::shared_ptr<const DolbyVisionFrameMetadata> FfmpegVideoDecoder::ExtractFrame
     seeded->compatibilityId = dolbyVisionCompatId_;
     seeded->elPresent = dolbyVisionElPresent_;
     seeded->blPresent = dolbyVisionBlPresent_;
+    return seeded;
+}
+
+std::shared_ptr<const DolbyVisionFrameMetadata> FfmpegVideoDecoder::ExtractEnhancementDolbyVisionMetadata(const AVFrame* frame) {
+    auto metadata = ExtractDolbyVisionMetadata(frame);
+    if (!metadata) {
+        return nullptr;
+    }
+
+    auto seeded = std::make_shared<DolbyVisionFrameMetadata>(*metadata);
+    seeded->profile = dolbyVisionEnhancementProfile_;
+    seeded->level = dolbyVisionEnhancementLevel_;
+    seeded->compatibilityId = dolbyVisionEnhancementCompatId_;
+    seeded->elPresent = dolbyVisionEnhancementElPresent_;
+    seeded->blPresent = dolbyVisionEnhancementBlPresent_;
     return seeded;
 }
 
@@ -2468,15 +4169,98 @@ std::shared_ptr<std::vector<uint8_t>> FfmpegVideoDecoder::AcquireReusableBgraBuf
     return transient;
 }
 
+std::size_t FfmpegVideoDecoder::FrameQueueCostBytes(const NativeVideoFrame& frame) {
+    const std::size_t enhancementBytes =
+        frame.HasEnhancementYuv() && frame.enhancementYuv.data ? frame.enhancementYuv.data->size() : 0;
+    if (frame.HasD3DTexture()) {
+        return enhancementBytes;
+    }
+    if (frame.HasYuv()) {
+        return (frame.yuv.data ? frame.yuv.data->size() : 0) + enhancementBytes;
+    }
+    if (frame.HasPixels()) {
+        return (frame.bgra ? frame.bgra->size() : 0) + enhancementBytes;
+    }
+    return enhancementBytes;
+}
+
+std::size_t FfmpegVideoDecoder::MaxQueueDepthForFrame(const NativeVideoFrame& frame) {
+    if (frame.HasD3DTexture()) {
+        return kMaxHardwareQueuedFrames;
+    }
+    if (frame.HasYuv()) {
+        return kMaxYuvQueuedFrames;
+    }
+
+    const std::size_t bytes = FrameQueueCostBytes(frame);
+    constexpr std::size_t kLargeFrameBytes = 24ull * 1024ull * 1024ull;
+    return bytes >= kLargeFrameBytes ? kMaxLargeBgraQueuedFrames : kMaxSmallBgraQueuedFrames;
+}
+
+bool FfmpegVideoDecoder::HasQueueCapacityLocked(const NativeVideoFrame& frame) const {
+    if (frameQueue_.size() >= MaxQueueDepthForFrame(frame)) {
+        return false;
+    }
+
+    const std::size_t incomingBytes = FrameQueueCostBytes(frame);
+    if (incomingBytes == 0) {
+        return true;
+    }
+
+    std::size_t queuedBytes = 0;
+    for (const auto& queued : frameQueue_) {
+        queuedBytes += FrameQueueCostBytes(queued);
+        if (queuedBytes >= kMaxCpuQueuedFrameBytes) {
+            return false;
+        }
+    }
+
+    return frameQueue_.empty() || queuedBytes + incomingBytes <= kMaxCpuQueuedFrameBytes;
+}
+
+void FfmpegVideoDecoder::UpdateBufferedStatsLocked() {
+    stats_.queueDepth = frameQueue_.size();
+    const auto decodedStart = latestFrame_.HasContent()
+                                  ? latestFrame_.pts
+                                  : (frameQueue_.empty() ? stats_.clockPosition : frameQueue_.front().pts);
+    std::chrono::milliseconds decodedEnd = decodedStart;
+    std::chrono::milliseconds decodedDuration{0};
+    if (frameQueue_.empty()) {
+        if (latestFrame_.HasContent()) {
+            decodedEnd = latestFrame_.pts;
+        }
+        stats_.bufferedEnd = std::max(decodedEnd, stats_.readAheadEnd);
+        stats_.bufferedDuration = std::max(stats_.readAheadDuration,
+                                           std::max(std::chrono::milliseconds{0},
+                                                    stats_.bufferedEnd - decodedStart));
+        return;
+    }
+
+    const auto end = frameQueue_.back().pts;
+    decodedEnd = std::max(decodedStart, end);
+    decodedDuration = std::max(std::chrono::milliseconds{0}, decodedEnd - decodedStart);
+    stats_.bufferedEnd = std::max(decodedEnd, stats_.readAheadEnd);
+    stats_.bufferedDuration = std::max(decodedDuration,
+                                       std::max(stats_.readAheadDuration,
+                                                std::max(std::chrono::milliseconds{0},
+                                                         stats_.bufferedEnd - decodedStart)));
+}
+
 bool FfmpegVideoDecoder::EnqueueFrame(NativeVideoFrame&& frame) {
     while (!stopping_.load()) {
+        if (HasPendingSeek()) {
+            return true;
+        }
         ScheduleDueFrames();
         bool queued = false;
         {
             std::scoped_lock lock(mutex_);
-            if (frameQueue_.size() < kMaxQueuedFrames) {
+            if (HasQueueCapacityLocked(frame)) {
                 frameQueue_.push_back(std::move(frame));
-                stats_.queueDepth = frameQueue_.size();
+                UpdateBufferedStatsLocked();
+                queued = true;
+            } else if (playbackPaused_.load()) {
+                ++stats_.droppedQueueFull;
                 queued = true;
             }
         }
@@ -2484,7 +4268,7 @@ bool FfmpegVideoDecoder::EnqueueFrame(NativeVideoFrame&& frame) {
             ScheduleDueFrames();
             return true;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
     }
     return false;
 }
@@ -2498,7 +4282,7 @@ void FfmpegVideoDecoder::DrainQueuedFrames() {
                 return;
             }
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
     }
 }
 
@@ -2512,7 +4296,7 @@ void FfmpegVideoDecoder::ScheduleDueFrames() {
     {
         std::scoped_lock lock(mutex_);
         if (frameQueue_.empty()) {
-            stats_.queueDepth = 0;
+            UpdateBufferedStatsLocked();
             return;
         }
 
@@ -2528,6 +4312,14 @@ void FfmpegVideoDecoder::ScheduleDueFrames() {
         while (!frameQueue_.empty()) {
             const NativeVideoFrame& front = frameQueue_.front();
             const auto earlyBy = front.pts - clock.position;
+            const auto lateBy = clock.position - front.pts;
+            if (lateBy > kFrameLateDropThreshold && (stats_.rendered > 0 || frameQueue_.size() > 1)) {
+                frameQueue_.pop_front();
+                UpdateBufferedStatsLocked();
+                ++stats_.droppedLate;
+                continue;
+            }
+
             const bool frameIsDue = earlyBy <= kFrameEarlyTolerance;
             if (!frameIsDue) {
                 break;
@@ -2535,7 +4327,7 @@ void FfmpegVideoDecoder::ScheduleDueFrames() {
 
             NativeVideoFrame candidate = std::move(frameQueue_.front());
             frameQueue_.pop_front();
-            stats_.queueDepth = frameQueue_.size();
+            UpdateBufferedStatsLocked();
 
             const bool anotherFrameDue = !frameQueue_.empty() &&
                 (frameQueue_.front().pts - clock.position) <= kFrameEarlyTolerance;
@@ -2551,12 +4343,12 @@ void FfmpegVideoDecoder::ScheduleDueFrames() {
 
         if (hasFrame) {
             stats_.driftMs = static_cast<int>((frameToPublish.pts - clock.position).count());
-            stats_.queueDepth = frameQueue_.size();
             ++stats_.rendered;
             firstPublishedFrame = stats_.rendered == 1;
-            publishedQueueDepth = stats_.queueDepth;
             publishedClockPosition = clock.position;
             latestFrame_ = frameToPublish;
+            UpdateBufferedStatsLocked();
+            publishedQueueDepth = stats_.queueDepth;
         }
     }
 
@@ -2573,6 +4365,10 @@ void FfmpegVideoDecoder::ScheduleDueFrames() {
 }
 
 FfmpegVideoDecoder::SchedulerClock FfmpegVideoDecoder::CurrentSchedulerClockLocked(const std::chrono::milliseconds firstQueuedPts) {
+    if (playbackPaused_.load()) {
+        return {std::chrono::milliseconds{pausedPositionMs_.load()}, false};
+    }
+
     if (clockCallback_) {
         if (const auto audioClock = clockCallback_()) {
             return {*audioClock, true};

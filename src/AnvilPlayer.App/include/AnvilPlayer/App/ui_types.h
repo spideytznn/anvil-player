@@ -22,11 +22,15 @@ enum class Command {
     Fullscreen,
     Settings,
     ToggleSidebar,
+    InspectorRecent,
+    InspectorFolder,
     InspectorMedia,
-    InspectorDevice,
+    InspectorSystem,
     InspectorLog,
     ToggleDolbyVisionHdr,
+    ToggleDolbyVisionCmv4Approx,
     ResetHdrToneCurve,
+    ToggleHdrToneCurveExpanded,
 };
 
 // Which icon asset a button shows. Mirrors assets/icons/*.png filenames.
@@ -46,19 +50,26 @@ enum class IconKind {
     Windowed,
     ChevronLeft,
     ChevronRight,
+    HdrColor,
+    DolbyVisionColor,
 };
 
 // Visual style of a UI button.
 enum class ButtonKind {
     Icon,
     TransportPrimary,
+    TransportIcon,
+    TransportLabel,
     Tab,
+    InspectorTab,
 };
 
 // Which inspector panel is currently visible.
 enum class InspectorTab {
+    Recent,
+    Folder,
     Media,
-    Device,
+    System,
     Log,
     Settings,
 };
