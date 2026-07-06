@@ -66,6 +66,12 @@ std::wstring FormatAverageMilliseconds(const uint64_t totalMicroseconds, const u
     return FormatMillisecondsFromMicroseconds(totalMicroseconds / count);
 }
 
+bool WantsDolbyVisionHdrOutput(const anvil::playback::VideoSettings& settings,
+                               const anvil::playback::DisplayCapabilities& display) {
+    (void)display;
+    return settings.dolbyVisionHdrOutput;
+}
+
 }  // namespace
 
 void MainWindow::ConfigureLogging(const LogLevel minimumLevel) {
@@ -997,7 +1003,8 @@ void MainWindow::StartRuntime(const PlaybackSessionSnapshot& snapshot, const boo
                                                    PlaybackSurfaceBounds(),
                                                    snapshot.media->path,
                                                    snapshot.position,
-                                                   snapshot.volume);
+                                                   snapshot.volume,
+                                                   snapshot.media->dolbyVisionDetected);
         LogApp(started ? (restart ? LogLevel::Debug : LogLevel::Info) : LogLevel::Error,
                std::wstring(L"external ffplay playback ") + (restart ? L"restart=" : L"start=") + (started ? L"true" : L"false"));
         LogApp(LogLevel::Debug, L"ffplay command=" + playbackPlayer_.LastCommandLine());
@@ -1088,6 +1095,7 @@ void MainWindow::EnsureVideoHost() {
 void MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot, const bool restart) {
     bool videoStarted = true;
     bool audioStarted = true;
+    bool preferDolbyVisionHdrOutput = false;
     lastNativeStatsLog_ = {};
     if (snapshot.media->hasAudio) {
         audioPlayer_.SetPlaybackRate(snapshot.playbackRate);
@@ -1104,6 +1112,10 @@ void MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot, con
         EnsureLayout();
         EnsureVideoHost();
         const auto settings = controller_.Settings();
+        const auto& capabilities = CachedCapabilities();
+        preferDolbyVisionHdrOutput =
+            snapshot.media->dolbyVisionDetected &&
+            WantsDolbyVisionHdrOutput(settings.video, capabilities.display);
         const bool preferHardwareDecode = snapshot.media->selectedDecodePath == L"ffmpeg_d3d11va";
         videoStarted = videoHostReady_ && nativeVideoDecoder_ &&
                        nativeVideoDecoder_->Start(snapshot.media->path,
@@ -1125,7 +1137,9 @@ void MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot, con
                                                   settings.subtitles.preferredLanguage,
                                                   settings.subtitles.selectedTrackIndex,
                                                   std::chrono::milliseconds{settings.subtitles.subtitleDelayMs},
-                                                  settings.subtitles.externalSubtitleAutoLoad);
+                                                  settings.subtitles.externalSubtitleAutoLoad,
+                                                  false,
+                                                  preferDolbyVisionHdrOutput);
         if (videoStarted) {
             MarkLayoutDirty();
             EnsureLayout();
@@ -1141,6 +1155,11 @@ void MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot, con
                L" audio=" + (audioStarted ? L"true" : L"false"));
     if (snapshot.media->hasVideo && videoStarted) {
         LogApp(LogLevel::Debug, L"native decode path=" + nativeVideoDecoder_->Path().wstring());
+        if (snapshot.media->dolbyVisionDetected) {
+            LogApp(LogLevel::Info,
+                   L"dolby vision libplacebo output=" +
+                       std::wstring(preferDolbyVisionHdrOutput ? L"hdr_bt2020_pq" : L"sdr_bt709"));
+        }
     }
     if (snapshot.media->hasAudio) {
         LogApp(LogLevel::Debug, L"wasapi audio=" + audioPlayer_.LastStatus());
@@ -1171,6 +1190,10 @@ void MainWindow::RefreshPausedNativeFrame(const PlaybackSessionSnapshot& snapsho
     EnsureVideoHost();
 
     const auto settings = controller_.Settings();
+    const auto& capabilities = CachedCapabilities();
+    const bool preferDolbyVisionHdrOutput =
+        snapshot.media->dolbyVisionDetected &&
+        WantsDolbyVisionHdrOutput(settings.video, capabilities.display);
     const bool preferHardwareDecode = snapshot.media->selectedDecodePath == L"ffmpeg_d3d11va";
     const bool started = videoHostReady_ &&
                          d3dRenderer_ &&
@@ -1185,7 +1208,8 @@ void MainWindow::RefreshPausedNativeFrame(const PlaybackSessionSnapshot& snapsho
                                                     settings.subtitles.selectedTrackIndex,
                                                     std::chrono::milliseconds{settings.subtitles.subtitleDelayMs},
                                                     settings.subtitles.externalSubtitleAutoLoad,
-                                                    true);
+                                                    true,
+                                                    preferDolbyVisionHdrOutput);
     if (started) {
         nativeFrameHoldVisible_ = true;
         MarkLayoutDirty();

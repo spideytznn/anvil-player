@@ -36,7 +36,8 @@ public:
                RECT bounds,
                const std::filesystem::path& mediaPath,
                std::chrono::milliseconds startPosition,
-               double volume);
+               double volume,
+               bool useLibplaceboDolbyVision);
 
     void Stop();
 

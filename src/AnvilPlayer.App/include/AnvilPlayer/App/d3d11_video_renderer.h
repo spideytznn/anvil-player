@@ -130,6 +130,7 @@ private:
     D3D11_VIEWPORT viewport_{};
     int textureW_ = 0;
     int textureH_ = 0;
+    DXGI_FORMAT textureFormat_ = DXGI_FORMAT_UNKNOWN;
     int subtitleTextureW_ = 0;
     int subtitleTextureH_ = 0;
     bool hardwareTextureFailureLogged_ = false;

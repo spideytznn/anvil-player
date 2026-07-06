@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -15,6 +16,31 @@ using anvil::playback::PlaybackState;
 namespace {
 
 constexpr UINT kSubtitleMenuCommandBase = 0x5000;
+constexpr double kHdrToneCurveMaxNits = 10000.0;
+
+double ToneCurveNitsToUnit(const double nits) {
+    const double clamped = std::clamp(nits, 0.0, kHdrToneCurveMaxNits);
+    return std::log10(clamped + 1.0) / std::log10(kHdrToneCurveMaxNits + 1.0);
+}
+
+double UnitToToneCurveNits(const double unit) {
+    const double clamped = std::clamp(unit, 0.0, 1.0);
+    return std::pow(10.0, clamped * std::log10(kHdrToneCurveMaxNits + 1.0)) - 1.0;
+}
+
+int ToneCurveX(const RECT& plot, const double nits) {
+    return plot.left + static_cast<int>(std::round(ToneCurveNitsToUnit(nits) * RectWidth(plot)));
+}
+
+int ToneCurveY(const RECT& plot, const double nits) {
+    return plot.bottom - static_cast<int>(std::round(ToneCurveNitsToUnit(nits) * RectHeight(plot)));
+}
+
+double RoundToneCurveNits(const double nits) {
+    const double clamped = std::clamp(nits, 0.0, kHdrToneCurveMaxNits);
+    const double step = clamped < 100.0 ? 5.0 : (clamped < 1000.0 ? 10.0 : (clamped < 4000.0 ? 50.0 : 100.0));
+    return std::round(clamped / step) * step;
+}
 
 std::vector<int> SubtitleTrackCycle(const std::optional<anvil::playback::MediaDescriptor>& media) {
     std::vector<int> tracks;
@@ -98,6 +124,10 @@ void MainWindow::OnMouseMove(const int x, const int y) {
         InvalidateTransportArea();
         return;
     }
+    if (draggingHdrToneCurve_) {
+        UpdateHdrToneCurveDrag(point);
+        return;
+    }
 
     if (!trackingMouseLeave_) {
         TRACKMOUSEEVENT event{};
@@ -138,6 +168,9 @@ void MainWindow::OnLeftButtonDown(const int x, const int y) {
         Execute(buttons_[static_cast<std::size_t>(hit)].command);
         return;
     }
+    if (BeginHdrToneCurveDrag(point)) {
+        return;
+    }
     if (ContainsPoint(ProgressHitRect(), point)) {
         BeginProgressDrag(point.x);
         return;
@@ -150,6 +183,11 @@ void MainWindow::OnLeftButtonDown(const int x, const int y) {
 }
 
 void MainWindow::OnLeftButtonUp(const int x, const int y) {
+    if (draggingHdrToneCurve_) {
+        UpdateHdrToneCurveDrag(POINT{x, y});
+        EndHdrToneCurveDrag();
+        return;
+    }
     if (draggingProgress_) {
         dragSeekPosition_ = PositionFromProgressX(x);
         CommitProgressDrag();
@@ -212,6 +250,133 @@ void MainWindow::CommitProgressDrag() {
         ReleaseCapture();
     }
     SeekToPosition(dragSeekPosition_);
+}
+
+bool MainWindow::IsHdrToneCurveVisible() const {
+    const auto settings = controller_.Settings();
+    return inspectorTab_ == InspectorTab::Settings &&
+           settings.video.dolbyVisionHdrOutput &&
+           RectWidth(hdrToneCurvePlot_) > 0 &&
+           RectHeight(hdrToneCurvePlot_) > 0;
+}
+
+bool MainWindow::BeginHdrToneCurveDrag(const POINT point) {
+    if (!IsHdrToneCurveVisible()) {
+        return false;
+    }
+
+    RECT hitRect = hdrToneCurvePlot_;
+    InflateRect(&hitRect, Scale(18), Scale(18));
+    if (!ContainsPoint(hitRect, point)) {
+        return false;
+    }
+
+    const auto settings = controller_.Settings();
+    int nearest = -1;
+    int nearestDistanceSq = Scale(24) * Scale(24);
+    for (std::size_t index = 1; index < settings.video.hdrToneCurve.size(); ++index) {
+        const auto& curvePoint = settings.video.hdrToneCurve[index];
+        const double inputNits = index < anvil::playback::kDefaultHdrToneCurve.size()
+                                     ? anvil::playback::kDefaultHdrToneCurve[index].inputNits
+                                     : curvePoint.inputNits;
+        const int dx = point.x - ToneCurveX(hdrToneCurvePlot_, inputNits);
+        const int dy = point.y - ToneCurveY(hdrToneCurvePlot_, curvePoint.outputNits);
+        const int distanceSq = dx * dx + dy * dy;
+        if (distanceSq <= nearestDistanceSq) {
+            nearest = static_cast<int>(index);
+            nearestDistanceSq = distanceSq;
+        }
+    }
+
+    if (nearest < 0) {
+        return false;
+    }
+
+    draggingHdrToneCurve_ = true;
+    draggedHdrToneCurvePoint_ = nearest;
+    SetCapture(hwnd_);
+    UpdateHdrToneCurveDrag(point);
+    return true;
+}
+
+void MainWindow::UpdateHdrToneCurveDrag(const POINT point) {
+    if (!draggingHdrToneCurve_ ||
+        draggedHdrToneCurvePoint_ <= 0 ||
+        !IsHdrToneCurveVisible() ||
+        RectWidth(hdrToneCurvePlot_) <= 0 ||
+        RectHeight(hdrToneCurvePlot_) <= 0) {
+        return;
+    }
+
+    auto settings = controller_.Settings();
+    auto& curve = settings.video.hdrToneCurve;
+    const std::size_t index = static_cast<std::size_t>(draggedHdrToneCurvePoint_);
+    if (index >= curve.size()) {
+        return;
+    }
+
+    const double unitY = 1.0 - static_cast<double>(point.y - hdrToneCurvePlot_.top) / static_cast<double>(RectHeight(hdrToneCurvePlot_));
+    double outputNits = RoundToneCurveNits(UnitToToneCurveNits(unitY));
+
+    for (std::size_t i = 0; i < curve.size() && i < anvil::playback::kDefaultHdrToneCurve.size(); ++i) {
+        curve[i].inputNits = anvil::playback::kDefaultHdrToneCurve[i].inputNits;
+    }
+
+    const double minOutput = curve[index - 1].outputNits;
+    const double maxOutput = index + 1 < curve.size()
+                                 ? curve[index + 1].outputNits
+                                 : kHdrToneCurveMaxNits;
+
+    outputNits = std::clamp(outputNits, minOutput, std::max(minOutput, maxOutput));
+    curve[index].outputNits = outputNits;
+    settings.video.peakBrightnessNits = static_cast<int>(std::clamp(curve.back().outputNits, 100.0, 10000.0));
+
+    controller_.ApplySettings(settings);
+    ApplyLiveHdrToneCurveSettings();
+}
+
+void MainWindow::EndHdrToneCurveDrag() {
+    if (!draggingHdrToneCurve_) {
+        return;
+    }
+
+    draggingHdrToneCurve_ = false;
+    draggedHdrToneCurvePoint_ = -1;
+    if (GetCapture() == hwnd_) {
+        ReleaseCapture();
+    }
+
+    const auto settings = controller_.Settings();
+    LogApp(anvil::playback::LogLevel::Info,
+           L"hdr tone curve peak=" + std::to_wstring(settings.video.peakBrightnessNits) + L" nits");
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::ResetHdrToneCurve() {
+    auto settings = controller_.Settings();
+    settings.video.hdrToneCurve = anvil::playback::kDefaultHdrToneCurve;
+    settings.video.peakBrightnessNits =
+        static_cast<int>(std::clamp(settings.video.hdrToneCurve.back().outputNits, 100.0, 10000.0));
+    controller_.ApplySettings(settings);
+    ApplyLiveHdrToneCurveSettings();
+    LogApp(anvil::playback::LogLevel::Info, L"hdr tone curve reset");
+}
+
+void MainWindow::ApplyLiveHdrToneCurveSettings() {
+    const auto snapshot = controller_.Snapshot();
+    const auto settings = controller_.Settings();
+    if (d3dRenderer_ && snapshot.media.has_value()) {
+        d3dRenderer_->ConfigureColorPipeline(settings.video, CachedCapabilities().display, snapshot.media->videoColor);
+    }
+    if (backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+        snapshot.state == PlaybackState::Paused &&
+        heldNativeFrame_.has_value()) {
+        RenderHeldNativeFrame();
+    }
+    MarkLayoutDirty();
+    EnsureLayout();
+    InvalidateFullscreenOverlay();
+    InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
 void MainWindow::BeginVideoPress(const POINT point) {
@@ -303,6 +468,9 @@ void MainWindow::OnKeyDown(const WPARAM key) {
     case 'F':
         ToggleFullscreen();
         break;
+    case 'H':
+        ToggleDolbyVisionHdrOutput();
+        break;
     case 'S':
         CycleSubtitleTrack();
         break;
@@ -356,6 +524,29 @@ void MainWindow::CycleSubtitleTrack() {
         current = tracks.begin();
     }
     ApplySubtitleSelection(*current);
+}
+
+void MainWindow::ToggleDolbyVisionHdrOutput() {
+    auto settings = controller_.Settings();
+    settings.video.dolbyVisionHdrOutput = !settings.video.dolbyVisionHdrOutput;
+    controller_.ApplySettings(settings);
+    LogApp(anvil::playback::LogLevel::Info,
+           L"dolby vision hdr output=" +
+               std::wstring(settings.video.dolbyVisionHdrOutput ? L"on" : L"off"));
+
+    const auto snapshot = controller_.Snapshot();
+    if (snapshot.state == PlaybackState::Paused &&
+        snapshot.media.has_value() &&
+        snapshot.media->hasVideo &&
+        backend_ == PlaybackBackend::NativeFfmpegD3D11) {
+        RefreshPausedNativeFrame(snapshot);
+    } else {
+        RestartPlaybackIfPlaying();
+    }
+    MarkLayoutDirty();
+    EnsureLayout();
+    InvalidateFullscreenOverlay();
+    InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
 void MainWindow::ShowSubtitleMenu() {
@@ -486,6 +677,12 @@ void MainWindow::Execute(const Command command) {
         inspectorTab_ = InspectorTab::Log;
         MarkLayoutDirty();
         EnsureLayout();
+        break;
+    case Command::ToggleDolbyVisionHdr:
+        ToggleDolbyVisionHdrOutput();
+        break;
+    case Command::ResetHdrToneCurve:
+        ResetHdrToneCurve();
         break;
     }
     InvalidateFullscreenOverlay();

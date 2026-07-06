@@ -2,12 +2,32 @@
 
 #include "AnvilPlayer/Playback/Types.h"
 
+#include <array>
+#include <cstddef>
 #include <string>
 
 namespace anvil::playback {
 
 inline constexpr int kSubtitleTrackAuto = -2;
 inline constexpr int kSubtitleTrackOff = -1;
+inline constexpr std::size_t kHdrToneCurvePointCount = 9;
+
+struct HdrToneCurvePoint {
+    double inputNits = 0.0;
+    double outputNits = 0.0;
+};
+
+inline constexpr std::array<HdrToneCurvePoint, kHdrToneCurvePointCount> kDefaultHdrToneCurve = {{
+    {0.0, 0.0},
+    {50.0, 50.0},
+    {100.0, 100.0},
+    {250.0, 235.0},
+    {400.0, 360.0},
+    {700.0, 540.0},
+    {1000.0, 700.0},
+    {2000.0, 880.0},
+    {4000.0, 1000.0},
+}};
 
 struct VideoSettings {
     HardwareDecodeMode hardwareDecode = HardwareDecodeMode::Auto;
@@ -15,7 +35,9 @@ struct VideoSettings {
     HdrOutputMode hdrOutput = HdrOutputMode::Auto;
     ToneMappingMode toneMapping = ToneMappingMode::Balanced;
     DolbyVisionMode dolbyVision = DolbyVisionMode::FallbackOnly;
+    bool dolbyVisionHdrOutput = false;
     int peakBrightnessNits = 1000;
+    std::array<HdrToneCurvePoint, kHdrToneCurvePointCount> hdrToneCurve = kDefaultHdrToneCurve;
 };
 
 struct AudioSettings {

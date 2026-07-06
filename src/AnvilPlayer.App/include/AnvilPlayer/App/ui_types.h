@@ -25,6 +25,8 @@ enum class Command {
     InspectorMedia,
     InspectorDevice,
     InspectorLog,
+    ToggleDolbyVisionHdr,
+    ResetHdrToneCurve,
 };
 
 // Which icon asset a button shows. Mirrors assets/icons/*.png filenames.
