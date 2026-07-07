@@ -1,6 +1,7 @@
 #pragma once
 
 #include "AnvilPlayer/App/log_sink_ptr.h"
+#include "AnvilPlayer/Playback/Settings.h"
 
 #include <audioclient.h>
 #include <mmdeviceapi.h>
@@ -43,7 +44,8 @@ public:
 
     bool Start(const std::filesystem::path& mediaPath,
                std::chrono::milliseconds startPosition,
-               double volume);
+               double volume,
+               int selectedAudioTrackIndex = anvil::playback::kAudioTrackAuto);
 
     void Stop();
     bool Seek(std::chrono::milliseconds position);
@@ -174,6 +176,7 @@ private:
 
     std::filesystem::path path_;
     std::chrono::milliseconds startPosition_{0};
+    int selectedAudioTrackIndex_ = anvil::playback::kAudioTrackAuto;
     LogSinkPtr logSink_;
     std::atomic<double> volume_{1.0};
     std::atomic<double> playbackRate_{1.0};

@@ -158,6 +158,8 @@ private:
     std::wstring activeSubtitleBitmapKey_;
     RECT activeSubtitleViewport_{};
     double activeSubtitleFontScale_ = 0.0;
+    int activeSubtitleOffsetXPx_ = 0;
+    int activeSubtitleOffsetYPx_ = 0;
     DXGI_COLOR_SPACE_TYPE activeColorSpace_ = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
     bool hdrMetadataApplied_ = false;
     bool hdrColorSpaceFailureLogged_ = false;

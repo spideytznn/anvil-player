@@ -1483,6 +1483,7 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
                                const int selectedSubtitleTrackIndex,
                                const std::chrono::milliseconds subtitleDelay,
                                const bool autoLoadExternalSubtitles,
+                               std::filesystem::path externalSubtitlePath,
                                const bool oneShotFrame,
                                const bool preferDolbyVisionHdrOutput,
                                const bool enableDolbyVisionEnhancementDecode) {
@@ -1514,6 +1515,7 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
     selectedSubtitleTrackIndex_ = selectedSubtitleTrackIndex;
     subtitleDelay_ = subtitleDelay;
     autoLoadExternalSubtitles_ = autoLoadExternalSubtitles;
+    externalSubtitlePath_ = std::move(externalSubtitlePath);
     oneShotFrame_ = oneShotFrame;
     preferDolbyVisionHdrOutput_ = preferDolbyVisionHdrOutput;
     enableDolbyVisionEnhancementDecode_ = enableDolbyVisionEnhancementDecode;
@@ -1526,6 +1528,7 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
     dolbyVisionEnhancementFirstPackedLogged_ = false;
     dolbyVisionCpuReferenceLogged_ = false;
     dolbyVisionMultiPartitionFallbackLogged_ = false;
+    dolbyVisionEnhancementStartupMisses_ = 0;
     dolbyVisionEnhancementLastDynamicMetadataFingerprint_ = 0;
     dolbyVisionEnhancementFramesDecoded_ = 0;
     dolbyVisionEnhancementStreamIndex_ = -1;
@@ -1700,6 +1703,85 @@ bool FfmpegVideoDecoder::WaitForPreroll(const std::chrono::milliseconds targetDu
     return false;
 }
 
+bool FfmpegVideoDecoder::WaitForEnhancementPreroll(const std::chrono::milliseconds minPts,
+                                                   const std::chrono::milliseconds timeout,
+                                                   const bool publishReadyFrame) {
+    if (oneShotFrame_ || !enableDolbyVisionEnhancementDecode_ || timeout.count() <= 0) {
+        return false;
+    }
+
+    struct EnhancementPrerollWaitScope {
+        std::atomic_bool& active;
+        explicit EnhancementPrerollWaitScope(std::atomic_bool& value) : active(value) {
+            active.store(true);
+        }
+        ~EnhancementPrerollWaitScope() {
+            active.store(false);
+        }
+    } waitScope{enhancementPrerollWaitActive_};
+
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!stopping_.load() && running_.load() && std::chrono::steady_clock::now() < deadline) {
+        if (HasPendingSeek()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+            continue;
+        }
+        bool ready = false;
+        bool notify = false;
+        {
+            std::scoped_lock lock(mutex_);
+            const auto closeToTarget = [minPts](const NativeVideoFrame& frame) {
+                constexpr std::chrono::milliseconds kBehindTolerance{120};
+                constexpr std::chrono::milliseconds kAheadTolerance{500};
+                return frame.pts + kBehindTolerance >= minPts &&
+                       frame.pts <= minPts + kAheadTolerance;
+            };
+            const auto enhanced = std::find_if(frameQueue_.begin(), frameQueue_.end(), [minPts](const NativeVideoFrame& frame) {
+                constexpr std::chrono::milliseconds kBehindTolerance{120};
+                constexpr std::chrono::milliseconds kAheadTolerance{500};
+                return frame.HasEnhancementYuv() &&
+                       frame.pts + kBehindTolerance >= minPts &&
+                       frame.pts <= minPts + kAheadTolerance;
+            });
+            if (enhanced != frameQueue_.end()) {
+                const std::size_t framesToDrop =
+                    static_cast<std::size_t>(std::distance(frameQueue_.begin(), enhanced));
+                for (std::size_t index = 0; index < framesToDrop; ++index) {
+                    frameQueue_.pop_front();
+                    ++stats_.droppedLate;
+                }
+                if (publishReadyFrame) {
+                    NativeVideoFrame frameToPublish = std::move(frameQueue_.front());
+                    frameQueue_.pop_front();
+                    latestFrame_ = std::move(frameToPublish);
+                    ++stats_.rendered;
+                    schedulePrimed_ = true;
+                    notify = true;
+                }
+                UpdateBufferedStatsLocked();
+                ready = true;
+            } else if (!publishReadyFrame &&
+                       latestFrame_.HasEnhancementYuv() &&
+                       closeToTarget(latestFrame_)) {
+                ready = true;
+            } else if (!frameQueue_.empty()) {
+                const std::size_t dropped = frameQueue_.size();
+                frameQueue_.clear();
+                stats_.droppedLate += dropped;
+                UpdateBufferedStatsLocked();
+            }
+        }
+        if (notify) {
+            NotifyFrameReady();
+        }
+        if (ready) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    return false;
+}
+
 int FfmpegVideoDecoder::SelectVideoStream(AVFormatContext* formatCtx) const {
     if (!formatCtx) {
         return AVERROR(EINVAL);
@@ -1805,6 +1887,13 @@ void FfmpegVideoDecoder::DecodeLoop() {
         bool externalSubtitlesLoaded = false;
         if (selectedSubtitleTrackIndex_ == anvil::playback::kSubtitleTrackOff) {
             LogThread(LogLevel::Info, L"subtitle", L"selected=off");
+        } else if (selectedSubtitleTrackIndex_ == anvil::playback::kSubtitleTrackAuto &&
+                   !externalSubtitlePath_.empty()) {
+            externalSubtitlesLoaded = DecodeExternalSubtitleFile(externalSubtitlePath_);
+            if (externalSubtitlesLoaded) {
+                externalSubtitlesActive_ = true;
+                externalSubtitleCues_ = subtitleCues_;
+            }
         } else if (selectedSubtitleTrackIndex_ == anvil::playback::kSubtitleTrackAuto && autoLoadExternalSubtitles_) {
             const auto externalSubtitle = FindExternalSubtitleFile(path_, preferredSubtitleLanguage_);
             if (externalSubtitle.has_value()) {
@@ -2119,6 +2208,12 @@ void FfmpegVideoDecoder::DecodeLoop() {
             const bool paused = playbackPaused_.load();
             const bool hasPreroll = hasDecodedPreroll();
             const bool elOverlay = enhancementOverlayReadAheadActive();
+            const bool enhancementPrerollWaitActive = enhancementPrerollWaitActive_.load();
+            if (paused && hasPreroll && !enhancementPrerollWaitActive) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{1});
+                continue;
+            }
+
             if (paused) {
                 readAheadPackets(elOverlay ? kDolbyVisionEnhancementPausedPacketReadAheadBatch
                                            : kPausedPacketReadAheadBatch);
@@ -2130,11 +2225,6 @@ void FfmpegVideoDecoder::DecodeLoop() {
                                            : kPlayingPacketReadAheadBatch);
             }
             if (HasPendingSeek()) {
-                continue;
-            }
-
-            if (paused && hasPreroll) {
-                std::this_thread::sleep_for(std::chrono::milliseconds{1});
                 continue;
             }
 
@@ -3387,6 +3477,26 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
 
             queued.yuv = std::move(packedYuv);
             AttachDolbyVisionEnhancementFrame(queued, pts);
+            if (enhancementOverlayPath && !queued.HasEnhancementYuv()) {
+                constexpr int kMaxStartupEnhancementMisses = 4;
+                bool hasRenderedFrame = false;
+                {
+                    std::scoped_lock lock(mutex_);
+                    hasRenderedFrame = stats_.rendered > 0 || latestFrame_.HasContent();
+                }
+                if (!hasRenderedFrame && dolbyVisionEnhancementStartupMisses_ < kMaxStartupEnhancementMisses) {
+                    ++dolbyVisionEnhancementStartupMisses_;
+                    if (dolbyVisionEnhancementStartupMisses_ == 1) {
+                        LogThread(LogLevel::Debug,
+                                  L"decoder",
+                                  L"dolby_vision_el_overlay startup_wait_for_match bl_pts_ms=" +
+                                      std::to_wstring(pts.count()));
+                    }
+                    return true;
+                }
+            } else if (enhancementOverlayPath) {
+                dolbyVisionEnhancementStartupMisses_ = 0;
+            }
             queued.subtitleText = SubtitleTextForPts(pts);
             queued.subtitleBitmaps = SubtitleBitmapsForPts(pts, srcW, srcH);
             queued.pts = pts;
@@ -3613,6 +3723,7 @@ bool FfmpegVideoDecoder::ApplyPendingSeek(AVFormatContext* formatCtx,
     dolbyVisionEnhancementFirstPackedLogged_ = false;
     dolbyVisionCpuReferenceLogged_ = false;
     dolbyVisionMultiPartitionFallbackLogged_ = false;
+    dolbyVisionEnhancementStartupMisses_ = 0;
     dolbyVisionEnhancementLastDynamicMetadataFingerprint_ = 0;
     dolbyVisionEnhancementFramesDecoded_ = 0;
     latestDolbyVisionEnhancementMetadata_.reset();

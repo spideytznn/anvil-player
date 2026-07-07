@@ -19,6 +19,15 @@ using anvil::playback::ToDisplayString;
 
 namespace {
 
+bool RectsIntersect(const RECT& a, const RECT& b) {
+    RECT intersection{};
+    return RectWidth(a) > 0 &&
+           RectHeight(a) > 0 &&
+           RectWidth(b) > 0 &&
+           RectHeight(b) > 0 &&
+           IntersectRect(&intersection, &a, &b) != FALSE;
+}
+
 COLORREF FadeForOpacity(const COLORREF color, const double opacity) {
     return BlendColor(RGB(0, 0, 0), color, std::clamp(opacity, 0.0, 1.0));
 }
@@ -138,12 +147,70 @@ std::wstring SubtitleMenuCodecLabel(const int selection, const std::optional<anv
     return {};
 }
 
+std::wstring AudioMenuPrimaryLabel(const int selection, const std::optional<anvil::playback::MediaDescriptor>& media) {
+    if (selection == anvil::playback::kAudioTrackAuto) {
+        return L"自动";
+    }
+    if (selection == anvil::playback::kAudioTrackOff) {
+        return L"关闭";
+    }
+
+    std::wstring label = L"Stream " + std::to_wstring(selection);
+    if (!media.has_value()) {
+        return label;
+    }
+    for (const auto& stream : media->streams) {
+        if (stream.kind != L"Audio" || stream.index != selection) {
+            continue;
+        }
+        const std::wstring language = SubtitleLanguageName(stream.language);
+        if (!language.empty()) {
+            label = language;
+        }
+        break;
+    }
+    return label;
+}
+
+std::wstring AudioMenuCodecLabel(const int selection, const std::optional<anvil::playback::MediaDescriptor>& media) {
+    if (selection < 0 || !media.has_value()) {
+        return {};
+    }
+
+    for (const auto& stream : media->streams) {
+        if (stream.kind == L"Audio" && stream.index == selection) {
+            return UppercaseCopy(stream.codec);
+        }
+    }
+    return {};
+}
+
 std::wstring SubtitleDelayText(const int delayMs) {
     std::wostringstream stream;
     stream.setf(std::ios::fixed);
     stream.precision(1);
     stream << static_cast<double>(delayMs) / 1000.0 << L" s";
     return stream.str();
+}
+
+std::wstring PercentTextFromInt(const int value) {
+    return std::to_wstring(value) + L"%";
+}
+
+std::wstring SubtitleScaleText(const double scale) {
+    return std::to_wstring(static_cast<int>(std::round(scale * 100.0))) + L"%";
+}
+
+std::wstring PixelOffsetText(const int value) {
+    return (value > 0 ? L"+" : L"") + std::to_wstring(value) + L" px";
+}
+
+std::wstring DanmakuModeText(const int mode) {
+    switch (mode) {
+    case 1: return L"顶部";
+    case 2: return L"底部";
+    default: return L"滚动";
+    }
 }
 
 void DrawCheckMark(HDC hdc, const POINT center, const int size, const COLORREF color) {
@@ -247,21 +314,26 @@ void MainWindow::Paint() {
     const auto settings = controller_.Settings();
     const auto& capabilities = CachedCapabilities();
 
-    if (RectWidth(topBar_) > 0 && RectHeight(topBar_) > 0) {
+    if (RectWidth(topBar_) > 0 && RectHeight(topBar_) > 0 && RectsIntersect(paintRect, topBar_)) {
         DrawTopBar(bufferDc, snapshot);
     }
-    if (RectWidth(videoSurface_) > 0 && RectHeight(videoSurface_) > 0) {
-        DrawVideoSurface(bufferDc, snapshot);
+    if (RectWidth(videoSurface_) > 0 && RectHeight(videoSurface_) > 0 && RectsIntersect(paintRect, videoSurface_)) {
+        DrawVideoSurface(bufferDc, snapshot, paintRect);
     }
-    if (!fullscreen_ && RectWidth(transportBar_) > 0 && RectHeight(transportBar_) > 0) {
+    if (!fullscreen_ &&
+        RectWidth(transportBar_) > 0 &&
+        RectHeight(transportBar_) > 0 &&
+        RectsIntersect(paintRect, transportBar_)) {
         DrawTransport(bufferDc, snapshot);
     }
-    if (RectWidth(inspector_) > 0 && RectHeight(inspector_) > 0) {
+    if (RectWidth(inspector_) > 0 && RectHeight(inspector_) > 0 && RectsIntersect(paintRect, inspector_)) {
         DrawInspectorPanel(bufferDc, snapshot, settings, capabilities);
     }
-    if (!fullscreen_) {
+    if (!fullscreen_ &&
+        (RectsIntersect(paintRect, topBar_) ||
+         RectsIntersect(paintRect, transportBar_) ||
+         RectsIntersect(paintRect, inspector_))) {
         DrawButtons(bufferDc, snapshot);
-        DrawSubtitleMenu(bufferDc, snapshot);
         DrawTooltip(bufferDc);
     }
 
@@ -309,7 +381,6 @@ void MainWindow::PaintFullscreenOverlay(HWND overlay) {
     const auto snapshot = controller_.Snapshot();
     DrawTransport(bufferDc, snapshot);
     DrawButtons(bufferDc, snapshot);
-    DrawSubtitleMenu(bufferDc, snapshot);
 
     SetViewportOrgEx(bufferDc, oldOrigin.x, oldOrigin.y, nullptr);
     BitBlt(windowDc, paintRect.left, paintRect.top, RectWidth(paintRect), RectHeight(paintRect), bufferDc, 0, 0, SRCCOPY);
@@ -323,6 +394,48 @@ void MainWindow::PaintFullscreenOverlay(HWND overlay) {
 
 void MainWindow::PaintTransportOverlay(HWND overlay) {
     PaintFullscreenOverlay(overlay);
+}
+
+void MainWindow::PaintSubtitleMenuOverlay(HWND overlay) {
+    PAINTSTRUCT paint{};
+    HDC windowDc = BeginPaint(overlay, &paint);
+
+    RECT paintRect = paint.rcPaint;
+    if (RectWidth(paintRect) <= 0 || RectHeight(paintRect) <= 0) {
+        EndPaint(overlay, &paint);
+        return;
+    }
+
+    HDC bufferDc = CreateCompatibleDC(windowDc);
+    HBITMAP bufferBitmap = CreateCompatibleBitmap(windowDc, std::max(1, RectWidth(paintRect)), std::max(1, RectHeight(paintRect)));
+    HGDIOBJ oldBitmap = SelectObject(bufferDc, bufferBitmap);
+    POINT oldPaintOrigin{};
+    SetViewportOrgEx(bufferDc, -paintRect.left, -paintRect.top, &oldPaintOrigin);
+    SetBkMode(bufferDc, TRANSPARENT);
+
+    POINT overlayOrigin{};
+    RECT overlayWindow{};
+    if (GetWindowRect(overlay, &overlayWindow)) {
+        overlayOrigin = POINT{overlayWindow.left, overlayWindow.top};
+        ScreenToClient(hwnd_, &overlayOrigin);
+    } else {
+        overlayOrigin = POINT{subtitleMenu_.left, subtitleMenu_.top};
+    }
+
+    POINT oldOrigin{};
+    SetViewportOrgEx(bufferDc, -overlayOrigin.x - paintRect.left, -overlayOrigin.y - paintRect.top, &oldOrigin);
+
+    const auto snapshot = controller_.Snapshot();
+    DrawSubtitleMenu(bufferDc, snapshot);
+
+    SetViewportOrgEx(bufferDc, oldOrigin.x, oldOrigin.y, nullptr);
+    BitBlt(windowDc, paintRect.left, paintRect.top, RectWidth(paintRect), RectHeight(paintRect), bufferDc, 0, 0, SRCCOPY);
+
+    SetViewportOrgEx(bufferDc, oldPaintOrigin.x, oldPaintOrigin.y, nullptr);
+    SelectObject(bufferDc, oldBitmap);
+    DeleteObject(bufferBitmap);
+    DeleteDC(bufferDc);
+    EndPaint(overlay, &paint);
 }
 
 void MainWindow::PaintHdrToneCurveWindow(HWND window) {
@@ -766,7 +879,7 @@ void MainWindow::DrawDecodedVideoFrame(HDC hdc, RECT target, const VideoFrame& f
     DeleteObject(clip);
 }
 
-void MainWindow::DrawVideoSurface(HDC hdc, const PlaybackSessionSnapshot& snapshot) const {
+void MainWindow::DrawVideoSurface(HDC hdc, const PlaybackSessionSnapshot& snapshot, const RECT& paintRect) const {
     if (fullscreen_) {
         FillRectColor(hdc, videoSurface_, RGB(0, 0, 0));
         if (snapshot.media.has_value()) {
@@ -786,12 +899,15 @@ void MainWindow::DrawVideoSurface(HDC hdc, const PlaybackSessionSnapshot& snapsh
 
     const bool compactSurface = RectWidth(videoSurface_) < Scale(720) || RectHeight(videoSurface_) < Scale(280);
     RECT inner = DeflateRectCopy(videoSurface_, compactSurface ? Scale(18) : Scale(24), compactSurface ? Scale(16) : Scale(22));
-    HFONT titleFont = CreateUiFont(compactSurface ? Scale(18) : Scale(22), FW_SEMIBOLD);
-    HFONT emptyFont = CreateUiFont(compactSurface ? Scale(20) : Scale(24), FW_SEMIBOLD);
-    HFONT bodyFont = CreateUiFont(compactSurface ? Scale(12) : Scale(13), FW_NORMAL);
-    HFONT smallFont = CreateUiFont(Scale(11), FW_NORMAL);
 
     if (snapshot.media.has_value()) {
+        if (SidebarAnimationActive()) {
+            return;
+        }
+
+        HFONT titleFont = CreateUiFont(compactSurface ? Scale(18) : Scale(22), FW_SEMIBOLD);
+        HFONT bodyFont = CreateUiFont(compactSurface ? Scale(12) : Scale(13), FW_NORMAL);
+        HFONT smallFont = CreateUiFont(Scale(11), FW_NORMAL);
         VideoFrame decodedFrame;
         const bool nativeActive = (backend_ == PlaybackBackend::NativeFfmpegD3D11) &&
                                   nativeVideoDecoder_ && nativeVideoDecoder_->IsRunning();
@@ -832,6 +948,9 @@ void MainWindow::DrawVideoSurface(HDC hdc, const PlaybackSessionSnapshot& snapsh
             StrokeRoundRect(hdc, badge, palette_.border, Scale(7));
             DrawTextInRect(hdc, RuntimeShortLabel(), DeflateRectCopy(badge, Scale(10), Scale(6)), smallFont, palette_.muted, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         }
+        DeleteObject(titleFont);
+        DeleteObject(bodyFont);
+        DeleteObject(smallFont);
     } else {
         ClearPreviewBitmap();
         const int tileSize = compactSurface ? Scale(62) : Scale(74);
@@ -839,20 +958,26 @@ void MainWindow::DrawVideoSurface(HDC hdc, const PlaybackSessionSnapshot& snapsh
                              inner.top + RectHeight(inner) / 2 - (compactSurface ? Scale(68) : Scale(82)),
                              inner.left + RectWidth(inner) / 2 + tileSize / 2,
                              inner.top + RectHeight(inner) / 2 - Scale(8));
+        RECT title = MakeRect(inner.left, tile.bottom + Scale(18), inner.right, tile.bottom + (compactSurface ? Scale(44) : Scale(54)));
+        RECT subtitle = MakeRect(inner.left, title.bottom + Scale(2), inner.right, title.bottom + Scale(26));
+        RECT placeholder = tile;
+        UnionRect(&placeholder, &placeholder, &title);
+        UnionRect(&placeholder, &placeholder, &subtitle);
+        if (!RectsIntersect(paintRect, placeholder)) {
+            return;
+        }
+
+        HFONT emptyFont = CreateUiFont(compactSurface ? Scale(20) : Scale(24), FW_SEMIBOLD);
+        HFONT bodyFont = CreateUiFont(compactSurface ? Scale(12) : Scale(13), FW_NORMAL);
         FillRoundRect(hdc, tile, RGB(13, 16, 20), Scale(12));
         StrokeRoundRect(hdc, tile, palette_.border, Scale(12));
         iconPainter_.Draw(hdc, IconKind::Play, DeflateRectCopy(tile, compactSurface ? Scale(17) : Scale(20), compactSurface ? Scale(17) : Scale(20)), palette_.text);
 
-        RECT title = MakeRect(inner.left, tile.bottom + Scale(18), inner.right, tile.bottom + (compactSurface ? Scale(44) : Scale(54)));
         DrawTextInRect(hdc, L"No media loaded", title, emptyFont, palette_.text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-        RECT subtitle = MakeRect(inner.left, title.bottom + Scale(2), inner.right, title.bottom + Scale(26));
         DrawTextInRect(hdc, L"Ready", subtitle, bodyFont, palette_.dim, DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+        DeleteObject(emptyFont);
+        DeleteObject(bodyFont);
     }
-
-    DeleteObject(titleFont);
-    DeleteObject(emptyFont);
-    DeleteObject(bodyFont);
-    DeleteObject(smallFont);
 }
 
 void MainWindow::DrawTransport(HDC hdc, const PlaybackSessionSnapshot& snapshot) const {
@@ -1043,14 +1168,11 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
         return FadeForOpacity(color, opacity);
     };
 
-    RECT visible = subtitleMenu_;
-    if (RectHeight(visible) <= 0) {
+    if (RectHeight(subtitleMenu_) <= 0) {
         return;
     }
 
     const int savedDc = SaveDC(hdc);
-    HRGN clip = CreateRectRgn(visible.left, visible.top, visible.right + 1, visible.bottom + 1);
-    SelectClipRgn(hdc, clip);
 
     const COLORREF panel = RGB(43, 43, 42);
     const COLORREF panelLine = RGB(66, 66, 64);
@@ -1070,16 +1192,32 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
     HFONT smallFont = CreateUiFont(Scale(10), FW_SEMIBOLD);
     HFONT valueFont = CreateUiFont(Scale(13), FW_SEMIBOLD);
     const auto settings = controller_.Settings();
+    const auto finish = [&]() {
+        RestoreDC(hdc, savedDc);
+        DeleteObject(valueFont);
+        DeleteObject(smallFont);
+        DeleteObject(metaFont);
+        DeleteObject(selectedItemFont);
+        DeleteObject(itemFont);
+        DeleteObject(tabFont);
+    };
     const int headerHeight = Scale(62);
     const int itemHeight = Scale(42);
     const int listGap = Scale(8);
     const int rowInset = Scale(8);
     const int delayHeight = Scale(56);
     const int actionHeight = Scale(44);
-    const int count = std::max(1, static_cast<int>(subtitleMenuTracks_.size()));
-    const int visibleItemCount = subtitleMenuVisibleItemCount_ > 0
-                                     ? std::clamp(subtitleMenuVisibleItemCount_, 1, count)
-                                     : count;
+    const int styleHeight = Scale(48);
+    const bool audioPage = subtitleMenuPage_ == SubtitleMenuPage::Audio;
+    const bool subtitlePage = subtitleMenuPage_ == SubtitleMenuPage::Subtitles;
+    const bool danmakuPage = subtitleMenuPage_ == SubtitleMenuPage::Danmaku;
+    const std::vector<int>& menuTracks = audioPage ? audioMenuTracks_ : subtitleMenuTracks_;
+    const int count = std::max(1, static_cast<int>(menuTracks.size()));
+    const int visibleItemCount = danmakuPage
+                                     ? 0
+                                     : (subtitleMenuVisibleItemCount_ > 0
+                                            ? std::clamp(subtitleMenuVisibleItemCount_, 1, count)
+                                            : count);
     const int firstItem = std::clamp(subtitleMenuScrollOffset_, 0, std::max(0, count - visibleItemCount));
 
     const RECT header = MakeRect(subtitleMenu_.left,
@@ -1092,20 +1230,21 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
                                   header.right - Scale(14),
                                   header.bottom - Scale(14));
     const int tabWidth = (RectWidth(tabRail) - tabGap * 2) / 3;
+    const int activeTab = audioPage ? 0 : (subtitlePage ? 1 : 2);
     const wchar_t* tabLabels[] = {L"音频", L"字幕", L"弹幕"};
     for (int index = 0; index < 3; ++index) {
         const RECT tab = MakeRect(tabRail.left + index * (tabWidth + tabGap),
                                   tabRail.top,
                                   tabRail.left + index * (tabWidth + tabGap) + tabWidth,
                                   tabRail.bottom);
-        if (index == 1) {
+        if (index == activeTab) {
             FillRoundRect(hdc, tab, fade(panelRaised), Scale(6));
         }
         DrawTextInRect(hdc,
                        tabLabels[index],
                        tab,
                        tabFont,
-                       fade(index == 1 ? panelText : panelMuted),
+                       fade(index == activeTab ? panelText : panelMuted),
                        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
     DrawLine(hdc,
@@ -1122,13 +1261,15 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
                                    listTop + itemHeight * localIndex,
                                    subtitleMenu_.right - rowInset,
                                    listTop + itemHeight * (localIndex + 1));
-        if (item.bottom < visible.top || item.top > visible.bottom) {
+        if (item.bottom < subtitleMenu_.top || item.top > subtitleMenu_.bottom) {
             continue;
         }
 
-        const bool hasTrack = index < static_cast<int>(subtitleMenuTracks_.size());
-        const int track = hasTrack ? subtitleMenuTracks_[static_cast<std::size_t>(index)] : anvil::playback::kSubtitleTrackOff;
-        const bool selected = hasTrack && track == settings.subtitles.selectedTrackIndex;
+        const bool hasTrack = index < static_cast<int>(menuTracks.size());
+        const int track = hasTrack ? menuTracks[static_cast<std::size_t>(index)] : anvil::playback::kSubtitleTrackOff;
+        const bool selected = hasTrack &&
+                              track == (audioPage ? settings.audio.selectedTrackIndex
+                                                  : settings.subtitles.selectedTrackIndex);
         const bool hovered = hasTrack && index == hoveredSubtitleMenuItem_;
         if (selected || hovered) {
             FillRoundRect(hdc,
@@ -1145,7 +1286,14 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
         }
 
         const std::wstring label = hasTrack ? SubtitleMenuPrimaryLabel(track, snapshot.media) : L"没有可用字幕";
-        const std::wstring codec = hasTrack ? SubtitleMenuCodecLabel(track, snapshot.media) : L"";
+        const std::wstring codec = hasTrack
+                                       ? (audioPage ? AudioMenuCodecLabel(track, snapshot.media)
+                                                    : SubtitleMenuCodecLabel(track, snapshot.media))
+                                       : L"";
+        const std::wstring displayLabel = hasTrack
+                                              ? (audioPage ? AudioMenuPrimaryLabel(track, snapshot.media)
+                                                           : label)
+                                              : (audioPage ? L"没有可用音频" : L"没有可用字幕");
         const RECT codecText = MakeRect(item.right - Scale(76), item.top, item.right - Scale(12), item.bottom);
         const int labelLeft = hasTrack ? item.left + Scale(50) : item.left + Scale(16);
         RECT text = MakeRect(labelLeft,
@@ -1153,7 +1301,7 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
                              codec.empty() ? item.right - Scale(12) : codecText.left - Scale(8),
                              item.bottom);
         DrawTextInRect(hdc,
-                       label,
+                       displayLabel,
                        text,
                        selected ? selectedItemFont : itemFont,
                        fade(hasTrack ? (selected ? panelText : RGB(226, 226, 225)) : panelMuted),
@@ -1169,7 +1317,7 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
     }
 
     const int listContentBottom = listTop + itemHeight * visibleItemCount;
-    if (count > visibleItemCount) {
+    if (visibleItemCount > 0 && count > visibleItemCount) {
         const RECT scrollTrack = MakeRect(subtitleMenu_.right - Scale(8),
                                           listTop + Scale(5),
                                           subtitleMenu_.right - Scale(5),
@@ -1195,6 +1343,99 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
                                         thumbTop + thumbHeight);
             FillRoundRect(hdc, thumb, fade(panelMuted), Scale(2));
         }
+    }
+
+    const auto drawStepperRow = [&](const RECT& row, const std::wstring& title, const std::wstring& value) {
+        DrawTextInRect(hdc,
+                       L"-",
+                       MakeRect(row.left + Scale(24), row.top, row.left + Scale(58), row.bottom),
+                       valueFont,
+                       fade(panelText),
+                       DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        DrawTextInRect(hdc,
+                       title,
+                       MakeRect(row.left + Scale(70), row.top + Scale(7), row.right - Scale(70), row.top + Scale(25)),
+                       smallFont,
+                       fade(panelMuted),
+                       DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        DrawTextInRect(hdc,
+                       value,
+                       MakeRect(row.left + Scale(70), row.top + Scale(24), row.right - Scale(70), row.bottom - Scale(6)),
+                       valueFont,
+                       fade(panelText),
+                       DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        DrawPlusMark(hdc,
+                     POINT{row.right - Scale(38), row.top + RectHeight(row) / 2},
+                     Scale(13),
+                     fade(panelText));
+    };
+    const auto drawMenuActionRow = [&](const RECT& row, const IconKind icon, const std::wstring& label, const std::wstring& meta) {
+        const RECT iconRect = MakeRect(row.left + Scale(24),
+                                       row.top + RectHeight(row) / 2 - Scale(12),
+                                       row.left + Scale(48),
+                                       row.top + RectHeight(row) / 2 + Scale(12));
+        iconPainter_.Draw(hdc, icon, iconRect, fade(panelMuted));
+        DrawTextInRect(hdc,
+                       label,
+                       MakeRect(row.left + Scale(62), row.top, meta.empty() ? row.right - Scale(18) : row.right - Scale(96), row.bottom),
+                       itemFont,
+                       fade(panelText),
+                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        if (!meta.empty()) {
+            DrawTextInRect(hdc,
+                           meta,
+                           MakeRect(row.right - Scale(94), row.top, row.right - Scale(18), row.bottom),
+                           metaFont,
+                           fade(panelMuted),
+                           DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        }
+    };
+
+    if (audioPage) {
+        finish();
+        return;
+    }
+
+    if (danmakuPage) {
+        int rowTop = header.bottom + Scale(8);
+        const auto nextRow = [&](const int height) {
+            RECT row = MakeRect(subtitleMenu_.left, rowTop, subtitleMenu_.right, rowTop + height);
+            rowTop += height;
+            return row;
+        };
+        const RECT toggleRow = nextRow(actionHeight);
+        if (settings.danmaku.enabled) {
+            DrawCheckMark(hdc,
+                          POINT{toggleRow.left + Scale(32), toggleRow.top + RectHeight(toggleRow) / 2},
+                          Scale(16),
+                          fade(panelAccent));
+        }
+        DrawTextInRect(hdc,
+                       L"启用弹幕",
+                       MakeRect(toggleRow.left + Scale(62), toggleRow.top, toggleRow.right - Scale(18), toggleRow.bottom),
+                       itemFont,
+                       fade(panelText),
+                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        DrawLine(hdc, subtitleMenu_.left, toggleRow.bottom, subtitleMenu_.right, toggleRow.bottom, fade(panelLine));
+
+        const RECT modeRow = nextRow(actionHeight);
+        drawMenuActionRow(modeRow, IconKind::Subtitles, L"显示模式", DanmakuModeText(settings.danmaku.mode));
+        DrawLine(hdc, subtitleMenu_.left, modeRow.bottom, subtitleMenu_.right, modeRow.bottom, fade(panelLine));
+
+        const RECT opacityRow = nextRow(styleHeight);
+        drawStepperRow(opacityRow, L"透明度", PercentTextFromInt(settings.danmaku.opacityPercent));
+        DrawLine(hdc, subtitleMenu_.left, opacityRow.bottom, subtitleMenu_.right, opacityRow.bottom, fade(panelLine));
+
+        const RECT speedRow = nextRow(styleHeight);
+        drawStepperRow(speedRow, L"速度", PercentTextFromInt(settings.danmaku.speedPercent));
+        DrawLine(hdc, subtitleMenu_.left, speedRow.bottom, subtitleMenu_.right, speedRow.bottom, fade(panelLine));
+
+        const std::wstring danmakuMeta = settings.danmaku.externalDanmakuPath.empty()
+                                             ? L"XML/JSON/ASS"
+                                             : settings.danmaku.externalDanmakuPath.filename().wstring();
+        drawMenuActionRow(nextRow(actionHeight), IconKind::Folder, L"添加弹幕文件...", danmakuMeta);
+        finish();
+        return;
     }
 
     const int listBottom = listContentBottom + Scale(6);
@@ -1239,7 +1480,9 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
              fade(panelLine));
 
     const RECT addRow = MakeRect(subtitleMenu_.left, delayRow.bottom, subtitleMenu_.right, delayRow.bottom + actionHeight);
-    const RECT styleRow = MakeRect(subtitleMenu_.left, addRow.bottom, subtitleMenu_.right, addRow.bottom + actionHeight);
+    const RECT sizeRow = MakeRect(subtitleMenu_.left, addRow.bottom, subtitleMenu_.right, addRow.bottom + styleHeight);
+    const RECT offsetXRow = MakeRect(subtitleMenu_.left, sizeRow.bottom, subtitleMenu_.right, sizeRow.bottom + styleHeight);
+    const RECT offsetYRow = MakeRect(subtitleMenu_.left, offsetXRow.bottom, subtitleMenu_.right, offsetXRow.bottom + styleHeight);
     const auto drawActionRow = [&](const RECT& row, const IconKind icon, const std::wstring& label, const bool plus) {
         const RECT iconRect = MakeRect(row.left + Scale(24),
                                        row.top + RectHeight(row) / 2 - Scale(12),
@@ -1265,17 +1508,24 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
              addRow.bottom,
              subtitleMenu_.right,
              addRow.bottom,
-             fade(BlendColor(panelLine, panel, 0.25)));
-    drawActionRow(styleRow, IconKind::Cog, L"编辑字幕样式...", false);
+             fade(panelLine));
+    drawStepperRow(sizeRow, L"\u5b57\u5e55\u5927\u5c0f", SubtitleScaleText(settings.subtitles.fontScale));
+    DrawLine(hdc,
+             subtitleMenu_.left,
+             sizeRow.bottom,
+             subtitleMenu_.right,
+             sizeRow.bottom,
+             fade(panelLine));
+    drawStepperRow(offsetXRow, L"\u6c34\u5e73\u504f\u79fb", PixelOffsetText(settings.subtitles.offsetXPx));
+    DrawLine(hdc,
+             subtitleMenu_.left,
+             offsetXRow.bottom,
+             subtitleMenu_.right,
+             offsetXRow.bottom,
+             fade(panelLine));
+    drawStepperRow(offsetYRow, L"\u5782\u76f4\u504f\u79fb", PixelOffsetText(settings.subtitles.offsetYPx));
 
-    RestoreDC(hdc, savedDc);
-    DeleteObject(clip);
-    DeleteObject(valueFont);
-    DeleteObject(smallFont);
-    DeleteObject(metaFont);
-    DeleteObject(selectedItemFont);
-    DeleteObject(itemFont);
-    DeleteObject(tabFont);
+    finish();
 }
 
 void MainWindow::DrawSectionHeader(HDC hdc, const std::wstring& text, RECT& cursor) const {
@@ -1317,6 +1567,12 @@ void MainWindow::DrawInspectorPanel(HDC hdc,
                                     const PlaybackSessionSnapshot& snapshot,
                                     const PlayerSettings& settings,
                                     const CapabilityReport& capabilities) const {
+    if (SidebarAnimationActive()) {
+        FillRectColor(hdc, inspector_, palette_.surface);
+        DrawLine(hdc, inspector_.left, inspector_.top, inspector_.left, inspector_.bottom, palette_.border);
+        return;
+    }
+
     FillRoundRect(hdc, inspector_, palette_.surface, Scale(12));
     StrokeRoundRect(hdc, inspector_, palette_.border, Scale(12));
 
@@ -1599,7 +1855,7 @@ void MainWindow::DrawSettingsContent(HDC hdc, const PlayerSettings& settings, RE
     }
     if (CurrentMediaHasCmv4Control()) {
         DrawField(hdc,
-                  L"CMv4 Approx",
+                  L"Dolby Vision Enhanced",
                   CurrentCmv4ControlEnabled(settings)
                       ? (settings.video.dolbyVisionCmv4Approx ? L"On" : L"Off")
                       : L"Disabled",

@@ -10,6 +10,14 @@ namespace anvil::app {
 using anvil::playback::PlaybackState;
 using anvil::playback::PlaybackSessionSnapshot;
 
+namespace {
+
+bool RectEquals(const RECT& a, const RECT& b) {
+    return a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom;
+}
+
+}  // namespace
+
 void MainWindow::MarkLayoutDirty() {
     layoutDirty_ = true;
 }
@@ -180,8 +188,11 @@ void MainWindow::UpdateLayout() {
     const auto snapshot = controller_.Snapshot();
     const bool playing = snapshot.state == PlaybackState::Playing;
     const auto settings = controller_.Settings();
-    const bool subtitlesEnabled = settings.subtitles.selectedTrackIndex != anvil::playback::kSubtitleTrackOff;
-    const bool showSubtitleButton = snapshot.media.has_value();
+    const bool subtitlesEnabled = snapshot.media.has_value() &&
+                                  settings.subtitles.selectedTrackIndex != anvil::playback::kSubtitleTrackOff;
+    // Keep the subtitle menu reachable even before embedded subtitle streams
+    // are discovered; the menu also hosts external-subtitle actions.
+    const bool showSubtitleButton = true;
     if (hdrToneCurveExpanded_ &&
         (inspectorTab_ != InspectorTab::Settings || !HdrToneCurveAvailable(settings))) {
         hdrToneCurveExpanded_ = false;
@@ -217,15 +228,15 @@ void MainWindow::UpdateLayout() {
     const bool cmv4ButtonEnabled = CurrentCmv4ControlEnabled(settings);
     const bool dolbyVisionButton = showCmv4Button;
     const int hdrButtonWidth = showHdrButton ? (dolbyVisionButton ? Scale(42) : Scale(48)) : 0;
-    const int cmv4ButtonWidth = showCmv4Button ? Scale(46) : 0;
+    const int cmv4ButtonWidth = showCmv4Button ? Scale(86) : 0;
     const std::wstring hdrOutputTooltip =
         dolbyVisionButton
             ? (settings.video.dolbyVisionHdrOutput ? L"Disable Dolby Vision HDR output"
                                                     : L"Enable Dolby Vision HDR output")
             : (settings.video.dolbyVisionHdrOutput ? L"Disable HDR output" : L"Enable HDR output");
     const std::wstring cmv4Tooltip = settings.video.dolbyVisionCmv4Approx
-                                         ? L"Disable CMv4 mapping"
-                                         : L"Enable CMv4 mapping";
+                                         ? L"Disable Dolby Vision Enhanced"
+                                         : L"Enable Dolby Vision Enhanced";
     const auto addDolbyVisionHdrButton = [&](const int left, const int top) {
         buttons_.push_back(UiButton{Command::ToggleDolbyVisionHdr,
                                     MakeRect(left, top, left + hdrButtonWidth, top + rightButtonSize),
@@ -239,7 +250,7 @@ void MainWindow::UpdateLayout() {
     const auto addDolbyVisionCmv4Button = [&](const int left, const int top) {
         buttons_.push_back(UiButton{Command::ToggleDolbyVisionCmv4Approx,
                                     MakeRect(left, top, left + cmv4ButtonWidth, top + rightButtonSize),
-                                    L"CM4",
+                                    L"Enhanced",
                                     cmv4Tooltip,
                                     IconKind::None,
                                     ButtonKind::TransportLabel,
@@ -253,6 +264,7 @@ void MainWindow::UpdateLayout() {
         inspector_ = RECT{};
         showInspectorTabs_ = false;
         videoSurface_ = client;
+        playbackSurface_ = videoSurface_;
 
         const bool showTransport = ShouldShowFullscreenTransport(snapshot);
         const int fullscreenInset = Scale(18);
@@ -380,10 +392,13 @@ void MainWindow::UpdateLayout() {
         }
 
         UpdateSubtitleMenuLayout();
-        playbackPlayer_.SetBounds(PlaybackSurfaceBounds());
+        if (!SidebarAnimationActive()) {
+            playbackPlayer_.SetBounds(PlaybackSurfaceBounds());
+        }
         UpdateVideoHost();
         UpdateTransportOverlay();
         UpdateFullscreenOverlay();
+        UpdateSubtitleMenuOverlay();
         return;
     }
 
@@ -396,23 +411,35 @@ void MainWindow::UpdateLayout() {
 
     if (sideInspector) {
         const int expandedInspectorWidth = std::clamp(clientWidth / 4, compact ? Scale(286) : Scale(304), Scale(360));
-        const double collapse = std::clamp(inspectorCollapseAmount_, 0.0, 1.0);
-        const int inspectorWidth = static_cast<int>(std::round(expandedInspectorWidth * (1.0 - collapse)));
-        const int animatedGap = static_cast<int>(std::round(gap * (1.0 - collapse)));
-        if (inspectorWidth > 0) {
-            inspector_ = MakeRect(content.right - inspectorWidth, content.top, content.right, content.bottom);
+        const double animatedCollapse = std::clamp(inspectorCollapseAmount_, 0.0, 1.0);
+        const double layoutCollapse = std::clamp(inspectorCollapseTarget_, 0.0, 1.0);
+        const int animatedInspectorWidth =
+            static_cast<int>(std::round(expandedInspectorWidth * (1.0 - animatedCollapse)));
+        const int animatedGap = static_cast<int>(std::round(gap * (1.0 - animatedCollapse)));
+        const int layoutInspectorWidth =
+            static_cast<int>(std::round(expandedInspectorWidth * (1.0 - layoutCollapse)));
+        const int layoutGap = static_cast<int>(std::round(gap * (1.0 - layoutCollapse)));
+        if (animatedInspectorWidth > 0) {
+            inspector_ = MakeRect(content.right - animatedInspectorWidth, content.top, content.right, content.bottom);
             videoSurface_ = MakeRect(content.left, content.top, inspector_.left - animatedGap, content.bottom);
         } else {
             inspector_ = RECT{};
             videoSurface_ = content;
         }
-        showInspectorTabs_ = inspectorWidth >= Scale(240) && collapse < 0.55;
+        if (layoutInspectorWidth > 0) {
+            playbackSurface_ = MakeRect(content.left, content.top, content.right - layoutInspectorWidth - layoutGap, content.bottom);
+        } else {
+            playbackSurface_ = content;
+        }
+        showInspectorTabs_ = !SidebarAnimationActive() && animatedInspectorWidth >= Scale(240) && animatedCollapse < 0.55;
     } else if (settingsOverlay) {
         inspector_ = content;
         videoSurface_ = RECT{};
+        playbackSurface_ = videoSurface_;
     } else {
         inspector_ = RECT{};
         videoSurface_ = content;
+        playbackSurface_ = videoSurface_;
     }
     const int progressInset = compact ? Scale(18) : Scale(24);
     progress_ = MakeRect(transportBar_.left + progressInset,
@@ -680,19 +707,23 @@ void MainWindow::UpdateLayout() {
         UpdateHdrToneCurveFloatingLayout();
     }
 
-    playbackPlayer_.SetBounds(PlaybackSurfaceBounds());
+    if (!SidebarAnimationActive()) {
+        playbackPlayer_.SetBounds(PlaybackSurfaceBounds());
+    }
     UpdateVideoHost();
     UpdateTransportOverlay();
     UpdateFullscreenOverlay();
+    UpdateSubtitleMenuOverlay();
 }
 
 void MainWindow::UpdateVideoHost() {
     if (!videoHostReady_ || !videoHost_) {
         return;
     }
+    if (SidebarAnimationActive()) {
+        return;
+    }
     const RECT bounds = PlaybackSurfaceBounds();
-    const int w = RectWidth(bounds);
-    const int h = RectHeight(bounds);
     const auto snapshot = controller_.Snapshot();
     const bool nativeActive = nativeVideoDecoder_ && nativeVideoDecoder_->IsRunning();
     const bool nativePausedFrame = backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
@@ -702,7 +733,10 @@ void MainWindow::UpdateVideoHost() {
     const bool nativeHeldFrame = backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
                                  nativeFrameHoldVisible_ &&
                                  heldNativeFrame_.has_value();
-    if ((nativeActive || nativePausedFrame || nativeHeldFrame) && w > 0 && h > 0) {
+    const bool nativeVideoVisible = nativeActive || nativePausedFrame || nativeHeldFrame;
+    const int w = RectWidth(bounds);
+    const int h = RectHeight(bounds);
+    if (nativeVideoVisible && w > 0 && h > 0) {
         const bool wasVisible = IsWindowVisible(videoHost_) != FALSE;
         const bool boundsChanged = bounds.left != lastVideoHostBounds_.left ||
                                    bounds.top != lastVideoHostBounds_.top ||
@@ -719,14 +753,22 @@ void MainWindow::UpdateVideoHost() {
                 resized = true;
             }
         }
-        ShowWindow(videoHost_, SW_SHOW);
-        if (!nativeActive &&
+        if (!wasVisible) {
+            ShowWindow(videoHost_, SW_SHOW);
+        }
+        if ((snapshot.state == PlaybackState::Paused || !nativeActive) &&
             heldNativeFrame_.has_value() &&
             (resized || !wasVisible || heldNativeFrameNeedsPresent_)) {
-            RenderHeldNativeFrame();
+            RenderHeldNativeFrame(false);
         }
     } else {
-        ShowWindow(videoHost_, SW_HIDE);
+        if (IsWindowVisible(videoHost_)) {
+            ShowWindow(videoHost_, SW_HIDE);
+        }
+        const RECT empty{};
+        if (!RectEquals(lastVideoHostBounds_, empty)) {
+            lastVideoHostBounds_ = empty;
+        }
     }
 }
 
@@ -789,7 +831,6 @@ void MainWindow::UpdateTransportOverlay() {
             ShowWindow(transportOverlay_, SW_HIDE);
         }
         lastTransportOverlayBounds_ = RECT{};
-        lastTransportOverlayIncludesSubtitleMenu_ = false;
         return;
     }
 
@@ -799,14 +840,6 @@ void MainWindow::UpdateTransportOverlay() {
     }
 
     RECT overlayBounds = transportBar_;
-    const bool includeSubtitleMenu = (subtitleMenuOpen_ ||
-                                      subtitleMenuTarget_ > 0.0 ||
-                                      subtitleMenuAmount_ > 0.001) &&
-                                     RectWidth(subtitleMenu_) > 0 &&
-                                     RectHeight(subtitleMenu_) > 0;
-    if (includeSubtitleMenu) {
-        UnionRect(&overlayBounds, &overlayBounds, &subtitleMenu_);
-    }
 
     const int w = RectWidth(overlayBounds);
     const int h = RectHeight(overlayBounds);
@@ -815,7 +848,7 @@ void MainWindow::UpdateTransportOverlay() {
                        overlayBounds.top != lastTransportOverlayBounds_.top ||
                        w != RectWidth(lastTransportOverlayBounds_) ||
                        h != RectHeight(lastTransportOverlayBounds_);
-    const bool regionChanged = moved || includeSubtitleMenu != lastTransportOverlayIncludesSubtitleMenu_;
+    const bool regionChanged = moved;
     if (moved || !wasVisible) {
         SetWindowPos(transportOverlay_,
                      HWND_TOP,
@@ -824,14 +857,6 @@ void MainWindow::UpdateTransportOverlay() {
                      w,
                      h,
                      SWP_NOACTIVATE);
-    } else {
-        SetWindowPos(transportOverlay_,
-                     HWND_TOP,
-                     0,
-                     0,
-                     0,
-                     0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW);
     }
 
     if (regionChanged) {
@@ -844,24 +869,13 @@ void MainWindow::UpdateTransportOverlay() {
                                                   Scale(12));
         CombineRgn(region, region, transportRegion, RGN_OR);
         DeleteObject(transportRegion);
-        if (includeSubtitleMenu) {
-            HRGN menuRegion = CreateRoundRectRgn(subtitleMenu_.left - overlayBounds.left,
-                                                 subtitleMenu_.top - overlayBounds.top,
-                                                 subtitleMenu_.right - overlayBounds.left + 1,
-                                                 subtitleMenu_.bottom - overlayBounds.top + 1,
-                                                 Scale(9),
-                                                 Scale(9));
-            CombineRgn(region, region, menuRegion, RGN_OR);
-            DeleteObject(menuRegion);
-        }
         SetWindowRgn(transportOverlay_, region, TRUE);
         lastTransportOverlayBounds_ = overlayBounds;
-        lastTransportOverlayIncludesSubtitleMenu_ = includeSubtitleMenu;
     }
     if (!wasVisible) {
         ShowWindow(transportOverlay_, SW_SHOWNOACTIVATE);
     }
-    if (moved || regionChanged || !wasVisible || includeSubtitleMenu) {
+    if (moved || regionChanged || !wasVisible) {
         InvalidateRect(transportOverlay_, nullptr, FALSE);
     }
 }
@@ -873,7 +887,6 @@ void MainWindow::UpdateFullscreenOverlay() {
             ShowWindow(fullscreenOverlay_, SW_HIDE);
         }
         lastFullscreenOverlayBounds_ = RECT{};
-        lastFullscreenOverlayIncludesSubtitleMenu_ = false;
         return;
     }
 
@@ -883,14 +896,6 @@ void MainWindow::UpdateFullscreenOverlay() {
     }
 
     RECT overlayBounds = transportBar_;
-    const bool includeSubtitleMenu = (subtitleMenuOpen_ ||
-                                      subtitleMenuTarget_ > 0.0 ||
-                                      subtitleMenuAmount_ > 0.001) &&
-                                     RectWidth(subtitleMenu_) > 0 &&
-                                     RectHeight(subtitleMenu_) > 0;
-    if (includeSubtitleMenu) {
-        UnionRect(&overlayBounds, &overlayBounds, &subtitleMenu_);
-    }
 
     const int w = RectWidth(overlayBounds);
     const int h = RectHeight(overlayBounds);
@@ -899,7 +904,7 @@ void MainWindow::UpdateFullscreenOverlay() {
                        overlayBounds.top != lastFullscreenOverlayBounds_.top ||
                        w != RectWidth(lastFullscreenOverlayBounds_) ||
                        h != RectHeight(lastFullscreenOverlayBounds_);
-    const bool regionChanged = moved || includeSubtitleMenu != lastFullscreenOverlayIncludesSubtitleMenu_;
+    const bool regionChanged = moved;
     if (moved || !wasVisible) {
         SetWindowPos(fullscreenOverlay_,
                      HWND_TOP,
@@ -908,14 +913,6 @@ void MainWindow::UpdateFullscreenOverlay() {
                      w,
                      h,
                      SWP_NOACTIVATE);
-    } else {
-        SetWindowPos(fullscreenOverlay_,
-                     HWND_TOP,
-                     0,
-                     0,
-                     0,
-                     0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW);
     }
 
     if (regionChanged) {
@@ -928,25 +925,90 @@ void MainWindow::UpdateFullscreenOverlay() {
                                                   Scale(12));
         CombineRgn(region, region, transportRegion, RGN_OR);
         DeleteObject(transportRegion);
-        if (includeSubtitleMenu) {
-            HRGN menuRegion = CreateRoundRectRgn(subtitleMenu_.left - overlayBounds.left,
-                                                 subtitleMenu_.top - overlayBounds.top,
-                                                 subtitleMenu_.right - overlayBounds.left + 1,
-                                                 subtitleMenu_.bottom - overlayBounds.top + 1,
-                                                 Scale(9),
-                                                 Scale(9));
-            CombineRgn(region, region, menuRegion, RGN_OR);
-            DeleteObject(menuRegion);
-        }
         SetWindowRgn(fullscreenOverlay_, region, TRUE);
         lastFullscreenOverlayBounds_ = overlayBounds;
-        lastFullscreenOverlayIncludesSubtitleMenu_ = includeSubtitleMenu;
     }
     if (!wasVisible) {
         ShowWindow(fullscreenOverlay_, SW_SHOWNOACTIVATE);
     }
-    if (moved || regionChanged || !wasVisible || includeSubtitleMenu) {
+    if (moved || regionChanged || !wasVisible) {
         InvalidateRect(fullscreenOverlay_, nullptr, FALSE);
+    }
+}
+
+void MainWindow::EnsureSubtitleMenuOverlay() {
+    if (subtitleMenuOverlay_) {
+        return;
+    }
+
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.hInstance = instance_;
+    wc.lpfnWndProc = &MainWindow::SubtitleMenuOverlayProc;
+    wc.lpszClassName = kSubtitleMenuOverlayClassName;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = nullptr;
+    RegisterClassExW(&wc);
+
+    subtitleMenuOverlay_ = CreateWindowExW(
+        0,
+        kSubtitleMenuOverlayClassName,
+        L"",
+        WS_CHILD | WS_CLIPSIBLINGS,
+        0, 0, 1, 1,
+        hwnd_,
+        nullptr,
+        instance_,
+        this);
+}
+
+void MainWindow::UpdateSubtitleMenuOverlay() {
+    const bool showOverlay = (subtitleMenuOpen_ ||
+                              subtitleMenuTarget_ > 0.0 ||
+                              subtitleMenuAmount_ > 0.001) &&
+                             RectWidth(subtitleMenu_) > 0 &&
+                             RectHeight(subtitleMenu_) > 0;
+    if (!showOverlay) {
+        if (subtitleMenuOverlay_) {
+            ShowWindow(subtitleMenuOverlay_, SW_HIDE);
+        }
+        lastSubtitleMenuOverlayBounds_ = RECT{};
+        return;
+    }
+
+    EnsureSubtitleMenuOverlay();
+    if (!subtitleMenuOverlay_) {
+        return;
+    }
+
+    const int w = RectWidth(subtitleMenu_);
+    const int h = RectHeight(subtitleMenu_);
+    const bool wasVisible = IsWindowVisible(subtitleMenuOverlay_) != FALSE;
+    const bool moved = subtitleMenu_.left != lastSubtitleMenuOverlayBounds_.left ||
+                       subtitleMenu_.top != lastSubtitleMenuOverlayBounds_.top ||
+                       w != RectWidth(lastSubtitleMenuOverlayBounds_) ||
+                       h != RectHeight(lastSubtitleMenuOverlayBounds_);
+
+    if (moved || !wasVisible) {
+        SetWindowPos(subtitleMenuOverlay_,
+                     HWND_TOP,
+                     subtitleMenu_.left,
+                     subtitleMenu_.top,
+                     w,
+                     h,
+                     SWP_NOACTIVATE);
+    }
+
+    if (moved || !wasVisible) {
+        HRGN region = CreateRoundRectRgn(0, 0, w + 1, h + 1, Scale(9), Scale(9));
+        SetWindowRgn(subtitleMenuOverlay_, region, TRUE);
+        lastSubtitleMenuOverlayBounds_ = subtitleMenu_;
+    }
+    if (!wasVisible) {
+        ShowWindow(subtitleMenuOverlay_, SW_SHOWNOACTIVATE);
+    }
+    if (moved || !wasVisible) {
+        InvalidateRect(subtitleMenuOverlay_, nullptr, FALSE);
     }
 }
 
@@ -1058,15 +1120,30 @@ void MainWindow::UpdateSubtitleMenuLayout() {
         return;
     }
 
-    const int itemCount = std::max(1, static_cast<int>(subtitleMenuTracks_.size()));
     const int headerHeight = Scale(62);
     const int listGap = Scale(8);
     const int itemHeight = Scale(42);
     const int listBottomGap = Scale(6);
     const int delayHeight = Scale(56);
     const int actionHeight = Scale(44);
+    const int styleHeight = Scale(48);
     const int desiredPanelWidth = Scale(366);
-    const int fixedPanelHeight = headerHeight + listGap + listBottomGap + delayHeight + actionHeight * 2;
+    int itemCount = 0;
+    int fixedPanelHeight = headerHeight;
+    int maxVisibleRows = 0;
+    if (subtitleMenuPage_ == SubtitleMenuPage::Audio) {
+        itemCount = std::max(1, static_cast<int>(audioMenuTracks_.size()));
+        fixedPanelHeight = headerHeight + listGap + listBottomGap;
+        maxVisibleRows = 7;
+    } else if (subtitleMenuPage_ == SubtitleMenuPage::Subtitles) {
+        itemCount = std::max(1, static_cast<int>(subtitleMenuTracks_.size()));
+        fixedPanelHeight = headerHeight + listGap + listBottomGap + delayHeight + actionHeight + styleHeight * 3;
+        maxVisibleRows = 6;
+    } else {
+        itemCount = 0;
+        fixedPanelHeight = headerHeight + Scale(8) + actionHeight * 3 + styleHeight * 2;
+        maxVisibleRows = 0;
+    }
 
     RECT client{};
     GetClientRect(hwnd_, &client);
@@ -1094,10 +1171,14 @@ void MainWindow::UpdateSubtitleMenuLayout() {
     const int minTop = (!fullscreen_ && RectHeight(topBar_) > 0)
                            ? static_cast<int>(topBar_.bottom) + Scale(10)
                            : static_cast<int>(client.top) + Scale(10);
-    const int availableHeight = std::max(fixedPanelHeight + itemHeight,
+    const int availableHeight = std::max(fixedPanelHeight + (maxVisibleRows > 0 ? itemHeight : 0),
                                          bottom - minTop);
-    const int maxVisibleRowsBySpace = std::max(1, (availableHeight - fixedPanelHeight) / itemHeight);
-    subtitleMenuVisibleItemCount_ = std::clamp(std::min(itemCount, maxVisibleRowsBySpace), 1, 6);
+    const int maxVisibleRowsBySpace = maxVisibleRows > 0
+                                          ? std::max(1, (availableHeight - fixedPanelHeight) / itemHeight)
+                                          : 0;
+    subtitleMenuVisibleItemCount_ = maxVisibleRows > 0
+                                        ? std::clamp(std::min(itemCount, maxVisibleRowsBySpace), 1, maxVisibleRows)
+                                        : 0;
     const int panelHeight = fixedPanelHeight + itemHeight * subtitleMenuVisibleItemCount_;
     subtitleMenuScrollOffset_ = std::clamp(subtitleMenuScrollOffset_,
                                            0,

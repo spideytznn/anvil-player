@@ -46,6 +46,7 @@ private:
     static LRESULT CALLBACK VideoHostProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK FullscreenOverlayProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK TransportOverlayProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK SubtitleMenuOverlayProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK HdrToneCurveWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     static void CALLBACK PlaybackTimerQueueProc(PVOID context, BOOLEAN timerOrWaitFired);
     LRESULT HandleMessage(UINT message, WPARAM wParam, LPARAM lParam);
@@ -56,6 +57,7 @@ private:
     void LogRuntime(anvil::playback::LogLevel level, const std::wstring& category, const std::wstring& message) const;
     void MaybeLogNativeSchedulerStats(const NativeVideoQueueStats& stats);
     void StartUiAnimationTimer() const;
+    bool SidebarAnimationActive() const;
     void UpdateUiAnimations();
     bool IsPointInteractive(POINT point) const;
     void SetProgressHover(bool hovered);
@@ -95,8 +97,12 @@ private:
     bool Cmv4ApproxActiveForPlayback(const anvil::playback::PlaybackSessionSnapshot& snapshot,
                                      const anvil::playback::VideoSettings& settings) const;
     bool ApplyNativeColorSettingsLive(const anvil::playback::PlaybackSessionSnapshot& snapshot);
+    void ScheduleNativeColorSettingsRefresh(bool requiresDecoderRefresh);
+    void ApplyNativeColorSettingsRefresh(bool requiresDecoderRefresh);
     bool NativeHdrOutputToggleRequiresDecoderRestart(const anvil::playback::PlaybackSessionSnapshot& snapshot) const;
     bool NativeCmv4ToggleRequiresDecoderRestart(const anvil::playback::PlaybackSessionSnapshot& snapshot) const;
+    bool NativeCmv4ToggleNeedsDecoderRefresh(const anvil::playback::PlaybackSessionSnapshot& snapshot,
+                                             const anvil::playback::VideoSettings& settings) const;
     int SettingsVideoFieldCount() const;
     void ApplyDefaultHdrControlsForCurrentMedia();
 
@@ -117,6 +123,8 @@ private:
     void UpdateFullscreenOverlay();
     void EnsureTransportOverlay();
     void UpdateTransportOverlay();
+    void EnsureSubtitleMenuOverlay();
+    void UpdateSubtitleMenuOverlay();
     void EnsureHdrToneCurveWindow();
     void UpdateHdrToneCurveFloatingLayout();
     void UpdateSubtitleMenuLayout();
@@ -144,6 +152,29 @@ private:
     void CancelVolumeDrag();
     int HitSubtitleMenuItem(POINT point) const;
     bool IsPointInSubtitleMenu(POINT point) const;
+    enum class SubtitleMenuAction {
+        None,
+        TabAudio,
+        TabSubtitles,
+        TabDanmaku,
+        DelayDown,
+        DelayUp,
+        AddFile,
+        SubtitleSizeDown,
+        SubtitleSizeUp,
+        SubtitleOffsetXDown,
+        SubtitleOffsetXUp,
+        SubtitleOffsetYDown,
+        SubtitleOffsetYUp,
+        DanmakuToggle,
+        DanmakuMode,
+        DanmakuOpacityDown,
+        DanmakuOpacityUp,
+        DanmakuSpeedDown,
+        DanmakuSpeedUp,
+        AddDanmakuFile,
+    };
+    SubtitleMenuAction HitSubtitleMenuAction(POINT point) const;
     HWND HdrToneCurveInteractionWindow() const;
     std::chrono::milliseconds PositionFromProgressX(int x) const;
     void BeginProgressDrag(int x);
@@ -175,26 +206,43 @@ private:
     void Execute(Command command);
     void OpenInspectorPathItem(int itemIndex);
     void OpenFileDialog();
+    void OpenSubtitleFileDialog();
+    void OpenDanmakuFileDialog();
 
     // main_window.cpp runtime + transport
     void StopRuntime(bool clearVideoFrame = true);
-    void StartRuntime(const anvil::playback::PlaybackSessionSnapshot& snapshot, bool restart);
+    void StartRuntime(const anvil::playback::PlaybackSessionSnapshot& snapshot,
+                      bool restart,
+                      bool waitForPreroll = true);
     void EnsureVideoHost();
-    void StartNativeRuntime(const anvil::playback::PlaybackSessionSnapshot& snapshot, bool restart);
+    void StartNativeRuntime(const anvil::playback::PlaybackSessionSnapshot& snapshot,
+                            bool restart,
+                            bool waitForPreroll = true);
     bool SeekNativeRuntime(const anvil::playback::PlaybackSessionSnapshot& snapshot);
+    bool PrepareNativeEnhancedPlaybackBeforePlay(const anvil::playback::PlaybackSessionSnapshot& snapshot);
     bool CaptureLatestNativeFrame();
-    void RenderHeldNativeFrame();
-    void RefreshPausedNativeFrame(const anvil::playback::PlaybackSessionSnapshot& snapshot);
+    void RenderHeldNativeFrame(bool logRepaint = true);
+    void RefreshPausedNativeFrame(const anvil::playback::PlaybackSessionSnapshot& snapshot,
+                                  bool forceDecoderRestart = false);
     void OpenPath(const std::filesystem::path& path, bool autoplay = true);
     void StartPlayback();
     void PausePlayback();
     void TogglePlayback();
     void StopPlayback();
-    void RestartPlaybackIfPlaying();
+    void RestartPlaybackIfPlaying(bool waitForPreroll = true);
     void SeekRelative(std::chrono::milliseconds delta);
     void SeekToPosition(std::chrono::milliseconds position);
     void SeekFromProgress(int x);
+    void ApplyAudioSelection(int selectedTrackIndex);
     void ApplySubtitleSelection(int selectedTrackIndex);
+    void ApplySubtitleDelayDelta(int deltaMs);
+    void ApplySubtitleFontScaleDelta(double delta);
+    void ApplySubtitleOffsetDelta(int deltaX, int deltaY);
+    void ApplyLiveSubtitleStyleSettings();
+    void ToggleDanmakuEnabled();
+    void CycleDanmakuMode();
+    void ApplyDanmakuOpacityDelta(int deltaPercent);
+    void ApplyDanmakuSpeedDelta(int deltaPercent);
     void CycleSubtitleTrack();
     void ShowSubtitleMenu();
     void ToggleDolbyVisionHdrOutput();
@@ -206,6 +254,7 @@ private:
     void Paint();
     void PaintFullscreenOverlay(HWND overlay);
     void PaintTransportOverlay(HWND overlay);
+    void PaintSubtitleMenuOverlay(HWND overlay);
     void PaintHdrToneCurveWindow(HWND window);
     void DrawTopBar(HDC hdc, const anvil::playback::PlaybackSessionSnapshot& snapshot) const;
     void DrawButtons(HDC hdc, const anvil::playback::PlaybackSessionSnapshot& snapshot) const;
@@ -214,7 +263,7 @@ private:
     HBITMAP LoadPreviewBitmap(const std::filesystem::path& imagePath) const;
     void DrawPreviewBitmap(HDC hdc, RECT target, const std::filesystem::path& imagePath) const;
     void DrawDecodedVideoFrame(HDC hdc, RECT target, const VideoFrame& frame) const;
-    void DrawVideoSurface(HDC hdc, const anvil::playback::PlaybackSessionSnapshot& snapshot) const;
+    void DrawVideoSurface(HDC hdc, const anvil::playback::PlaybackSessionSnapshot& snapshot, const RECT& paintRect) const;
     void DrawTransport(HDC hdc, const anvil::playback::PlaybackSessionSnapshot& snapshot) const;
     void DrawVolumeSlider(HDC hdc, const anvil::playback::PlaybackSessionSnapshot& snapshot) const;
     void DrawSubtitleMenu(HDC hdc, const anvil::playback::PlaybackSessionSnapshot& snapshot) const;
@@ -260,18 +309,20 @@ private:
     HWND videoHost_ = nullptr;
     HWND fullscreenOverlay_ = nullptr;
     HWND transportOverlay_ = nullptr;
+    HWND subtitleMenuOverlay_ = nullptr;
     HWND hdrToneCurveWindow_ = nullptr;
     bool videoHostReady_ = false;
     bool layoutDirty_ = true;
     bool nativeFrameHoldVisible_ = false;
     bool pendingPausedFrameRefresh_ = false;
     bool heldNativeFrameNeedsPresent_ = false;
+    UINT_PTR nativeColorSettingsRefreshSerial_ = 0;
+    bool nativeColorSettingsRefreshRequiresDecoderRefresh_ = false;
     std::optional<NativeVideoFrame> heldNativeFrame_;
     RECT lastVideoHostBounds_{};
     RECT lastFullscreenOverlayBounds_{};
     RECT lastTransportOverlayBounds_{};
-    bool lastTransportOverlayIncludesSubtitleMenu_ = false;
-    bool lastFullscreenOverlayIncludesSubtitleMenu_ = false;
+    RECT lastSubtitleMenuOverlayBounds_{};
     bool trackingMouseLeave_ = false;
     bool hdrToneCurveWindowTrackingMouseLeave_ = false;
     int hoveredButton_ = -1;
@@ -285,6 +336,7 @@ private:
     std::chrono::steady_clock::time_point lastNativeStatsLog_{};
     RECT topBar_{};
     RECT videoSurface_{};
+    RECT playbackSurface_{};
     RECT transportBar_{};
     RECT inspector_{};
     RECT progress_{};
@@ -359,6 +411,13 @@ private:
     std::array<double, anvil::playback::kHdrToneCurvePointCount> hdrToneCurveDragStartOutputs_{};
     std::array<bool, anvil::playback::kHdrToneCurvePointCount> selectedHdrToneCurvePoints_{};
     std::vector<int> subtitleMenuTracks_;
+    std::vector<int> audioMenuTracks_;
+    enum class SubtitleMenuPage {
+        Audio,
+        Subtitles,
+        Danmaku,
+    };
+    SubtitleMenuPage subtitleMenuPage_ = SubtitleMenuPage::Subtitles;
     std::vector<std::filesystem::path> recentMedia_;
     std::vector<std::filesystem::path> currentFolderEntries_;
     std::vector<InspectorPathItem> inspectorPathItems_;

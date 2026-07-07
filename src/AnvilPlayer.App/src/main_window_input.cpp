@@ -114,15 +114,27 @@ std::vector<int> SubtitleTrackCycle(const std::optional<anvil::playback::MediaDe
 
 std::vector<int> SubtitleTrackMenuItems(const std::optional<anvil::playback::MediaDescriptor>& media) {
     std::vector<int> tracks;
-    if (!media.has_value()) {
-        return tracks;
-    }
-
     tracks.push_back(anvil::playback::kSubtitleTrackOff);
     tracks.push_back(anvil::playback::kSubtitleTrackAuto);
-    for (const auto& stream : media->streams) {
-        if (stream.kind == L"Subtitle") {
-            tracks.push_back(stream.index);
+    if (media.has_value()) {
+        for (const auto& stream : media->streams) {
+            if (stream.kind == L"Subtitle") {
+                tracks.push_back(stream.index);
+            }
+        }
+    }
+    return tracks;
+}
+
+std::vector<int> AudioTrackMenuItems(const std::optional<anvil::playback::MediaDescriptor>& media) {
+    std::vector<int> tracks;
+    tracks.push_back(anvil::playback::kAudioTrackOff);
+    tracks.push_back(anvil::playback::kAudioTrackAuto);
+    if (media.has_value()) {
+        for (const auto& stream : media->streams) {
+            if (stream.kind == L"Audio") {
+                tracks.push_back(stream.index);
+            }
         }
     }
     return tracks;
@@ -133,6 +145,16 @@ std::wstring SubtitleSelectionLogLabel(const int selection) {
         return L"auto";
     }
     if (selection == anvil::playback::kSubtitleTrackOff) {
+        return L"off";
+    }
+    return L"stream=" + std::to_wstring(selection);
+}
+
+std::wstring AudioSelectionLogLabel(const int selection) {
+    if (selection == anvil::playback::kAudioTrackAuto) {
+        return L"auto";
+    }
+    if (selection == anvil::playback::kAudioTrackOff) {
         return L"off";
     }
     return L"stream=" + std::to_wstring(selection);
@@ -255,12 +277,118 @@ void MainWindow::OnLeftButtonDown(const int x, const int y) {
     if (subtitleMenuAmount_ > 0.01 || subtitleMenuTarget_ > 0.0) {
         const int item = HitSubtitleMenuItem(point);
         if (item >= 0) {
-            if (item < static_cast<int>(subtitleMenuTracks_.size())) {
-                const int selectedTrack = subtitleMenuTracks_[static_cast<std::size_t>(item)];
-                HideSubtitleMenu();
-                ApplySubtitleSelection(selectedTrack);
+            if (subtitleMenuPage_ == SubtitleMenuPage::Audio) {
+                if (item < static_cast<int>(audioMenuTracks_.size())) {
+                    const int selectedTrack = audioMenuTracks_[static_cast<std::size_t>(item)];
+                    HideSubtitleMenu();
+                    ApplyAudioSelection(selectedTrack);
+                }
+            } else if (subtitleMenuPage_ == SubtitleMenuPage::Subtitles) {
+                if (item < static_cast<int>(subtitleMenuTracks_.size())) {
+                    const int selectedTrack = subtitleMenuTracks_[static_cast<std::size_t>(item)];
+                    HideSubtitleMenu();
+                    ApplySubtitleSelection(selectedTrack);
+                }
             }
             return;
+        }
+        switch (HitSubtitleMenuAction(point)) {
+        case SubtitleMenuAction::TabAudio:
+            subtitleMenuPage_ = SubtitleMenuPage::Audio;
+            hoveredSubtitleMenuItem_ = -1;
+            subtitleMenuScrollOffset_ = 0;
+            MarkLayoutDirty();
+            EnsureLayout();
+            InvalidateTransportArea();
+            return;
+        case SubtitleMenuAction::TabSubtitles:
+            subtitleMenuPage_ = SubtitleMenuPage::Subtitles;
+            hoveredSubtitleMenuItem_ = -1;
+            subtitleMenuScrollOffset_ = 0;
+            MarkLayoutDirty();
+            EnsureLayout();
+            InvalidateTransportArea();
+            return;
+        case SubtitleMenuAction::TabDanmaku:
+            subtitleMenuPage_ = SubtitleMenuPage::Danmaku;
+            hoveredSubtitleMenuItem_ = -1;
+            subtitleMenuScrollOffset_ = 0;
+            MarkLayoutDirty();
+            EnsureLayout();
+            InvalidateTransportArea();
+            return;
+        case SubtitleMenuAction::DelayDown:
+            ApplySubtitleDelayDelta(-100);
+            return;
+        case SubtitleMenuAction::DelayUp:
+            ApplySubtitleDelayDelta(100);
+            return;
+        case SubtitleMenuAction::SubtitleSizeDown:
+            ApplySubtitleFontScaleDelta(-0.05);
+            return;
+        case SubtitleMenuAction::SubtitleSizeUp:
+            ApplySubtitleFontScaleDelta(0.05);
+            return;
+        case SubtitleMenuAction::SubtitleOffsetXDown:
+            ApplySubtitleOffsetDelta(-10, 0);
+            return;
+        case SubtitleMenuAction::SubtitleOffsetXUp:
+            ApplySubtitleOffsetDelta(10, 0);
+            return;
+        case SubtitleMenuAction::SubtitleOffsetYDown:
+            ApplySubtitleOffsetDelta(0, -10);
+            return;
+        case SubtitleMenuAction::SubtitleOffsetYUp:
+            ApplySubtitleOffsetDelta(0, 10);
+            return;
+        case SubtitleMenuAction::AddFile:
+            HideSubtitleMenu();
+            if (transportOverlay_) {
+                UpdateWindow(transportOverlay_);
+            }
+            if (fullscreenOverlay_) {
+                UpdateWindow(fullscreenOverlay_);
+            }
+            if (subtitleMenuOverlay_) {
+                UpdateWindow(subtitleMenuOverlay_);
+            }
+            UpdateWindow(hwnd_);
+            OpenSubtitleFileDialog();
+            return;
+        case SubtitleMenuAction::DanmakuToggle:
+            ToggleDanmakuEnabled();
+            return;
+        case SubtitleMenuAction::DanmakuMode:
+            CycleDanmakuMode();
+            return;
+        case SubtitleMenuAction::DanmakuOpacityDown:
+            ApplyDanmakuOpacityDelta(-5);
+            return;
+        case SubtitleMenuAction::DanmakuOpacityUp:
+            ApplyDanmakuOpacityDelta(5);
+            return;
+        case SubtitleMenuAction::DanmakuSpeedDown:
+            ApplyDanmakuSpeedDelta(-10);
+            return;
+        case SubtitleMenuAction::DanmakuSpeedUp:
+            ApplyDanmakuSpeedDelta(10);
+            return;
+        case SubtitleMenuAction::AddDanmakuFile:
+            HideSubtitleMenu();
+            if (transportOverlay_) {
+                UpdateWindow(transportOverlay_);
+            }
+            if (fullscreenOverlay_) {
+                UpdateWindow(fullscreenOverlay_);
+            }
+            if (subtitleMenuOverlay_) {
+                UpdateWindow(subtitleMenuOverlay_);
+            }
+            UpdateWindow(hwnd_);
+            OpenDanmakuFileDialog();
+            return;
+        case SubtitleMenuAction::None:
+            break;
         }
         if (IsPointInSubtitleMenu(point)) {
             return;
@@ -530,11 +658,13 @@ bool MainWindow::IsPointInSubtitleMenu(const POINT point) const {
 }
 
 int MainWindow::HitSubtitleMenuItem(const POINT point) const {
-    if (!IsPointInSubtitleMenu(point)) {
+    if (!IsPointInSubtitleMenu(point) || subtitleMenuPage_ == SubtitleMenuPage::Danmaku) {
         return -1;
     }
 
-    const int count = static_cast<int>(subtitleMenuTracks_.size());
+    const int count = subtitleMenuPage_ == SubtitleMenuPage::Audio
+                          ? static_cast<int>(audioMenuTracks_.size())
+                          : static_cast<int>(subtitleMenuTracks_.size());
     if (count <= 0) {
         return -1;
     }
@@ -558,6 +688,149 @@ int MainWindow::HitSubtitleMenuItem(const POINT point) const {
         return -1;
     }
     return index;
+}
+
+MainWindow::SubtitleMenuAction MainWindow::HitSubtitleMenuAction(const POINT point) const {
+    if (!IsPointInSubtitleMenu(point)) {
+        return SubtitleMenuAction::None;
+    }
+
+    const int headerHeight = Scale(62);
+    const RECT header = MakeRect(subtitleMenu_.left,
+                                 subtitleMenu_.top,
+                                 subtitleMenu_.right,
+                                 subtitleMenu_.top + headerHeight);
+    const int tabGap = Scale(8);
+    const RECT tabRail = MakeRect(header.left + Scale(14),
+                                  header.top + Scale(12),
+                                  header.right - Scale(14),
+                                  header.bottom - Scale(14));
+    const int tabWidth = (RectWidth(tabRail) - tabGap * 2) / 3;
+    for (int index = 0; index < 3; ++index) {
+        const RECT tab = MakeRect(tabRail.left + index * (tabWidth + tabGap),
+                                  tabRail.top,
+                                  tabRail.left + index * (tabWidth + tabGap) + tabWidth,
+                                  tabRail.bottom);
+        if (!ContainsPoint(tab, point)) {
+            continue;
+        }
+        if (index == 0) {
+            return SubtitleMenuAction::TabAudio;
+        }
+        if (index == 1) {
+            return SubtitleMenuAction::TabSubtitles;
+        }
+        return SubtitleMenuAction::TabDanmaku;
+    }
+
+    const int listGap = Scale(8);
+    const int itemHeight = Scale(42);
+    const int listBottomGap = Scale(6);
+    const int delayHeight = Scale(56);
+    const int actionHeight = Scale(44);
+    const int styleHeight = Scale(48);
+
+    if (subtitleMenuPage_ == SubtitleMenuPage::Danmaku) {
+        int rowTop = subtitleMenu_.top + headerHeight + Scale(8);
+        const auto row = [&](const int height) {
+            RECT result = MakeRect(subtitleMenu_.left, rowTop, subtitleMenu_.right, rowTop + height);
+            rowTop += height;
+            return result;
+        };
+        if (ContainsPoint(row(actionHeight), point)) {
+            return SubtitleMenuAction::DanmakuToggle;
+        }
+        if (ContainsPoint(row(actionHeight), point)) {
+            return SubtitleMenuAction::DanmakuMode;
+        }
+        const RECT opacityRow = row(styleHeight);
+        if (ContainsPoint(opacityRow, point)) {
+            if (point.x < opacityRow.left + Scale(76)) {
+                return SubtitleMenuAction::DanmakuOpacityDown;
+            }
+            if (point.x > opacityRow.right - Scale(76)) {
+                return SubtitleMenuAction::DanmakuOpacityUp;
+            }
+            return SubtitleMenuAction::None;
+        }
+        const RECT speedRow = row(styleHeight);
+        if (ContainsPoint(speedRow, point)) {
+            if (point.x < speedRow.left + Scale(76)) {
+                return SubtitleMenuAction::DanmakuSpeedDown;
+            }
+            if (point.x > speedRow.right - Scale(76)) {
+                return SubtitleMenuAction::DanmakuSpeedUp;
+            }
+            return SubtitleMenuAction::None;
+        }
+        if (ContainsPoint(row(actionHeight), point)) {
+            return SubtitleMenuAction::AddDanmakuFile;
+        }
+        return SubtitleMenuAction::None;
+    }
+
+    if (subtitleMenuPage_ == SubtitleMenuPage::Audio) {
+        return SubtitleMenuAction::None;
+    }
+
+    const int count = std::max(1, static_cast<int>(subtitleMenuTracks_.size()));
+    const int visibleCount = subtitleMenuVisibleItemCount_ > 0
+                                 ? std::clamp(subtitleMenuVisibleItemCount_, 1, count)
+                                 : count;
+    const int listTop = subtitleMenu_.top + headerHeight + listGap;
+    const int listBottom = listTop + itemHeight * visibleCount + listBottomGap;
+    const RECT delayRow = MakeRect(subtitleMenu_.left, listBottom, subtitleMenu_.right, listBottom + delayHeight);
+    if (ContainsPoint(delayRow, point)) {
+        const RECT minusHit = MakeRect(delayRow.left, delayRow.top, delayRow.left + Scale(76), delayRow.bottom);
+        const RECT plusHit = MakeRect(delayRow.right - Scale(76), delayRow.top, delayRow.right, delayRow.bottom);
+        if (ContainsPoint(minusHit, point)) {
+            return SubtitleMenuAction::DelayDown;
+        }
+        if (ContainsPoint(plusHit, point)) {
+            return SubtitleMenuAction::DelayUp;
+        }
+        return SubtitleMenuAction::None;
+    }
+
+    const RECT addRow = MakeRect(subtitleMenu_.left, delayRow.bottom, subtitleMenu_.right, delayRow.bottom + actionHeight);
+    if (ContainsPoint(addRow, point)) {
+        return SubtitleMenuAction::AddFile;
+    }
+
+    const RECT sizeRow = MakeRect(subtitleMenu_.left, addRow.bottom, subtitleMenu_.right, addRow.bottom + styleHeight);
+    if (ContainsPoint(sizeRow, point)) {
+        if (point.x < sizeRow.left + Scale(76)) {
+            return SubtitleMenuAction::SubtitleSizeDown;
+        }
+        if (point.x > sizeRow.right - Scale(76)) {
+            return SubtitleMenuAction::SubtitleSizeUp;
+        }
+        return SubtitleMenuAction::None;
+    }
+
+    const RECT offsetXRow = MakeRect(subtitleMenu_.left, sizeRow.bottom, subtitleMenu_.right, sizeRow.bottom + styleHeight);
+    if (ContainsPoint(offsetXRow, point)) {
+        if (point.x < offsetXRow.left + Scale(76)) {
+            return SubtitleMenuAction::SubtitleOffsetXDown;
+        }
+        if (point.x > offsetXRow.right - Scale(76)) {
+            return SubtitleMenuAction::SubtitleOffsetXUp;
+        }
+        return SubtitleMenuAction::None;
+    }
+
+    const RECT offsetYRow = MakeRect(subtitleMenu_.left, offsetXRow.bottom, subtitleMenu_.right, offsetXRow.bottom + styleHeight);
+    if (ContainsPoint(offsetYRow, point)) {
+        if (point.x < offsetYRow.left + Scale(76)) {
+            return SubtitleMenuAction::SubtitleOffsetYDown;
+        }
+        if (point.x > offsetYRow.right - Scale(76)) {
+            return SubtitleMenuAction::SubtitleOffsetYUp;
+        }
+        return SubtitleMenuAction::None;
+    }
+
+    return SubtitleMenuAction::None;
 }
 
 double MainWindow::VolumeFromSliderX(const int x) const {
@@ -1237,6 +1510,152 @@ void MainWindow::ApplySubtitleSelection(const int selectedTrackIndex) {
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
+void MainWindow::ApplyAudioSelection(const int selectedTrackIndex) {
+    auto settings = controller_.Settings();
+    if (settings.audio.selectedTrackIndex == selectedTrackIndex) {
+        return;
+    }
+
+    settings.audio.selectedTrackIndex = selectedTrackIndex;
+    controller_.ApplySettings(settings);
+    LogApp(anvil::playback::LogLevel::Info,
+           L"audio track=" + AudioSelectionLogLabel(settings.audio.selectedTrackIndex));
+
+    const auto updated = controller_.Snapshot();
+    if (updated.state == PlaybackState::Playing) {
+        RestartPlaybackIfPlaying();
+    } else if (updated.state == PlaybackState::Paused &&
+               updated.media.has_value() &&
+               updated.media->hasAudio &&
+               backend_ == PlaybackBackend::NativeFfmpegD3D11) {
+        audioPlayer_.Stop();
+    }
+    MarkLayoutDirty();
+    EnsureLayout();
+    InvalidateTransportArea();
+    InvalidateFullscreenOverlay();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::ApplySubtitleDelayDelta(const int deltaMs) {
+    auto settings = controller_.Settings();
+    const int nextDelay = std::clamp(settings.subtitles.subtitleDelayMs + deltaMs, -600000, 600000);
+    if (nextDelay == settings.subtitles.subtitleDelayMs) {
+        return;
+    }
+
+    settings.subtitles.subtitleDelayMs = nextDelay;
+    controller_.ApplySettings(settings);
+    LogApp(anvil::playback::LogLevel::Info, L"subtitle delay_ms=" + std::to_wstring(nextDelay));
+
+    const auto updated = controller_.Snapshot();
+    if (updated.state == PlaybackState::Paused &&
+        updated.media.has_value() &&
+        updated.media->hasVideo &&
+        backend_ == PlaybackBackend::NativeFfmpegD3D11) {
+        RefreshPausedNativeFrame(updated);
+    } else {
+        RestartPlaybackIfPlaying();
+    }
+    MarkLayoutDirty();
+    EnsureLayout();
+    InvalidateTransportArea();
+    InvalidateFullscreenOverlay();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::ApplySubtitleFontScaleDelta(const double delta) {
+    auto settings = controller_.Settings();
+    const double nextScale = std::clamp(std::round((settings.subtitles.fontScale + delta) * 100.0) / 100.0, 0.50, 2.00);
+    if (std::abs(nextScale - settings.subtitles.fontScale) < 0.001) {
+        return;
+    }
+
+    settings.subtitles.fontScale = nextScale;
+    controller_.ApplySettings(settings);
+    LogApp(anvil::playback::LogLevel::Info,
+           L"subtitle font_scale=" + std::to_wstring(static_cast<int>(std::round(nextScale * 100.0))) + L"%");
+    ApplyLiveSubtitleStyleSettings();
+}
+
+void MainWindow::ApplySubtitleOffsetDelta(const int deltaX, const int deltaY) {
+    auto settings = controller_.Settings();
+    const int nextX = std::clamp(settings.subtitles.offsetXPx + deltaX, -400, 400);
+    const int nextY = std::clamp(settings.subtitles.offsetYPx + deltaY, -400, 400);
+    if (nextX == settings.subtitles.offsetXPx && nextY == settings.subtitles.offsetYPx) {
+        return;
+    }
+
+    settings.subtitles.offsetXPx = nextX;
+    settings.subtitles.offsetYPx = nextY;
+    controller_.ApplySettings(settings);
+    LogApp(anvil::playback::LogLevel::Info,
+           L"subtitle offset x=" + std::to_wstring(nextX) + L" y=" + std::to_wstring(nextY));
+    ApplyLiveSubtitleStyleSettings();
+}
+
+void MainWindow::ApplyLiveSubtitleStyleSettings() {
+    const auto settings = controller_.Settings();
+    if (d3dRenderer_) {
+        d3dRenderer_->ConfigureSubtitleSettings(settings.subtitles);
+    }
+    const auto snapshot = controller_.Snapshot();
+    if (backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+        snapshot.state == PlaybackState::Paused &&
+        heldNativeFrame_.has_value()) {
+        RenderHeldNativeFrame();
+    }
+    MarkLayoutDirty();
+    EnsureLayout();
+    InvalidateTransportArea();
+    InvalidateFullscreenOverlay();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::ToggleDanmakuEnabled() {
+    auto settings = controller_.Settings();
+    settings.danmaku.enabled = !settings.danmaku.enabled;
+    controller_.ApplySettings(settings);
+    LogApp(anvil::playback::LogLevel::Info,
+           L"danmaku enabled=" + std::wstring(settings.danmaku.enabled ? L"true" : L"false"));
+    InvalidateTransportArea();
+    InvalidateFullscreenOverlay();
+}
+
+void MainWindow::CycleDanmakuMode() {
+    auto settings = controller_.Settings();
+    settings.danmaku.mode = (settings.danmaku.mode + 1) % 3;
+    controller_.ApplySettings(settings);
+    LogApp(anvil::playback::LogLevel::Info,
+           L"danmaku mode=" + std::to_wstring(settings.danmaku.mode));
+    InvalidateTransportArea();
+    InvalidateFullscreenOverlay();
+}
+
+void MainWindow::ApplyDanmakuOpacityDelta(const int deltaPercent) {
+    auto settings = controller_.Settings();
+    const int next = std::clamp(settings.danmaku.opacityPercent + deltaPercent, 20, 100);
+    if (next == settings.danmaku.opacityPercent) {
+        return;
+    }
+    settings.danmaku.opacityPercent = next;
+    controller_.ApplySettings(settings);
+    InvalidateTransportArea();
+    InvalidateFullscreenOverlay();
+}
+
+void MainWindow::ApplyDanmakuSpeedDelta(const int deltaPercent) {
+    auto settings = controller_.Settings();
+    const int next = std::clamp(settings.danmaku.speedPercent + deltaPercent, 50, 200);
+    if (next == settings.danmaku.speedPercent) {
+        return;
+    }
+    settings.danmaku.speedPercent = next;
+    controller_.ApplySettings(settings);
+    InvalidateTransportArea();
+    InvalidateFullscreenOverlay();
+}
+
 void MainWindow::CycleSubtitleTrack() {
     const auto snapshot = controller_.Snapshot();
     const auto settings = controller_.Settings();
@@ -1304,28 +1723,20 @@ void MainWindow::ToggleDolbyVisionCmv4Approx() {
                std::wstring(settings.video.dolbyVisionCmv4Approx ? L"on" : L"off"));
 
     const auto snapshot = controller_.Snapshot();
-    bool handledLive = false;
-    if (backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
-        snapshot.media.has_value() &&
-        snapshot.media->hasVideo &&
-        !NativeCmv4ToggleRequiresDecoderRestart(snapshot)) {
-        handledLive = ApplyNativeColorSettingsLive(snapshot);
-    }
-    if (!handledLive) {
-        if (snapshot.state == PlaybackState::Paused &&
-            snapshot.media.has_value() &&
-            snapshot.media->hasVideo &&
-            backend_ == PlaybackBackend::NativeFfmpegD3D11) {
-            RefreshPausedNativeFrame(snapshot);
-        } else {
-            RestartPlaybackIfPlaying();
-        }
-    }
+    const bool requiresDecoderRefresh = NativeCmv4ToggleNeedsDecoderRefresh(snapshot, settings.video);
+    ScheduleNativeColorSettingsRefresh(requiresDecoderRefresh);
     MarkLayoutDirty();
     EnsureLayout();
     InvalidateTransportArea();
     InvalidateFullscreenOverlay();
     InvalidateHdrToneCurveEditor();
+    if (transportOverlay_ && IsWindowVisible(transportOverlay_)) {
+        UpdateWindow(transportOverlay_);
+    }
+    if (fullscreenOverlay_ && IsWindowVisible(fullscreenOverlay_)) {
+        UpdateWindow(fullscreenOverlay_);
+    }
+    UpdateWindow(hwnd_);
 }
 
 void MainWindow::ShowSubtitleMenu() {
@@ -1337,18 +1748,20 @@ void MainWindow::ShowSubtitleMenu() {
         return;
     }
 
+    audioMenuTracks_.clear();
+    audioMenuTracks_ = AudioTrackMenuItems(snapshot.media);
     subtitleMenuTracks_.clear();
-    if (snapshot.media.has_value()) {
-        subtitleMenuTracks_ = SubtitleTrackMenuItems(snapshot.media);
-    }
+    subtitleMenuTracks_ = SubtitleTrackMenuItems(snapshot.media);
     subtitleMenuVisibleItemCount_ = 0;
     subtitleMenuScrollOffset_ = 0;
     const auto settings = controller_.Settings();
-    const auto selected = std::find(subtitleMenuTracks_.begin(),
-                                    subtitleMenuTracks_.end(),
-                                    settings.subtitles.selectedTrackIndex);
-    if (selected != subtitleMenuTracks_.end()) {
-        subtitleMenuScrollOffset_ = std::max(0, static_cast<int>(std::distance(subtitleMenuTracks_.begin(), selected)) - 1);
+    const auto& selectedTracks = subtitleMenuPage_ == SubtitleMenuPage::Audio ? audioMenuTracks_ : subtitleMenuTracks_;
+    const int selectedTrack = subtitleMenuPage_ == SubtitleMenuPage::Audio
+                                  ? settings.audio.selectedTrackIndex
+                                  : settings.subtitles.selectedTrackIndex;
+    const auto selected = std::find(selectedTracks.begin(), selectedTracks.end(), selectedTrack);
+    if (selected != selectedTracks.end()) {
+        subtitleMenuScrollOffset_ = std::max(0, static_cast<int>(std::distance(selectedTracks.begin(), selected)) - 1);
     }
     hoveredSubtitleMenuItem_ = -1;
     SetSubtitleMenuTarget(true);

@@ -615,7 +615,9 @@ void BlendSubtitleBitmap(std::vector<uint8_t>& destination,
                          const NativeSubtitleBitmap& source,
                          const D3D11_VIEWPORT& videoViewport,
                          const int frameWidth,
-                         const int frameHeight) {
+                         const int frameHeight,
+                         const int offsetXPx,
+                         const int offsetYPx) {
     if (!source.HasPixels() || destinationWidth <= 0 || destinationHeight <= 0) {
         return;
     }
@@ -628,8 +630,8 @@ void BlendSubtitleBitmap(std::vector<uint8_t>& destination,
 
     const double scaleX = static_cast<double>(videoViewport.Width) / static_cast<double>(canvasWidth);
     const double scaleY = static_cast<double>(videoViewport.Height) / static_cast<double>(canvasHeight);
-    const int destLeft = static_cast<int>(std::round(videoViewport.TopLeftX + static_cast<float>(source.x) * scaleX));
-    const int destTop = static_cast<int>(std::round(videoViewport.TopLeftY + static_cast<float>(source.y) * scaleY));
+    const int destLeft = static_cast<int>(std::round(videoViewport.TopLeftX + static_cast<float>(source.x) * scaleX)) + offsetXPx;
+    const int destTop = static_cast<int>(std::round(videoViewport.TopLeftY + static_cast<float>(source.y) * scaleY)) + offsetYPx;
     const int destWidth = std::max(1, static_cast<int>(std::round(static_cast<double>(source.width) * scaleX)));
     const int destHeight = std::max(1, static_cast<int>(std::round(static_cast<double>(source.height) * scaleY)));
     const int clippedLeft = std::clamp(destLeft, 0, destinationWidth);
@@ -854,9 +856,12 @@ void D3D11VideoRenderer::Render(const NativeVideoFrame& frame) {
     bool hasBgraTexture = false;
     bool hasYuvTexture = false;
     bool hasEnhancementYuvTexture = false;
+    const bool enhancementYuvEnabled =
+        (videoSettings_.dolbyVisionCmv4Approx || ExperimentalDoviTrimEnabled()) &&
+        frame.HasEnhancementYuv();
     if (!hasHardwareTexture && frame.HasYuv()) {
         hasYuvTexture = UpdateYuvTexture(frame);
-        if (hasYuvTexture && frame.HasEnhancementYuv()) {
+        if (hasYuvTexture && enhancementYuvEnabled) {
             hasEnhancementYuvTexture = UpdateEnhancementYuvTexture(frame);
             if (hasEnhancementYuvTexture && !felOverlayLogged_) {
                 felOverlayLogged_ = true;
@@ -1860,16 +1865,21 @@ bool D3D11VideoRenderer::UpdateColorPipeline(const NativeVideoFrame& frame) {
         return false;
     }
 
+    const bool cmv4ApproxEnabled = videoSettings_.dolbyVisionCmv4Approx || ExperimentalDoviTrimEnabled();
+    const bool enhancementYuvEnabled = cmv4ApproxEnabled && frame.HasEnhancementYuv();
     const bool hasDolbyVisionMetadata = frame.dovi && frame.dovi->valid;
     const bool hasEnhancementDolbyVisionMetadata = frame.enhancementDovi && frame.enhancementDovi->valid;
     const bool libplaceboProcessedDolbyVision =
         frame.dynamicMetadataPath.find(L"dolby_vision_libplacebo") != std::wstring::npos;
     const bool rawDolbyVisionInput = hasDolbyVisionMetadata && !libplaceboProcessedDolbyVision;
-    const bool felComposerInput = frame.HasEnhancementYuv() && hasEnhancementDolbyVisionMetadata;
-    const bool felOverlayInput = frame.HasEnhancementYuv() && !felComposerInput;
+    const bool felComposerInput = enhancementYuvEnabled && hasEnhancementDolbyVisionMetadata;
+    const bool felOverlayInput = enhancementYuvEnabled && !felComposerInput;
+    const bool libplaceboCmv4TrimInput =
+        libplaceboProcessedDolbyVision && cmv4ApproxEnabled && hasDolbyVisionMetadata;
     const auto* doviForDisplay = rawDolbyVisionInput
                                      ? frame.dovi.get()
-                                     : (felComposerInput ? frame.enhancementDovi.get() : nullptr);
+                                     : (felComposerInput ? frame.enhancementDovi.get()
+                                                         : (libplaceboCmv4TrimInput ? frame.dovi.get() : nullptr));
     const auto* doviForActiveArea = hasDolbyVisionMetadata
                                         ? frame.dovi.get()
                                         : (felComposerInput ? frame.enhancementDovi.get() : nullptr);
@@ -1878,7 +1888,6 @@ bool D3D11VideoRenderer::UpdateColorPipeline(const NativeVideoFrame& frame) {
     const VideoColorMetadata color = NormalizeDolbyVisionOutput(
         MergeColorMetadata(frame.color, mediaColor_),
         rawDolbyVisionInput);
-    const bool cmv4ApproxEnabled = videoSettings_.dolbyVisionCmv4Approx || ExperimentalDoviTrimEnabled();
     const bool cmv4LibplaceboIntermediate =
         cmv4ApproxEnabled &&
         libplaceboProcessedDolbyVision &&
@@ -2120,7 +2129,9 @@ bool D3D11VideoRenderer::UpdateColorPipeline(const NativeVideoFrame& frame) {
 void D3D11VideoRenderer::UpdateDoviConstants(const NativeVideoFrame& frame) {
     DoviShaderConstants dc{};
 
-    const bool p7Composer = frame.HasEnhancementYuv() &&
+    const bool cmv4ApproxEnabled = videoSettings_.dolbyVisionCmv4Approx || ExperimentalDoviTrimEnabled();
+    const bool p7Composer = cmv4ApproxEnabled &&
+                            frame.HasEnhancementYuv() &&
                             frame.enhancementDovi &&
                             frame.enhancementDovi->valid;
     const auto* doviSource = p7Composer
@@ -2732,7 +2743,9 @@ bool D3D11VideoRenderer::UpdateSubtitleOverlay(const NativeVideoFrame& frame, co
         text == activeSubtitleText_ &&
         bitmapKey == activeSubtitleBitmapKey_ &&
         RectEquals(videoRect, activeSubtitleViewport_) &&
-        std::abs(activeSubtitleFontScale_ - subtitleSettings_.fontScale) < 0.001) {
+        std::abs(activeSubtitleFontScale_ - subtitleSettings_.fontScale) < 0.001 &&
+        activeSubtitleOffsetXPx_ == subtitleSettings_.offsetXPx &&
+        activeSubtitleOffsetYPx_ == subtitleSettings_.offsetYPx) {
         return true;
     }
     if (diagnosticsEnabled_) {
@@ -2761,9 +2774,12 @@ bool D3D11VideoRenderer::UpdateSubtitleOverlay(const NativeVideoFrame& frame, co
         const float marginBottom = std::clamp(videoViewport.Height * 0.085f, 22.0f, 86.0f);
         const float layoutHeight = std::min(videoViewport.Height * 0.34f,
                                             std::max(fontPixels * 2.1f, fontPixels * (static_cast<float>(lineCount) + 1.2f)));
-        const float layoutLeft = videoViewport.TopLeftX + (videoViewport.Width - maxTextWidth) * 0.5f;
+        const float layoutLeft = videoViewport.TopLeftX +
+                                 (videoViewport.Width - maxTextWidth) * 0.5f +
+                                 static_cast<float>(subtitleSettings_.offsetXPx);
         const float layoutTop = std::max(videoViewport.TopLeftY,
-                                         videoViewport.TopLeftY + videoViewport.Height - marginBottom - layoutHeight);
+                                         videoViewport.TopLeftY + videoViewport.Height - marginBottom - layoutHeight) +
+                                static_cast<float>(subtitleSettings_.offsetYPx);
         Gdiplus::RectF layout(layoutLeft, layoutTop, maxTextWidth, layoutHeight);
 
         Gdiplus::FontFamily family(L"Segoe UI");
@@ -2809,7 +2825,15 @@ bool D3D11VideoRenderer::UpdateSubtitleOverlay(const NativeVideoFrame& frame, co
     bitmap.UnlockBits(&bitmapData);
 
     for (const auto& subtitleBitmap : bitmaps) {
-        BlendSubtitleBitmap(pixels, surfaceWidth, surfaceHeight, subtitleBitmap, videoViewport, frame.width, frame.height);
+        BlendSubtitleBitmap(pixels,
+                            surfaceWidth,
+                            surfaceHeight,
+                            subtitleBitmap,
+                            videoViewport,
+                            frame.width,
+                            frame.height,
+                            subtitleSettings_.offsetXPx,
+                            subtitleSettings_.offsetYPx);
     }
 
     if (!subtitleTexture_ || subtitleTextureW_ != surfaceWidth || subtitleTextureH_ != surfaceHeight || !subtitleSrv_) {
@@ -2856,6 +2880,8 @@ bool D3D11VideoRenderer::UpdateSubtitleOverlay(const NativeVideoFrame& frame, co
     activeSubtitleBitmapKey_ = bitmapKey;
     activeSubtitleViewport_ = videoRect;
     activeSubtitleFontScale_ = subtitleSettings_.fontScale;
+    activeSubtitleOffsetXPx_ = subtitleSettings_.offsetXPx;
+    activeSubtitleOffsetYPx_ = subtitleSettings_.offsetYPx;
     if (textChanged || bitmapBecameActive) {
         LogInfo(L"subtitle_overlay active=true lines=" + std::to_wstring(lineCount) +
                 L" bitmap_rects=" + std::to_wstring(bitmaps.size()) +
@@ -2933,6 +2959,8 @@ void D3D11VideoRenderer::ReleaseAll() {
     activeSubtitleBitmapKey_.clear();
     activeSubtitleViewport_ = {};
     activeSubtitleFontScale_ = 0.0;
+    activeSubtitleOffsetXPx_ = 0;
+    activeSubtitleOffsetYPx_ = 0;
     activeColorSpace_ = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
     hdrMetadataApplied_ = false;
     hdrColorSpaceFailureLogged_ = false;

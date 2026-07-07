@@ -181,6 +181,7 @@ public:
                int selectedSubtitleTrackIndex = anvil::playback::kSubtitleTrackAuto,
                std::chrono::milliseconds subtitleDelay = std::chrono::milliseconds{0},
                bool autoLoadExternalSubtitles = true,
+               std::filesystem::path externalSubtitlePath = {},
                bool oneShotFrame = false,
                bool preferDolbyVisionHdrOutput = false,
                bool enableDolbyVisionEnhancementDecode = false);
@@ -193,6 +194,14 @@ public:
         return running_.load();
     }
 
+    bool DolbyVisionEnhancementDecodeEnabled() const {
+        return enableDolbyVisionEnhancementDecode_;
+    }
+
+    bool OneShotFrame() const {
+        return oneShotFrame_;
+    }
+
     bool LatestFrame(NativeVideoFrame& frame) const;
 
     void ClearFrame();
@@ -201,6 +210,9 @@ public:
 
     NativeVideoQueueStats Stats() const;
     bool WaitForPreroll(std::chrono::milliseconds targetDuration, std::chrono::milliseconds timeout) const;
+    bool WaitForEnhancementPreroll(std::chrono::milliseconds minPts,
+                                    std::chrono::milliseconds timeout,
+                                    bool publishReadyFrame = true);
 
     const std::filesystem::path& Path() const { return path_; }
 
@@ -219,8 +231,8 @@ private:
     static constexpr int kPlayingPacketReadAheadBatch = 12;
     static constexpr int kPausedPacketReadAheadBatch = 256;
     static constexpr std::chrono::milliseconds kPlayingPacketReadAheadTarget{15000};
-    static constexpr int kDolbyVisionEnhancementStartupPacketReadAheadBatch = 1;
-    static constexpr int kDolbyVisionEnhancementPlayingPacketReadAheadBatch = 2;
+    static constexpr int kDolbyVisionEnhancementStartupPacketReadAheadBatch = 6;
+    static constexpr int kDolbyVisionEnhancementPlayingPacketReadAheadBatch = 4;
     static constexpr int kDolbyVisionEnhancementPausedPacketReadAheadBatch = 24;
     static constexpr std::chrono::milliseconds kDolbyVisionEnhancementPacketReadAheadTarget{1500};
     static constexpr std::size_t kMaxDolbyVisionEnhancementQueuedFrames = 160;
@@ -382,6 +394,7 @@ private:
     bool dolbyVisionEnhancementFirstPackedLogged_ = false;
     bool dolbyVisionCpuReferenceLogged_ = false;
     bool dolbyVisionMultiPartitionFallbackLogged_ = false;
+    int dolbyVisionEnhancementStartupMisses_ = 0;
     uint64_t dolbyVisionEnhancementLastDynamicMetadataFingerprint_ = 0;
     uint64_t dolbyVisionEnhancementFramesDecoded_ = 0;
     int dolbyVisionEnhancementStreamIndex_ = -1;
@@ -397,6 +410,7 @@ private:
     int selectedSubtitleTrackIndex_ = anvil::playback::kSubtitleTrackAuto;
     std::chrono::milliseconds subtitleDelay_{0};
     bool autoLoadExternalSubtitles_ = true;
+    std::filesystem::path externalSubtitlePath_;
     bool oneShotFrame_ = false;
     int subtitleCanvasWidth_ = 0;
     int subtitleCanvasHeight_ = 0;
@@ -420,6 +434,7 @@ private:
     std::atomic_bool frameMessagePending_{false};
     std::atomic<int64_t> pendingSeekMs_{-1};
     std::atomic_bool playbackPaused_{false};
+    std::atomic_bool enhancementPrerollWaitActive_{false};
     std::atomic<int64_t> pausedPositionMs_{0};
     std::thread decodeThread_;
 };

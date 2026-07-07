@@ -4,12 +4,15 @@
 
 #include <array>
 #include <cstddef>
+#include <filesystem>
 #include <string>
 
 namespace anvil::playback {
 
 inline constexpr int kVideoTrackDolbyVisionEnhancement = -2;
 inline constexpr int kVideoTrackAuto = -1;
+inline constexpr int kAudioTrackAuto = -2;
+inline constexpr int kAudioTrackOff = -1;
 inline constexpr int kSubtitleTrackAuto = -2;
 inline constexpr int kSubtitleTrackOff = -1;
 inline constexpr std::size_t kHdrToneCurvePointCount = 9;
@@ -48,6 +51,7 @@ struct AudioSettings {
     std::wstring outputDevice = L"Auto";
     AudioOutputMode outputMode = AudioOutputMode::Auto;
     WasapiMode wasapiMode = WasapiMode::Shared;
+    int selectedTrackIndex = kAudioTrackAuto;
     bool ac3Passthrough = true;
     bool eac3Passthrough = true;
     bool trueHdPassthrough = true;
@@ -58,9 +62,20 @@ struct AudioSettings {
 struct SubtitleSettings {
     std::wstring preferredLanguage = L"Auto";
     int selectedTrackIndex = kSubtitleTrackAuto;
+    std::filesystem::path externalSubtitlePath;
     double fontScale = 1.0;
+    int offsetXPx = 0;
+    int offsetYPx = 0;
     int subtitleDelayMs = 0;
     bool externalSubtitleAutoLoad = true;
+};
+
+struct DanmakuSettings {
+    bool enabled = false;
+    int mode = 0;
+    int opacityPercent = 70;
+    int speedPercent = 100;
+    std::filesystem::path externalDanmakuPath;
 };
 
 struct DiagnosticsSettings {
@@ -72,6 +87,7 @@ struct PlayerSettings {
     VideoSettings video;
     AudioSettings audio;
     SubtitleSettings subtitles;
+    DanmakuSettings danmaku;
     DiagnosticsSettings diagnostics;
 };
 

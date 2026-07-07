@@ -55,6 +55,41 @@ double AnimatedValue(const double from,
     return from + (to - from) * EaseOutCubic(t);
 }
 
+bool HasArea(const RECT& rect) {
+    return RectWidth(rect) > 0 && RectHeight(rect) > 0;
+}
+
+bool SameRect(const RECT& a, const RECT& b) {
+    return a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom;
+}
+
+bool RectsIntersect(const RECT& a, const RECT& b) {
+    RECT intersection{};
+    return HasArea(a) && HasArea(b) && IntersectRect(&intersection, &a, &b) != FALSE;
+}
+
+RECT InflateRectCopy(RECT rect, const int dx, const int dy) {
+    InflateRect(&rect, dx, dy);
+    return rect;
+}
+
+void InvalidateIfVisible(HWND hwnd, RECT rect, const int padding) {
+    if (!hwnd || !HasArea(rect)) {
+        return;
+    }
+    rect = InflateRectCopy(rect, padding, padding);
+    InvalidateRect(hwnd, &rect, FALSE);
+}
+
+RECT SidebarEdgeRect(const RECT& before, const RECT& after) {
+    if (!HasArea(before) || !HasArea(after)) {
+        return HasArea(before) ? before : after;
+    }
+    const int left = std::min(before.right, after.right);
+    const int right = std::max(before.right, after.right);
+    return MakeRect(left, std::min(before.top, after.top), right, std::max(before.bottom, after.bottom));
+}
+
 std::wstring FormatMillisecondsFromMicroseconds(const uint64_t microseconds) {
     std::wostringstream stream;
     stream << std::fixed << std::setprecision(2) << (static_cast<double>(microseconds) / 1000.0);
@@ -434,6 +469,45 @@ LRESULT CALLBACK MainWindow::TransportOverlayProc(HWND hwnd, UINT message, WPARA
     return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 
+LRESULT CALLBACK MainWindow::SubtitleMenuOverlayProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    MainWindow* window = nullptr;
+    if (message == WM_NCCREATE) {
+        auto* createStruct = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        window = static_cast<MainWindow*>(createStruct->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(window));
+    } else {
+        window = reinterpret_cast<MainWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    }
+
+    if (window && (message == WM_MOUSEMOVE || message == WM_LBUTTONDOWN || message == WM_LBUTTONUP)) {
+        POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        MapWindowPoints(hwnd, window->hwnd_, &point, 1);
+        return SendMessageW(window->hwnd_, message, wParam, MAKELPARAM(point.x, point.y));
+    }
+    if (window && message == WM_MOUSEWHEEL) {
+        return SendMessageW(window->hwnd_, message, wParam, lParam);
+    }
+
+    if (window && message == WM_PAINT) {
+        window->PaintSubtitleMenuOverlay(hwnd);
+        return 0;
+    }
+
+    if (window && message == WM_SETCURSOR && LOWORD(lParam) == HTCLIENT) {
+        POINT point{};
+        GetCursorPos(&point);
+        ScreenToClient(window->hwnd_, &point);
+        SetCursor(LoadCursorW(nullptr, window->IsPointInteractive(point) ? IDC_HAND : IDC_ARROW));
+        return TRUE;
+    }
+
+    if (message == WM_ERASEBKGND) {
+        return 1;
+    }
+
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
 LRESULT CALLBACK MainWindow::HdrToneCurveWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     MainWindow* window = nullptr;
     if (message == WM_NCCREATE) {
@@ -480,6 +554,9 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
     case kNativeVideoFrameReadyMessage: {
         if (nativeVideoDecoder_) {
             nativeVideoDecoder_->AcknowledgeFrameNotification();
+            if (SidebarAnimationActive()) {
+                return 0;
+            }
             NativeVideoFrame frame;
             const auto snapshot = controller_.Snapshot();
             const bool shouldRenderFrame = snapshot.state == PlaybackState::Playing || pendingPausedFrameRefresh_;
@@ -590,6 +667,13 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
         return 1;
     case kPlaybackTimerTickMessage:
         OnPlaybackTimerTick();
+        return 0;
+    case kNativeColorSettingsRefreshMessage:
+        if (static_cast<UINT_PTR>(wParam) == nativeColorSettingsRefreshSerial_) {
+            const bool requiresDecoderRefresh = nativeColorSettingsRefreshRequiresDecoderRefresh_;
+            nativeColorSettingsRefreshRequiresDecoderRefresh_ = false;
+            ApplyNativeColorSettingsRefresh(requiresDecoderRefresh);
+        }
         return 0;
     case WM_TIMER:
         if (wParam == kUiAnimationTimer) {
@@ -859,12 +943,21 @@ void MainWindow::StartUiAnimationTimer() const {
     }
 }
 
+bool MainWindow::SidebarAnimationActive() const {
+    return !fullscreen_ && std::abs(inspectorCollapseAmount_ - inspectorCollapseTarget_) > 0.001;
+}
+
 void MainWindow::UpdateUiAnimations() {
     const auto now = std::chrono::steady_clock::now();
+    const RECT previousVideoSurface = videoSurface_;
+    const RECT previousInspector = inspector_;
+    const double previousInspectorCollapseAmount = inspectorCollapseAmount_;
+    const double previousProgressHoverAmount = progressHoverAmount_;
+    const double previousFullscreenTransportAmount = fullscreenTransportAmount_;
     bool sidebarComplete = true;
     bool hoverComplete = true;
     bool fullscreenTransportComplete = true;
-    bool subtitleMenuComplete = true;
+    const bool sidebarWasActive = SidebarAnimationActive();
 
     inspectorCollapseAmount_ = AnimatedValue(inspectorCollapseStartAmount_,
                                              inspectorCollapseTarget_,
@@ -884,9 +977,6 @@ void MainWindow::UpdateUiAnimations() {
                                                kFullscreenTransportAnimationDuration,
                                                now,
                                                fullscreenTransportComplete);
-    subtitleMenuAmount_ = subtitleMenuTarget_;
-    subtitleMenuComplete = true;
-
     if (sidebarComplete) {
         inspectorCollapseAmount_ = inspectorCollapseTarget_;
     }
@@ -896,26 +986,76 @@ void MainWindow::UpdateUiAnimations() {
     if (fullscreenTransportComplete) {
         fullscreenTransportAmount_ = fullscreenTransportTarget_;
     }
-    if (subtitleMenuComplete) {
-        subtitleMenuAmount_ = subtitleMenuTarget_;
-        if (subtitleMenuTarget_ <= 0.0) {
-            subtitleMenuOpen_ = false;
-            hoveredSubtitleMenuItem_ = -1;
+
+    const bool sidebarValueChanged = std::abs(inspectorCollapseAmount_ - previousInspectorCollapseAmount) > 0.0001;
+    const bool hoverValueChanged = std::abs(progressHoverAmount_ - previousProgressHoverAmount) > 0.0001;
+    const bool fullscreenTransportValueChanged =
+        std::abs(fullscreenTransportAmount_ - previousFullscreenTransportAmount) > 0.0001;
+
+    if (sidebarValueChanged || fullscreenTransportValueChanged) {
+        MarkLayoutDirty();
+        EnsureLayout();
+    }
+
+    const int invalidationPadding = Scale(4);
+    const auto noMediaPlaceholderRect = [this](const RECT& surface) {
+        if (!HasArea(surface)) {
+            return RECT{};
+        }
+        const bool compactSurface = RectWidth(surface) < Scale(720) || RectHeight(surface) < Scale(280);
+        const RECT inner = DeflateRectCopy(surface,
+                                           compactSurface ? Scale(18) : Scale(24),
+                                           compactSurface ? Scale(16) : Scale(22));
+        const int centerX = inner.left + RectWidth(inner) / 2;
+        const int centerY = inner.top + RectHeight(inner) / 2;
+        const int width = std::min(RectWidth(inner), compactSurface ? Scale(280) : Scale(340));
+        const int topOffset = compactSurface ? Scale(88) : Scale(104);
+        const int bottomOffset = compactSurface ? Scale(56) : Scale(64);
+        return MakeRect(centerX - width / 2, centerY - topOffset, centerX + width / 2, centerY + bottomOffset);
+    };
+
+    if (hoverValueChanged) {
+        InvalidateTransportArea();
+    }
+    if (fullscreenTransportValueChanged) {
+        InvalidateFullscreenOverlay();
+    }
+
+    if (!fullscreen_) {
+        const bool inspectorGeometryChanged = !SameRect(previousInspector, inspector_);
+        const bool videoGeometryChanged = !SameRect(previousVideoSurface, videoSurface_);
+        if (inspectorGeometryChanged || videoGeometryChanged) {
+            InvalidateIfVisible(hwnd_, previousInspector, invalidationPadding);
+            InvalidateIfVisible(hwnd_, inspector_, invalidationPadding);
+            if (videoGeometryChanged) {
+                const auto snapshot = controller_.Snapshot();
+                InvalidateIfVisible(hwnd_, SidebarEdgeRect(previousVideoSurface, videoSurface_), invalidationPadding);
+                if (!snapshot.media.has_value()) {
+                    InvalidateIfVisible(hwnd_, noMediaPlaceholderRect(previousVideoSurface), invalidationPadding);
+                    InvalidateIfVisible(hwnd_, noMediaPlaceholderRect(videoSurface_), invalidationPadding);
+                }
+            }
         }
     }
 
-    MarkLayoutDirty();
-    EnsureLayout();
-    if (fullscreenOverlay_ && IsWindowVisible(fullscreenOverlay_)) {
-        InvalidateRect(fullscreenOverlay_, nullptr, FALSE);
-    } else if (transportOverlay_ && IsWindowVisible(transportOverlay_)) {
-        InvalidateRect(transportOverlay_, nullptr, FALSE);
-    }
-    if (!fullscreen_ && (!transportOverlay_ || !IsWindowVisible(transportOverlay_))) {
-        InvalidateRect(hwnd_, nullptr, FALSE);
+    if (sidebarWasActive && sidebarComplete) {
+        UpdateVideoHost();
+        if (backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+            nativeVideoDecoder_ &&
+            nativeVideoDecoder_->IsRunning() &&
+            d3dRenderer_) {
+            NativeVideoFrame frame;
+            if (nativeVideoDecoder_->LatestFrame(frame)) {
+                d3dRenderer_->Render(frame);
+                heldNativeFrame_ = frame;
+                heldNativeFrameNeedsPresent_ = false;
+                nativeFrameHoldVisible_ = false;
+            }
+        }
+        InvalidateVideoSurface();
     }
 
-    if (sidebarComplete && hoverComplete && fullscreenTransportComplete && subtitleMenuComplete) {
+    if (sidebarComplete && hoverComplete && fullscreenTransportComplete) {
         KillTimer(hwnd_, kUiAnimationTimer);
     } else {
         StartUiAnimationTimer();
@@ -923,6 +1063,7 @@ void MainWindow::UpdateUiAnimations() {
 }
 
 void MainWindow::SetSubtitleMenuTarget(const bool visible) {
+    const RECT oldMenu = subtitleMenu_;
     subtitleMenuOpen_ = visible;
     subtitleMenuAmount_ = visible ? 1.0 : 0.0;
     subtitleMenuTarget_ = visible ? 1.0 : 0.0;
@@ -933,6 +1074,9 @@ void MainWindow::SetSubtitleMenuTarget(const bool visible) {
     EnsureLayout();
     InvalidateTransportArea();
     InvalidateFullscreenOverlay();
+    if (!visible && RectWidth(oldMenu) > 0 && RectHeight(oldMenu) > 0) {
+        InvalidateRect(hwnd_, &oldMenu, FALSE);
+    }
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
@@ -986,6 +1130,10 @@ void MainWindow::SetProgressHover(const bool hovered) {
 }
 
 void MainWindow::ToggleSidebar() {
+    const RECT previousVideoSurface = videoSurface_;
+    const RECT previousInspector = inspector_;
+    const RECT previousTopBar = topBar_;
+    const auto snapshot = controller_.Snapshot();
     inspectorCollapsed_ = !inspectorCollapsed_;
     inspectorCollapseStartAmount_ = inspectorCollapseAmount_;
     inspectorCollapseTarget_ = inspectorCollapsed_ ? 1.0 : 0.0;
@@ -993,7 +1141,31 @@ void MainWindow::ToggleSidebar() {
     StartUiAnimationTimer();
     MarkLayoutDirty();
     EnsureLayout();
-    InvalidateRect(hwnd_, nullptr, FALSE);
+    const int invalidationPadding = Scale(4);
+    InvalidateIfVisible(hwnd_, previousTopBar, invalidationPadding);
+    InvalidateIfVisible(hwnd_, topBar_, invalidationPadding);
+    InvalidateIfVisible(hwnd_, previousInspector, invalidationPadding);
+    InvalidateIfVisible(hwnd_, inspector_, invalidationPadding);
+    InvalidateIfVisible(hwnd_, SidebarEdgeRect(previousVideoSurface, videoSurface_), invalidationPadding);
+    if (!snapshot.media.has_value()) {
+        const auto noMediaPlaceholderRect = [this](const RECT& surface) {
+            if (!HasArea(surface)) {
+                return RECT{};
+            }
+            const bool compactSurface = RectWidth(surface) < Scale(720) || RectHeight(surface) < Scale(280);
+            const RECT inner = DeflateRectCopy(surface,
+                                               compactSurface ? Scale(18) : Scale(24),
+                                               compactSurface ? Scale(16) : Scale(22));
+            const int centerX = inner.left + RectWidth(inner) / 2;
+            const int centerY = inner.top + RectHeight(inner) / 2;
+            const int width = std::min(RectWidth(inner), compactSurface ? Scale(280) : Scale(340));
+            const int topOffset = compactSurface ? Scale(88) : Scale(104);
+            const int bottomOffset = compactSurface ? Scale(56) : Scale(64);
+            return MakeRect(centerX - width / 2, centerY - topOffset, centerX + width / 2, centerY + bottomOffset);
+        };
+        InvalidateIfVisible(hwnd_, noMediaPlaceholderRect(previousVideoSurface), invalidationPadding);
+        InvalidateIfVisible(hwnd_, noMediaPlaceholderRect(videoSurface_), invalidationPadding);
+    }
 }
 
 bool MainWindow::ShouldShowFullscreenTransport(const PlaybackSessionSnapshot&) const {
@@ -1196,6 +1368,9 @@ void MainWindow::InvalidateVideoSurface() const {
 }
 
 void MainWindow::InvalidateTransportArea() const {
+    if (subtitleMenuOverlay_ && IsWindowVisible(subtitleMenuOverlay_)) {
+        InvalidateRect(subtitleMenuOverlay_, nullptr, FALSE);
+    }
     if (transportOverlay_ && IsWindowVisible(transportOverlay_)) {
         InvalidateRect(transportOverlay_, nullptr, FALSE);
         return;
@@ -1210,6 +1385,9 @@ void MainWindow::InvalidateTransportArea() const {
 }
 
 void MainWindow::InvalidateFullscreenOverlay() const {
+    if (subtitleMenuOverlay_ && IsWindowVisible(subtitleMenuOverlay_)) {
+        InvalidateRect(subtitleMenuOverlay_, nullptr, FALSE);
+    }
     if (fullscreenOverlay_ && IsWindowVisible(fullscreenOverlay_)) {
         InvalidateRect(fullscreenOverlay_, nullptr, FALSE);
     }
@@ -1301,10 +1479,46 @@ bool MainWindow::ApplyNativeColorSettingsLive(const PlaybackSessionSnapshot& sna
             nativeFrameHoldVisible_ = true;
             pendingPausedFrameRefresh_ = false;
         }
+    } else {
+        LogApp(LogLevel::Debug, L"native color settings live apply has no frame to repaint");
+        return false;
     }
 
     LogApp(LogLevel::Debug, L"native color settings applied live");
     return true;
+}
+
+void MainWindow::ScheduleNativeColorSettingsRefresh(const bool requiresDecoderRefresh) {
+    if (!hwnd_) {
+        return;
+    }
+    ++nativeColorSettingsRefreshSerial_;
+    nativeColorSettingsRefreshRequiresDecoderRefresh_ = requiresDecoderRefresh;
+    PostMessageW(hwnd_, kNativeColorSettingsRefreshMessage, nativeColorSettingsRefreshSerial_, 0);
+}
+
+void MainWindow::ApplyNativeColorSettingsRefresh(const bool requiresDecoderRefresh) {
+    const auto snapshot = controller_.Snapshot();
+    const bool nativeVideo = backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+                             snapshot.media.has_value() &&
+                             snapshot.media->hasVideo;
+    bool handledLive = false;
+    if (nativeVideo && !requiresDecoderRefresh) {
+        handledLive = ApplyNativeColorSettingsLive(snapshot);
+    }
+    if (!handledLive) {
+        if (snapshot.state == PlaybackState::Paused && nativeVideo) {
+            RefreshPausedNativeFrame(snapshot, requiresDecoderRefresh);
+        } else {
+            RestartPlaybackIfPlaying(false);
+        }
+    }
+    MarkLayoutDirty();
+    EnsureLayout();
+    InvalidateTransportArea();
+    InvalidateFullscreenOverlay();
+    InvalidateHdrToneCurveEditor();
+    InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
 bool MainWindow::NativeHdrOutputToggleRequiresDecoderRestart(const PlaybackSessionSnapshot& snapshot) const {
@@ -1319,6 +1533,19 @@ bool MainWindow::NativeCmv4ToggleRequiresDecoderRestart(const PlaybackSessionSna
            snapshot.media.has_value() &&
            snapshot.media->hasVideo &&
            MediaHasDolbyVisionEnhancementStream(snapshot.media);
+}
+
+bool MainWindow::NativeCmv4ToggleNeedsDecoderRefresh(const PlaybackSessionSnapshot& snapshot,
+                                                     const anvil::playback::VideoSettings& settings) const {
+    if (!NativeCmv4ToggleRequiresDecoderRestart(snapshot) || !WantsCmv4Approx(settings)) {
+        return false;
+    }
+    if (heldNativeFrame_.has_value() && heldNativeFrame_->HasEnhancementYuv()) {
+        return false;
+    }
+    return !nativeVideoDecoder_ ||
+           !nativeVideoDecoder_->IsRunning() ||
+           !nativeVideoDecoder_->DolbyVisionEnhancementDecodeEnabled();
 }
 
 int MainWindow::SettingsVideoFieldCount() const {
@@ -1342,14 +1569,15 @@ void MainWindow::ApplyDefaultHdrControlsForCurrentMedia() {
     const bool windowsHdrEnabled = CachedCapabilities().display.hdrEnabled;
     const bool hdrControlVisible = MediaHasHdrSignal(snapshot.media);
     const bool defaultHdrOutput = hdrControlVisible && windowsHdrEnabled;
+    const bool defaultEnhanced = MediaIsDolbyVision(snapshot.media);
     bool changed = false;
 
     if (settings.video.dolbyVisionHdrOutput != defaultHdrOutput) {
         settings.video.dolbyVisionHdrOutput = defaultHdrOutput;
         changed = true;
     }
-    if (settings.video.dolbyVisionCmv4Approx) {
-        settings.video.dolbyVisionCmv4Approx = false;
+    if (settings.video.dolbyVisionCmv4Approx != defaultEnhanced) {
+        settings.video.dolbyVisionCmv4Approx = defaultEnhanced;
         changed = true;
     }
 
@@ -1363,8 +1591,8 @@ void MainWindow::ApplyDefaultHdrControlsForCurrentMedia() {
     LogApp(LogLevel::Info,
            L"media hdr controls hdr=" +
                std::wstring(hdrControlVisible ? (settings.video.dolbyVisionHdrOutput ? L"on" : L"off") : L"hidden") +
-               L" cm4=" +
-               std::wstring(MediaIsDolbyVision(snapshot.media) ? L"visible_off" : L"hidden") +
+               L" enhanced=" +
+               std::wstring(MediaIsDolbyVision(snapshot.media) ? (settings.video.dolbyVisionCmv4Approx ? L"on" : L"off") : L"hidden") +
                L" curve=" +
                std::wstring(HdrToneCurveAvailable(settings) ? L"visible" : L"hidden") +
                L" windows_hdr=" +
@@ -1393,13 +1621,16 @@ int MainWindow::Scale(const int value) const {
 }
 
 RECT MainWindow::PlaybackSurfaceBounds() const {
-    if (RectWidth(videoSurface_) <= 0 || RectHeight(videoSurface_) <= 0) {
+    const RECT surface = (RectWidth(playbackSurface_) > 0 && RectHeight(playbackSurface_) > 0)
+                             ? playbackSurface_
+                             : videoSurface_;
+    if (RectWidth(surface) <= 0 || RectHeight(surface) <= 0) {
         return RECT{};
     }
     if (fullscreen_) {
-        return videoSurface_;
+        return surface;
     }
-    return DeflateRectCopy(videoSurface_, Scale(2), Scale(2));
+    return DeflateRectCopy(surface, Scale(2), Scale(2));
 }
 
 void MainWindow::ApplyWindowChrome() const {
@@ -1429,6 +1660,81 @@ void MainWindow::OpenFileDialog() {
     if (GetOpenFileNameW(&dialog)) {
         OpenPath(filePath.data());
     }
+}
+
+void MainWindow::OpenSubtitleFileDialog() {
+    const auto snapshot = controller_.Snapshot();
+    if (!snapshot.media.has_value()) {
+        return;
+    }
+
+    std::vector<wchar_t> filePath(32768);
+    OPENFILENAMEW dialog{};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = hwnd_;
+    dialog.lpstrFile = filePath.data();
+    dialog.nMaxFile = static_cast<DWORD>(filePath.size());
+    dialog.lpstrFilter = L"Subtitle Files\0*.srt;*.ass;*.ssa;*.vtt\0All Files\0*.*\0";
+    dialog.nFilterIndex = 1;
+    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR;
+
+    if (!GetOpenFileNameW(&dialog)) {
+        return;
+    }
+
+    auto settings = controller_.Settings();
+    settings.subtitles.externalSubtitlePath = filePath.data();
+    settings.subtitles.selectedTrackIndex = anvil::playback::kSubtitleTrackAuto;
+    controller_.ApplySettings(settings);
+    LogApp(LogLevel::Info, L"subtitle external=" + settings.subtitles.externalSubtitlePath.filename().wstring());
+
+    const auto updated = controller_.Snapshot();
+    if (updated.state == PlaybackState::Paused &&
+        updated.media.has_value() &&
+        updated.media->hasVideo &&
+        backend_ == PlaybackBackend::NativeFfmpegD3D11) {
+        RefreshPausedNativeFrame(updated);
+    } else {
+        RestartPlaybackIfPlaying();
+    }
+    MarkLayoutDirty();
+    EnsureLayout();
+    InvalidateTransportArea();
+    InvalidateFullscreenOverlay();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::OpenDanmakuFileDialog() {
+    const auto snapshot = controller_.Snapshot();
+    if (!snapshot.media.has_value()) {
+        return;
+    }
+
+    std::vector<wchar_t> filePath(32768);
+    OPENFILENAMEW dialog{};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = hwnd_;
+    dialog.lpstrFile = filePath.data();
+    dialog.nMaxFile = static_cast<DWORD>(filePath.size());
+    dialog.lpstrFilter = L"Danmaku Files\0*.xml;*.json;*.ass\0All Files\0*.*\0";
+    dialog.nFilterIndex = 1;
+    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR;
+
+    if (!GetOpenFileNameW(&dialog)) {
+        return;
+    }
+
+    auto settings = controller_.Settings();
+    settings.danmaku.externalDanmakuPath = filePath.data();
+    settings.danmaku.enabled = true;
+    controller_.ApplySettings(settings);
+    LogApp(LogLevel::Info, L"danmaku external=" + settings.danmaku.externalDanmakuPath.filename().wstring());
+
+    MarkLayoutDirty();
+    EnsureLayout();
+    InvalidateTransportArea();
+    InvalidateFullscreenOverlay();
+    InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
 void MainWindow::StopRuntime(const bool clearVideoFrame) {
@@ -1471,25 +1777,29 @@ bool MainWindow::CaptureLatestNativeFrame() {
     return heldNativeFrame_.has_value();
 }
 
-void MainWindow::RenderHeldNativeFrame() {
+void MainWindow::RenderHeldNativeFrame(const bool logRepaint) {
     if (backend_ != PlaybackBackend::NativeFfmpegD3D11 || !d3dRenderer_) {
         return;
     }
 
     if (heldNativeFrame_.has_value() && heldNativeFrame_->HasContent()) {
-        LogApp(LogLevel::Debug,
-               L"repainting cached native frame pixels=" +
-                   std::wstring(heldNativeFrame_->HasPixels() ? L"true" : L"false") +
-                   L" texture=" +
-                   std::wstring(heldNativeFrame_->HasD3DTexture() ? L"true" : L"false"));
+        if (logRepaint) {
+            LogApp(LogLevel::Debug,
+                   L"repainting cached native frame pixels=" +
+                       std::wstring(heldNativeFrame_->HasPixels() ? L"true" : L"false") +
+                       L" texture=" +
+                       std::wstring(heldNativeFrame_->HasD3DTexture() ? L"true" : L"false"));
+        }
         d3dRenderer_->Render(*heldNativeFrame_);
-    } else {
+    } else if (logRepaint) {
         LogApp(LogLevel::Debug, L"no cached native frame available to repaint");
     }
     heldNativeFrameNeedsPresent_ = false;
 }
 
-void MainWindow::StartRuntime(const PlaybackSessionSnapshot& snapshot, const bool restart) {
+void MainWindow::StartRuntime(const PlaybackSessionSnapshot& snapshot,
+                              const bool restart,
+                              const bool waitForPreroll) {
     if (!snapshot.media.has_value()) {
         return;
     }
@@ -1498,7 +1808,7 @@ void MainWindow::StartRuntime(const PlaybackSessionSnapshot& snapshot, const boo
     StopRuntime(false);
 
     if (backend_ == PlaybackBackend::NativeFfmpegD3D11) {
-        StartNativeRuntime(snapshot, restart);
+        StartNativeRuntime(snapshot, restart, waitForPreroll);
         return;
     }
 
@@ -1524,9 +1834,14 @@ void MainWindow::StartRuntime(const PlaybackSessionSnapshot& snapshot, const boo
                                           hwnd_,
                                           kVideoFrameReadyMessage);
     }
-    if (snapshot.media->hasAudio) {
+    const auto runtimeSettings = controller_.Settings();
+    if (snapshot.media->hasAudio &&
+        runtimeSettings.audio.selectedTrackIndex != anvil::playback::kAudioTrackOff) {
         audioPlayer_.SetPlaybackRate(snapshot.playbackRate);
-        audioStarted = audioPlayer_.Start(snapshot.media->path, snapshot.position, snapshot.volume);
+        audioStarted = audioPlayer_.Start(snapshot.media->path,
+                                          snapshot.position,
+                                          snapshot.volume,
+                                          runtimeSettings.audio.selectedTrackIndex);
     }
 
     const LogLevel level = videoStarted && audioStarted ? (restart ? LogLevel::Debug : LogLevel::Info) : LogLevel::Error;
@@ -1596,7 +1911,9 @@ void MainWindow::EnsureVideoHost() {
     LogApp(LogLevel::Info, L"native video host window created");
 }
 
-void MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot, const bool restart) {
+void MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
+                                    const bool restart,
+                                    const bool waitForPreroll) {
     bool videoStarted = true;
     bool audioStarted = true;
     bool preferDolbyVisionHdrOutput = false;
@@ -1644,6 +1961,7 @@ void MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot, con
                                                   settings.subtitles.selectedTrackIndex,
                                                   std::chrono::milliseconds{settings.subtitles.subtitleDelayMs},
                                                   settings.subtitles.externalSubtitleAutoLoad,
+                                                  settings.subtitles.externalSubtitlePath,
                                                   false,
                                                   preferDolbyVisionHdrOutput,
                                                   enableDolbyVisionEnhancementDecode);
@@ -1653,14 +1971,33 @@ void MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot, con
             UpdateVideoHost();
         }
     }
-    if (videoStarted && snapshot.media->hasVideo && snapshot.media->hasAudio && nativeVideoDecoder_) {
+    const auto runtimeSettings = controller_.Settings();
+    const bool waitForEnhancedPreroll =
+        waitForPreroll &&
+        restart &&
+        videoStarted &&
+        snapshot.media->hasVideo &&
+        nativeVideoDecoder_ &&
+        enableDolbyVisionEnhancementDecode &&
+        Cmv4ApproxActiveForPlayback(snapshot, runtimeSettings.video);
+    if (waitForEnhancedPreroll) {
+        const bool enhancedReady = nativeVideoDecoder_->WaitForEnhancementPreroll(
+            snapshot.position,
+            std::chrono::milliseconds{5000});
+        LogApp(enhancedReady ? LogLevel::Debug : LogLevel::Warning,
+               L"native enhanced preroll start ready=" + std::wstring(enhancedReady ? L"true" : L"false"));
+    } else if (waitForPreroll && videoStarted && snapshot.media->hasVideo && snapshot.media->hasAudio && nativeVideoDecoder_) {
         nativeVideoDecoder_->WaitForPreroll(std::chrono::milliseconds{250},
                                             restart ? std::chrono::milliseconds{140}
                                                     : std::chrono::milliseconds{260});
     }
-    if (snapshot.media->hasAudio) {
+    if (snapshot.media->hasAudio &&
+        runtimeSettings.audio.selectedTrackIndex != anvil::playback::kAudioTrackOff) {
         audioPlayer_.SetPlaybackRate(snapshot.playbackRate);
-        audioStarted = audioPlayer_.Start(snapshot.media->path, snapshot.position, snapshot.volume);
+        audioStarted = audioPlayer_.Start(snapshot.media->path,
+                                          snapshot.position,
+                                          snapshot.volume,
+                                          runtimeSettings.audio.selectedTrackIndex);
     }
 
     const LogLevel level = videoStarted && audioStarted ? (restart ? LogLevel::Debug : LogLevel::Info) : LogLevel::Error;
@@ -1706,13 +2043,20 @@ bool MainWindow::SeekNativeRuntime(const PlaybackSessionSnapshot& snapshot) {
     }
 
     bool audioSeeked = true;
-    if (snapshot.media->hasAudio) {
+    const auto runtimeSettings = controller_.Settings();
+    if (snapshot.media->hasAudio &&
+        runtimeSettings.audio.selectedTrackIndex != anvil::playback::kAudioTrackOff) {
         if (audioPlayer_.IsRunning()) {
             audioSeeked = audioPlayer_.Seek(snapshot.position);
         } else {
             audioPlayer_.SetPlaybackRate(snapshot.playbackRate);
-            audioSeeked = audioPlayer_.Start(snapshot.media->path, snapshot.position, snapshot.volume);
+            audioSeeked = audioPlayer_.Start(snapshot.media->path,
+                                             snapshot.position,
+                                             snapshot.volume,
+                                             runtimeSettings.audio.selectedTrackIndex);
         }
+    } else {
+        audioPlayer_.Stop();
     }
     if (!audioSeeked) {
         return false;
@@ -1730,7 +2074,127 @@ bool MainWindow::SeekNativeRuntime(const PlaybackSessionSnapshot& snapshot) {
     return true;
 }
 
-void MainWindow::RefreshPausedNativeFrame(const PlaybackSessionSnapshot& snapshot) {
+bool MainWindow::PrepareNativeEnhancedPlaybackBeforePlay(const PlaybackSessionSnapshot& snapshot) {
+    if (backend_ != PlaybackBackend::NativeFfmpegD3D11 ||
+        !snapshot.media.has_value() ||
+        !snapshot.media->hasVideo ||
+        !nativeVideoDecoder_) {
+        return true;
+    }
+
+    const auto settings = controller_.Settings();
+    const bool wantsEnhancedPlayback =
+        NativeCmv4ToggleRequiresDecoderRestart(snapshot) &&
+        Cmv4ApproxActiveForPlayback(snapshot, settings.video) &&
+        settings.video.dolbyVision != anvil::playback::DolbyVisionMode::Off;
+    if (!wantsEnhancedPlayback) {
+        return true;
+    }
+
+    const bool enableDolbyVisionEnhancementDecode =
+        MediaHasDolbyVisionEnhancementStream(snapshot.media) &&
+        settings.video.dolbyVision != anvil::playback::DolbyVisionMode::Off &&
+        Cmv4ApproxActiveForPlayback(snapshot, settings.video);
+    if (!enableDolbyVisionEnhancementDecode) {
+        return true;
+    }
+
+    audioPlayer_.Stop();
+    pendingPausedFrameRefresh_ = false;
+    nativeFrameHoldVisible_ = heldNativeFrame_.has_value();
+    heldNativeFrameNeedsPresent_ = false;
+    lastNativeStatsLog_ = {};
+
+    if (d3dRenderer_) {
+        d3dRenderer_->ConfigureColorPipeline(settings.video, CachedCapabilities().display, snapshot.media->videoColor);
+        d3dRenderer_->ConfigureSubtitleSettings(settings.subtitles);
+        d3dRenderer_->ResetRenderStats();
+    }
+    MarkLayoutDirty();
+    EnsureLayout();
+    EnsureVideoHost();
+
+    bool videoReadyToPreroll =
+        nativeVideoDecoder_->IsRunning() &&
+        !nativeVideoDecoder_->OneShotFrame() &&
+        nativeVideoDecoder_->DolbyVisionEnhancementDecodeEnabled();
+
+    if (videoReadyToPreroll) {
+        nativeVideoDecoder_->SetPaused(true, snapshot.position);
+        LogApp(LogLevel::Debug,
+               L"native enhanced preroll gate reuse decoder position=" + FormatTimecode(snapshot.position));
+    } else {
+        StopRuntime(false);
+        pendingPausedFrameRefresh_ = false;
+        nativeFrameHoldVisible_ = heldNativeFrame_.has_value();
+        heldNativeFrameNeedsPresent_ = false;
+        MarkLayoutDirty();
+        EnsureLayout();
+        EnsureVideoHost();
+
+        const bool preferDolbyVisionHdrOutput = snapshot.media->dolbyVisionDetected;
+        const bool preferHardwareDecode = snapshot.media->selectedDecodePath == L"ffmpeg_d3d11va";
+        videoReadyToPreroll =
+            videoHostReady_ &&
+            nativeVideoDecoder_->Start(snapshot.media->path,
+                                       snapshot.position,
+                                       hwnd_,
+                                       kNativeVideoFrameReadyMessage,
+                                       [this]() {
+                                           if (const auto audioClock = audioPlayer_.PlaybackClock()) {
+                                               return audioClock;
+                                           }
+                                           const auto clockSnapshot = controller_.Snapshot();
+                                           if (clockSnapshot.state == PlaybackState::Playing ||
+                                               clockSnapshot.state == PlaybackState::Paused) {
+                                               return std::optional<std::chrono::milliseconds>{clockSnapshot.position};
+                                           }
+                                           return std::optional<std::chrono::milliseconds>{};
+                                       },
+                                       preferHardwareDecode,
+                                       d3dRenderer_ ? d3dRenderer_->Device() : nullptr,
+                                       settings.video.selectedTrackIndex,
+                                       settings.subtitles.preferredLanguage,
+                                       settings.subtitles.selectedTrackIndex,
+                                       std::chrono::milliseconds{settings.subtitles.subtitleDelayMs},
+                                       settings.subtitles.externalSubtitleAutoLoad,
+                                       settings.subtitles.externalSubtitlePath,
+                                       false,
+                                       preferDolbyVisionHdrOutput,
+                                       enableDolbyVisionEnhancementDecode);
+        if (videoReadyToPreroll) {
+            nativeVideoDecoder_->SetPaused(true, snapshot.position);
+            UpdateVideoHost();
+            LogApp(LogLevel::Debug,
+                   L"native enhanced preroll gate decoder start position=" + FormatTimecode(snapshot.position));
+        }
+    }
+
+    if (!videoReadyToPreroll) {
+        LogApp(LogLevel::Warning, L"native enhanced preroll gate decoder unavailable");
+        return false;
+    }
+
+    const bool enhancedReady = nativeVideoDecoder_->WaitForEnhancementPreroll(
+        snapshot.position,
+        std::chrono::milliseconds{5000},
+        true);
+    LogApp(enhancedReady ? LogLevel::Debug : LogLevel::Warning,
+           L"native enhanced preroll gate ready=" + std::wstring(enhancedReady ? L"true" : L"false"));
+    if (!enhancedReady) {
+        nativeVideoDecoder_->SetPaused(true, snapshot.position);
+        return false;
+    }
+
+    NativeVideoFrame frame;
+    if (nativeVideoDecoder_->LatestFrame(frame) && frame.HasEnhancementYuv()) {
+        heldNativeFrame_ = frame;
+    }
+    return true;
+}
+
+void MainWindow::RefreshPausedNativeFrame(const PlaybackSessionSnapshot& snapshot,
+                                          const bool forceDecoderRestart) {
     if (backend_ != PlaybackBackend::NativeFfmpegD3D11 ||
         !snapshot.media.has_value() ||
         !snapshot.media->hasVideo ||
@@ -1738,7 +2202,14 @@ void MainWindow::RefreshPausedNativeFrame(const PlaybackSessionSnapshot& snapsho
         return;
     }
 
-    if (nativeVideoDecoder_->IsRunning()) {
+    if (!forceDecoderRestart && d3dRenderer_) {
+        const auto settings = controller_.Settings();
+        d3dRenderer_->ConfigureColorPipeline(settings.video, CachedCapabilities().display, snapshot.media->videoColor);
+        d3dRenderer_->ConfigureSubtitleSettings(settings.subtitles);
+        d3dRenderer_->ResetRenderStats();
+    }
+
+    if (!forceDecoderRestart && nativeVideoDecoder_->IsRunning()) {
         nativeFrameHoldVisible_ = heldNativeFrame_.has_value();
         pendingPausedFrameRefresh_ = true;
         lastNativeStatsLog_ = {};
@@ -1753,22 +2224,24 @@ void MainWindow::RefreshPausedNativeFrame(const PlaybackSessionSnapshot& snapsho
         }
     }
 
+    if (forceDecoderRestart) {
+        LogApp(LogLevel::Debug, L"paused native frame refresh requires decoder restart");
+    }
     StopRuntime(false);
     nativeFrameHoldVisible_ = heldNativeFrame_.has_value();
     pendingPausedFrameRefresh_ = true;
+    heldNativeFrameNeedsPresent_ = false;
     lastNativeStatsLog_ = {};
-
-    if (d3dRenderer_) {
-        const auto settings = controller_.Settings();
-        d3dRenderer_->ConfigureColorPipeline(settings.video, CachedCapabilities().display, snapshot.media->videoColor);
-        d3dRenderer_->ConfigureSubtitleSettings(settings.subtitles);
-        d3dRenderer_->ResetRenderStats();
-    }
     MarkLayoutDirty();
     EnsureLayout();
     EnsureVideoHost();
 
     const auto settings = controller_.Settings();
+    if (d3dRenderer_) {
+        d3dRenderer_->ConfigureColorPipeline(settings.video, CachedCapabilities().display, snapshot.media->videoColor);
+        d3dRenderer_->ConfigureSubtitleSettings(settings.subtitles);
+        d3dRenderer_->ResetRenderStats();
+    }
     const bool preferDolbyVisionHdrOutput = snapshot.media->dolbyVisionDetected;
     const bool preferHardwareDecode = snapshot.media->selectedDecodePath == L"ffmpeg_d3d11va";
     const bool enableDolbyVisionEnhancementDecode =
@@ -1789,6 +2262,7 @@ void MainWindow::RefreshPausedNativeFrame(const PlaybackSessionSnapshot& snapsho
                                                     settings.subtitles.selectedTrackIndex,
                                                     std::chrono::milliseconds{settings.subtitles.subtitleDelayMs},
                                                     settings.subtitles.externalSubtitleAutoLoad,
+                                                    settings.subtitles.externalSubtitlePath,
                                                     true,
                                                     preferDolbyVisionHdrOutput,
                                                     enableDolbyVisionEnhancementDecode);
@@ -1814,6 +2288,20 @@ void MainWindow::OpenPath(const std::filesystem::path& path, const bool autoplay
     LogApp(opened ? LogLevel::Info : LogLevel::Error,
            std::wstring(L"open result=") + (opened ? L"true" : L"false") + L" autoplay=" + (autoplay ? L"true" : L"false"));
     if (opened) {
+        auto settings = controller_.Settings();
+        bool settingsChanged = false;
+        if (!settings.subtitles.externalSubtitlePath.empty()) {
+            settings.subtitles.externalSubtitlePath.clear();
+            settingsChanged = true;
+        }
+        if (!settings.danmaku.externalDanmakuPath.empty()) {
+            settings.danmaku.externalDanmakuPath.clear();
+            settings.danmaku.enabled = false;
+            settingsChanged = true;
+        }
+        if (settingsChanged) {
+            controller_.ApplySettings(settings);
+        }
         UpdateInspectorMediaLists(path);
         ApplyDefaultHdrControlsForCurrentMedia();
         MarkLayoutDirty();
@@ -1847,30 +2335,76 @@ void MainWindow::UpdateInspectorMediaLists(const std::filesystem::path& path) {
 
 void MainWindow::StartPlayback() {
     const auto before = controller_.Snapshot();
+    const auto beforeSettings = controller_.Settings();
+    const bool nativeEnhancedPlaybackGate =
+        backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+        before.state == PlaybackState::Paused &&
+        before.media.has_value() &&
+        before.media->hasVideo &&
+        NativeCmv4ToggleRequiresDecoderRestart(before) &&
+        Cmv4ApproxActiveForPlayback(before, beforeSettings.video) &&
+        beforeSettings.video.dolbyVision != anvil::playback::DolbyVisionMode::Off;
+    if (nativeEnhancedPlaybackGate && !PrepareNativeEnhancedPlaybackBeforePlay(before)) {
+        InvalidateTransportArea();
+        InvalidateFullscreenOverlay();
+        return;
+    }
+
+    const bool nativeRuntimePreparedBeforePlay =
+        nativeEnhancedPlaybackGate &&
+        nativeVideoDecoder_ &&
+        nativeVideoDecoder_->IsRunning() &&
+        !nativeVideoDecoder_->OneShotFrame();
+
     controller_.Play();
     const auto snapshot = controller_.Snapshot();
     LogApp(LogLevel::Info, L"start playback state=" + ToDisplayString(snapshot.state) + L" hasMedia=" + (snapshot.media.has_value() ? L"true" : L"false"));
     if (snapshot.state == PlaybackState::Playing &&
         snapshot.media.has_value() &&
         (snapshot.media->hasVideo || snapshot.media->hasAudio)) {
+        const auto settings = controller_.Settings();
+        const bool enhancedPlaybackNeedsRestart = NativeCmv4ToggleNeedsDecoderRefresh(snapshot, settings.video);
         const bool resumedNativeRuntime =
-            before.state == PlaybackState::Paused &&
+            (before.state == PlaybackState::Paused || nativeRuntimePreparedBeforePlay) &&
             backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
             nativeVideoDecoder_ &&
-            nativeVideoDecoder_->IsRunning();
+            nativeVideoDecoder_->IsRunning() &&
+            !nativeVideoDecoder_->OneShotFrame() &&
+            !enhancedPlaybackNeedsRestart;
         if (resumedNativeRuntime) {
+            if (d3dRenderer_) {
+                d3dRenderer_->ConfigureColorPipeline(settings.video, CachedCapabilities().display, snapshot.media->videoColor);
+                d3dRenderer_->ConfigureSubtitleSettings(settings.subtitles);
+                d3dRenderer_->ResetRenderStats();
+            }
             nativeVideoDecoder_->SetPaused(false, snapshot.position);
             pendingPausedFrameRefresh_ = false;
             nativeFrameHoldVisible_ = false;
             heldNativeFrameNeedsPresent_ = false;
-            if (snapshot.media->hasAudio) {
+            if (snapshot.media->hasAudio &&
+                settings.audio.selectedTrackIndex != anvil::playback::kAudioTrackOff) {
                 audioPlayer_.Stop();
                 audioPlayer_.SetPlaybackRate(snapshot.playbackRate);
-                const bool audioStarted = audioPlayer_.Start(snapshot.media->path, snapshot.position, snapshot.volume);
+                const bool audioStarted = audioPlayer_.Start(snapshot.media->path,
+                                                             snapshot.position,
+                                                             snapshot.volume,
+                                                             settings.audio.selectedTrackIndex);
                 LogApp(audioStarted ? LogLevel::Debug : LogLevel::Warning,
                        L"native paused runtime resume audio=" + std::wstring(audioStarted ? L"true" : L"false"));
+            } else {
+                audioPlayer_.Stop();
             }
         } else {
+            if (before.state == PlaybackState::Paused &&
+                backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+                nativeVideoDecoder_ &&
+                nativeVideoDecoder_->IsRunning()) {
+                LogApp(LogLevel::Debug,
+                       L"native paused runtime resume requires restart one_shot=" +
+                           std::wstring(nativeVideoDecoder_->OneShotFrame() ? L"true" : L"false") +
+                           L" enhanced_decoder=" +
+                           std::wstring(nativeVideoDecoder_->DolbyVisionEnhancementDecodeEnabled() ? L"true" : L"false"));
+            }
             StartRuntime(snapshot, false);
         }
         SetPlaybackTimer(true);
@@ -1934,12 +2468,12 @@ void MainWindow::StopPlayback() {
     InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
-void MainWindow::RestartPlaybackIfPlaying() {
+void MainWindow::RestartPlaybackIfPlaying(const bool waitForPreroll) {
     const auto snapshot = controller_.Snapshot();
     if (snapshot.state == PlaybackState::Playing &&
         snapshot.media.has_value() &&
         (snapshot.media->hasVideo || snapshot.media->hasAudio)) {
-        StartRuntime(snapshot, true);
+        StartRuntime(snapshot, true, waitForPreroll);
         SetPlaybackTimer(true);
     }
 }

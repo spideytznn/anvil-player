@@ -9,6 +9,7 @@ constexpr wchar_t kWindowClassName[] = L"AnvilPlayerWindow";
 constexpr wchar_t kVideoHostClassName[] = L"AnvilVideoHostWindow";
 constexpr wchar_t kFullscreenOverlayClassName[] = L"AnvilFullscreenOverlayWindow";
 constexpr wchar_t kTransportOverlayClassName[] = L"AnvilTransportOverlayWindow";
+constexpr wchar_t kSubtitleMenuOverlayClassName[] = L"AnvilSubtitleMenuOverlayWindow";
 constexpr wchar_t kHdrToneCurveWindowClassName[] = L"AnvilHdrToneCurveWindow";
 
 // Playback UI timer.
@@ -18,13 +19,14 @@ constexpr UINT_PTR kFullscreenChromeHideTimer = 1003;
 constexpr UINT_PTR kVideoPressTimer = 1004;
 constexpr UINT kIdlePlaybackTimerMs = 250;
 constexpr UINT kPlayingPlaybackTimerMs = 100;
-constexpr UINT kUiAnimationTimerMs = 10;
+constexpr UINT kUiAnimationTimerMs = 16;
 constexpr UINT kVideoLongPressTimerMs = 320;
 
 // Custom WM_APP messages posted from decode threads to the UI thread.
 constexpr UINT kVideoFrameReadyMessage = WM_APP + 1;
 constexpr UINT kNativeVideoFrameReadyMessage = WM_APP + 2;
 constexpr UINT kPlaybackTimerTickMessage = WM_APP + 3;
+constexpr UINT kNativeColorSettingsRefreshMessage = WM_APP + 4;
 
 // DWM attribute constants for window chrome customization.
 constexpr DWORD kDwmUseImmersiveDarkMode = 20;

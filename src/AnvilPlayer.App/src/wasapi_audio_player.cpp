@@ -48,14 +48,18 @@ void WasapiAudioPlayer::SetLogSink(LogSinkPtr logSink) {
     logSink_ = std::move(logSink);
 }
 
-bool WasapiAudioPlayer::Start(const std::filesystem::path& mediaPath, const std::chrono::milliseconds startPosition, const double volume) {
+bool WasapiAudioPlayer::Start(const std::filesystem::path& mediaPath,
+                              const std::chrono::milliseconds startPosition,
+                              const double volume,
+                              const int selectedAudioTrackIndex) {
     Stop();
-    if (mediaPath.empty()) {
+    if (mediaPath.empty() || selectedAudioTrackIndex == anvil::playback::kAudioTrackOff) {
         return false;
     }
 
     path_ = mediaPath;
     startPosition_ = startPosition;
+    selectedAudioTrackIndex_ = selectedAudioTrackIndex;
     volume_.store(std::clamp(volume, 0.0, 1.0));
     pendingSeekMs_.store(-1);
     ResetPlaybackClock();
@@ -216,11 +220,24 @@ void WasapiAudioPlayer::PlaybackLoop() {
             LogError(L"avformat_find_stream_info failed: " + FfmpegErrorString(error));
             break;
         }
-        audioStreamIndex = av_find_best_stream(formatCtx, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+        if (selectedAudioTrackIndex_ >= 0 &&
+            selectedAudioTrackIndex_ < static_cast<int>(formatCtx->nb_streams) &&
+            formatCtx->streams[selectedAudioTrackIndex_] &&
+            formatCtx->streams[selectedAudioTrackIndex_]->codecpar &&
+            formatCtx->streams[selectedAudioTrackIndex_]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            audioStreamIndex = selectedAudioTrackIndex_;
+        } else {
+            if (selectedAudioTrackIndex_ >= 0) {
+                LogInfo(L"requested audio stream unavailable stream=" + std::to_wstring(selectedAudioTrackIndex_) +
+                        L" fallback=auto");
+            }
+            audioStreamIndex = av_find_best_stream(formatCtx, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+        }
         if (audioStreamIndex < 0) {
             LogError(L"no audio stream found");
             break;
         }
+        LogInfo(L"audio stream=" + std::to_wstring(audioStreamIndex));
 
         const AVStream* audioStream = formatCtx->streams[audioStreamIndex];
         audioTimeBase = audioStream->time_base;
