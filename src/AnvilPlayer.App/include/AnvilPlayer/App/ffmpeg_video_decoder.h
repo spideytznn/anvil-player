@@ -39,6 +39,7 @@ extern "C" {
 namespace anvil::app {
 
 struct DoviLibplaceboFilterState;
+class LibassSubtitleRenderer;
 
 struct NativeSubtitleBitmap {
     int x = 0;
@@ -106,6 +107,7 @@ struct NativeVideoFrame {
     std::wstring enhancementMetadataDetails;
     std::wstring subtitleText;
     std::vector<NativeSubtitleBitmap> subtitleBitmaps;
+    bool subtitlesPrepared = false;
     std::shared_ptr<AVFrame> hardwareFrameRef;
     std::chrono::milliseconds pts{0};
     uint64_t serial = 0;
@@ -142,12 +144,15 @@ struct NativeVideoQueueStats {
     std::chrono::milliseconds readAheadDuration{0};
     uint64_t rendered = 0;
     uint64_t droppedLate = 0;
+    uint64_t droppedSuperseded = 0;
     uint64_t droppedQueueFull = 0;
     uint64_t hardwareFrames = 0;
     uint64_t zeroCopyFrames = 0;
     uint64_t cpuTransferFrames = 0;
     std::chrono::milliseconds clockPosition{0};
     int driftMs = 0;
+    int frameCadenceMs = 0;
+    int earlyToleranceMs = 0;
     bool usingAudioClock = false;
     bool usingHardwareDecode = false;
     std::wstring decoder = L"ffmpeg_software";
@@ -237,8 +242,12 @@ private:
     static constexpr std::chrono::milliseconds kDolbyVisionEnhancementPacketReadAheadTarget{1500};
     static constexpr std::size_t kMaxDolbyVisionEnhancementQueuedFrames = 160;
     static constexpr std::size_t kMaxDolbyVisionEnhancementQueuedBytes = 768ull * 1024ull * 1024ull;
-    static constexpr std::chrono::milliseconds kFrameEarlyTolerance{12};
+    static constexpr std::chrono::milliseconds kMinFrameEarlyTolerance{2};
+    static constexpr std::chrono::milliseconds kMaxFrameEarlyTolerance{6};
     static constexpr std::chrono::milliseconds kFrameLateDropThreshold{120};
+    static constexpr std::chrono::milliseconds kMaxMeasuredFrameCadence{250};
+    static constexpr int kSeekStartupPacketReadAheadBatch = 1;
+    static constexpr int kSeekFastResumeFrameCount = 4;
 
     struct NativeSubtitleCue {
         std::chrono::milliseconds start{0};
@@ -269,6 +278,10 @@ private:
                              AVRational& subtitleTimeBase,
                              AVCodecContext*& subtitleCodecCtx);
     bool DecodeExternalSubtitleFile(const std::filesystem::path& subtitlePath);
+    bool DecodeExternalAssSubtitleFile(const std::filesystem::path& subtitlePath);
+    bool EnsureAssSubtitleRenderer();
+    bool ConfigureAssSubtitleStream(AVFormatContext* formatCtx, const AVStream* stream);
+    void AddAssFontAttachments(AVFormatContext* formatCtx);
     AVCodecContext* AllocateVideoCodecContext(const AVCodec* codec, const AVCodecParameters* codecpar) const;
     bool ConfigureD3D11VA(const AVCodec* codec, AVCodecContext* codecCtx, AVBufferRef*& hwDeviceCtx);
     int CreateD3D11VADeviceContext(AVBufferRef** device, std::wstring& deviceMode);
@@ -302,12 +315,21 @@ private:
     bool ApplyPendingSeek(AVFormatContext* formatCtx,
                           AVCodecContext* codecCtx,
                           AVCodecContext* subtitleCodecCtx,
-                          AVCodecContext* enhancementCodecCtx);
+                          AVCodecContext* enhancementCodecCtx,
+                          int videoStreamIndex,
+                          AVRational videoTimeBase);
     std::optional<std::chrono::milliseconds> TakePendingSeek();
     bool HasPendingSeek() const;
     void TrimActiveBitmapSubtitleCues(std::chrono::milliseconds time);
+    void PruneExpiredSubtitleCues(std::chrono::milliseconds effectivePts);
+    void RefreshFrameSubtitles(NativeVideoFrame& frame, bool force = false);
+    bool RefreshLatestFrameSubtitles();
+    bool RefreshQueuedFrameSubtitles();
     std::wstring SubtitleTextForPts(std::chrono::milliseconds pts);
-    std::vector<NativeSubtitleBitmap> SubtitleBitmapsForPts(std::chrono::milliseconds pts, int frameWidth, int frameHeight);
+    std::vector<NativeSubtitleBitmap> SubtitleBitmapsForPts(std::chrono::milliseconds pts,
+                                                            int frameWidth,
+                                                            int frameHeight,
+                                                            bool includeAss = true);
 
     bool ShouldDropSeekPreroll(std::chrono::milliseconds pts) const;
 
@@ -366,6 +388,7 @@ private:
     bool hardwareFormatLogged_ = false;
     bool zeroCopyFallbackLogged_ = false;
     bool bitmapSubtitleLogged_ = false;
+    bool frameSubtitleBitmapLogged_ = false;
     anvil::playback::VideoColorMetadata streamColorMetadata_;
     bool dolbyVisionStream_ = false;        // stream-level DV detection (AV_PKT_DATA_DOVI_CONF)
     bool dolbyVisionFirstFrameLogged_ = false;
@@ -416,6 +439,10 @@ private:
     int subtitleCanvasHeight_ = 0;
     bool subtitleCanvasLogged_ = false;
     uint64_t subtitleBitmapSerial_ = 0;
+    bool subtitleAssActive_ = false;
+    bool subtitleAssExternalFullTrack_ = false;
+    bool subtitleAssLogged_ = false;
+    std::unique_ptr<LibassSubtitleRenderer> subtitleAssRenderer_;
     bool schedulePrimed_ = false;   // startup warm-up gate for the scheduler
     bool externalSubtitlesActive_ = false;
     std::deque<NativeSubtitleCue> subtitleCues_;
@@ -435,6 +462,8 @@ private:
     std::atomic<int64_t> pendingSeekMs_{-1};
     std::atomic_bool playbackPaused_{false};
     std::atomic_bool enhancementPrerollWaitActive_{false};
+    std::atomic<int> seekFastResumeFramesRemaining_{0};
+    std::atomic_bool seekFastResumeLogged_{false};
     std::atomic<int64_t> pausedPositionMs_{0};
     std::thread decodeThread_;
 };

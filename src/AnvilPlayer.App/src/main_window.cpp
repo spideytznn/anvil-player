@@ -26,16 +26,102 @@ using anvil::playback::ToDisplayString;
 
 namespace {
 
-constexpr auto kSidebarAnimationDuration = std::chrono::milliseconds{340};
-constexpr auto kProgressHoverAnimationDuration = std::chrono::milliseconds{140};
-constexpr auto kFullscreenTransportAnimationDuration = std::chrono::milliseconds{180};
+constexpr auto kSidebarAnimationDuration = std::chrono::milliseconds{460};
+constexpr auto kProgressHoverAnimationDuration = std::chrono::milliseconds{180};
+constexpr auto kFullscreenTransportAnimationDuration = std::chrono::milliseconds{260};
+constexpr auto kSubtitleMenuAnimationDuration = std::chrono::milliseconds{240};
+constexpr auto kWebUiSubtitleMenuOpenAnimationDuration = std::chrono::milliseconds{560};
+constexpr auto kWebUiSubtitleMenuCloseAnimationDuration = std::chrono::milliseconds{260};
+constexpr auto kButtonHoverAnimationDuration = std::chrono::milliseconds{180};
+constexpr auto kButtonPressAnimationDuration = std::chrono::milliseconds{220};
+constexpr auto kVolumeHoverAnimationDuration = std::chrono::milliseconds{180};
+constexpr auto kWebUiProgressUpdateInterval = std::chrono::milliseconds{100};
 constexpr auto kFullscreenTransportHideDelay = std::chrono::seconds{5};
 constexpr int kFullscreenTransportActivationHeight = 110;
 
-double EaseOutCubic(const double value) {
-    const double clamped = std::clamp(value, 0.0, 1.0);
-    const double inverse = 1.0 - clamped;
-    return 1.0 - inverse * inverse * inverse;
+enum class MotionCurve {
+    Fluid,
+    Spring,
+    Press,
+    Fade,
+    EaseIn,
+};
+
+double Cubic(const double a,
+             const double b,
+             const double c,
+             const double d,
+             const double t) {
+    const double inverse = 1.0 - t;
+    return inverse * inverse * inverse * a +
+           3.0 * inverse * inverse * t * b +
+           3.0 * inverse * t * t * c +
+           t * t * t * d;
+}
+
+double CubicDerivative(const double p1, const double p2, const double t) {
+    const double inverse = 1.0 - t;
+    return 3.0 * inverse * inverse * p1 +
+           6.0 * inverse * t * (p2 - p1) +
+           3.0 * t * t * (1.0 - p2);
+}
+
+double CubicBezierEase(const double value,
+                       const double x1,
+                       const double y1,
+                       const double x2,
+                       const double y2) {
+    const double x = std::clamp(value, 0.0, 1.0);
+    if (x <= 0.0 || x >= 1.0) {
+        return x;
+    }
+
+    double t = x;
+    for (int i = 0; i < 5; ++i) {
+        const double currentX = Cubic(0.0, x1, x2, 1.0, t);
+        const double derivative = CubicDerivative(x1, x2, t);
+        if (std::abs(derivative) < 0.000001) {
+            break;
+        }
+        const double next = t - (currentX - x) / derivative;
+        if (next < 0.0 || next > 1.0) {
+            break;
+        }
+        t = next;
+    }
+
+    double lower = 0.0;
+    double upper = 1.0;
+    for (int i = 0; i < 8; ++i) {
+        const double currentX = Cubic(0.0, x1, x2, 1.0, t);
+        if (std::abs(currentX - x) < 0.00001) {
+            break;
+        }
+        if (currentX < x) {
+            lower = t;
+        } else {
+            upper = t;
+        }
+        t = (lower + upper) * 0.5;
+    }
+
+    return Cubic(0.0, y1, y2, 1.0, t);
+}
+
+double Ease(const double value, const MotionCurve curve) {
+    switch (curve) {
+    case MotionCurve::Fluid:
+        return CubicBezierEase(value, 0.16, 1.0, 0.30, 1.0);
+    case MotionCurve::Spring:
+        return CubicBezierEase(value, 0.18, 1.35, 0.28, 1.0);
+    case MotionCurve::Press:
+        return CubicBezierEase(value, 0.18, 1.20, 0.28, 1.0);
+    case MotionCurve::Fade:
+        return CubicBezierEase(value, 0.22, 1.0, 0.36, 1.0);
+    case MotionCurve::EaseIn:
+        return CubicBezierEase(value, 0.32, 0.0, 0.67, 0.0);
+    }
+    return value;
 }
 
 double AnimatedValue(const double from,
@@ -43,6 +129,7 @@ double AnimatedValue(const double from,
                      const std::chrono::steady_clock::time_point startedAt,
                      const std::chrono::milliseconds duration,
                      const std::chrono::steady_clock::time_point now,
+                     const MotionCurve curve,
                      bool& complete) {
     if (duration.count() <= 0 || startedAt.time_since_epoch().count() == 0) {
         complete = true;
@@ -52,7 +139,26 @@ double AnimatedValue(const double from,
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - startedAt);
     const double t = std::clamp(static_cast<double>(elapsed.count()) / static_cast<double>(duration.count()), 0.0, 1.0);
     complete = t >= 1.0;
-    return from + (to - from) * EaseOutCubic(t);
+    return from + (to - from) * Ease(t, curve);
+}
+
+bool UpdateMotionValue(UiMotionValue& value,
+                       const std::chrono::milliseconds duration,
+                       const std::chrono::steady_clock::time_point now,
+                       const MotionCurve curve,
+                       bool& complete) {
+    const double previous = value.amount;
+    value.amount = AnimatedValue(value.startAmount,
+                                 value.target,
+                                 value.startedAt,
+                                 duration,
+                                 now,
+                                 curve,
+                                 complete);
+    if (complete) {
+        value.amount = value.target;
+    }
+    return std::abs(value.amount - previous) > 0.0001;
 }
 
 bool HasArea(const RECT& rect) {
@@ -93,6 +199,12 @@ RECT SidebarEdgeRect(const RECT& before, const RECT& after) {
 std::wstring FormatMillisecondsFromMicroseconds(const uint64_t microseconds) {
     std::wostringstream stream;
     stream << std::fixed << std::setprecision(2) << (static_cast<double>(microseconds) / 1000.0);
+    return stream.str();
+}
+
+std::wstring FormatFixed2(const double value) {
+    std::wostringstream stream;
+    stream << std::fixed << std::setprecision(2) << value;
     return stream.str();
 }
 
@@ -200,14 +312,11 @@ bool MediaHasDolbyVisionEnhancementStream(const std::optional<anvil::playback::M
         return false;
     }
     for (const auto& stream : media->streams) {
-        if (stream.kind == L"Video" &&
-            (ContainsInsensitive(stream.details, L"EL-only") ||
-             ContainsInsensitive(stream.details, L"BL+EL") ||
-             ContainsInsensitive(stream.details, L"Dolby Vision P7"))) {
+        if (stream.kind == L"Video" && ContainsInsensitive(stream.details, L"EL-only")) {
             return true;
         }
     }
-    return ContainsInsensitive(media->hdrFormat, L"Dolby Vision Profile 7");
+    return false;
 }
 
 bool MediaHasHdrSignal(const std::optional<anvil::playback::MediaDescriptor>& media) {
@@ -217,6 +326,350 @@ bool MediaHasHdrSignal(const std::optional<anvil::playback::MediaDescriptor>& me
     return media->dolbyVisionDetected ||
            media->videoColor.IsHdr() ||
            HdrFormatLooksHdr(media->hdrFormat);
+}
+
+std::wstring JsonEscape(const std::wstring& value) {
+    std::wostringstream escaped;
+    for (const wchar_t ch : value) {
+        switch (ch) {
+        case L'\\':
+            escaped << L"\\\\";
+            break;
+        case L'"':
+            escaped << L"\\\"";
+            break;
+        case L'\b':
+            escaped << L"\\b";
+            break;
+        case L'\f':
+            escaped << L"\\f";
+            break;
+        case L'\n':
+            escaped << L"\\n";
+            break;
+        case L'\r':
+            escaped << L"\\r";
+            break;
+        case L'\t':
+            escaped << L"\\t";
+            break;
+        default:
+            if (ch < 0x20) {
+                escaped << L"\\u"
+                        << std::hex
+                        << std::setw(4)
+                        << std::setfill(L'0')
+                        << static_cast<int>(ch)
+                        << std::dec
+                        << std::setfill(L' ');
+            } else {
+                escaped << ch;
+            }
+            break;
+        }
+    }
+    return escaped.str();
+}
+
+bool MessageContains(const std::wstring_view message, const wchar_t* needle) {
+    return message.find(needle) != std::wstring_view::npos;
+}
+
+std::optional<double> ReadJsonNumber(const std::wstring_view message, const wchar_t* field) {
+    const std::wstring key = L"\"" + std::wstring(field) + L"\":";
+    const std::size_t start = message.find(key);
+    if (start == std::wstring_view::npos) {
+        return std::nullopt;
+    }
+
+    std::size_t valueStart = start + key.size();
+    while (valueStart < message.size() && std::iswspace(message[valueStart])) {
+        ++valueStart;
+    }
+
+    std::size_t valueEnd = valueStart;
+    while (valueEnd < message.size()) {
+        const wchar_t ch = message[valueEnd];
+        if ((ch >= L'0' && ch <= L'9') || ch == L'-' || ch == L'+' || ch == L'.' || ch == L'e' || ch == L'E') {
+            ++valueEnd;
+            continue;
+        }
+        break;
+    }
+
+    if (valueEnd <= valueStart) {
+        return std::nullopt;
+    }
+
+    try {
+        return std::stod(std::wstring(message.substr(valueStart, valueEnd - valueStart)));
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+std::optional<std::wstring> ReadJsonString(const std::wstring_view message, const wchar_t* field) {
+    const std::wstring key = L"\"" + std::wstring(field) + L"\":";
+    const std::size_t start = message.find(key);
+    if (start == std::wstring_view::npos) {
+        return std::nullopt;
+    }
+
+    std::size_t valueStart = start + key.size();
+    while (valueStart < message.size() && std::iswspace(message[valueStart])) {
+        ++valueStart;
+    }
+    if (valueStart >= message.size() || message[valueStart] != L'"') {
+        return std::nullopt;
+    }
+    ++valueStart;
+
+    std::wstring value;
+    for (std::size_t index = valueStart; index < message.size(); ++index) {
+        const wchar_t ch = message[index];
+        if (ch == L'"') {
+            return value;
+        }
+        if (ch != L'\\') {
+            value.push_back(ch);
+            continue;
+        }
+        if (++index >= message.size()) {
+            return std::nullopt;
+        }
+        const wchar_t escaped = message[index];
+        switch (escaped) {
+        case L'"': value.push_back(L'"'); break;
+        case L'\\': value.push_back(L'\\'); break;
+        case L'/': value.push_back(L'/'); break;
+        case L'b': value.push_back(L'\b'); break;
+        case L'f': value.push_back(L'\f'); break;
+        case L'n': value.push_back(L'\n'); break;
+        case L'r': value.push_back(L'\r'); break;
+        case L't': value.push_back(L'\t'); break;
+        case L'u': {
+            if (index + 4 >= message.size()) {
+                return std::nullopt;
+            }
+            int code = 0;
+            for (int digit = 0; digit < 4; ++digit) {
+                const wchar_t hex = message[++index];
+                code <<= 4;
+                if (hex >= L'0' && hex <= L'9') {
+                    code += static_cast<int>(hex - L'0');
+                } else if (hex >= L'a' && hex <= L'f') {
+                    code += 10 + static_cast<int>(hex - L'a');
+                } else if (hex >= L'A' && hex <= L'F') {
+                    code += 10 + static_cast<int>(hex - L'A');
+                } else {
+                    return std::nullopt;
+                }
+            }
+            value.push_back(static_cast<wchar_t>(code));
+            break;
+        }
+        default:
+            value.push_back(escaped);
+            break;
+        }
+    }
+    return std::nullopt;
+}
+
+std::wstring InspectorTabName(const InspectorTab tab) {
+    switch (tab) {
+    case InspectorTab::Recent: return L"recent";
+    case InspectorTab::Folder: return L"folder";
+    case InspectorTab::Media: return L"media";
+    case InspectorTab::System: return L"system";
+    case InspectorTab::Log: return L"log";
+    case InspectorTab::Settings: return L"settings";
+    }
+    return L"recent";
+}
+
+std::wstring MediaPathItemsJson(const std::vector<std::filesystem::path>& paths, const std::size_t maxCount) {
+    std::wostringstream json;
+    json << L"[";
+    const std::size_t count = std::min(paths.size(), maxCount);
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto& path = paths[index];
+        const std::wstring name = path.filename().empty() ? path.wstring() : path.filename().wstring();
+        if (index > 0) {
+            json << L",";
+        }
+        json << L"{\"name\":\"" << JsonEscape(name) << L"\",\"path\":\"" << JsonEscape(path.wstring()) << L"\"}";
+    }
+    json << L"]";
+    return json.str();
+}
+
+std::wstring RecentLogLinesJson(const std::shared_ptr<anvil::playback::InMemoryLogSink>& sink, const std::size_t maxCount) {
+    std::wostringstream json;
+    json << L"[";
+    if (sink) {
+        const auto entries = sink->Entries();
+        const std::size_t start = entries.size() > maxCount ? entries.size() - maxCount : 0;
+        for (std::size_t index = start; index < entries.size(); ++index) {
+            if (index > start) {
+                json << L",";
+            }
+            json << L"\"" << JsonEscape(ToDisplayString(entries[index].level) + L" " +
+                                        entries[index].category + L": " +
+                                        entries[index].message)
+                 << L"\"";
+        }
+    }
+    json << L"]";
+    return json.str();
+}
+
+std::wstring DisplayLanguageName(const std::wstring& language) {
+    if (language.empty() || language == L"-") {
+        return {};
+    }
+
+    const std::wstring normalized = LowerCopy(language);
+    if (normalized == L"chi" || normalized == L"zho" || normalized == L"zh" ||
+        normalized == L"chs" || normalized == L"cht" || normalized == L"cmn" ||
+        normalized == L"cn" || normalized.rfind(L"zh-", 0) == 0 ||
+        normalized.find(L"chinese") != std::wstring::npos) {
+        if (normalized == L"cht" ||
+            normalized.find(L"trad") != std::wstring::npos ||
+            normalized.find(L"hant") != std::wstring::npos ||
+            normalized.find(L"tw") != std::wstring::npos) {
+            return L"Chinese Traditional";
+        }
+        if (normalized == L"chs" ||
+            normalized.find(L"simp") != std::wstring::npos ||
+            normalized.find(L"hans") != std::wstring::npos ||
+            normalized.find(L"cn") != std::wstring::npos) {
+            return L"Chinese Simplified";
+        }
+        return L"Chinese";
+    }
+    if (normalized == L"eng" || normalized == L"en") {
+        return L"English";
+    }
+    if (normalized == L"jpn" || normalized == L"ja") {
+        return L"Japanese";
+    }
+    if (normalized == L"kor" || normalized == L"ko") {
+        return L"Korean";
+    }
+    return language;
+}
+
+std::wstring UpperCopy(std::wstring value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](const wchar_t ch) {
+        return static_cast<wchar_t>(std::towupper(ch));
+    });
+    return value;
+}
+
+std::vector<int> TrackMenuItems(const std::optional<anvil::playback::MediaDescriptor>& media,
+                                const std::wstring& kind,
+                                const int offTrack,
+                                const int autoTrack) {
+    std::vector<int> tracks;
+    tracks.push_back(offTrack);
+    tracks.push_back(autoTrack);
+    if (media.has_value()) {
+        for (const auto& stream : media->streams) {
+            if (stream.kind == kind) {
+                tracks.push_back(stream.index);
+            }
+        }
+    }
+    return tracks;
+}
+
+const anvil::playback::MediaStreamSummary* FindStream(const std::optional<anvil::playback::MediaDescriptor>& media,
+                                                      const std::wstring& kind,
+                                                      const int index) {
+    if (!media.has_value() || index < 0) {
+        return nullptr;
+    }
+    for (const auto& stream : media->streams) {
+        if (stream.kind == kind && stream.index == index) {
+            return &stream;
+        }
+    }
+    return nullptr;
+}
+
+std::wstring TrackLabel(const std::optional<anvil::playback::MediaDescriptor>& media,
+                        const std::wstring& kind,
+                        const int index,
+                        const int offTrack,
+                        const int autoTrack) {
+    if (index == offTrack) {
+        return L"Off";
+    }
+    if (index == autoTrack) {
+        return L"Auto";
+    }
+
+    std::wstring label = L"Stream " + std::to_wstring(index);
+    if (const auto* stream = FindStream(media, kind, index)) {
+        const std::wstring language = DisplayLanguageName(stream->language);
+        if (!language.empty()) {
+            label = language;
+        }
+    }
+    return label;
+}
+
+std::wstring TrackDetail(const std::optional<anvil::playback::MediaDescriptor>& media,
+                         const std::wstring& kind,
+                         const int index) {
+    if (const auto* stream = FindStream(media, kind, index)) {
+        const std::wstring codec = UpperCopy(stream->codec);
+        if (!codec.empty() && !stream->details.empty()) {
+            return codec + L" / " + stream->details;
+        }
+        return !codec.empty() ? codec : stream->details;
+    }
+    return {};
+}
+
+std::wstring TrackItemsJson(const std::optional<anvil::playback::MediaDescriptor>& media,
+                            const std::wstring& kind,
+                            const int offTrack,
+                            const int autoTrack) {
+    const auto tracks = TrackMenuItems(media, kind, offTrack, autoTrack);
+    std::wostringstream json;
+    json << L"[";
+    for (std::size_t index = 0; index < tracks.size(); ++index) {
+        if (index > 0) {
+            json << L",";
+        }
+        const int track = tracks[index];
+        json << L"{\"index\":" << track
+             << L",\"label\":\"" << JsonEscape(TrackLabel(media, kind, track, offTrack, autoTrack)) << L"\""
+             << L",\"detail\":\"" << JsonEscape(TrackDetail(media, kind, track)) << L"\"}";
+    }
+    json << L"]";
+    return json.str();
+}
+
+std::wstring HdrToneCurveJson(const anvil::playback::VideoSettings& settings) {
+    std::wostringstream json;
+    json << L"[";
+    for (std::size_t index = 0; index < settings.hdrToneCurve.size(); ++index) {
+        if (index > 0) {
+            json << L",";
+        }
+        const double inputNits = index < anvil::playback::kDefaultHdrToneCurve.size()
+                                     ? anvil::playback::kDefaultHdrToneCurve[index].inputNits
+                                     : settings.hdrToneCurve[index].inputNits;
+        json << L"{\"index\":" << index
+             << L",\"inputNits\":" << std::fixed << std::setprecision(0) << inputNits
+             << L",\"outputNits\":" << std::fixed << std::setprecision(0) << settings.hdrToneCurve[index].outputNits
+             << L"}";
+    }
+    json << L"]";
+    return json.str();
 }
 
 }  // namespace
@@ -261,6 +714,10 @@ void MainWindow::SetInitialVideoTrackSelection(const int selectedTrackIndex) {
         label = L"stream=" + std::to_wstring(selectedTrackIndex);
     }
     LogApp(LogLevel::Info, L"initial video track=" + label);
+}
+
+void MainWindow::SetWebUiEnabled(const bool enabled) {
+    webUiRequested_ = enabled;
 }
 
 bool MainWindow::Create(HINSTANCE instance) {
@@ -329,7 +786,12 @@ bool MainWindow::Create(HINSTANCE instance) {
         instance_,
         this);
 
-    return hwnd_ != nullptr;
+    if (!hwnd_) {
+        return false;
+    }
+
+    TryCreateWebUi();
+    return true;
 }
 
 void MainWindow::Show(const int commandShow) const {
@@ -337,11 +799,359 @@ void MainWindow::Show(const int commandShow) const {
     UpdateWindow(hwnd_);
 }
 
+std::filesystem::path MainWindow::WebUiRoot() const {
+    wchar_t modulePath[MAX_PATH]{};
+    constexpr DWORD modulePathCount = static_cast<DWORD>(sizeof(modulePath) / sizeof(modulePath[0]));
+    const DWORD length = GetModuleFileNameW(instance_, modulePath, modulePathCount);
+    if (length > 0 && length < modulePathCount) {
+        const auto outputRoot = std::filesystem::path(modulePath).parent_path() / L"webui";
+        std::error_code error;
+        if (std::filesystem::exists(outputRoot / L"index.html", error)) {
+            return outputRoot;
+        }
+    }
+
+    std::error_code error;
+    const auto sourceRoot = std::filesystem::current_path(error) / L"src" / L"AnvilPlayer.App" / L"webui" / L"dist";
+    if (!error && std::filesystem::exists(sourceRoot / L"index.html", error)) {
+        return sourceRoot;
+    }
+
+    return std::filesystem::current_path(error) / L"webui";
+}
+
+bool MainWindow::TryCreateWebUi() {
+    if (!webUiRequested_ || webUiActive_ || !hwnd_) {
+        return false;
+    }
+
+    auto host = std::make_unique<WebUiHost>();
+    const auto root = WebUiRoot();
+    const bool started = host->Create(hwnd_, root, [this](const std::wstring& message) {
+        HandleWebUiMessage(message);
+    });
+    if (!started) {
+        LogApp(LogLevel::Warning, L"web ui unavailable root=" + root.wstring());
+        return false;
+    }
+
+    webUiHost_ = std::move(host);
+    webUiActive_ = true;
+    LogApp(LogLevel::Info, L"web ui enabled root=" + root.wstring());
+    return true;
+}
+
+std::wstring MainWindow::BuildWebUiStateJson() const {
+    const auto snapshot = controller_.Snapshot();
+    const auto settings = controller_.Settings();
+
+    std::wstring playbackState = ToDisplayString(snapshot.state);
+    if (!snapshot.media.has_value()) {
+        playbackState = L"Empty";
+    }
+
+    const std::wstring mediaName = snapshot.media.has_value() ? snapshot.media->displayName : L"No media loaded";
+    const long long positionMs = std::max<long long>(0, snapshot.position.count());
+    const long long durationMs = snapshot.media.has_value() ? std::max<long long>(0, snapshot.media->duration.count()) : 0;
+    long long bufferedEndMs = positionMs;
+    if (backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+        nativeVideoDecoder_ &&
+        snapshot.media.has_value() &&
+        snapshot.media->duration.count() > 0) {
+        const auto stats = nativeVideoDecoder_->Stats();
+        if ((stats.queueDepth > 0 || stats.packetQueueDepth > 0) && stats.bufferedEnd > snapshot.position) {
+            bufferedEndMs = std::clamp<long long>(stats.bufferedEnd.count(), positionMs, durationMs);
+        }
+    }
+    const bool hdrAvailable = CurrentMediaHasHdrControls();
+    const bool cmv4Available = CurrentMediaHasCmv4Control();
+    const bool cmv4Enabled = CurrentCmv4ControlEnabled(settings) && settings.video.dolbyVisionCmv4Approx;
+    const bool hdrToneCurveAvailable = HdrToneCurveAvailable(settings);
+    const bool hasVideo = snapshot.media.has_value() && snapshot.media->hasVideo;
+    const bool hasAudio = snapshot.media.has_value() && snapshot.media->hasAudio;
+    const std::wstring mediaPath = snapshot.media.has_value() ? snapshot.media->path.wstring() : L"";
+    const std::wstring container = snapshot.media.has_value() ? snapshot.media->container : L"";
+    const std::wstring videoCodec = snapshot.media.has_value() ? snapshot.media->videoCodec : L"";
+    const std::wstring audioCodec = snapshot.media.has_value() ? snapshot.media->audioCodec : L"";
+    const std::wstring hdrFormat = snapshot.media.has_value() ? snapshot.media->hdrFormat : L"";
+    std::wstring resolution;
+    std::wstring frameRate;
+    int streamCount = 0;
+    if (snapshot.media.has_value()) {
+        streamCount = static_cast<int>(snapshot.media->streams.size());
+        if (snapshot.media->videoWidth > 0 && snapshot.media->videoHeight > 0) {
+            resolution = std::to_wstring(snapshot.media->videoWidth) + L" x " + std::to_wstring(snapshot.media->videoHeight);
+        }
+        if (snapshot.media->videoFrameRate > 0.0) {
+            std::wostringstream fps;
+            fps << std::fixed << std::setprecision(2) << snapshot.media->videoFrameRate << L" fps";
+            frameRate = fps.str();
+        }
+    }
+
+    std::wostringstream json;
+    json << L"{\"type\":\"state\",\"state\":{";
+    json << L"\"playbackState\":\"" << JsonEscape(playbackState) << L"\",";
+    json << L"\"mediaName\":\"" << JsonEscape(mediaName) << L"\",";
+    json << L"\"mediaPath\":\"" << JsonEscape(mediaPath) << L"\",";
+    json << L"\"hasMedia\":" << (snapshot.media.has_value() ? L"true" : L"false") << L",";
+    json << L"\"hasVideo\":" << (hasVideo ? L"true" : L"false") << L",";
+    json << L"\"hasAudio\":" << (hasAudio ? L"true" : L"false") << L",";
+    json << L"\"positionMs\":" << positionMs << L",";
+    json << L"\"durationMs\":" << durationMs << L",";
+    json << L"\"bufferedEndMs\":" << bufferedEndMs << L",";
+    json << L"\"volume\":" << std::fixed << std::setprecision(3) << std::clamp(snapshot.volume, 0.0, 1.0) << L",";
+    json << L"\"runtimeLabel\":\"" << JsonEscape(RuntimeShortLabel()) << L"\",";
+    json << L"\"backendLabel\":\"" << JsonEscape(RuntimeLabel()) << L"\",";
+    json << L"\"sidebarCollapsed\":" << (inspectorCollapsed_ ? L"true" : L"false") << L",";
+    json << L"\"fullscreen\":" << (fullscreen_ ? L"true" : L"false") << L",";
+    json << L"\"fullscreenTransportVisible\":"
+         << ((!fullscreen_ || fullscreenTransportTarget_ > 0.0 || draggingProgress_ || draggingVolume_) ? L"true" : L"false")
+         << L",";
+    json << L"\"subtitleMenuOpen\":" << ((subtitleMenuTarget_ > 0.0 || subtitleMenuAmount_ > 0.01) ? L"true" : L"false") << L",";
+    json << L"\"inspectorTab\":\"" << InspectorTabName(inspectorTab_) << L"\",";
+    json << L"\"hdrAvailable\":" << (hdrAvailable ? L"true" : L"false") << L",";
+    json << L"\"hdrOutput\":" << (settings.video.dolbyVisionHdrOutput ? L"true" : L"false") << L",";
+    json << L"\"cmv4Available\":" << (cmv4Available ? L"true" : L"false") << L",";
+    json << L"\"cmv4Enabled\":" << (cmv4Enabled ? L"true" : L"false") << L",";
+    json << L"\"audioSelectedTrack\":" << settings.audio.selectedTrackIndex << L",";
+    json << L"\"subtitleSelectedTrack\":" << settings.subtitles.selectedTrackIndex << L",";
+    json << L"\"subtitleDelayMs\":" << settings.subtitles.subtitleDelayMs << L",";
+    json << L"\"subtitleFontScale\":" << std::fixed << std::setprecision(2) << settings.subtitles.fontScale << L",";
+    json << L"\"subtitleOffsetX\":" << settings.subtitles.offsetXPx << L",";
+    json << L"\"subtitleOffsetY\":" << settings.subtitles.offsetYPx << L",";
+    json << L"\"danmakuEnabled\":" << (settings.danmaku.enabled ? L"true" : L"false") << L",";
+    json << L"\"danmakuMode\":" << settings.danmaku.mode << L",";
+    json << L"\"danmakuOpacityPercent\":" << settings.danmaku.opacityPercent << L",";
+    json << L"\"danmakuSpeedPercent\":" << settings.danmaku.speedPercent << L",";
+    json << L"\"danmakuPath\":\"" << JsonEscape(settings.danmaku.externalDanmakuPath.wstring()) << L"\",";
+    json << L"\"audioTracks\":" << TrackItemsJson(snapshot.media,
+                                                   L"Audio",
+                                                   anvil::playback::kAudioTrackOff,
+                                                  anvil::playback::kAudioTrackAuto) << L",";
+    json << L"\"subtitleTracks\":" << TrackItemsJson(snapshot.media,
+                                                     L"Subtitle",
+                                                     anvil::playback::kSubtitleTrackOff,
+                                                     anvil::playback::kSubtitleTrackAuto) << L",";
+    json << L"\"hdrToneCurveAvailable\":" << (hdrToneCurveAvailable ? L"true" : L"false") << L",";
+    json << L"\"hdrToneCurvePeakNits\":" << settings.video.peakBrightnessNits << L",";
+    json << L"\"hdrToneCurve\":" << HdrToneCurveJson(settings.video) << L",";
+    json << L"\"container\":\"" << JsonEscape(container) << L"\",";
+    json << L"\"videoCodec\":\"" << JsonEscape(videoCodec) << L"\",";
+    json << L"\"audioCodec\":\"" << JsonEscape(audioCodec) << L"\",";
+    json << L"\"hdrFormat\":\"" << JsonEscape(hdrFormat) << L"\",";
+    json << L"\"resolution\":\"" << JsonEscape(resolution) << L"\",";
+    json << L"\"frameRate\":\"" << JsonEscape(frameRate) << L"\",";
+    json << L"\"streamCount\":" << streamCount << L",";
+    json << L"\"recentMedia\":" << MediaPathItemsJson(recentMedia_, 8) << L",";
+    json << L"\"folderMedia\":" << MediaPathItemsJson(currentFolderEntries_, 16) << L",";
+    json << L"\"logLines\":" << RecentLogLinesJson(controller_.LogSink(), 14);
+    json << L"}}";
+    return json.str();
+}
+
+void MainWindow::PostWebUiState(const bool force) const {
+    if (webUiActive_ && webUiHost_ && webUiHost_->Ready()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!force &&
+            lastWebUiStatePostedAt_.time_since_epoch().count() != 0 &&
+            now - lastWebUiStatePostedAt_ < kWebUiProgressUpdateInterval) {
+            return;
+        }
+        lastWebUiStatePostedAt_ = now;
+        webUiHost_->PostJson(BuildWebUiStateJson());
+    }
+}
+
+void MainWindow::HandleWebUiMessage(const std::wstring_view message) {
+    if (MessageContains(message, L"\"type\":\"requestState\"")) {
+        PostWebUiState();
+        return;
+    }
+
+    if (!MessageContains(message, L"\"type\":\"command\"")) {
+        return;
+    }
+
+    if (MessageContains(message, L"\"command\":\"open\"")) {
+        OpenFileDialog();
+    } else if (MessageContains(message, L"\"command\":\"openPath\"")) {
+        if (const auto path = ReadJsonString(message, L"path")) {
+            OpenPath(*path, true);
+        }
+    } else if (MessageContains(message, L"\"command\":\"playPause\"")) {
+        TogglePlayback();
+    } else if (MessageContains(message, L"\"command\":\"stop\"")) {
+        StopPlayback();
+    } else if (MessageContains(message, L"\"command\":\"back\"")) {
+        SeekRelative(-std::chrono::seconds{10});
+    } else if (MessageContains(message, L"\"command\":\"forward\"")) {
+        SeekRelative(std::chrono::seconds{10});
+    } else if (MessageContains(message, L"\"command\":\"toggleSidebar\"")) {
+        ToggleSidebar();
+    } else if (MessageContains(message, L"\"command\":\"toggleFullscreen\"")) {
+        ToggleFullscreen();
+    } else if (MessageContains(message, L"\"command\":\"subtitleGeometry\"")) {
+        const double scale = std::clamp(ReadJsonNumber(message, L"scale").value_or(1.0), 0.25, 4.0);
+        const auto scaled = [scale](const std::optional<double>& value) {
+            return static_cast<int>(std::round(value.value_or(0.0) * scale));
+        };
+        const auto anchorLeft = ReadJsonNumber(message, L"anchorLeft");
+        const auto anchorTop = ReadJsonNumber(message, L"anchorTop");
+        const auto anchorWidth = ReadJsonNumber(message, L"anchorWidth");
+        const auto anchorHeight = ReadJsonNumber(message, L"anchorHeight");
+        const auto popoverLeft = ReadJsonNumber(message, L"popoverLeft");
+        const auto popoverTop = ReadJsonNumber(message, L"popoverTop");
+        const auto popoverWidth = ReadJsonNumber(message, L"popoverWidth");
+        const auto popoverHeight = ReadJsonNumber(message, L"popoverHeight");
+        if (anchorLeft && anchorTop && anchorWidth && anchorHeight &&
+            popoverLeft && popoverTop && popoverWidth && popoverHeight) {
+            const int anchorX = scaled(anchorLeft);
+            const int anchorY = scaled(anchorTop);
+            const int anchorW = std::max(1, scaled(anchorWidth));
+            const int anchorH = std::max(1, scaled(anchorHeight));
+            const int popoverX = scaled(popoverLeft);
+            const int popoverY = scaled(popoverTop);
+            const int popoverW = std::max(1, scaled(popoverWidth));
+            const int popoverH = std::max(1, scaled(popoverHeight));
+            webUiSubtitleAnchor_ = MakeRect(anchorX, anchorY, anchorX + anchorW, anchorY + anchorH);
+            webUiSubtitlePopover_ = MakeRect(popoverX, popoverY, popoverX + popoverW, popoverY + popoverH);
+            webUiSubtitleGeometryValid_ = true;
+            MarkLayoutDirty();
+            EnsureLayout();
+            UpdateVideoHost();
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        }
+    } else if (MessageContains(message, L"\"command\":\"transportGeometry\"")) {
+        const double scale = std::clamp(ReadJsonNumber(message, L"scale").value_or(1.0), 0.25, 4.0);
+        const auto scaled = [scale](const std::optional<double>& value) {
+            return static_cast<int>(std::round(value.value_or(0.0) * scale));
+        };
+        const auto left = ReadJsonNumber(message, L"left");
+        const auto top = ReadJsonNumber(message, L"top");
+        const auto width = ReadJsonNumber(message, L"width");
+        const auto height = ReadJsonNumber(message, L"height");
+        if (left && top && width && height) {
+            const int x = scaled(left);
+            const int y = scaled(top);
+            const int w = std::max(1, scaled(width));
+            const int h = std::max(1, scaled(height));
+            webUiTransportBounds_ = MakeRect(x, y, x + w, y + h);
+            webUiTransportGeometryValid_ = true;
+            MarkLayoutDirty();
+            EnsureLayout();
+            UpdateVideoHost();
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        }
+    } else if (MessageContains(message, L"\"command\":\"subtitleMenu\"")) {
+        ShowSubtitleMenu();
+    } else if (MessageContains(message, L"\"command\":\"hideSubtitleMenu\"")) {
+        HideSubtitleMenu();
+    } else if (MessageContains(message, L"\"command\":\"settings\"")) {
+        Execute(Command::Settings);
+    } else if (MessageContains(message, L"\"command\":\"inspectorRecent\"")) {
+        Execute(Command::InspectorRecent);
+    } else if (MessageContains(message, L"\"command\":\"inspectorFolder\"")) {
+        Execute(Command::InspectorFolder);
+    } else if (MessageContains(message, L"\"command\":\"inspectorMedia\"")) {
+        Execute(Command::InspectorMedia);
+    } else if (MessageContains(message, L"\"command\":\"inspectorSystem\"")) {
+        Execute(Command::InspectorSystem);
+    } else if (MessageContains(message, L"\"command\":\"inspectorLog\"")) {
+        Execute(Command::InspectorLog);
+    } else if (MessageContains(message, L"\"command\":\"toggleHdr\"")) {
+        Execute(Command::ToggleDolbyVisionHdr);
+    } else if (MessageContains(message, L"\"command\":\"toggleCmv4\"")) {
+        Execute(Command::ToggleDolbyVisionCmv4Approx);
+    } else if (MessageContains(message, L"\"command\":\"setAudioTrack\"")) {
+        if (const auto index = ReadJsonNumber(message, L"index")) {
+            ApplyAudioSelection(static_cast<int>(std::round(*index)));
+        }
+    } else if (MessageContains(message, L"\"command\":\"setSubtitleTrack\"")) {
+        if (const auto index = ReadJsonNumber(message, L"index")) {
+            ApplySubtitleSelection(static_cast<int>(std::round(*index)));
+        }
+    } else if (MessageContains(message, L"\"command\":\"setSubtitleDelay\"")) {
+        if (const auto delayMs = ReadJsonNumber(message, L"delayMs")) {
+            const auto settings = controller_.Settings();
+            ApplySubtitleDelayDelta(static_cast<int>(std::round(*delayMs)) - settings.subtitles.subtitleDelayMs);
+        }
+    } else if (MessageContains(message, L"\"command\":\"setSubtitleFontScale\"")) {
+        if (const auto scale = ReadJsonNumber(message, L"scale")) {
+            const auto settings = controller_.Settings();
+            ApplySubtitleFontScaleDelta(std::clamp(*scale, 0.5, 2.0) - settings.subtitles.fontScale);
+        }
+    } else if (MessageContains(message, L"\"command\":\"setSubtitleOffset\"")) {
+        const auto x = ReadJsonNumber(message, L"x");
+        const auto y = ReadJsonNumber(message, L"y");
+        if (x && y) {
+            const auto settings = controller_.Settings();
+            ApplySubtitleOffsetDelta(static_cast<int>(std::round(*x)) - settings.subtitles.offsetXPx,
+                                     static_cast<int>(std::round(*y)) - settings.subtitles.offsetYPx);
+        }
+    } else if (MessageContains(message, L"\"command\":\"openSubtitleFile\"")) {
+        OpenSubtitleFileDialog();
+    } else if (MessageContains(message, L"\"command\":\"toggleDanmakuEnabled\"")) {
+        ToggleDanmakuEnabled();
+    } else if (MessageContains(message, L"\"command\":\"cycleDanmakuMode\"")) {
+        CycleDanmakuMode();
+    } else if (MessageContains(message, L"\"command\":\"setDanmakuOpacity\"")) {
+        if (const auto opacityPercent = ReadJsonNumber(message, L"opacityPercent")) {
+            const auto settings = controller_.Settings();
+            ApplyDanmakuOpacityDelta(static_cast<int>(std::round(*opacityPercent)) - settings.danmaku.opacityPercent);
+        }
+    } else if (MessageContains(message, L"\"command\":\"setDanmakuSpeed\"")) {
+        if (const auto speedPercent = ReadJsonNumber(message, L"speedPercent")) {
+            const auto settings = controller_.Settings();
+            ApplyDanmakuSpeedDelta(static_cast<int>(std::round(*speedPercent)) - settings.danmaku.speedPercent);
+        }
+    } else if (MessageContains(message, L"\"command\":\"openDanmakuFile\"")) {
+        OpenDanmakuFileDialog();
+    } else if (MessageContains(message, L"\"command\":\"resetHdrToneCurve\"")) {
+        ResetHdrToneCurve();
+    } else if (MessageContains(message, L"\"command\":\"toggleHdrToneCurveExpanded\"")) {
+        Execute(Command::ToggleHdrToneCurveExpanded);
+    } else if (MessageContains(message, L"\"command\":\"setHdrToneCurvePoints\"")) {
+        std::array<double, anvil::playback::kHdrToneCurvePointCount> outputNits{};
+        std::array<bool, anvil::playback::kHdrToneCurvePointCount> hasOutput{};
+        for (std::size_t index = 1; index < outputNits.size(); ++index) {
+            const std::wstring field = L"output" + std::to_wstring(index);
+            if (const auto value = ReadJsonNumber(message, field.c_str())) {
+                outputNits[index] = *value;
+                hasOutput[index] = true;
+            }
+        }
+        ApplyHdrToneCurvePoints(outputNits, hasOutput);
+    } else if (MessageContains(message, L"\"command\":\"setHdrToneCurvePoint\"")) {
+        const auto index = ReadJsonNumber(message, L"index");
+        const auto outputNits = ReadJsonNumber(message, L"outputNits");
+        if (index && outputNits) {
+            ApplyHdrToneCurvePoint(static_cast<int>(std::round(*index)), *outputNits);
+        }
+    } else if (MessageContains(message, L"\"command\":\"setVolume\"")) {
+        if (const auto volume = ReadJsonNumber(message, L"volume")) {
+            ApplyVolume(std::clamp(*volume, 0.0, 1.0), true);
+        }
+    } else if (MessageContains(message, L"\"command\":\"seekToRatio\"")) {
+        const auto snapshot = controller_.Snapshot();
+        if (snapshot.media.has_value() && snapshot.media->duration.count() > 0) {
+            if (const auto ratio = ReadJsonNumber(message, L"ratio")) {
+                const auto duration = snapshot.media->duration;
+                SeekToPosition(std::chrono::milliseconds{
+                    static_cast<long long>(static_cast<double>(duration.count()) * std::clamp(*ratio, 0.0, 1.0))});
+            }
+        }
+    }
+
+    PostWebUiState();
+}
+
 void MainWindow::OpenInitialPath(const std::filesystem::path& path, const bool autoplay) {
     if (!path.empty()) {
         LogApp(LogLevel::Info, L"initial path=" + path.wstring() + L" autoplay=" + (autoplay ? L"true" : L"false"));
         OpenPath(path, autoplay);
     }
+    PostWebUiState();
 }
 
 LRESULT CALLBACK MainWindow::WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -554,7 +1364,7 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
     case kNativeVideoFrameReadyMessage: {
         if (nativeVideoDecoder_) {
             nativeVideoDecoder_->AcknowledgeFrameNotification();
-            if (SidebarAnimationActive()) {
+            if (SidebarAnimationActive() && !webUiActive_) {
                 return 0;
             }
             NativeVideoFrame frame;
@@ -606,6 +1416,11 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
     case WM_SIZE:
         MarkLayoutDirty();
         EnsureLayout();
+        if (webUiActive_ && webUiHost_) {
+            RECT client{};
+            GetClientRect(hwnd_, &client);
+            webUiHost_->Resize(client);
+        }
         InvalidateRect(hwnd_, nullptr, FALSE);
         return 0;
     case WM_MOUSEMOVE:
@@ -613,10 +1428,11 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
         return 0;
     case WM_MOUSELEAVE:
         trackingMouseLeave_ = false;
+        ClearButtonHoverTargets();
         hoveredButton_ = -1;
         hoveredInspectorPathItem_ = -1;
         hoveredHdrToneCurvePoint_ = -1;
-        volumeSliderHovered_ = false;
+        SetVolumeSliderHover(false);
         SetProgressHover(false);
         InvalidateFullscreenOverlay();
         InvalidateRect(hwnd_, nullptr, FALSE);
@@ -770,7 +1586,7 @@ LRESULT MainWindow::HandleHdrToneCurveWindowMessage(HWND window, const UINT mess
         if (BeginHdrToneCurveDrag(point)) {
             return 0;
         }
-        if (!ContainsPoint(hdrToneCurvePlot_, point)) {
+        if (HasHdrToneCurveSelection()) {
             ClearHdrToneCurveSelection();
         }
         return 0;
@@ -894,7 +1710,10 @@ void MainWindow::MaybeLogNativeSchedulerStats(const NativeVideoQueueStats& stats
                    L" zero_copy_frames=" + std::to_wstring(stats.zeroCopyFrames) +
                    L" cpu_transfer_frames=" + std::to_wstring(stats.cpuTransferFrames) +
                    L" dropped_late=" + std::to_wstring(stats.droppedLate) +
+                   L" dropped_superseded=" + std::to_wstring(stats.droppedSuperseded) +
                    L" dropped_queue_full=" + std::to_wstring(stats.droppedQueueFull) +
+                   L" cadence_ms=" + std::to_wstring(stats.frameCadenceMs) +
+                   L" early_tolerance_ms=" + std::to_wstring(stats.earlyToleranceMs) +
                    (stats.fallbackReason.empty() ? L"" : L" fallback_reason=" + stats.fallbackReason));
 
     if (!d3dRenderer_) {
@@ -931,7 +1750,24 @@ void MainWindow::MaybeLogNativeSchedulerStats(const NativeVideoQueueStats& stats
         renderMessage +=
             L" subtitle_avg_ms=" + FormatAverageMilliseconds(renderStats.subtitleUs, subtitleCount) +
             L" subtitle_frames=" + std::to_wstring(renderStats.subtitleFrames) +
-            L" subtitle_rebuilds=" + std::to_wstring(renderStats.subtitleSurfaceRebuilds);
+            L" subtitle_rebuilds=" + std::to_wstring(renderStats.subtitleSurfaceRebuilds) +
+            L" subtitle_bitmap_rects=" + std::to_wstring(renderStats.subtitleBitmapRects) +
+            L" subtitle_bitmap_mpixels=" +
+                FormatFixed2(static_cast<double>(renderStats.subtitleBitmapPixels) / 1000000.0);
+    }
+    if (renderStats.presentSyncFrames > 0 ||
+        renderStats.frameLatencyWaits > 0 ||
+        renderStats.frameStatsSamples > 0 ||
+        renderStats.frameStatsDisjoint > 0) {
+        renderMessage +=
+            L" present_sync_frames=" + std::to_wstring(renderStats.presentSyncFrames) +
+            L" frame_latency_waits=" + std::to_wstring(renderStats.frameLatencyWaits) +
+            L" frame_latency_wait_avg_ms=" +
+                FormatAverageMilliseconds(renderStats.frameLatencyWaitUs, renderStats.frameLatencyWaits) +
+            L" frame_latency_wait_max_ms=" + FormatMillisecondsFromMicroseconds(renderStats.maxFrameLatencyWaitUs) +
+            L" frame_latency_wait_timeouts=" + std::to_wstring(renderStats.frameLatencyWaitTimeouts) +
+            L" frame_stats_samples=" + std::to_wstring(renderStats.frameStatsSamples) +
+            L" frame_stats_disjoint=" + std::to_wstring(renderStats.frameStatsDisjoint);
     }
 
     LogRuntime(LogLevel::Debug, L"renderer", renderMessage);
@@ -947,6 +1783,104 @@ bool MainWindow::SidebarAnimationActive() const {
     return !fullscreen_ && std::abs(inspectorCollapseAmount_ - inspectorCollapseTarget_) > 0.001;
 }
 
+void MainWindow::SetButtonHoverTarget(const int buttonIndex, const bool hovered) {
+    if (buttonIndex < 0 || buttonIndex >= static_cast<int>(buttons_.size())) {
+        return;
+    }
+
+    const std::size_t slot = static_cast<std::size_t>(buttons_[static_cast<std::size_t>(buttonIndex)].command);
+    if (slot >= buttonHoverAnimations_.size()) {
+        return;
+    }
+
+    UiMotionValue& animation = buttonHoverAnimations_[slot];
+    const double target = hovered ? 1.0 : 0.0;
+    if (std::abs(animation.target - target) < 0.001) {
+        return;
+    }
+
+    animation.startAmount = animation.amount;
+    animation.target = target;
+    animation.startedAt = std::chrono::steady_clock::now();
+    StartUiAnimationTimer();
+    InvalidateTransportArea();
+    InvalidateFullscreenOverlay();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::ClearButtonHoverTargets() {
+    bool changed = false;
+    const auto now = std::chrono::steady_clock::now();
+    for (auto& animation : buttonHoverAnimations_) {
+        if (animation.target <= 0.001 && animation.amount <= 0.001) {
+            continue;
+        }
+        animation.startAmount = animation.amount;
+        animation.target = 0.0;
+        animation.startedAt = now;
+        changed = true;
+    }
+    if (!changed) {
+        return;
+    }
+
+    StartUiAnimationTimer();
+    InvalidateTransportArea();
+    InvalidateFullscreenOverlay();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::TriggerButtonPress(const int buttonIndex) {
+    if (buttonIndex < 0 || buttonIndex >= static_cast<int>(buttons_.size())) {
+        return;
+    }
+
+    const std::size_t slot = static_cast<std::size_t>(buttons_[static_cast<std::size_t>(buttonIndex)].command);
+    if (slot >= buttonPressAnimations_.size()) {
+        return;
+    }
+
+    UiMotionValue& animation = buttonPressAnimations_[slot];
+    animation.amount = 1.0;
+    animation.startAmount = 1.0;
+    animation.target = 0.0;
+    animation.startedAt = std::chrono::steady_clock::now();
+    StartUiAnimationTimer();
+    InvalidateTransportArea();
+    InvalidateFullscreenOverlay();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+double MainWindow::ButtonHoverAmount(const Command command) const {
+    const std::size_t slot = static_cast<std::size_t>(command);
+    if (slot >= buttonHoverAnimations_.size()) {
+        return 0.0;
+    }
+    return std::clamp(buttonHoverAnimations_[slot].amount, 0.0, 1.0);
+}
+
+double MainWindow::ButtonPressAmount(const Command command) const {
+    const std::size_t slot = static_cast<std::size_t>(command);
+    if (slot >= buttonPressAnimations_.size()) {
+        return 0.0;
+    }
+    return std::clamp(buttonPressAnimations_[slot].amount, 0.0, 1.0);
+}
+
+void MainWindow::SetVolumeSliderHover(const bool hovered) {
+    if (volumeSliderHovered_ == hovered && volumeHoverTarget_ == (hovered ? 1.0 : 0.0)) {
+        return;
+    }
+
+    volumeSliderHovered_ = hovered;
+    volumeHoverStartAmount_ = volumeHoverAmount_;
+    volumeHoverTarget_ = hovered ? 1.0 : 0.0;
+    volumeHoverAnimationStartedAt_ = std::chrono::steady_clock::now();
+    StartUiAnimationTimer();
+    InvalidateTransportArea();
+    InvalidateFullscreenOverlay();
+}
+
 void MainWindow::UpdateUiAnimations() {
     const auto now = std::chrono::steady_clock::now();
     const RECT previousVideoSurface = videoSurface_;
@@ -954,9 +1888,14 @@ void MainWindow::UpdateUiAnimations() {
     const double previousInspectorCollapseAmount = inspectorCollapseAmount_;
     const double previousProgressHoverAmount = progressHoverAmount_;
     const double previousFullscreenTransportAmount = fullscreenTransportAmount_;
+    const double previousSubtitleMenuAmount = subtitleMenuAmount_;
+    const double previousVolumeHoverAmount = volumeHoverAmount_;
     bool sidebarComplete = true;
     bool hoverComplete = true;
     bool fullscreenTransportComplete = true;
+    bool subtitleMenuComplete = true;
+    bool volumeHoverComplete = true;
+    bool commandAnimationsComplete = true;
     const bool sidebarWasActive = SidebarAnimationActive();
 
     inspectorCollapseAmount_ = AnimatedValue(inspectorCollapseStartAmount_,
@@ -964,19 +1903,45 @@ void MainWindow::UpdateUiAnimations() {
                                              inspectorAnimationStartedAt_,
                                              kSidebarAnimationDuration,
                                              now,
+                                             MotionCurve::Fluid,
                                              sidebarComplete);
     progressHoverAmount_ = AnimatedValue(progressHoverStartAmount_,
                                          progressHoverTarget_,
                                          progressHoverAnimationStartedAt_,
                                          kProgressHoverAnimationDuration,
                                          now,
+                                         MotionCurve::Press,
                                          hoverComplete);
     fullscreenTransportAmount_ = AnimatedValue(fullscreenTransportStartAmount_,
                                                fullscreenTransportTarget_,
                                                fullscreenTransportAnimationStartedAt_,
                                                kFullscreenTransportAnimationDuration,
                                                now,
+                                               MotionCurve::Fluid,
                                                fullscreenTransportComplete);
+    const auto subtitleMenuDuration = webUiActive_
+                                          ? (subtitleMenuTarget_ > subtitleMenuStartAmount_
+                                                 ? kWebUiSubtitleMenuOpenAnimationDuration
+                                                 : kWebUiSubtitleMenuCloseAnimationDuration)
+                                          : kSubtitleMenuAnimationDuration;
+    const MotionCurve subtitleMenuCurve = webUiActive_ &&
+                                                  subtitleMenuTarget_ <= subtitleMenuStartAmount_
+                                              ? MotionCurve::EaseIn
+                                              : MotionCurve::Fluid;
+    subtitleMenuAmount_ = AnimatedValue(subtitleMenuStartAmount_,
+                                        subtitleMenuTarget_,
+                                        subtitleMenuAnimationStartedAt_,
+                                        subtitleMenuDuration,
+                                        now,
+                                        subtitleMenuCurve,
+                                        subtitleMenuComplete);
+    volumeHoverAmount_ = AnimatedValue(volumeHoverStartAmount_,
+                                       volumeHoverTarget_,
+                                       volumeHoverAnimationStartedAt_,
+                                       kVolumeHoverAnimationDuration,
+                                       now,
+                                       MotionCurve::Press,
+                                       volumeHoverComplete);
     if (sidebarComplete) {
         inspectorCollapseAmount_ = inspectorCollapseTarget_;
     }
@@ -986,13 +1951,40 @@ void MainWindow::UpdateUiAnimations() {
     if (fullscreenTransportComplete) {
         fullscreenTransportAmount_ = fullscreenTransportTarget_;
     }
+    if (subtitleMenuComplete) {
+        subtitleMenuAmount_ = subtitleMenuTarget_;
+        if (subtitleMenuTarget_ <= 0.001) {
+            subtitleMenuOpen_ = false;
+        }
+    }
+    if (volumeHoverComplete) {
+        volumeHoverAmount_ = volumeHoverTarget_;
+    }
+
+    bool commandAnimationValueChanged = false;
+    for (auto& animation : buttonHoverAnimations_) {
+        bool complete = true;
+        commandAnimationValueChanged =
+            UpdateMotionValue(animation, kButtonHoverAnimationDuration, now, MotionCurve::Press, complete) ||
+            commandAnimationValueChanged;
+        commandAnimationsComplete = commandAnimationsComplete && complete;
+    }
+    for (auto& animation : buttonPressAnimations_) {
+        bool complete = true;
+        commandAnimationValueChanged =
+            UpdateMotionValue(animation, kButtonPressAnimationDuration, now, MotionCurve::Press, complete) ||
+            commandAnimationValueChanged;
+        commandAnimationsComplete = commandAnimationsComplete && complete;
+    }
 
     const bool sidebarValueChanged = std::abs(inspectorCollapseAmount_ - previousInspectorCollapseAmount) > 0.0001;
     const bool hoverValueChanged = std::abs(progressHoverAmount_ - previousProgressHoverAmount) > 0.0001;
     const bool fullscreenTransportValueChanged =
         std::abs(fullscreenTransportAmount_ - previousFullscreenTransportAmount) > 0.0001;
+    const bool subtitleMenuValueChanged = std::abs(subtitleMenuAmount_ - previousSubtitleMenuAmount) > 0.0001;
+    const bool volumeHoverValueChanged = std::abs(volumeHoverAmount_ - previousVolumeHoverAmount) > 0.0001;
 
-    if (sidebarValueChanged || fullscreenTransportValueChanged) {
+    if (sidebarValueChanged || fullscreenTransportValueChanged || subtitleMenuValueChanged) {
         MarkLayoutDirty();
         EnsureLayout();
     }
@@ -1017,8 +2009,21 @@ void MainWindow::UpdateUiAnimations() {
     if (hoverValueChanged) {
         InvalidateTransportArea();
     }
-    if (fullscreenTransportValueChanged) {
+    if (volumeHoverValueChanged || commandAnimationValueChanged) {
+        InvalidateTransportArea();
         InvalidateFullscreenOverlay();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+    if (fullscreenTransportValueChanged) {
+        UpdateVideoHost();
+        InvalidateFullscreenOverlay();
+    }
+    if (subtitleMenuValueChanged) {
+        UpdateVideoHost();
+        UpdateSubtitleMenuOverlay();
+        InvalidateTransportArea();
+        InvalidateFullscreenOverlay();
+        InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
     if (!fullscreen_) {
@@ -1055,7 +2060,12 @@ void MainWindow::UpdateUiAnimations() {
         InvalidateVideoSurface();
     }
 
-    if (sidebarComplete && hoverComplete && fullscreenTransportComplete) {
+    if (sidebarComplete &&
+        hoverComplete &&
+        fullscreenTransportComplete &&
+        subtitleMenuComplete &&
+        volumeHoverComplete &&
+        commandAnimationsComplete) {
         KillTimer(hwnd_, kUiAnimationTimer);
     } else {
         StartUiAnimationTimer();
@@ -1064,20 +2074,31 @@ void MainWindow::UpdateUiAnimations() {
 
 void MainWindow::SetSubtitleMenuTarget(const bool visible) {
     const RECT oldMenu = subtitleMenu_;
-    subtitleMenuOpen_ = visible;
-    subtitleMenuAmount_ = visible ? 1.0 : 0.0;
-    subtitleMenuTarget_ = visible ? 1.0 : 0.0;
+    const double target = visible ? 1.0 : 0.0;
+    if (std::abs(subtitleMenuTarget_ - target) < 0.001 &&
+        std::abs(subtitleMenuAmount_ - target) < 0.001) {
+        return;
+    }
+
+    subtitleMenuOpen_ = visible || subtitleMenuAmount_ > 0.001;
+    subtitleMenuStartAmount_ = subtitleMenuAmount_;
+    subtitleMenuTarget_ = target;
+    subtitleMenuAnimationStartedAt_ = std::chrono::steady_clock::now();
     if (!visible) {
         hoveredSubtitleMenuItem_ = -1;
     }
+    StartUiAnimationTimer();
     MarkLayoutDirty();
     EnsureLayout();
+    UpdateVideoHost();
+    UpdateSubtitleMenuOverlay();
     InvalidateTransportArea();
     InvalidateFullscreenOverlay();
     if (!visible && RectWidth(oldMenu) > 0 && RectHeight(oldMenu) > 0) {
         InvalidateRect(hwnd_, &oldMenu, FALSE);
     }
     InvalidateRect(hwnd_, nullptr, FALSE);
+    PostWebUiState();
 }
 
 void MainWindow::HideSubtitleMenu() {
@@ -1166,6 +2187,7 @@ void MainWindow::ToggleSidebar() {
         InvalidateIfVisible(hwnd_, noMediaPlaceholderRect(previousVideoSurface), invalidationPadding);
         InvalidateIfVisible(hwnd_, noMediaPlaceholderRect(videoSurface_), invalidationPadding);
     }
+    PostWebUiState();
 }
 
 bool MainWindow::ShouldShowFullscreenTransport(const PlaybackSessionSnapshot&) const {
@@ -1212,15 +2234,48 @@ void MainWindow::UpdateFullscreenTransportCursorPolling() {
     if (moved &&
         !ShouldShowFullscreenTransport(controller_.Snapshot()) &&
         IsFullscreenTransportActivationPoint(point)) {
-        ShowFullscreenTransport();
+        ShowFullscreenTransport(L"cursor_poll_activation");
     }
 }
 
-void MainWindow::ShowFullscreenTransport() {
+std::wstring MainWindow::FullscreenTransportDebugState(const wchar_t* reason) const {
+    std::wostringstream stream;
+    stream << std::fixed << std::setprecision(3)
+           << L" reason=" << (reason ? reason : L"unspecified")
+           << L" target=" << fullscreenTransportTarget_
+           << L" amount=" << fullscreenTransportAmount_;
+    if (fullscreenTransportLastShownAt_.time_since_epoch().count() != 0) {
+        const auto idleMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - fullscreenTransportLastShownAt_).count();
+        stream << L" idle_ms=" << idleMs;
+    } else {
+        stream << L" idle_ms=none";
+    }
+    if (hasLastFullscreenCursorClient_) {
+        const bool activation = IsFullscreenTransportActivationPoint(lastFullscreenCursorClient_);
+        const bool transportHit = ContainsPoint(transportBar_, lastFullscreenCursorClient_);
+        const bool menuHit = IsPointInSubtitleMenu(lastFullscreenCursorClient_);
+        stream << L" cursor=" << lastFullscreenCursorClient_.x << L"," << lastFullscreenCursorClient_.y
+               << L" activation=" << (activation ? L"true" : L"false")
+               << L" transport_hit=" << (transportHit ? L"true" : L"false")
+               << L" menu_hit=" << (menuHit ? L"true" : L"false");
+    } else {
+        stream << L" cursor=none";
+    }
+    stream << L" dragging_progress=" << (draggingProgress_ ? L"true" : L"false")
+           << L" dragging_volume=" << (draggingVolume_ ? L"true" : L"false")
+           << L" subtitle_menu=" << ((subtitleMenuTarget_ > 0.0 || subtitleMenuAmount_ > 0.01) ? L"true" : L"false");
+    return stream.str();
+}
+
+void MainWindow::ShowFullscreenTransport(const wchar_t* reason) {
     if (!fullscreen_) {
         return;
     }
 
+    if (fullscreenTransportTarget_ <= 0.001 && fullscreenTransportAmount_ <= 0.001) {
+        LogApp(LogLevel::Debug, L"fullscreen_transport show" + FullscreenTransportDebugState(reason));
+    }
     SetFullscreenTransportTarget(true);
     fullscreenTransportLastShownAt_ = std::chrono::steady_clock::now();
     SetTimer(hwnd_, kFullscreenChromeHideTimer, 120, nullptr);
@@ -1235,18 +2290,37 @@ void MainWindow::HideFullscreenTransportIfIdle() {
     UpdateFullscreenTransportCursorPolling();
 
     if (draggingProgress_ || draggingVolume_) {
+        if (fullscreenTransportTarget_ <= 0.001) {
+            LogApp(LogLevel::Debug,
+                   L"fullscreen_transport keep" +
+                       FullscreenTransportDebugState(draggingProgress_ ? L"dragging_progress" : L"dragging_volume"));
+        }
         SetFullscreenTransportTarget(true);
         return;
     }
 
     const auto now = std::chrono::steady_clock::now();
+    if (subtitleMenuTarget_ > 0.0 || subtitleMenuAmount_ > 0.01) {
+        if (fullscreenTransportTarget_ <= 0.001) {
+            LogApp(LogLevel::Debug, L"fullscreen_transport keep" + FullscreenTransportDebugState(L"subtitle_menu"));
+        }
+        SetFullscreenTransportTarget(true);
+        fullscreenTransportLastShownAt_ = now;
+        return;
+    }
+
     if (fullscreenTransportLastShownAt_.time_since_epoch().count() != 0 &&
         now - fullscreenTransportLastShownAt_ < kFullscreenTransportHideDelay) {
         return;
     }
 
+    if (fullscreenTransportTarget_ > 0.001 || fullscreenTransportAmount_ > 0.001) {
+        LogApp(LogLevel::Debug, L"fullscreen_transport hide" + FullscreenTransportDebugState(L"idle_timeout"));
+    }
     SetFullscreenTransportTarget(false);
+    ClearButtonHoverTargets();
     hoveredButton_ = -1;
+    SetVolumeSliderHover(false);
     SetProgressHover(false);
 }
 
@@ -1263,8 +2337,10 @@ void MainWindow::SetFullscreenTransportTarget(const bool visible) {
     StartUiAnimationTimer();
     MarkLayoutDirty();
     EnsureLayout();
+    UpdateVideoHost();
     InvalidateFullscreenOverlay();
     InvalidateRect(hwnd_, nullptr, FALSE);
+    PostWebUiState();
 }
 
 void MainWindow::SetTemporaryPlaybackRate(const double rate) {
@@ -1345,6 +2421,7 @@ void MainWindow::OnPlaybackTimerTick() {
             MaybeLogNativeSchedulerStats(nativeVideoDecoder_->Stats());
             InvalidateRect(hwnd_, &transportBar_, FALSE);
             InvalidateFullscreenOverlay();
+            PostWebUiState(false);
             return;
         }
         // Paused keeps the freeze frame captured by PausePlayback; other
@@ -1353,8 +2430,10 @@ void MainWindow::OnPlaybackTimerTick() {
         StopRuntime(keepFrame ? false : true);
         SetPlaybackTimer(false);
         InvalidateRect(hwnd_, nullptr, FALSE);
+        PostWebUiState();
     } else {
         RenderPlaybackTick(snapshot);
+        PostWebUiState(false);
     }
 }
 
@@ -1693,7 +2772,7 @@ void MainWindow::OpenSubtitleFileDialog() {
         updated.media.has_value() &&
         updated.media->hasVideo &&
         backend_ == PlaybackBackend::NativeFfmpegD3D11) {
-        RefreshPausedNativeFrame(updated);
+        RefreshPausedNativeFrame(updated, true);
     } else {
         RestartPlaybackIfPlaying();
     }
@@ -2312,6 +3391,7 @@ void MainWindow::OpenPath(const std::filesystem::path& path, const bool autoplay
         return;
     }
     InvalidateRect(hwnd_, nullptr, FALSE);
+    PostWebUiState();
 }
 
 void MainWindow::UpdateInspectorMediaLists(const std::filesystem::path& path) {
@@ -2347,6 +3427,7 @@ void MainWindow::StartPlayback() {
     if (nativeEnhancedPlaybackGate && !PrepareNativeEnhancedPlaybackBeforePlay(before)) {
         InvalidateTransportArea();
         InvalidateFullscreenOverlay();
+        PostWebUiState();
         return;
     }
 
@@ -2383,12 +3464,14 @@ void MainWindow::StartPlayback() {
             heldNativeFrameNeedsPresent_ = false;
             if (snapshot.media->hasAudio &&
                 settings.audio.selectedTrackIndex != anvil::playback::kAudioTrackOff) {
-                audioPlayer_.Stop();
                 audioPlayer_.SetPlaybackRate(snapshot.playbackRate);
-                const bool audioStarted = audioPlayer_.Start(snapshot.media->path,
-                                                             snapshot.position,
-                                                             snapshot.volume,
-                                                             settings.audio.selectedTrackIndex);
+                bool audioStarted = audioPlayer_.IsRunning() && audioPlayer_.Resume(snapshot.position);
+                if (!audioStarted) {
+                    audioStarted = audioPlayer_.Start(snapshot.media->path,
+                                                      snapshot.position,
+                                                      snapshot.volume,
+                                                      settings.audio.selectedTrackIndex);
+                }
                 LogApp(audioStarted ? LogLevel::Debug : LogLevel::Warning,
                        L"native paused runtime resume audio=" + std::wstring(audioStarted ? L"true" : L"false"));
             } else {
@@ -2414,6 +3497,7 @@ void MainWindow::StartPlayback() {
     InvalidateTransportArea();
     InvalidateFullscreenOverlay();
     InvalidateRect(hwnd_, nullptr, FALSE);
+    PostWebUiState();
 }
 
 void MainWindow::PausePlayback() {
@@ -2424,18 +3508,23 @@ void MainWindow::PausePlayback() {
         nativeVideoDecoder_ &&
         nativeVideoDecoder_->IsRunning() &&
         d3dRenderer_) {
+        const bool hadHeldFrame = heldNativeFrame_.has_value() && heldNativeFrame_->HasContent();
         nativeVideoDecoder_->SetPaused(true, snapshot.position);
         NativeVideoFrame frame;
         if (nativeVideoDecoder_->LatestFrame(frame)) {
-            d3dRenderer_->Render(frame);
             heldNativeFrame_ = frame;
             nativeFrameHoldVisible_ = true;
             heldNativeFrameNeedsPresent_ = false;
+            if (!hadHeldFrame) {
+                d3dRenderer_->Render(frame);
+            }
             LogApp(LogLevel::Debug,
-                   L"rendered native pause freeze frame pixels=" +
-                        std::wstring(frame.HasPixels() ? L"true" : L"false"));
+                   L"captured native pause freeze frame pixels=" +
+                        std::wstring(frame.HasPixels() ? L"true" : L"false") +
+                        L" rendered=" +
+                        std::wstring(!hadHeldFrame ? L"true" : L"false"));
         }
-        audioPlayer_.Stop();
+        audioPlayer_.Pause(snapshot.position);
     } else {
         StopRuntime(false);
     }
@@ -2445,6 +3534,7 @@ void MainWindow::PausePlayback() {
     InvalidateTransportArea();
     InvalidateFullscreenOverlay();
     InvalidateRect(hwnd_, nullptr, FALSE);
+    PostWebUiState();
 }
 
 void MainWindow::TogglePlayback() {
@@ -2466,6 +3556,7 @@ void MainWindow::StopPlayback() {
     InvalidateTransportArea();
     InvalidateFullscreenOverlay();
     InvalidateRect(hwnd_, nullptr, FALSE);
+    PostWebUiState();
 }
 
 void MainWindow::RestartPlaybackIfPlaying(const bool waitForPreroll) {
@@ -2491,6 +3582,7 @@ void MainWindow::SeekRelative(const std::chrono::milliseconds delta) {
         RestartPlaybackIfPlaying();
     }
     InvalidateRect(hwnd_, nullptr, FALSE);
+    PostWebUiState();
 }
 
 void MainWindow::SeekToPosition(const std::chrono::milliseconds position) {
@@ -2507,6 +3599,7 @@ void MainWindow::SeekToPosition(const std::chrono::milliseconds position) {
     }
     InvalidateFullscreenOverlay();
     InvalidateRect(hwnd_, nullptr, FALSE);
+    PostWebUiState();
 }
 
 void MainWindow::SeekFromProgress(const int x) {
@@ -2573,6 +3666,7 @@ void MainWindow::ToggleFullscreen() {
     MarkLayoutDirty();
     EnsureLayout();
     InvalidateRect(hwnd_, nullptr, FALSE);
+    PostWebUiState();
 }
 
 }  // namespace anvil::app

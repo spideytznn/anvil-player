@@ -16,6 +16,18 @@ bool RectEquals(const RECT& a, const RECT& b) {
     return a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom;
 }
 
+int LerpInt(const int from, const int to, const double amount) {
+    return from + static_cast<int>(std::round((to - from) * amount));
+}
+
+RECT LerpRect(const RECT& from, const RECT& to, const double amount) {
+    const double clamped = std::clamp(amount, 0.0, 1.0);
+    return MakeRect(LerpInt(from.left, to.left, clamped),
+                    LerpInt(from.top, to.top, clamped),
+                    LerpInt(from.right, to.right, clamped),
+                    LerpInt(from.bottom, to.bottom, clamped));
+}
+
 }  // namespace
 
 void MainWindow::MarkLayoutDirty() {
@@ -177,13 +189,13 @@ void MainWindow::UpdateLayout() {
     const int margin = compact ? Scale(10) : Scale(16);
     const int gap = compact ? Scale(8) : Scale(12);
     const int topHeight = compact ? Scale(48) : Scale(56);
-    const int bottomHeight = compact ? Scale(112) : Scale(128);
+    const int bottomHeight = compact ? Scale(88) : Scale(96);
     const int topButtonSize = compact ? Scale(30) : Scale(32);
-    const int transportButtonSize = compact ? Scale(34) : Scale(38);
-    const int playButtonSize = compact ? Scale(42) : Scale(48);
-    const int buttonGap = compact ? Scale(10) : Scale(14);
-    const int rightButtonSize = compact ? Scale(28) : Scale(32);
-    const int rightButtonGap = compact ? Scale(10) : Scale(16);
+    const int transportButtonSize = compact ? Scale(30) : Scale(32);
+    const int playButtonSize = compact ? Scale(38) : Scale(42);
+    const int buttonGap = compact ? Scale(8) : Scale(12);
+    const int rightButtonSize = compact ? Scale(28) : Scale(30);
+    const int rightButtonGap = compact ? Scale(8) : Scale(12);
     const int volumeSliderWidth = compact ? Scale(158) : Scale(202);
     const auto snapshot = controller_.Snapshot();
     const bool playing = snapshot.state == PlaybackState::Playing;
@@ -227,7 +239,7 @@ void MainWindow::UpdateLayout() {
     const bool showCmv4Button = CurrentMediaHasCmv4Control();
     const bool cmv4ButtonEnabled = CurrentCmv4ControlEnabled(settings);
     const bool dolbyVisionButton = showCmv4Button;
-    const int hdrButtonWidth = showHdrButton ? (dolbyVisionButton ? Scale(42) : Scale(48)) : 0;
+    const int hdrButtonWidth = showHdrButton ? (dolbyVisionButton ? Scale(104) : Scale(48)) : 0;
     const int cmv4ButtonWidth = showCmv4Button ? Scale(86) : 0;
     const std::wstring hdrOutputTooltip =
         dolbyVisionButton
@@ -240,7 +252,7 @@ void MainWindow::UpdateLayout() {
     const auto addDolbyVisionHdrButton = [&](const int left, const int top) {
         buttons_.push_back(UiButton{Command::ToggleDolbyVisionHdr,
                                     MakeRect(left, top, left + hdrButtonWidth, top + rightButtonSize),
-                                    dolbyVisionButton ? L"DV" : L"HDR",
+                                    dolbyVisionButton ? L"Dolby Vision" : L"HDR",
                                     hdrOutputTooltip,
                                     IconKind::None,
                                     ButtonKind::TransportLabel,
@@ -443,9 +455,9 @@ void MainWindow::UpdateLayout() {
     }
     const int progressInset = compact ? Scale(18) : Scale(24);
     progress_ = MakeRect(transportBar_.left + progressInset,
-                         transportBar_.top + (compact ? Scale(36) : Scale(42)),
+                         transportBar_.top + (compact ? Scale(26) : Scale(30)),
                          transportBar_.right - progressInset,
-                         transportBar_.top + (compact ? Scale(42) : Scale(48)));
+                         transportBar_.top + (compact ? Scale(32) : Scale(36)));
     const int topButtonY = topBar_.top + (RectHeight(topBar_) - topButtonSize) / 2;
     int topButtonX = topBar_.right - (compact ? Scale(10) : Scale(12)) - topButtonSize;
     const bool settingsOpen = inspectorTab_ == InspectorTab::Settings;
@@ -590,7 +602,7 @@ void MainWindow::UpdateLayout() {
         }
     }
 
-    const int controlCenterY = transportBar_.bottom - (compact ? Scale(36) : Scale(42));
+    const int controlCenterY = transportBar_.bottom - (compact ? Scale(28) : Scale(30));
     int x = static_cast<int>(transportBar_.left) + (compact ? Scale(18) : Scale(24));
     transportControlsLeft_ = x;
     const int smallTop = controlCenterY - transportButtonSize / 2;
@@ -707,8 +719,12 @@ void MainWindow::UpdateLayout() {
         UpdateHdrToneCurveFloatingLayout();
     }
 
-    if (!SidebarAnimationActive()) {
-        playbackPlayer_.SetBounds(PlaybackSurfaceBounds());
+    if (!SidebarAnimationActive() || webUiActive_) {
+        RECT playerBounds = PlaybackSurfaceBounds();
+        if (webUiActive_ && !fullscreen_ && RectWidth(videoSurface_) > 0 && RectHeight(videoSurface_) > 0) {
+            playerBounds = DeflateRectCopy(videoSurface_, Scale(5), Scale(5));
+        }
+        playbackPlayer_.SetBounds(playerBounds);
     }
     UpdateVideoHost();
     UpdateTransportOverlay();
@@ -720,10 +736,13 @@ void MainWindow::UpdateVideoHost() {
     if (!videoHostReady_ || !videoHost_) {
         return;
     }
-    if (SidebarAnimationActive()) {
+    if (SidebarAnimationActive() && !webUiActive_) {
         return;
     }
-    const RECT bounds = PlaybackSurfaceBounds();
+    RECT bounds = PlaybackSurfaceBounds();
+    if (webUiActive_ && !fullscreen_ && RectWidth(videoSurface_) > 0 && RectHeight(videoSurface_) > 0) {
+        bounds = DeflateRectCopy(videoSurface_, Scale(5), Scale(5));
+    }
     const auto snapshot = controller_.Snapshot();
     const bool nativeActive = nativeVideoDecoder_ && nativeVideoDecoder_->IsRunning();
     const bool nativePausedFrame = backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
@@ -744,7 +763,7 @@ void MainWindow::UpdateVideoHost() {
                                    h != RectHeight(lastVideoHostBounds_);
         bool resized = false;
         if (boundsChanged || !wasVisible) {
-            SetWindowPos(videoHost_, HWND_BOTTOM, bounds.left, bounds.top, w, h, SWP_NOACTIVATE);
+            SetWindowPos(videoHost_, webUiActive_ ? HWND_TOP : HWND_BOTTOM, bounds.left, bounds.top, w, h, SWP_NOACTIVATE);
             if (boundsChanged) {
                 lastVideoHostBounds_ = bounds;
             }
@@ -752,6 +771,72 @@ void MainWindow::UpdateVideoHost() {
                 d3dRenderer_->OnResize();
                 resized = true;
             }
+        }
+        if (webUiActive_) {
+            HRGN region = fullscreen_
+                              ? CreateRectRgn(0, 0, w + 1, h + 1)
+                              : CreateRoundRectRgn(0, 0, w + 1, h + 1, Scale(8), Scale(8));
+            const auto subtractCutout = [&](RECT cutout, const int radius) {
+                OffsetRect(&cutout, -bounds.left, -bounds.top);
+                const RECT localBounds = MakeRect(0, 0, w, h);
+                RECT clippedCutout{};
+                if (IntersectRect(&clippedCutout, &cutout, &localBounds)) {
+                    HRGN cutoutRegion = radius > 0
+                                             ? CreateRoundRectRgn(clippedCutout.left,
+                                                                  clippedCutout.top,
+                                                                  clippedCutout.right + 1,
+                                                                  clippedCutout.bottom + 1,
+                                                                  radius,
+                                                                  radius)
+                                             : CreateRectRgn(clippedCutout.left,
+                                                             clippedCutout.top,
+                                                             clippedCutout.right + 1,
+                                                             clippedCutout.bottom + 1);
+                    CombineRgn(region, region, cutoutRegion, RGN_DIFF);
+                    DeleteObject(cutoutRegion);
+                }
+            };
+            if ((subtitleMenuTarget_ > 0.0 || subtitleMenuAmount_ > 0.01) &&
+                RectWidth(subtitleMenu_) > 0 &&
+                RectHeight(subtitleMenu_) > 0) {
+                RECT subtitleAnchor = webUiSubtitleGeometryValid_ ? webUiSubtitleAnchor_ : RECT{};
+                bool foundSubtitleAnchor = webUiSubtitleGeometryValid_;
+                if (!foundSubtitleAnchor) {
+                    for (const auto& button : buttons_) {
+                        if (button.command == Command::SubtitleMenu) {
+                            subtitleAnchor = button.bounds;
+                            foundSubtitleAnchor = true;
+                            break;
+                        }
+                    }
+                }
+
+                RECT cutout = subtitleMenu_;
+                if (foundSubtitleAnchor &&
+                    RectWidth(subtitleAnchor) > 0 &&
+                    RectHeight(subtitleAnchor) > 0) {
+                    cutout = LerpRect(subtitleAnchor, subtitleMenu_, subtitleMenuAmount_);
+                }
+                InflateRect(&cutout, 1, 1);
+                subtractCutout(cutout, Scale(8));
+            }
+            if (fullscreen_ &&
+                (fullscreenTransportTarget_ > 0.0 || fullscreenTransportAmount_ > 0.01)) {
+                RECT transportCutout = webUiTransportGeometryValid_ ? webUiTransportBounds_ : transportBar_;
+                if (RectWidth(transportCutout) > 0 && RectHeight(transportCutout) > 0) {
+                    const int hiddenOffset = RectHeight(transportCutout) + Scale(24);
+                    const int currentOffset = static_cast<int>(
+                        std::round(hiddenOffset * (1.0 - std::clamp(fullscreenTransportAmount_, 0.0, 1.0))));
+                    OffsetRect(&transportCutout, 0, currentOffset);
+                    InflateRect(&transportCutout, 1, 1);
+                    subtractCutout(transportCutout, Scale(8));
+                }
+            }
+            if (!SetWindowRgn(videoHost_, region, TRUE)) {
+                DeleteObject(region);
+            }
+        } else {
+            SetWindowRgn(videoHost_, nullptr, TRUE);
         }
         if (!wasVisible) {
             ShowWindow(videoHost_, SW_SHOW);
@@ -825,6 +910,14 @@ void MainWindow::EnsureTransportOverlay() {
 }
 
 void MainWindow::UpdateTransportOverlay() {
+    if (webUiActive_) {
+        if (transportOverlay_) {
+            ShowWindow(transportOverlay_, SW_HIDE);
+        }
+        lastTransportOverlayBounds_ = RECT{};
+        return;
+    }
+
     const bool showOverlay = !fullscreen_ && RectWidth(transportBar_) > 0 && RectHeight(transportBar_) > 0;
     if (!showOverlay) {
         if (transportOverlay_) {
@@ -881,6 +974,14 @@ void MainWindow::UpdateTransportOverlay() {
 }
 
 void MainWindow::UpdateFullscreenOverlay() {
+    if (webUiActive_) {
+        if (fullscreenOverlay_) {
+            ShowWindow(fullscreenOverlay_, SW_HIDE);
+        }
+        lastFullscreenOverlayBounds_ = RECT{};
+        return;
+    }
+
     const bool showOverlay = fullscreen_ && RectWidth(transportBar_) > 0 && RectHeight(transportBar_) > 0;
     if (!showOverlay) {
         if (fullscreenOverlay_) {
@@ -963,9 +1064,16 @@ void MainWindow::EnsureSubtitleMenuOverlay() {
 }
 
 void MainWindow::UpdateSubtitleMenuOverlay() {
-    const bool showOverlay = (subtitleMenuOpen_ ||
-                              subtitleMenuTarget_ > 0.0 ||
-                              subtitleMenuAmount_ > 0.001) &&
+    if (webUiActive_) {
+        if (subtitleMenuOverlay_) {
+            ShowWindow(subtitleMenuOverlay_, SW_HIDE);
+        }
+        lastSubtitleMenuOverlayBounds_ = RECT{};
+        return;
+    }
+
+    const bool showOverlay = ((subtitleMenuTarget_ > 0.0 && subtitleMenuAmount_ > 0.025) ||
+                              subtitleMenuAmount_ > 0.04) &&
                              RectWidth(subtitleMenu_) > 0 &&
                              RectHeight(subtitleMenu_) > 0;
     if (!showOverlay) {
@@ -1004,11 +1112,10 @@ void MainWindow::UpdateSubtitleMenuOverlay() {
         SetWindowRgn(subtitleMenuOverlay_, region, TRUE);
         lastSubtitleMenuOverlayBounds_ = subtitleMenu_;
     }
+    InvalidateRect(subtitleMenuOverlay_, nullptr, FALSE);
     if (!wasVisible) {
         ShowWindow(subtitleMenuOverlay_, SW_SHOWNOACTIVATE);
-    }
-    if (moved || !wasVisible) {
-        InvalidateRect(subtitleMenuOverlay_, nullptr, FALSE);
+        UpdateWindow(subtitleMenuOverlay_);
     }
 }
 
@@ -1117,6 +1224,36 @@ void MainWindow::UpdateSubtitleMenuLayout() {
         }
     }
     if (!found || RectWidth(anchor) <= 0 || RectHeight(anchor) <= 0) {
+        return;
+    }
+
+    if (webUiActive_ && webUiSubtitleGeometryValid_) {
+        subtitleMenu_ = webUiSubtitlePopover_;
+        return;
+    }
+
+    if (webUiActive_) {
+        RECT client{};
+        GetClientRect(hwnd_, &client);
+        const int viewportWidth = RectWidth(client);
+        const int viewportHeight = RectHeight(client);
+        if (viewportWidth <= 0 || viewportHeight <= 0) {
+            return;
+        }
+
+        const bool compact = viewportWidth <= Scale(900) || viewportHeight <= Scale(560);
+        const int margin = compact ? Scale(10) : Scale(16);
+        const int width = std::min(compact ? Scale(380) : Scale(420),
+                                   std::max(Scale(280), viewportWidth - margin * 2));
+        const int height = std::min(compact ? Scale(480) : Scale(430),
+                                    std::max(Scale(260), viewportHeight - (compact ? Scale(126) : Scale(152))));
+        const auto clampPanelPosition = [](const int value, const int size, const int viewportSize, const int marginValue) {
+            const int maxValue = std::max(marginValue, viewportSize - size - marginValue);
+            return std::clamp(value, marginValue, maxValue);
+        };
+        const int left = clampPanelPosition(anchor.right - width, width, viewportWidth, margin);
+        const int top = clampPanelPosition(anchor.bottom - height, height, viewportHeight, margin);
+        subtitleMenu_ = MakeRect(left, top, left + width, top + height);
         return;
     }
 

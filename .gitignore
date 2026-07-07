@@ -1,5 +1,7 @@
 .vs/
 bin/
+!third_party/libass/bin/
+!third_party/libass/bin/*.dll
 obj/
 *.user
 *.suo
@@ -20,3 +22,9 @@ third_party/ffmpeg/include/
 third_party/ffmpeg/lib/
 third_party/ffmpeg/*.txt
 third_party/ffmpeg-shared.zip
+
+# React/WebView2 UI build output and package cache
+src/AnvilPlayer.App/webui/node_modules/
+src/AnvilPlayer.App/webui/dist/
+third_party/webview2/*.nupkg
+third_party/webview2/Microsoft.Web.WebView2.*/

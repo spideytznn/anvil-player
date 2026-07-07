@@ -32,6 +32,22 @@ COLORREF FadeForOpacity(const COLORREF color, const double opacity) {
     return BlendColor(RGB(0, 0, 0), color, std::clamp(opacity, 0.0, 1.0));
 }
 
+void DrawSurfaceRim(HDC hdc,
+                    const RECT& rect,
+                    const COLORREF topColor,
+                    const COLORREF coolColor,
+                    const COLORREF warmColor,
+                    const int inset,
+                    const int width = 1) {
+    if (RectWidth(rect) <= inset * 2 || RectHeight(rect) <= inset * 2) {
+        return;
+    }
+
+    DrawLine(hdc, rect.left + inset, rect.top + width, rect.right - inset, rect.top + width, topColor, width);
+    DrawLine(hdc, rect.left + width, rect.top + inset, rect.left + width, rect.bottom - inset, coolColor, width);
+    DrawLine(hdc, rect.right - width, rect.top + inset, rect.right - width, rect.bottom - inset, warmColor, width);
+}
+
 std::wstring PlaybackRateText(const double rate) {
     std::wostringstream stream;
     stream.setf(std::ios::fixed);
@@ -111,10 +127,10 @@ std::wstring SubtitleLanguageName(const std::wstring& language) {
 
 std::wstring SubtitleMenuPrimaryLabel(const int selection, const std::optional<anvil::playback::MediaDescriptor>& media) {
     if (selection == anvil::playback::kSubtitleTrackAuto) {
-        return L"自动";
+        return L"Auto";
     }
     if (selection == anvil::playback::kSubtitleTrackOff) {
-        return L"关闭";
+        return L"Off";
     }
 
     std::wstring label = L"Stream " + std::to_wstring(selection);
@@ -149,10 +165,10 @@ std::wstring SubtitleMenuCodecLabel(const int selection, const std::optional<anv
 
 std::wstring AudioMenuPrimaryLabel(const int selection, const std::optional<anvil::playback::MediaDescriptor>& media) {
     if (selection == anvil::playback::kAudioTrackAuto) {
-        return L"自动";
+        return L"Auto";
     }
     if (selection == anvil::playback::kAudioTrackOff) {
-        return L"关闭";
+        return L"Off";
     }
 
     std::wstring label = L"Stream " + std::to_wstring(selection);
@@ -207,9 +223,9 @@ std::wstring PixelOffsetText(const int value) {
 
 std::wstring DanmakuModeText(const int mode) {
     switch (mode) {
-    case 1: return L"顶部";
-    case 2: return L"底部";
-    default: return L"滚动";
+    case 1: return L"Top";
+    case 2: return L"Bottom";
+    default: return L"Scroll";
     }
 }
 
@@ -313,6 +329,16 @@ void MainWindow::Paint() {
     const auto snapshot = controller_.Snapshot();
     const auto settings = controller_.Settings();
     const auto& capabilities = CachedCapabilities();
+
+    if (webUiActive_) {
+        BitBlt(windowDc, paintRect.left, paintRect.top, RectWidth(paintRect), RectHeight(paintRect), bufferDc, 0, 0, SRCCOPY);
+        SetViewportOrgEx(bufferDc, oldOrigin.x, oldOrigin.y, nullptr);
+        SelectObject(bufferDc, oldBitmap);
+        DeleteObject(bufferBitmap);
+        DeleteDC(bufferDc);
+        EndPaint(hwnd_, &paint);
+        return;
+    }
 
     if (RectWidth(topBar_) > 0 && RectHeight(topBar_) > 0 && RectsIntersect(paintRect, topBar_)) {
         DrawTopBar(bufferDc, snapshot);
@@ -469,6 +495,12 @@ void MainWindow::PaintHdrToneCurveWindow(HWND window) {
 void MainWindow::DrawTopBar(HDC hdc, const PlaybackSessionSnapshot& snapshot) const {
     FillRoundRect(hdc, topBar_, palette_.surface, Scale(12));
     StrokeRoundRect(hdc, topBar_, palette_.border, Scale(12));
+    DrawSurfaceRim(hdc,
+                   topBar_,
+                   BlendColor(palette_.surface, palette_.text, 0.10),
+                   BlendColor(palette_.border, palette_.info, 0.22),
+                   BlendColor(palette_.border, palette_.accent, 0.16),
+                   Scale(14));
 
     HFONT markFont = CreateUiFont(Scale(17), FW_BOLD);
     HFONT brandFont = CreateUiFont(Scale(15), FW_SEMIBOLD);
@@ -563,34 +595,60 @@ void MainWindow::DrawButtons(HDC hdc, const PlaybackSessionSnapshot& snapshot) c
     };
 
     HFONT buttonFont = CreateUiFont(Scale(11), FW_SEMIBOLD);
+    const auto visualButtonBounds = [this](RECT bounds, const double hover, const double press) {
+        const int width = RectWidth(bounds);
+        const int height = RectHeight(bounds);
+        if (width <= 0 || height <= 0) {
+            return bounds;
+        }
+
+        const int hoverGrow = static_cast<int>(std::round(Scale(1) * hover));
+        const int pressInsetX = static_cast<int>(std::round(std::max(1.0, width * 0.006) * press));
+        const int pressInsetY = static_cast<int>(std::round(std::max(1.0, height * 0.012) * press));
+        InflateRect(&bounds, hoverGrow - pressInsetX, hoverGrow - pressInsetY);
+        OffsetRect(&bounds,
+                   0,
+                   -static_cast<int>(std::round(Scale(1) * hover)) +
+                       static_cast<int>(std::round(Scale(1) * press)));
+        return bounds;
+    };
+
     for (std::size_t index = 0; index < buttons_.size(); ++index) {
         const auto& button = buttons_[index];
         const bool hovered = button.enabled && static_cast<int>(index) == hoveredButton_;
+        const double hoverMotion = button.enabled ? ButtonHoverAmount(button.command) : 0.0;
+        const double pressMotion = button.enabled ? ButtonPressAmount(button.command) : 0.0;
+        const bool visuallyHovered = hovered || hoverMotion > 0.02;
+        const RECT bounds = visualButtonBounds(button.bounds, hoverMotion, pressMotion);
 
         if (button.kind == ButtonKind::TransportIcon || button.kind == ButtonKind::TransportLabel) {
-            const int radius = std::max(Scale(8), std::min(RectWidth(button.bounds), RectHeight(button.bounds)) / 2);
-            if (hovered || button.selected) {
+            const int radius = std::max(Scale(8), std::min(RectWidth(bounds), RectHeight(bounds)) / 2);
+            if (visuallyHovered || button.selected) {
                 const COLORREF fill = button.selected
                                           ? BlendColor(palette_.accentSoft, palette_.surfaceRaised, 0.12)
-                                          : BlendColor(palette_.surfaceRaised, palette_.text, 0.04);
-                FillRoundRect(hdc, button.bounds, fade(fill), radius);
+                                          : BlendColor(palette_.surfaceRaised, palette_.text, 0.025 + 0.055 * hoverMotion);
+                FillRoundRect(hdc, bounds, fade(fill), radius);
+                StrokeRoundRect(hdc,
+                                bounds,
+                                fade(BlendColor(palette_.border, palette_.text, 0.04 + 0.16 * hoverMotion)),
+                                radius);
             }
 
             COLORREF contentColor = !button.enabled
                                         ? palette_.dim
                                         : (button.selected ? palette_.accent : palette_.text);
             if (!button.selected && button.kind == ButtonKind::TransportIcon) {
-                contentColor = hovered ? palette_.text : palette_.muted;
+                contentColor = BlendColor(palette_.muted, palette_.text, hoverMotion);
             }
             if (button.kind == ButtonKind::TransportLabel) {
                 DrawTextInRect(hdc,
                                button.label,
-                               DeflateRectCopy(button.bounds, Scale(2), 0),
+                               DeflateRectCopy(bounds, Scale(2), 0),
                                buttonFont,
                                fade(contentColor),
                                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             } else {
-                RECT iconRect = DeflateRectCopy(button.bounds, Scale(7), Scale(7));
+                RECT iconRect = DeflateRectCopy(bounds, Scale(7), Scale(7));
                 IconKind icon = button.icon;
                 if (button.command == Command::PlayPause) {
                     icon = snapshot.state == PlaybackState::Playing ? IconKind::Pause : IconKind::Play;
@@ -604,30 +662,30 @@ void MainWindow::DrawButtons(HDC hdc, const PlaybackSessionSnapshot& snapshot) c
             COLORREF textColor = !button.enabled
                                      ? palette_.dim
                                      : (button.selected ? palette_.text : palette_.muted);
-            if (hovered && !button.selected) {
+            if (visuallyHovered && !button.selected) {
                 FillRoundRect(hdc,
-                              button.bounds,
-                              fade(BlendColor(palette_.surfaceRaised, palette_.text, 0.05)),
+                              bounds,
+                              fade(BlendColor(palette_.surfaceRaised, palette_.text, 0.04 + 0.04 * hoverMotion)),
                               Scale(6));
-                textColor = palette_.text;
+                textColor = BlendColor(palette_.muted, palette_.text, hoverMotion);
             }
             if (button.selected) {
                 FillRoundRect(hdc,
-                              button.bounds,
+                              bounds,
                               fade(BlendColor(palette_.accentSoft, palette_.surfaceRaised, 0.18)),
                               Scale(6));
-                const int underlineY = button.bounds.bottom - Scale(3);
+                const int underlineY = bounds.bottom - Scale(3);
                 DrawLine(hdc,
-                         button.bounds.left + Scale(8),
+                         bounds.left + Scale(8),
                          underlineY,
-                         button.bounds.right - Scale(8),
+                         bounds.right - Scale(8),
                          underlineY,
                          fade(palette_.accent),
                          std::max(1, Scale(2)));
             }
             DrawTextInRect(hdc,
                            button.label,
-                           DeflateRectCopy(button.bounds, Scale(2), 0),
+                           DeflateRectCopy(bounds, Scale(2), 0),
                            buttonFont,
                            fade(textColor),
                            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -639,21 +697,25 @@ void MainWindow::DrawButtons(HDC hdc, const PlaybackSessionSnapshot& snapshot) c
             if (!button.enabled) {
                 fill = BlendColor(fill, palette_.background, 0.35);
             }
-            if (hovered && !button.selected) {
-                fill = BlendColor(fill, palette_.text, 0.06);
+            if (visuallyHovered && !button.selected) {
+                fill = BlendColor(fill, palette_.text, 0.04 + 0.04 * hoverMotion);
             }
-            FillRoundRect(hdc, button.bounds, fade(fill), Scale(7));
+            FillRoundRect(hdc, bounds, fade(fill), Scale(7));
             StrokeRoundRect(hdc,
-                            button.bounds,
+                            bounds,
                             fade(!button.enabled
                                      ? BlendColor(palette_.border, palette_.background, 0.25)
-                                     : (button.selected ? BlendColor(palette_.borderStrong, palette_.accent, 0.16) : palette_.border)),
+                                     : (button.selected
+                                            ? BlendColor(palette_.borderStrong, palette_.accent, 0.16)
+                                            : BlendColor(palette_.border, palette_.text, 0.10 * hoverMotion))),
                             Scale(7));
             DrawTextInRect(hdc,
                            button.label,
-                           DeflateRectCopy(button.bounds, Scale(6), 0),
+                           DeflateRectCopy(bounds, Scale(6), 0),
                            buttonFont,
-                           fade(!button.enabled ? palette_.dim : (button.selected ? palette_.text : palette_.muted)),
+                           fade(!button.enabled
+                                    ? palette_.dim
+                                    : (button.selected ? palette_.text : BlendColor(palette_.muted, palette_.text, hoverMotion))),
                            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             continue;
         }
@@ -662,8 +724,8 @@ void MainWindow::DrawButtons(HDC hdc, const PlaybackSessionSnapshot& snapshot) c
         if (!button.enabled) {
             fill = BlendColor(palette_.surface, palette_.background, 0.35);
         } else {
-            if (hovered) {
-                fill = BlendColor(fill, palette_.text, button.primary ? 0.08 : 0.06);
+            if (visuallyHovered) {
+                fill = BlendColor(fill, palette_.text, (button.primary ? 0.08 : 0.05) * std::max(0.3, hoverMotion));
             }
             if (button.selected && !button.primary) {
                 fill = BlendColor(fill, palette_.accent, 0.16);
@@ -671,34 +733,36 @@ void MainWindow::DrawButtons(HDC hdc, const PlaybackSessionSnapshot& snapshot) c
         }
 
         const int radius = button.kind == ButtonKind::TransportPrimary
-                               ? std::max(Scale(12), std::min(RectWidth(button.bounds), RectHeight(button.bounds)) / 2)
+                               ? std::max(Scale(12), std::min(RectWidth(bounds), RectHeight(bounds)) / 2)
                                : Scale(8);
-        FillRoundRect(hdc, button.bounds, fade(fill), radius);
+        FillRoundRect(hdc, bounds, fade(fill), radius);
         StrokeRoundRect(hdc,
-                        button.bounds,
+                        bounds,
                         fade(!button.enabled
                                  ? BlendColor(palette_.border, palette_.background, 0.25)
                                  : (button.primary
-                                        ? BlendColor(palette_.accent, palette_.text, 0.14)
-                                        : BlendColor(palette_.border, palette_.text, 0.03))),
+                                        ? BlendColor(palette_.accent, palette_.text, 0.14 + 0.10 * hoverMotion)
+                                        : BlendColor(palette_.border, palette_.text, 0.03 + 0.12 * hoverMotion))),
                         radius);
 
         const COLORREF iconColor = fade(!button.enabled
                                             ? palette_.dim
                                             : (button.primary ? RGB(255, 250, 248)
-                                                              : (button.selected ? palette_.text : palette_.muted)));
+                                                              : (button.selected
+                                                                     ? palette_.text
+                                                                     : BlendColor(palette_.muted, palette_.text, hoverMotion))));
         const bool wideTextIcon = button.icon == IconKind::HdrColor || button.icon == IconKind::DolbyVisionColor;
         const int iconInset = wideTextIcon
                                   ? Scale(3)
                                   : (button.kind == ButtonKind::TransportPrimary ? Scale(10) : Scale(8));
-        RECT iconRect = DeflateRectCopy(button.bounds, iconInset, iconInset);
+        RECT iconRect = DeflateRectCopy(bounds, iconInset, iconInset);
         IconKind icon = button.icon;
         if (button.command == Command::PlayPause) {
             icon = snapshot.state == PlaybackState::Playing ? IconKind::Pause : IconKind::Play;
         }
         iconPainter_.Draw(hdc, icon, iconRect, iconColor);
         if (!button.label.empty()) {
-            DrawTextInRect(hdc, button.label, button.bounds, buttonFont, iconColor, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            DrawTextInRect(hdc, button.label, bounds, buttonFont, iconColor, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         }
     }
     DeleteObject(buttonFont);
@@ -991,6 +1055,12 @@ void MainWindow::DrawTransport(HDC hdc, const PlaybackSessionSnapshot& snapshot)
 
     FillRoundRect(hdc, transportBar_, fade(palette_.surface), Scale(12));
     StrokeRoundRect(hdc, transportBar_, fade(palette_.border), Scale(12));
+    DrawSurfaceRim(hdc,
+                   transportBar_,
+                   fade(BlendColor(palette_.surface, palette_.text, 0.10)),
+                   fade(BlendColor(palette_.border, palette_.info, 0.20)),
+                   fade(BlendColor(palette_.border, palette_.accent, 0.15)),
+                   Scale(14));
 
     const bool compactBar = RectHeight(transportBar_) <= Scale(82);
     const int horizontalInset = compactBar ? Scale(18) : Scale(24);
@@ -1091,7 +1161,7 @@ void MainWindow::DrawVolumeSlider(HDC hdc, const PlaybackSessionSnapshot& snapsh
         return FadeForOpacity(color, opacity);
     };
 
-    const bool active = draggingVolume_ || volumeSliderHovered_;
+    const double activeAmount = draggingVolume_ ? 1.0 : std::clamp(volumeHoverAmount_, 0.0, 1.0);
 
     const double volume = std::clamp(snapshot.volume, 0.0, 1.0);
     const int centerY = volumeSlider_.top + RectHeight(volumeSlider_) / 2;
@@ -1106,24 +1176,30 @@ void MainWindow::DrawVolumeSlider(HDC hdc, const PlaybackSessionSnapshot& snapsh
 
     const RECT track = VolumeSliderTrackRect();
     if (RectWidth(track) > Scale(12) && RectHeight(track) > 0) {
-        FillRoundRect(hdc, track, fade(BlendColor(palette_.track, RGB(255, 255, 255), active ? 0.24 : 0.12)), Scale(3));
+        FillRoundRect(hdc,
+                      track,
+                      fade(BlendColor(palette_.track, RGB(255, 255, 255), 0.12 + 0.14 * activeAmount)),
+                      Scale(3));
         RECT fillRect = track;
         fillRect.right = fillRect.left + static_cast<int>(std::round(RectWidth(track) * volume));
         if (RectWidth(fillRect) > 0) {
             FillRoundRect(hdc,
                           fillRect,
-                          fade(active ? BlendColor(palette_.accent, RGB(255, 255, 255), 0.16) : palette_.text),
+                          fade(BlendColor(palette_.text, BlendColor(palette_.accent, RGB(255, 255, 255), 0.16), activeAmount)),
                           Scale(3));
         }
 
         const int knobX = track.left + static_cast<int>(std::round(RectWidth(track) * volume));
-        const int knobRadius = active ? Scale(6) : Scale(5);
+        const int knobRadius = Scale(5) + static_cast<int>(std::round(Scale(1) * activeAmount));
         RECT knob = MakeRect(knobX - knobRadius,
                              centerY - knobRadius,
                              knobX + knobRadius,
                              centerY + knobRadius);
         FillRoundRect(hdc, knob, fade(RGB(255, 255, 255)), knobRadius);
-        StrokeRoundRect(hdc, knob, fade(active ? palette_.accent : RGB(255, 255, 255)), knobRadius);
+        StrokeRoundRect(hdc,
+                        knob,
+                        fade(BlendColor(RGB(255, 255, 255), palette_.accent, activeAmount)),
+                        knobRadius);
 
         if (draggingVolume_) {
             HFONT tipFont = CreateMonoFont(Scale(10), FW_SEMIBOLD);
@@ -1174,16 +1250,22 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
 
     const int savedDc = SaveDC(hdc);
 
-    const COLORREF panel = RGB(43, 43, 42);
-    const COLORREF panelLine = RGB(66, 66, 64);
-    const COLORREF panelRaised = RGB(64, 64, 63);
-    const COLORREF panelHover = RGB(58, 58, 57);
-    const COLORREF panelMuted = RGB(174, 174, 173);
-    const COLORREF panelText = RGB(245, 245, 244);
-    const COLORREF panelAccent = RGB(69, 183, 255);
+    const COLORREF panel = RGB(16, 19, 24);
+    const COLORREF panelLine = RGB(39, 44, 53);
+    const COLORREF panelRaised = RGB(21, 25, 34);
+    const COLORREF panelHover = RGB(25, 30, 40);
+    const COLORREF panelMuted = RGB(152, 161, 175);
+    const COLORREF panelText = RGB(238, 241, 245);
+    const COLORREF panelAccent = RGB(223, 118, 95);
 
     FillRoundRect(hdc, subtitleMenu_, fade(panel), Scale(8));
-    StrokeRoundRect(hdc, subtitleMenu_, fade(RGB(83, 83, 81)), Scale(8));
+    StrokeRoundRect(hdc, subtitleMenu_, fade(BlendColor(panelLine, panelText, 0.08)), Scale(8));
+    DrawSurfaceRim(hdc,
+                   subtitleMenu_,
+                   fade(BlendColor(panel, panelText, 0.14)),
+                   fade(BlendColor(panelLine, panelAccent, 0.18)),
+                   fade(BlendColor(panelLine, palette_.accent, 0.14)),
+                   Scale(10));
 
     HFONT tabFont = CreateUiFont(Scale(13), FW_SEMIBOLD);
     HFONT itemFont = CreateUiFont(Scale(13), FW_NORMAL);
@@ -1231,7 +1313,7 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
                                   header.bottom - Scale(14));
     const int tabWidth = (RectWidth(tabRail) - tabGap * 2) / 3;
     const int activeTab = audioPage ? 0 : (subtitlePage ? 1 : 2);
-    const wchar_t* tabLabels[] = {L"音频", L"字幕", L"弹幕"};
+    const wchar_t* tabLabels[] = {L"Audio", L"Subtitles", L"Danmaku"};
     for (int index = 0; index < 3; ++index) {
         const RECT tab = MakeRect(tabRail.left + index * (tabWidth + tabGap),
                                   tabRail.top,
@@ -1285,7 +1367,7 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
                           fade(panelAccent));
         }
 
-        const std::wstring label = hasTrack ? SubtitleMenuPrimaryLabel(track, snapshot.media) : L"没有可用字幕";
+        const std::wstring label = hasTrack ? SubtitleMenuPrimaryLabel(track, snapshot.media) : L"No subtitles";
         const std::wstring codec = hasTrack
                                        ? (audioPage ? AudioMenuCodecLabel(track, snapshot.media)
                                                     : SubtitleMenuCodecLabel(track, snapshot.media))
@@ -1293,7 +1375,7 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
         const std::wstring displayLabel = hasTrack
                                               ? (audioPage ? AudioMenuPrimaryLabel(track, snapshot.media)
                                                            : label)
-                                              : (audioPage ? L"没有可用音频" : L"没有可用字幕");
+                                              : (audioPage ? L"No audio tracks" : L"No subtitles");
         const RECT codecText = MakeRect(item.right - Scale(76), item.top, item.right - Scale(12), item.bottom);
         const int labelLeft = hasTrack ? item.left + Scale(50) : item.left + Scale(16);
         RECT text = MakeRect(labelLeft,
@@ -1411,7 +1493,7 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
                           fade(panelAccent));
         }
         DrawTextInRect(hdc,
-                       L"启用弹幕",
+                       L"Enable danmaku",
                        MakeRect(toggleRow.left + Scale(62), toggleRow.top, toggleRow.right - Scale(18), toggleRow.bottom),
                        itemFont,
                        fade(panelText),
@@ -1419,21 +1501,21 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
         DrawLine(hdc, subtitleMenu_.left, toggleRow.bottom, subtitleMenu_.right, toggleRow.bottom, fade(panelLine));
 
         const RECT modeRow = nextRow(actionHeight);
-        drawMenuActionRow(modeRow, IconKind::Subtitles, L"显示模式", DanmakuModeText(settings.danmaku.mode));
+        drawMenuActionRow(modeRow, IconKind::Subtitles, L"Display mode", DanmakuModeText(settings.danmaku.mode));
         DrawLine(hdc, subtitleMenu_.left, modeRow.bottom, subtitleMenu_.right, modeRow.bottom, fade(panelLine));
 
         const RECT opacityRow = nextRow(styleHeight);
-        drawStepperRow(opacityRow, L"透明度", PercentTextFromInt(settings.danmaku.opacityPercent));
+        drawStepperRow(opacityRow, L"Opacity", PercentTextFromInt(settings.danmaku.opacityPercent));
         DrawLine(hdc, subtitleMenu_.left, opacityRow.bottom, subtitleMenu_.right, opacityRow.bottom, fade(panelLine));
 
         const RECT speedRow = nextRow(styleHeight);
-        drawStepperRow(speedRow, L"速度", PercentTextFromInt(settings.danmaku.speedPercent));
+        drawStepperRow(speedRow, L"Speed", PercentTextFromInt(settings.danmaku.speedPercent));
         DrawLine(hdc, subtitleMenu_.left, speedRow.bottom, subtitleMenu_.right, speedRow.bottom, fade(panelLine));
 
         const std::wstring danmakuMeta = settings.danmaku.externalDanmakuPath.empty()
                                              ? L"XML/JSON/ASS"
                                              : settings.danmaku.externalDanmakuPath.filename().wstring();
-        drawMenuActionRow(nextRow(actionHeight), IconKind::Folder, L"添加弹幕文件...", danmakuMeta);
+        drawMenuActionRow(nextRow(actionHeight), IconKind::Folder, L"Add danmaku file...", danmakuMeta);
         finish();
         return;
     }
@@ -1457,7 +1539,7 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
                    fade(panelText),
                    DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     DrawTextInRect(hdc,
-                   L"字幕延迟",
+                   L"Subtitle delay",
                    MakeRect(delayRow.left + Scale(70), delayRow.top + Scale(8), delayRow.right - Scale(70), delayRow.top + Scale(26)),
                    smallFont,
                    fade(panelMuted),
@@ -1502,28 +1584,28 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
                        fade(panelMuted),
                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     };
-    drawActionRow(addRow, IconKind::Folder, L"添加字幕文件...", true);
+    drawActionRow(addRow, IconKind::Folder, L"Add subtitle file...", true);
     DrawLine(hdc,
              subtitleMenu_.left,
              addRow.bottom,
              subtitleMenu_.right,
              addRow.bottom,
              fade(panelLine));
-    drawStepperRow(sizeRow, L"\u5b57\u5e55\u5927\u5c0f", SubtitleScaleText(settings.subtitles.fontScale));
+    drawStepperRow(sizeRow, L"Subtitle size", SubtitleScaleText(settings.subtitles.fontScale));
     DrawLine(hdc,
              subtitleMenu_.left,
              sizeRow.bottom,
              subtitleMenu_.right,
              sizeRow.bottom,
              fade(panelLine));
-    drawStepperRow(offsetXRow, L"\u6c34\u5e73\u504f\u79fb", PixelOffsetText(settings.subtitles.offsetXPx));
+    drawStepperRow(offsetXRow, L"Horizontal offset", PixelOffsetText(settings.subtitles.offsetXPx));
     DrawLine(hdc,
              subtitleMenu_.left,
              offsetXRow.bottom,
              subtitleMenu_.right,
              offsetXRow.bottom,
              fade(panelLine));
-    drawStepperRow(offsetYRow, L"\u5782\u76f4\u504f\u79fb", PixelOffsetText(settings.subtitles.offsetYPx));
+    drawStepperRow(offsetYRow, L"Vertical offset", PixelOffsetText(settings.subtitles.offsetYPx));
 
     finish();
 }
@@ -1575,6 +1657,12 @@ void MainWindow::DrawInspectorPanel(HDC hdc,
 
     FillRoundRect(hdc, inspector_, palette_.surface, Scale(12));
     StrokeRoundRect(hdc, inspector_, palette_.border, Scale(12));
+    DrawSurfaceRim(hdc,
+                   inspector_,
+                   BlendColor(palette_.surface, palette_.text, 0.09),
+                   BlendColor(palette_.border, palette_.info, 0.20),
+                   BlendColor(palette_.border, palette_.accent, 0.14),
+                   Scale(14));
 
     RECT inner = DeflateRectCopy(inspector_, Scale(16), Scale(16));
     HFONT titleFont = CreateUiFont(Scale(16), FW_SEMIBOLD);

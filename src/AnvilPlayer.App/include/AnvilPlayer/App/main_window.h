@@ -10,6 +10,7 @@
 #include "AnvilPlayer/App/ui_draw.h"
 #include "AnvilPlayer/App/ui_types.h"
 #include "AnvilPlayer/App/wasapi_audio_player.h"
+#include "AnvilPlayer/App/web_ui_host.h"
 #include "AnvilPlayer/Playback/PlayerController.h"
 #include "resource.h"
 
@@ -19,10 +20,19 @@
 #include <array>
 #include <chrono>
 #include <filesystem>
+#include <memory>
 #include <optional>
+#include <string_view>
 #include <vector>
 
 namespace anvil::app {
+
+struct UiMotionValue {
+    double amount = 0.0;
+    double startAmount = 0.0;
+    double target = 0.0;
+    std::chrono::steady_clock::time_point startedAt{};
+};
 
 // The native Win32 main window. Owns the PlayerController, the three playback
 // backends (native FFmpeg/D3D11, embedded ffplay, raw-frame bridge), the
@@ -36,6 +46,7 @@ public:
     void ConfigureLogging(anvil::playback::LogLevel minimumLevel);
     void SetBackend(PlaybackBackend backend);
     void SetInitialVideoTrackSelection(int selectedTrackIndex);
+    void SetWebUiEnabled(bool enabled);
 
     bool Create(HINSTANCE instance);
     void Show(int commandShow) const;
@@ -59,6 +70,17 @@ private:
     void StartUiAnimationTimer() const;
     bool SidebarAnimationActive() const;
     void UpdateUiAnimations();
+    bool TryCreateWebUi();
+    std::filesystem::path WebUiRoot() const;
+    void HandleWebUiMessage(std::wstring_view message);
+    void PostWebUiState(bool force = true) const;
+    std::wstring BuildWebUiStateJson() const;
+    void SetButtonHoverTarget(int buttonIndex, bool hovered);
+    void ClearButtonHoverTargets();
+    void TriggerButtonPress(int buttonIndex);
+    double ButtonHoverAmount(Command command) const;
+    double ButtonPressAmount(Command command) const;
+    void SetVolumeSliderHover(bool hovered);
     bool IsPointInteractive(POINT point) const;
     void SetProgressHover(bool hovered);
     void ToggleSidebar();
@@ -67,9 +89,10 @@ private:
     bool ShouldShowFullscreenTransport(const anvil::playback::PlaybackSessionSnapshot& snapshot) const;
     bool IsFullscreenTransportActivationPoint(POINT point) const;
     void UpdateFullscreenTransportCursorPolling();
-    void ShowFullscreenTransport();
+    void ShowFullscreenTransport(const wchar_t* reason = L"unspecified");
     void HideFullscreenTransportIfIdle();
     void SetFullscreenTransportTarget(bool visible);
+    std::wstring FullscreenTransportDebugState(const wchar_t* reason) const;
     void BeginVideoPress(POINT point);
     void CompleteVideoLongPress();
     void FinishVideoPress(POINT point);
@@ -198,6 +221,10 @@ private:
     void CancelHdrToneCurveInteraction();
     bool NudgeHdrToneCurveSelection(double deltaNits);
     void ApplyLiveHdrToneCurveSettings();
+    void ApplyHdrToneCurvePoint(int pointIndex, double outputNits);
+    void ApplyHdrToneCurvePoints(
+        const std::array<double, anvil::playback::kHdrToneCurvePointCount>& outputNits,
+        const std::array<bool, anvil::playback::kHdrToneCurvePointCount>& hasOutput);
     void ResetHdrToneCurve();
     void ShowHdrToneCurveWindow();
     void HideHdrToneCurveWindow();
@@ -293,6 +320,8 @@ private:
         std::filesystem::path path;
     };
 
+    static constexpr std::size_t kCommandAnimationSlotCount = 32;
+
     HWND hwnd_ = nullptr;
     HINSTANCE instance_ = nullptr;
     UINT dpi_ = 96;
@@ -306,12 +335,16 @@ private:
     std::optional<FfmpegVideoDecoder> nativeVideoDecoder_;
     std::optional<D3D11VideoRenderer> d3dRenderer_;
     IconPainter iconPainter_;
+    std::unique_ptr<WebUiHost> webUiHost_;
     HWND videoHost_ = nullptr;
     HWND fullscreenOverlay_ = nullptr;
     HWND transportOverlay_ = nullptr;
     HWND subtitleMenuOverlay_ = nullptr;
     HWND hdrToneCurveWindow_ = nullptr;
     bool videoHostReady_ = false;
+    bool webUiRequested_ = true;
+    bool webUiActive_ = false;
+    mutable std::chrono::steady_clock::time_point lastWebUiStatePostedAt_{};
     bool layoutDirty_ = true;
     bool nativeFrameHoldVisible_ = false;
     bool pendingPausedFrameRefresh_ = false;
@@ -342,6 +375,9 @@ private:
     RECT progress_{};
     RECT volumeSlider_{};
     RECT subtitleMenu_{};
+    RECT webUiSubtitleAnchor_{};
+    RECT webUiSubtitlePopover_{};
+    RECT webUiTransportBounds_{};
     RECT hdrToneCurvePlot_{};
     RECT hdrToneCurveExpandedEditor_{};
     RECT hdrToneCurveFloatingReset_{};
@@ -366,6 +402,8 @@ private:
     bool inspectorCollapsed_ = false;
     bool fullscreenTransportVisible_ = false;
     bool subtitleMenuOpen_ = false;
+    bool webUiSubtitleGeometryValid_ = false;
+    bool webUiTransportGeometryValid_ = false;
     bool progressHovered_ = false;
     bool volumeSliderHovered_ = false;
     bool volumeDragChanged_ = false;
@@ -383,7 +421,11 @@ private:
     double fullscreenTransportStartAmount_ = 0.0;
     double fullscreenTransportTarget_ = 0.0;
     double subtitleMenuAmount_ = 0.0;
+    double subtitleMenuStartAmount_ = 0.0;
     double subtitleMenuTarget_ = 0.0;
+    double volumeHoverAmount_ = 0.0;
+    double volumeHoverStartAmount_ = 0.0;
+    double volumeHoverTarget_ = 0.0;
     int settingsScrollOffset_ = 0;
     int settingsScrollMax_ = 0;
     int settingsContentHeight_ = 0;
@@ -392,6 +434,8 @@ private:
     std::chrono::steady_clock::time_point inspectorAnimationStartedAt_{};
     std::chrono::steady_clock::time_point progressHoverAnimationStartedAt_{};
     std::chrono::steady_clock::time_point fullscreenTransportAnimationStartedAt_{};
+    std::chrono::steady_clock::time_point subtitleMenuAnimationStartedAt_{};
+    std::chrono::steady_clock::time_point volumeHoverAnimationStartedAt_{};
     std::chrono::steady_clock::time_point fullscreenTransportLastShownAt_{};
     std::chrono::steady_clock::time_point lastPlaybackUiRefreshAt_{};
     HANDLE playbackTimerQueueTimer_ = nullptr;
@@ -412,6 +456,8 @@ private:
     std::array<bool, anvil::playback::kHdrToneCurvePointCount> selectedHdrToneCurvePoints_{};
     std::vector<int> subtitleMenuTracks_;
     std::vector<int> audioMenuTracks_;
+    std::array<UiMotionValue, kCommandAnimationSlotCount> buttonHoverAnimations_{};
+    std::array<UiMotionValue, kCommandAnimationSlotCount> buttonPressAnimations_{};
     enum class SubtitleMenuPage {
         Audio,
         Subtitles,

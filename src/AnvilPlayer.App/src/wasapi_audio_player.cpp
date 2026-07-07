@@ -61,6 +61,8 @@ bool WasapiAudioPlayer::Start(const std::filesystem::path& mediaPath,
     startPosition_ = startPosition;
     selectedAudioTrackIndex_ = selectedAudioTrackIndex;
     volume_.store(std::clamp(volume, 0.0, 1.0));
+    paused_.store(false);
+    pausePositionMs_.store(startPosition.count());
     pendingSeekMs_.store(-1);
     ResetPlaybackClock();
     {
@@ -89,6 +91,7 @@ bool WasapiAudioPlayer::Start(const std::filesystem::path& mediaPath,
 
 void WasapiAudioPlayer::Stop() {
     stopping_.store(true);
+    paused_.store(false);
     pendingSeekMs_.store(-1);
     SignalStart(false);
     if (playbackThread_.joinable()) {
@@ -98,6 +101,31 @@ void WasapiAudioPlayer::Stop() {
     SetPlaybackClockRunning(false);
 }
 
+void WasapiAudioPlayer::Pause(const std::chrono::milliseconds position) {
+    if (!running_.load()) {
+        SetPlaybackClockRunning(false);
+        return;
+    }
+
+    const auto clamped = std::max(position, std::chrono::milliseconds{0});
+    pausePositionMs_.store(clamped.count());
+    pendingSeekMs_.store(-1);
+    ResetPlaybackClock(clamped);
+    SetPlaybackClockRunning(false);
+    paused_.store(true);
+}
+
+bool WasapiAudioPlayer::Resume(const std::chrono::milliseconds position) {
+    if (!running_.load()) {
+        return false;
+    }
+
+    const auto clamped = std::max(position, std::chrono::milliseconds{0});
+    pendingSeekMs_.store(clamped.count());
+    paused_.store(false);
+    return true;
+}
+
 bool WasapiAudioPlayer::Seek(const std::chrono::milliseconds position) {
     if (!running_.load()) {
         return false;
@@ -105,6 +133,7 @@ bool WasapiAudioPlayer::Seek(const std::chrono::milliseconds position) {
 
     const auto clamped = std::max(position, std::chrono::milliseconds{0});
     pendingSeekMs_.store(clamped.count());
+    paused_.store(false);
     ResetPlaybackClock(clamped);
     return true;
 }
@@ -115,7 +144,7 @@ void WasapiAudioPlayer::SetVolume(const double volume) {
 
 int WasapiAudioPlayer::InterruptCallback(void* opaque) {
     const auto* player = static_cast<const WasapiAudioPlayer*>(opaque);
-    return player && (player->stopping_.load() || player->HasPendingSeek()) ? 1 : 0;
+    return player && (player->stopping_.load() || player->paused_.load() || player->HasPendingSeek()) ? 1 : 0;
 }
 
 void WasapiAudioPlayer::SetPlaybackRate(const double rate) {
@@ -299,6 +328,9 @@ void WasapiAudioPlayer::PlaybackLoop() {
         SignalStart(true);
 
         while (!stopping_.load()) {
+            if (!HandlePause(audioClient.Get(), outputFormat, submittedFrames, audioClientStarted)) {
+                break;
+            }
             if (!ApplyPendingSeek(formatCtx,
                                   codecCtx,
                                   swrCtx,
@@ -312,6 +344,9 @@ void WasapiAudioPlayer::PlaybackLoop() {
 
             const int readResult = av_read_frame(formatCtx, packet);
             if (readResult < 0) {
+                if (paused_.load()) {
+                    continue;
+                }
                 if (HasPendingSeek() &&
                     ApplyPendingSeek(formatCtx,
                                      codecCtx,
@@ -358,6 +393,50 @@ std::optional<std::chrono::milliseconds> WasapiAudioPlayer::TakePendingSeek() {
 
 bool WasapiAudioPlayer::HasPendingSeek() const {
     return pendingSeekMs_.load() >= 0;
+}
+
+bool WasapiAudioPlayer::HandlePause(IAudioClient* audioClient,
+                                    const WasapiFormat& outputFormat,
+                                    uint64_t& submittedFrames,
+                                    bool& audioClientStarted) {
+    if (!paused_.load()) {
+        return true;
+    }
+
+    const auto position = std::chrono::milliseconds{std::max<int64_t>(0, pausePositionMs_.load())};
+    startPosition_ = position;
+    if (audioClientStarted && audioClient) {
+        audioClient->Stop();
+        audioClient->Reset();
+        audioClientStarted = false;
+    }
+    submittedFrames = 0;
+    ResetPlaybackClock(position);
+    SetPlaybackClockRunning(false);
+
+    while (paused_.load() && !stopping_.load() && !HasPendingSeek()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+
+    if (stopping_.load()) {
+        return false;
+    }
+    if (HasPendingSeek()) {
+        return true;
+    }
+    if (!audioClient) {
+        return false;
+    }
+
+    const HRESULT hr = audioClient->Start();
+    if (FAILED(hr)) {
+        LogError(L"IAudioClient::Start after pause failed hr=0x" + HexHr(hr));
+        return false;
+    }
+    audioClientStarted = true;
+    UpdatePlaybackClock(outputFormat, submittedFrames, 0);
+    SetPlaybackClockRunning(true);
+    return true;
 }
 
 bool WasapiAudioPlayer::ApplyPendingSeek(AVFormatContext* formatCtx,
@@ -539,7 +618,7 @@ bool WasapiAudioPlayer::ReceiveFrames(AVCodecContext* codecCtx,
                                       IAudioRenderClient* renderClient,
                                       IAudioClient* audioClient,
                                       uint64_t& submittedFrames) {
-    while (!stopping_.load() && !HasPendingSeek()) {
+    while (!stopping_.load() && !paused_.load() && !HasPendingSeek()) {
         const int ret = avcodec_receive_frame(codecCtx, frame);
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
             return true;
@@ -564,7 +643,7 @@ void WasapiAudioPlayer::DrainDecoder(AVCodecContext* codecCtx,
                                      IAudioRenderClient* renderClient,
                                      IAudioClient* audioClient,
                                      uint64_t& submittedFrames) {
-    while (!stopping_.load() && !HasPendingSeek()) {
+    while (!stopping_.load() && !paused_.load() && !HasPendingSeek()) {
         const int ret = avcodec_receive_frame(codecCtx, frame);
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
             return;
@@ -589,7 +668,7 @@ bool WasapiAudioPlayer::RenderFrame(AVFrame* frame,
     if (!frame || frame->nb_samples <= 0 || !renderClient || !audioClient) {
         return true;
     }
-    if (HasPendingSeek()) {
+    if (paused_.load() || HasPendingSeek()) {
         return true;
     }
     if (ShouldDropSeekPreroll(frame, timeBase, outputFormat)) {
@@ -695,7 +774,7 @@ bool WasapiAudioPlayer::WritePcm(IAudioRenderClient* renderClient,
                                  UINT32 frames,
                                  uint64_t& submittedFrames) {
     UINT32 offsetFrames = 0;
-    while (offsetFrames < frames && !stopping_.load() && !HasPendingSeek()) {
+    while (offsetFrames < frames && !stopping_.load() && !paused_.load() && !HasPendingSeek()) {
         UINT32 bufferFrames = 0;
         HRESULT hr = audioClient->GetBufferSize(&bufferFrames);
         if (FAILED(hr) || bufferFrames == 0) {

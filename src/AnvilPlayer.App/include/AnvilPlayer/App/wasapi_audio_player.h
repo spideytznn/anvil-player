@@ -48,6 +48,8 @@ public:
                int selectedAudioTrackIndex = anvil::playback::kAudioTrackAuto);
 
     void Stop();
+    void Pause(std::chrono::milliseconds position);
+    bool Resume(std::chrono::milliseconds position);
     bool Seek(std::chrono::milliseconds position);
     void SetVolume(double volume);
     void SetPlaybackRate(double rate);
@@ -101,6 +103,10 @@ private:
     void PlaybackLoop();
     std::optional<std::chrono::milliseconds> TakePendingSeek();
     bool HasPendingSeek() const;
+    bool HandlePause(IAudioClient* audioClient,
+                     const WasapiFormat& outputFormat,
+                     uint64_t& submittedFrames,
+                     bool& audioClientStarted);
     bool ApplyPendingSeek(AVFormatContext* formatCtx,
                           AVCodecContext* codecCtx,
                           SwrContext*& swrCtx,
@@ -182,6 +188,8 @@ private:
     std::atomic<double> playbackRate_{1.0};
     std::atomic_bool stopping_{false};
     std::atomic_bool running_{false};
+    std::atomic_bool paused_{false};
+    std::atomic<int64_t> pausePositionMs_{0};
     std::atomic<int64_t> pendingSeekMs_{-1};
     mutable std::mutex stateMutex_;
     std::condition_variable startCv_;

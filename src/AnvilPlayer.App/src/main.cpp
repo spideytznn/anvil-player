@@ -3,6 +3,7 @@
 #include "AnvilPlayer/App/ui_types.h"
 #include "AnvilPlayer/Playback/PlayerController.h"
 
+#include <objbase.h>
 #include <shellapi.h>
 #include <windows.h>
 
@@ -19,6 +20,7 @@ using anvil::playback::LogLevelFromString;
 struct AppArguments {
     std::filesystem::path mediaPath;
     bool autoplay = false;
+    bool webUiEnabled = true;
     LogLevel logLevel = DefaultLogLevel();
     PlaybackBackend backend = PlaybackBackend::NativeFfmpegD3D11;
     int selectedVideoTrackIndex = anvil::playback::kVideoTrackAuto;
@@ -39,6 +41,14 @@ AppArguments ParseArguments(const int argumentCount, wchar_t** arguments) {
         }
         if (argument == L"--debug-log") {
             parsed.logLevel = LogLevel::Debug;
+            continue;
+        }
+        if (argument == L"--native-ui") {
+            parsed.webUiEnabled = false;
+            continue;
+        }
+        if (argument == L"--web-ui") {
+            parsed.webUiEnabled = true;
             continue;
         }
         if (argument == L"--video-stream" && index + 1 < argumentCount) {
@@ -82,10 +92,15 @@ AppArguments ParseArguments(const int argumentCount, wchar_t** arguments) {
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int commandShow) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    const HRESULT comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const bool comInitialized = SUCCEEDED(comResult);
 
     anvil::app::GdiplusSession gdiplus;
     if (!gdiplus.Ready()) {
         MessageBoxW(nullptr, L"Unable to initialize the icon renderer.", L"Anvil Player", MB_ICONERROR | MB_OK);
+        if (comInitialized) {
+            CoUninitialize();
+        }
         return 1;
     }
 
@@ -101,8 +116,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int commandShow) {
     window.ConfigureLogging(appArguments.logLevel);
     window.SetBackend(appArguments.backend);
     window.SetInitialVideoTrackSelection(appArguments.selectedVideoTrackIndex);
+    window.SetWebUiEnabled(appArguments.webUiEnabled && comInitialized);
     if (!window.Create(instance)) {
         MessageBoxW(nullptr, L"Unable to create Anvil Player window.", L"Anvil Player", MB_ICONERROR | MB_OK);
+        if (comInitialized) {
+            CoUninitialize();
+        }
         return 1;
     }
 
@@ -114,5 +133,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int commandShow) {
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
-    return static_cast<int>(message.wParam);
+    const int exitCode = static_cast<int>(message.wParam);
+    if (comInitialized) {
+        CoUninitialize();
+    }
+    return exitCode;
 }

@@ -1,0 +1,1728 @@
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent, type ReactNode, type Ref } from 'react'
+import {
+  Captions,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  Folder,
+  FolderOpen,
+  History,
+  Info,
+  Library,
+  Languages,
+  Maximize2,
+  Minimize2,
+  Monitor,
+  Pause,
+  Play,
+  RotateCcw,
+  ScrollText,
+  Settings,
+  SkipBack,
+  SkipForward,
+  SlidersHorizontal,
+  Square,
+  Volume2
+} from 'lucide-react'
+import { applyAppearanceSettings } from './appearance'
+import {
+  EMPTY_STATE,
+  postNativeCommand,
+  subscribeNativeState,
+  type HdrToneCurvePoint,
+  type MediaListItem,
+  type NativeCommand,
+  type PlayerState,
+  type TrackOption
+} from './nativeBridge'
+
+const LANGUAGE_STORAGE_KEY = 'anvil-player.uiLanguage'
+
+const en = {
+  appTitle: 'Anvil Player',
+  none: 'None',
+  noMediaLoaded: 'No media loaded',
+  ready: 'Ready',
+  openMedia: 'Open Media',
+  showInspector: 'Show inspector',
+  hideInspector: 'Hide inspector',
+  openMediaLabel: 'Open media',
+  settings: 'Settings',
+  inspector: 'Inspector',
+  recent: 'Recent',
+  folder: 'Folder',
+  media: 'Media',
+  system: 'System',
+  log: 'Log',
+  currentFolder: 'Current Folder',
+  mediaInfo: 'Media Info',
+  recentPlayback: 'Recent Playback',
+  noItems: 'No items',
+  noLogEntries: 'No log entries',
+  backend: 'Backend',
+  volume: 'Volume',
+  runtime: 'Runtime',
+  container: 'Container',
+  video: 'Video',
+  audio: 'Audio',
+  resolution: 'Resolution',
+  frameRate: 'Frame rate',
+  hdr: 'HDR',
+  hdrControls: 'HDR controls',
+  hdrOutput: 'HDR output',
+  dolbyVision: 'Dolby Vision',
+  streams: 'Streams',
+  available: 'Available',
+  unavailable: 'Unavailable',
+  on: 'On',
+  off: 'Off',
+  auto: 'Auto',
+  stream: 'Stream',
+  empty: 'Empty',
+  stopped: 'Stopped',
+  playing: 'Playing',
+  paused: 'Paused',
+  opening: 'Opening',
+  error: 'Error',
+  hdrCurve: 'HDR Curve',
+  reset: 'Reset',
+  zoom: 'Zoom',
+  peak: 'Peak',
+  nits: 'nits',
+  language: 'Language',
+  mediaLibrary: 'Media library',
+  interfaceLanguage: 'Interface language',
+  english: 'English',
+  chinese: 'Chinese',
+  back10: 'Back 10 seconds',
+  pause: 'Pause',
+  play: 'Play',
+  forward10: 'Forward 10 seconds',
+  stop: 'Stop',
+  subtitles: 'Subtitles',
+  subtitleTracks: 'Subtitle tracks',
+  audioTracks: 'Audio tracks',
+  danmaku: 'Danmaku',
+  addSubtitleFile: 'Add subtitle file...',
+  addDanmakuFile: 'Add danmaku file...',
+  delay: 'Delay',
+  subtitleSize: 'Subtitle size',
+  horizontalOffset: 'Horizontal offset',
+  verticalOffset: 'Vertical offset',
+  enableDanmaku: 'Enable danmaku',
+  displayMode: 'Display mode',
+  opacity: 'Opacity',
+  speed: 'Speed',
+  danmakuModeScroll: 'Scroll',
+  danmakuModeTop: 'Top',
+  danmakuModeBottom: 'Bottom',
+  fileTypes: 'XML / JSON / ASS',
+  enhanced: 'Enhanced',
+  exitFullscreen: 'Exit fullscreen',
+  fullscreen: 'Fullscreen',
+  chineseSimplified: 'Chinese Simplified',
+  chineseTraditional: 'Chinese Traditional',
+  chineseTrack: 'Chinese',
+  englishTrack: 'English',
+  japaneseTrack: 'Japanese',
+  koreanTrack: 'Korean'
+} as const
+
+const zh: Record<keyof typeof en, string> = {
+  appTitle: 'Anvil Player',
+  none: '无',
+  noMediaLoaded: '未加载媒体',
+  ready: '就绪',
+  openMedia: '打开媒体',
+  showInspector: '显示检查器',
+  hideInspector: '隐藏检查器',
+  openMediaLabel: '打开媒体',
+  settings: '设置',
+  inspector: '检查器',
+  recent: '最近',
+  folder: '文件夹',
+  media: '媒体',
+  system: '系统',
+  log: '日志',
+  currentFolder: '当前文件夹',
+  mediaInfo: '媒体信息',
+  recentPlayback: '最近播放',
+  noItems: '没有项目',
+  noLogEntries: '没有日志',
+  backend: '后端',
+  volume: '音量',
+  runtime: '运行时',
+  container: '封装',
+  video: '视频',
+  audio: '音频',
+  resolution: '分辨率',
+  frameRate: '帧率',
+  hdr: 'HDR',
+  hdrControls: 'HDR 控制',
+  hdrOutput: 'HDR 输出',
+  dolbyVision: '杜比视界',
+  streams: '流',
+  available: '可用',
+  unavailable: '不可用',
+  on: '开',
+  off: '关',
+  auto: '自动',
+  stream: '流',
+  empty: '空',
+  stopped: '已停止',
+  playing: '播放中',
+  paused: '已暂停',
+  opening: '打开中',
+  error: '错误',
+  hdrCurve: 'HDR 曲线',
+  reset: '重置',
+  zoom: '放大',
+  peak: '峰值',
+  nits: '尼特',
+  language: '语言',
+  mediaLibrary: '媒体库',
+  interfaceLanguage: '界面语言',
+  english: 'English',
+  chinese: '中文',
+  back10: '后退 10 秒',
+  pause: '暂停',
+  play: '播放',
+  forward10: '前进 10 秒',
+  stop: '停止',
+  subtitles: '字幕',
+  subtitleTracks: '字幕轨',
+  audioTracks: '音轨',
+  danmaku: '弹幕',
+  addSubtitleFile: '添加字幕文件...',
+  addDanmakuFile: '添加弹幕文件...',
+  delay: '延迟',
+  subtitleSize: '字幕大小',
+  horizontalOffset: '水平偏移',
+  verticalOffset: '垂直偏移',
+  enableDanmaku: '启用弹幕',
+  displayMode: '显示模式',
+  opacity: '透明度',
+  speed: '速度',
+  danmakuModeScroll: '滚动',
+  danmakuModeTop: '顶部',
+  danmakuModeBottom: '底部',
+  fileTypes: 'XML / JSON / ASS',
+  enhanced: '增强',
+  exitFullscreen: '退出全屏',
+  fullscreen: '全屏',
+  chineseSimplified: '简体中文',
+  chineseTraditional: '繁体中文',
+  chineseTrack: '中文',
+  englishTrack: '英语',
+  japaneseTrack: '日语',
+  koreanTrack: '韩语'
+}
+
+const copy = { en, zh }
+
+type UiLanguage = keyof typeof copy
+type Copy = Record<keyof typeof en, string>
+type SubtitlePanel = 'subtitles' | 'audio' | 'danmaku'
+
+function getInitialLanguage(): UiLanguage {
+  try {
+    const saved = window.localStorage.getItem(LANGUAGE_STORAGE_KEY)
+    if (saved === 'en' || saved === 'zh') return saved
+  } catch {
+    // Ignore storage failures inside constrained WebView profiles.
+  }
+  return navigator.language.toLowerCase().startsWith('zh') ? 'zh' : 'en'
+}
+
+function displayTrackLabel(label: string, t: Copy): string {
+  switch (label) {
+    case 'Off': return t.off
+    case 'Auto': return t.auto
+    case 'Chinese Simplified': return t.chineseSimplified
+    case 'Chinese Traditional': return t.chineseTraditional
+    case 'Chinese': return t.chineseTrack
+    case 'English': return t.englishTrack
+    case 'Japanese': return t.japaneseTrack
+    case 'Korean': return t.koreanTrack
+    default: {
+      const streamMatch = /^Stream\s+(.+)$/.exec(label)
+      return streamMatch ? `${t.stream} ${streamMatch[1]}` : label
+    }
+  }
+}
+
+interface RectSnapshot {
+  left: number
+  top: number
+  width: number
+  height: number
+}
+
+const DEFAULT_SUBTITLE_ANCHOR: RectSnapshot = {
+  left: 0,
+  top: 0,
+  width: 30,
+  height: 30
+}
+
+const DISCLOSURE_CLOSE_ELEVATION_MS = 560
+
+function rectSnapshotFromElement(element: HTMLElement | null): RectSnapshot {
+  if (!element) return DEFAULT_SUBTITLE_ANCHOR
+  const rect = element.getBoundingClientRect()
+  return {
+    left: rect.left,
+    top: rect.top,
+    width: rect.width,
+    height: rect.height
+  }
+}
+
+function layoutSnapshotFromElement(element: HTMLElement | null): RectSnapshot {
+  if (!element) return DEFAULT_SUBTITLE_ANCHOR
+  if (element.offsetWidth > 0 && element.offsetHeight > 0) {
+    return {
+      left: element.offsetLeft,
+      top: element.offsetTop,
+      width: element.offsetWidth,
+      height: element.offsetHeight
+    }
+  }
+  return rectSnapshotFromElement(element)
+}
+
+function clampPanelPosition(value: number, size: number, viewportSize: number, margin: number): number {
+  const max = Math.max(margin, viewportSize - size - margin)
+  return clamp(value, margin, max)
+}
+
+function subtitlePopoverLayout(anchor: RectSnapshot): { left: number; top: number; width: number; height: number } {
+  const viewportWidth = window.innerWidth || 1280
+  const viewportHeight = window.innerHeight || 720
+  const compact = viewportWidth <= 900 || viewportHeight <= 560
+  const margin = compact ? 10 : 16
+  const width = Math.min(compact ? 380 : 420, Math.max(280, viewportWidth - margin * 2))
+  const height = Math.min(compact ? 480 : 430, Math.max(260, viewportHeight - (compact ? 126 : 152)))
+  return {
+    left: clampPanelPosition(anchor.left + anchor.width - width, width, viewportWidth, margin),
+    top: clampPanelPosition(anchor.top + anchor.height - height, height, viewportHeight, margin),
+    width,
+    height
+  }
+}
+
+function postSubtitleGeometry(anchor: RectSnapshot): void {
+  const popover = subtitlePopoverLayout(anchor)
+  postNativeCommand({
+    type: 'command',
+    command: 'subtitleGeometry',
+    scale: window.devicePixelRatio || 1,
+    anchorLeft: anchor.left,
+    anchorTop: anchor.top,
+    anchorWidth: anchor.width,
+    anchorHeight: anchor.height,
+    popoverLeft: popover.left,
+    popoverTop: popover.top,
+    popoverWidth: popover.width,
+    popoverHeight: popover.height
+  })
+}
+
+function postTransportGeometry(bounds: RectSnapshot): void {
+  postNativeCommand({
+    type: 'command',
+    command: 'transportGeometry',
+    scale: window.devicePixelRatio || 1,
+    left: bounds.left,
+    top: bounds.top,
+    width: bounds.width,
+    height: bounds.height
+  })
+}
+
+function formatTime(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000))
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+  }
+  return `${minutes}:${String(seconds).padStart(2, '0')}`
+}
+
+function compactPath(path: string, emptyLabel: string): string {
+  if (!path) return emptyLabel
+  const parts = path.split(/[\\/]/).filter(Boolean)
+  if (parts.length <= 3) return path
+  return `${parts[0]} / ... / ${parts.slice(-2).join(' / ')}`
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value))
+}
+
+function formatSignedPixels(value: number): string {
+  return `${value > 0 ? '+' : ''}${value}px`
+}
+
+function formatDelay(ms: number): string {
+  const seconds = ms / 1000
+  return `${seconds > 0 ? '+' : ''}${seconds.toFixed(1)}s`
+}
+
+function formatScale(scale: number): string {
+  return `${Math.round(scale * 100)}%`
+}
+
+function formatPercent(value: number): string {
+  return `${Math.round(value)}%`
+}
+
+function rangeStyle(value: number, min: number, max: number): CSSProperties {
+  const span = Math.max(1, max - min)
+  const percent = clamp(((value - min) / span) * 100, 0, 100)
+  return { '--range-value': `${percent}%` } as CSSProperties
+}
+
+function danmakuModeLabel(mode: number, t: Copy): string {
+  switch (mode) {
+    case 1: return t.danmakuModeTop
+    case 2: return t.danmakuModeBottom
+    default: return t.danmakuModeScroll
+  }
+}
+
+function formatNits(nits: number, t: Copy): string {
+  return `${Math.round(nits)} ${t.nits}`
+}
+
+const HDR_CURVE_MAX_NITS = 4000
+const HDR_CURVE_FOCUS_NITS = 1000
+const HDR_CURVE_FOCUS_UNIT = 0.72
+
+function toneCurveNitsToUnit(nits: number): number {
+  const clamped = clamp(nits, 0, HDR_CURVE_MAX_NITS)
+  if (clamped <= HDR_CURVE_FOCUS_NITS) {
+    return (clamped / HDR_CURVE_FOCUS_NITS) * HDR_CURVE_FOCUS_UNIT
+  }
+  return HDR_CURVE_FOCUS_UNIT + ((clamped - HDR_CURVE_FOCUS_NITS) / (HDR_CURVE_MAX_NITS - HDR_CURVE_FOCUS_NITS)) * (1 - HDR_CURVE_FOCUS_UNIT)
+}
+
+function toneCurveUnitToNits(unit: number): number {
+  const clamped = clamp(unit, 0, 1)
+  if (clamped <= HDR_CURVE_FOCUS_UNIT) {
+    return (clamped / HDR_CURVE_FOCUS_UNIT) * HDR_CURVE_FOCUS_NITS
+  }
+  return HDR_CURVE_FOCUS_NITS + ((clamped - HDR_CURVE_FOCUS_UNIT) / (1 - HDR_CURVE_FOCUS_UNIT)) * (HDR_CURVE_MAX_NITS - HDR_CURVE_FOCUS_NITS)
+}
+
+function IconButton({
+  label,
+  children,
+  active = false,
+  primary = false,
+  disabled = false,
+  subtitleToggle = false,
+  buttonRef,
+  onClick
+}: {
+  label: string
+  children: ReactNode
+  active?: boolean
+  primary?: boolean
+  disabled?: boolean
+  subtitleToggle?: boolean
+  buttonRef?: Ref<HTMLButtonElement>
+  onClick: () => void
+}): JSX.Element {
+  return (
+    <button
+      ref={buttonRef}
+      type="button"
+      className={`line-button icon-button ${primary ? 'is-primary' : ''} ${active ? 'is-active' : ''}`}
+      aria-label={label}
+      title={label}
+      data-subtitle-toggle={subtitleToggle ? 'true' : undefined}
+      disabled={disabled}
+      onClick={onClick}
+    >
+      {children}
+    </button>
+  )
+}
+
+function InfoRow({ label, value, emptyLabel }: { label: string; value: ReactNode; emptyLabel: string }): JSX.Element {
+  const displayValue = value === null || value === undefined || value === '' ? emptyLabel : value
+  return (
+    <div className="info-row">
+      <span>{label}</span>
+      <strong>{displayValue}</strong>
+    </div>
+  )
+}
+
+type HdrCurveBatchCommand = Extract<NativeCommand, { command: 'setHdrToneCurvePoints' }>
+
+interface HdrCurveDrag {
+  pointIndex: number
+  group: boolean
+  selectedIndexes: number[]
+  startPointerNits: number
+  startOutputs: Map<number, number>
+}
+
+interface HdrCurveRangeSelection {
+  startX: number
+  currentX: number
+}
+
+function HdrCurveEditor({ state, t }: { state: PlayerState; t: Copy }): JSX.Element {
+  const svgRef = useRef<SVGSVGElement | null>(null)
+  const [dragging, setDragging] = useState<HdrCurveDrag | null>(null)
+  const [selectedPointIndexes, setSelectedPointIndexes] = useState<number[]>([])
+  const [rangeSelection, setRangeSelection] = useState<HdrCurveRangeSelection | null>(null)
+  const points = [...state.hdrToneCurve].sort((a, b) => a.index - b.index)
+
+  useEffect(() => {
+    setSelectedPointIndexes((current) => {
+      const next = current.filter((index) => index > 0 && points.some((point) => point.index === index))
+      return next.length === current.length ? current : next
+    })
+  }, [points])
+
+  if (!state.hdrToneCurveAvailable || points.length === 0) {
+    return (
+      <div className="control-group">
+        <div className="control-title">{t.hdrCurve}</div>
+        <div className="empty-list">{t.unavailable}</div>
+      </div>
+    )
+  }
+
+  const viewWidth = 320
+  const viewHeight = 178
+  const plot = { left: 42, top: 14, width: 252, height: 118 }
+  const gridTicks = [0, 250, 500, 750, 1000, 2000, 4000]
+  const defaultCurve = [
+    { inputNits: 0, outputNits: 0 },
+    { inputNits: 50, outputNits: 50 },
+    { inputNits: 100, outputNits: 100 },
+    { inputNits: 250, outputNits: 235 },
+    { inputNits: 400, outputNits: 360 },
+    { inputNits: 700, outputNits: 540 },
+    { inputNits: 1000, outputNits: 700 },
+    { inputNits: 2000, outputNits: 880 },
+    { inputNits: 4000, outputNits: 1000 }
+  ]
+
+  const pointLimits = (pointIndex: number): { min: number; max: number } => {
+    const point = points.find((candidate) => candidate.index === pointIndex)
+    if (!point) return { min: 0, max: HDR_CURVE_MAX_NITS }
+    const previous = points.find((candidate) => candidate.index === point.index - 1)
+    const next = points.find((candidate) => candidate.index === point.index + 1)
+    return {
+      min: previous ? previous.outputNits : 0,
+      max: next ? next.outputNits : HDR_CURVE_MAX_NITS
+    }
+  }
+
+  const xForNits = (nits: number): number => plot.left + toneCurveNitsToUnit(nits) * plot.width
+  const yForNits = (nits: number): number => plot.top + (1 - toneCurveNitsToUnit(nits)) * plot.height
+  const pointByIndex = (pointIndex: number): HdrToneCurvePoint | undefined => points.find((point) => point.index === pointIndex)
+  const svgPoint = (event: PointerEvent<Element>): { x: number; y: number } => {
+    const rect = svgRef.current?.getBoundingClientRect()
+    if (!rect || rect.width <= 0 || rect.height <= 0) {
+      return { x: plot.left, y: plot.top + plot.height }
+    }
+    return {
+      x: ((event.clientX - rect.left) / rect.width) * viewWidth,
+      y: ((event.clientY - rect.top) / rect.height) * viewHeight
+    }
+  }
+  const pointerOutputNits = (event: PointerEvent<Element>): number => {
+    const local = svgPoint(event)
+    const unitY = 1 - clamp((local.y - plot.top) / plot.height, 0, 1)
+    return toneCurveUnitToNits(unitY)
+  }
+  const sendPointFromPointer = (pointIndex: number, event: PointerEvent<Element>): void => {
+    const limits = pointLimits(pointIndex)
+    const outputNits = clamp(Math.round(pointerOutputNits(event)), limits.min, Math.max(limits.min, limits.max))
+    postNativeCommand({ type: 'command', command: 'setHdrToneCurvePoint', index: pointIndex, outputNits })
+  }
+  const postPointOutputs = (outputs: Map<number, number>): void => {
+    if (outputs.size === 0) return
+    const command: HdrCurveBatchCommand = { type: 'command', command: 'setHdrToneCurvePoints' }
+    outputs.forEach((outputNits, pointIndex) => {
+      switch (pointIndex) {
+      case 1:
+        command.output1 = outputNits
+        break
+      case 2:
+        command.output2 = outputNits
+        break
+      case 3:
+        command.output3 = outputNits
+        break
+      case 4:
+        command.output4 = outputNits
+        break
+      case 5:
+        command.output5 = outputNits
+        break
+      case 6:
+        command.output6 = outputNits
+        break
+      case 7:
+        command.output7 = outputNits
+        break
+      case 8:
+        command.output8 = outputNits
+        break
+      default:
+        break
+      }
+    })
+    postNativeCommand(command)
+  }
+  const clampSelectionDelta = (selectedIndexes: number[], startOutputs: Map<number, number>, desiredDelta: number): number => {
+    const selectedSet = new Set(selectedIndexes)
+    let minDelta = -HDR_CURVE_MAX_NITS
+    let maxDelta = HDR_CURVE_MAX_NITS
+
+    selectedIndexes.forEach((pointIndex) => {
+      const startOutput = startOutputs.get(pointIndex) ?? pointByIndex(pointIndex)?.outputNits ?? 0
+      const previous = pointByIndex(pointIndex - 1)
+      const next = pointByIndex(pointIndex + 1)
+      const lower = previous && !selectedSet.has(previous.index) ? previous.outputNits : 0
+      const upper = next && !selectedSet.has(next.index) ? next.outputNits : HDR_CURVE_MAX_NITS
+      minDelta = Math.max(minDelta, lower - startOutput)
+      maxDelta = Math.min(maxDelta, upper - startOutput)
+    })
+
+    return clamp(desiredDelta, minDelta, Math.max(minDelta, maxDelta))
+  }
+  const sendDragFromPointer = (drag: HdrCurveDrag, event: PointerEvent<Element>): void => {
+    if (!drag.group) {
+      sendPointFromPointer(drag.pointIndex, event)
+      return
+    }
+
+    const desiredDelta = Math.round(pointerOutputNits(event) - drag.startPointerNits)
+    const delta = clampSelectionDelta(drag.selectedIndexes, drag.startOutputs, desiredDelta)
+    const outputs = new Map<number, number>()
+    drag.selectedIndexes.forEach((pointIndex) => {
+      const startOutput = drag.startOutputs.get(pointIndex)
+      if (startOutput !== undefined) {
+        outputs.set(pointIndex, Math.round(clamp(startOutput + delta, 0, HDR_CURVE_MAX_NITS)))
+      }
+    })
+    postPointOutputs(outputs)
+  }
+  const pointIndexesInRange = (leftX: number, rightX: number): number[] => {
+    const rangeLeft = Math.min(leftX, rightX) - 4
+    const rangeRight = Math.max(leftX, rightX) + 4
+    return points
+      .filter((point) => point.index > 0)
+      .filter((point) => {
+        const x = xForNits(point.inputNits)
+        return x >= rangeLeft && x <= rangeRight
+      })
+      .map((point) => point.index)
+  }
+  const rangeXFromPointer = (event: PointerEvent<Element>): number => {
+    const local = svgPoint(event)
+    return clamp(local.x, plot.left, plot.left + plot.width)
+  }
+  const beginRangeSelection = (event: PointerEvent<Element>): boolean => {
+    if (event.button !== 0 || !event.shiftKey) return false
+    const local = svgPoint(event)
+    if (
+      local.x < plot.left ||
+      local.x > plot.left + plot.width ||
+      local.y < plot.top ||
+      local.y > plot.top + plot.height
+    ) {
+      return false
+    }
+
+    event.preventDefault()
+    event.stopPropagation()
+    svgRef.current?.setPointerCapture(event.pointerId)
+    const x = rangeXFromPointer(event)
+    setDragging(null)
+    setRangeSelection({ startX: x, currentX: x })
+    setSelectedPointIndexes(pointIndexesInRange(x, x))
+    return true
+  }
+  const updateRangeSelection = (event: PointerEvent<Element>): void => {
+    if (!rangeSelection) return
+    const x = rangeXFromPointer(event)
+    setRangeSelection({ ...rangeSelection, currentX: x })
+    setSelectedPointIndexes(pointIndexesInRange(rangeSelection.startX, x))
+  }
+  const beginPointDrag = (point: HdrToneCurvePoint, event: PointerEvent<Element>): void => {
+    if (point.index === 0 || event.button !== 0 || event.shiftKey) return
+    event.preventDefault()
+    event.stopPropagation()
+
+    const clickedSelected = selectedPointIndexes.includes(point.index)
+    const group = clickedSelected && selectedPointIndexes.length > 1
+    const selectedIndexes = group ? selectedPointIndexes : [point.index]
+    const startOutputs = new Map(
+      selectedIndexes.map((pointIndex) => [pointIndex, pointByIndex(pointIndex)?.outputNits ?? 0] as const)
+    )
+
+    svgRef.current?.setPointerCapture(event.pointerId)
+    if (!group) {
+      setSelectedPointIndexes([point.index])
+    }
+    const nextDrag = {
+      pointIndex: point.index,
+      group,
+      selectedIndexes,
+      startPointerNits: pointerOutputNits(event),
+      startOutputs
+    }
+    setDragging(nextDrag)
+    if (!group) {
+      sendPointFromPointer(point.index, event)
+    }
+  }
+  const curvePath = points.map((point) => `${xForNits(point.inputNits)},${yForNits(point.outputNits)}`).join(' ')
+  const referencePath = defaultCurve.map((point) => `${xForNits(point.inputNits)},${yForNits(point.outputNits)}`).join(' ')
+  const selectedSet = new Set(selectedPointIndexes)
+  const selectionBand = rangeSelection
+    ? {
+        x: Math.min(rangeSelection.startX, rangeSelection.currentX),
+        width: Math.abs(rangeSelection.currentX - rangeSelection.startX)
+      }
+    : null
+
+  return (
+    <div className="control-group hdr-curve">
+      <div className="control-title with-action">
+        <span>{t.hdrCurve}</span>
+        <div className="curve-actions">
+          <button className="line-button mini-text-button" type="button" onClick={() => postNativeCommand({ type: 'command', command: 'resetHdrToneCurve' })}>
+            <RotateCcw size={13} />
+            <span>{t.reset}</span>
+          </button>
+          <button className="line-button mini-text-button" type="button" onClick={() => postNativeCommand({ type: 'command', command: 'toggleHdrToneCurveExpanded' })}>
+            <Maximize2 size={13} />
+            <span>{t.zoom}</span>
+          </button>
+        </div>
+      </div>
+      <div className="curve-summary">
+        <span>{t.peak}</span>
+        <strong>{formatNits(state.hdrToneCurvePeakNits, t)}</strong>
+      </div>
+      <svg
+        ref={svgRef}
+        className="hdr-chart"
+        viewBox={`0 0 ${viewWidth} ${viewHeight}`}
+        role="img"
+        aria-label={t.hdrCurve}
+        onPointerDownCapture={(event) => {
+          beginRangeSelection(event)
+        }}
+        onPointerDown={(event) => {
+          if (event.button !== 0 || event.shiftKey || selectedPointIndexes.length === 0) return
+          const target = event.target
+          if (target instanceof Element && target.closest('[data-hdr-point="true"]')) return
+          setSelectedPointIndexes([])
+        }}
+        onPointerMove={(event) => {
+          if (rangeSelection) {
+            updateRangeSelection(event)
+            return
+          }
+          if (dragging) {
+            sendDragFromPointer(dragging, event)
+          }
+        }}
+        onPointerUp={(event) => {
+          if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+            event.currentTarget.releasePointerCapture(event.pointerId)
+          }
+          if (rangeSelection) {
+            updateRangeSelection(event)
+            setRangeSelection(null)
+            return
+          }
+          if (dragging) {
+            sendDragFromPointer(dragging, event)
+            setDragging(null)
+          }
+        }}
+        onPointerCancel={(event) => {
+          if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+            event.currentTarget.releasePointerCapture(event.pointerId)
+          }
+          setRangeSelection(null)
+          setDragging(null)
+        }}
+      >
+        <rect x={plot.left} y={plot.top} width={plot.width} height={plot.height} rx="6" />
+        {gridTicks.map((tick) => {
+          const x = xForNits(tick)
+          const y = yForNits(tick)
+          return (
+            <g key={tick} className={tick === 0 || tick === 1000 ? 'major' : undefined}>
+              <line x1={x} y1={plot.top} x2={x} y2={plot.top + plot.height} />
+              <line x1={plot.left} y1={y} x2={plot.left + plot.width} y2={y} />
+              <text x={x} y={plot.top + plot.height + 17} textAnchor="middle">{tick >= 1000 ? `${tick / 1000}k` : tick}</text>
+              <text x={plot.left - 8} y={y + 4} textAnchor="end">{tick >= 1000 ? `${tick / 1000}k` : tick}</text>
+            </g>
+          )
+        })}
+        {selectionBand && selectionBand.width > 0 && <rect className="selection-band" x={selectionBand.x} y={plot.top} width={selectionBand.width} height={plot.height} rx="4" />}
+        <polyline className="reference" points={referencePath} />
+        <polyline className="curve" points={curvePath} />
+        {points.map((point) => {
+          const active = dragging?.pointIndex === point.index
+          const selected = selectedSet.has(point.index)
+          return (
+            <g key={point.index}>
+              <circle
+                className="hit-target"
+                data-hdr-point="true"
+                cx={xForNits(point.inputNits)}
+                cy={yForNits(point.outputNits)}
+                r={12}
+                onPointerDown={(event) => beginPointDrag(point, event)}
+              />
+              <circle
+                className={`${point.index === 0 ? 'is-anchor' : ''} ${selected ? 'is-selected' : ''} ${active ? 'is-active' : ''}`}
+                data-hdr-point="true"
+                cx={xForNits(point.inputNits)}
+                cy={yForNits(point.outputNits)}
+                r={active ? 5.5 : (selected ? 5 : 4.25)}
+                onPointerDown={(event) => beginPointDrag(point, event)}
+              >
+                <title>{`${Math.round(point.inputNits)} -> ${Math.round(point.outputNits)} ${t.nits}`}</title>
+              </circle>
+            </g>
+          )
+        })}
+      </svg>
+    </div>
+  )
+}
+
+function TopBar({ state, t }: { state: PlayerState; t: Copy }): JSX.Element {
+  return (
+    <header className="topbar line-panel">
+      <div className="brand-area">
+        <img className="brand-mark" src="./app-icon.png" alt="" aria-hidden="true" draggable={false} />
+        <div className="brand-copy">
+          <div className="brand-name">Anvil Player</div>
+          <div className="brand-runtime">{state.runtimeLabel}</div>
+        </div>
+      </div>
+
+      <div className="top-media">
+        <div className="media-name">{state.hasMedia ? state.mediaName : t.noMediaLoaded}</div>
+        <div className="media-meta">{state.hasMedia ? compactPath(state.mediaPath, t.none) : state.backendLabel}</div>
+      </div>
+
+      <IconButton
+        label={state.sidebarCollapsed ? t.showInspector : t.hideInspector}
+        onClick={() => postNativeCommand({ type: 'command', command: 'toggleSidebar' })}
+      >
+        {state.sidebarCollapsed ? <ChevronLeft size={17} /> : <ChevronRight size={17} />}
+      </IconButton>
+      <IconButton label={t.openMediaLabel} onClick={() => postNativeCommand({ type: 'command', command: 'open' })}>
+        <FolderOpen size={17} />
+      </IconButton>
+      <IconButton label={t.mediaLibrary} onClick={() => { window.location.hash = '#/library' }}>
+        <Library size={17} />
+      </IconButton>
+      <IconButton
+        label={t.settings}
+        active={state.inspectorTab === 'settings'}
+        onClick={() => postNativeCommand({ type: 'command', command: 'settings' })}
+      >
+        <Settings size={17} />
+      </IconButton>
+    </header>
+  )
+}
+
+function VideoStage({ state, t }: { state: PlayerState; t: Copy }): JSX.Element {
+  return (
+    <main className="video-shell">
+      <div className="video-stage">
+        {!state.hasMedia && (
+          <div className="empty-stage">
+            <div className="empty-play">
+              <Play size={32} fill="currentColor" />
+            </div>
+            <div className="empty-title">{t.noMediaLoaded}</div>
+            <div className="empty-subtitle">{t.ready}</div>
+            <button className="line-button text-button" type="button" onClick={() => postNativeCommand({ type: 'command', command: 'open' })}>
+              <FolderOpen size={16} />
+              <span>{t.openMedia}</span>
+            </button>
+          </div>
+        )}
+      </div>
+    </main>
+  )
+}
+
+function inspectorTabs(t: Copy) {
+  return [
+    { key: 'recent', label: t.recent, icon: History, command: 'inspectorRecent' },
+    { key: 'folder', label: t.folder, icon: Folder, command: 'inspectorFolder' },
+    { key: 'media', label: t.media, icon: Info, command: 'inspectorMedia' },
+    { key: 'system', label: t.system, icon: Monitor, command: 'inspectorSystem' },
+    { key: 'log', label: t.log, icon: ScrollText, command: 'inspectorLog' }
+  ] as const
+}
+
+function MediaList({ items, t }: { items: MediaListItem[]; t: Copy }): JSX.Element {
+  if (items.length === 0) {
+    return <div className="empty-list">{t.noItems}</div>
+  }
+
+  return (
+    <div className="media-list">
+      {items.map((item) => (
+        <button
+          key={item.path}
+          className="media-list-item"
+          type="button"
+          title={item.path}
+          onClick={() => postNativeCommand({ type: 'command', command: 'openPath', path: item.path })}
+        >
+          <span>{item.name}</span>
+          <small>{compactPath(item.path, t.none)}</small>
+        </button>
+      ))}
+    </div>
+  )
+}
+
+function LanguageSwitcher({
+  language,
+  onLanguageChange,
+  t
+}: {
+  language: UiLanguage
+  onLanguageChange: (language: UiLanguage) => void
+  t: Copy
+}): JSX.Element {
+  const [open, setOpen] = useState(false)
+  const [elevated, setElevated] = useState(false)
+  const elevationTimerRef = useRef<number | null>(null)
+  const options = [
+    { value: 'zh' as UiLanguage, label: t.chinese },
+    { value: 'en' as UiLanguage, label: t.english }
+  ]
+  const currentLabel = options.find((option) => option.value === language)?.label ?? language
+
+  useEffect(() => {
+    if (elevationTimerRef.current !== null) {
+      window.clearTimeout(elevationTimerRef.current)
+      elevationTimerRef.current = null
+    }
+
+    if (open) {
+      setElevated(true)
+      return undefined
+    }
+
+    elevationTimerRef.current = window.setTimeout(() => {
+      elevationTimerRef.current = null
+      setElevated(false)
+    }, DISCLOSURE_CLOSE_ELEVATION_MS)
+
+    return () => {
+      if (elevationTimerRef.current !== null) {
+        window.clearTimeout(elevationTimerRef.current)
+        elevationTimerRef.current = null
+      }
+    }
+  }, [open])
+
+  return (
+    <div className="control-group language-control">
+      <div className="control-title with-action">
+        <span className="control-title-label">
+          <Languages size={14} />
+          <span>{t.interfaceLanguage}</span>
+        </span>
+      </div>
+      <div className={`language-disclosure ${elevated ? 'is-elevated' : ''}`}>
+        <div
+          className={`language-disclosure-panel ${open ? 'is-open' : ''}`}
+          onClick={(event) => event.stopPropagation()}
+          onPointerDown={(event) => event.stopPropagation()}
+        >
+          <button
+            type="button"
+            className="language-trigger"
+            aria-expanded={open}
+            aria-label={t.interfaceLanguage}
+            onClick={() => setOpen((value) => !value)}
+          >
+            <span className="language-trigger-copy">
+              <strong>{currentLabel}</strong>
+            </span>
+            <ChevronDown size={14} className={`language-chevron ${open ? 'is-open' : ''}`} />
+          </button>
+          <div className={`language-options ${open ? 'is-open' : ''}`}>
+            <div className="language-options-body">
+              {options.map((option, index) => {
+                const active = option.value === language
+                return (
+                  <button
+                    key={option.value}
+                    type="button"
+                    className={`language-option ${active ? 'is-selected' : ''}`}
+                    style={{
+                      transitionDelay: open ? `${index * 42}ms` : '0ms'
+                    }}
+                    onClick={() => {
+                      onLanguageChange(option.value)
+                      setOpen(false)
+                    }}
+                  >
+                    <span className="language-option-dot" />
+                    <span>{option.label}</span>
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+        </div>
+
+        {open && <div className="language-outside" onClick={() => setOpen(false)} />}
+
+        <div className="language-placeholder" aria-hidden="true">
+          <div className="language-trigger">
+            <span className="language-trigger-copy">
+              <strong>{currentLabel}</strong>
+            </span>
+            <ChevronDown size={14} />
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function InspectorContent({
+  state,
+  language,
+  onLanguageChange,
+  t
+}: {
+  state: PlayerState
+  language: UiLanguage
+  onLanguageChange: (language: UiLanguage) => void
+  t: Copy
+}): JSX.Element {
+  if (state.inspectorTab === 'settings') {
+    return (
+      <div className="inspector-content">
+        <div className="section-title">
+          <SlidersHorizontal size={15} />
+          <span>{t.settings}</span>
+        </div>
+        <LanguageSwitcher language={language} onLanguageChange={onLanguageChange} t={t} />
+        <HdrCurveEditor state={state} t={t} />
+        <InfoRow label={t.backend} value={state.backendLabel} emptyLabel={t.none} />
+        <InfoRow label={t.volume} value={`${Math.round(state.volume * 100)}%`} emptyLabel={t.none} />
+      </div>
+    )
+  }
+
+  if (state.inspectorTab === 'folder') {
+    return (
+      <div className="inspector-content">
+        <div className="section-title">
+          <Folder size={15} />
+          <span>{t.currentFolder}</span>
+        </div>
+        <MediaList items={state.folderMedia} t={t} />
+      </div>
+    )
+  }
+
+  if (state.inspectorTab === 'media') {
+    return (
+      <div className="inspector-content">
+        <div className="section-title">
+          <Info size={15} />
+          <span>{t.mediaInfo}</span>
+        </div>
+        <InfoRow label={t.container} value={state.container} emptyLabel={t.none} />
+        <InfoRow label={t.video} value={state.hasVideo ? state.videoCodec : t.off} emptyLabel={t.none} />
+        <InfoRow label={t.audio} value={state.hasAudio ? state.audioCodec : t.off} emptyLabel={t.none} />
+        <InfoRow label={t.resolution} value={state.resolution} emptyLabel={t.none} />
+        <InfoRow label={t.frameRate} value={state.frameRate} emptyLabel={t.none} />
+        <InfoRow label={t.hdr} value={state.hdrFormat} emptyLabel={t.none} />
+        <InfoRow label={t.streams} value={state.streamCount || 0} emptyLabel={t.none} />
+      </div>
+    )
+  }
+
+  if (state.inspectorTab === 'system') {
+    return (
+      <div className="inspector-content">
+        <div className="section-title">
+          <Monitor size={15} />
+          <span>{t.system}</span>
+        </div>
+        <InfoRow label={t.runtime} value={state.runtimeLabel} emptyLabel={t.none} />
+        <InfoRow label={t.backend} value={state.backendLabel} emptyLabel={t.none} />
+        <InfoRow label={t.hdrControls} value={state.hdrAvailable ? t.available : t.unavailable} emptyLabel={t.none} />
+        <InfoRow label={t.hdrOutput} value={state.hdrOutput ? t.on : t.off} emptyLabel={t.none} />
+        <InfoRow label={t.dolbyVision} value={state.cmv4Available ? t.available : t.unavailable} emptyLabel={t.none} />
+      </div>
+    )
+  }
+
+  if (state.inspectorTab === 'log') {
+    return (
+      <div className="inspector-content">
+        <div className="section-title">
+          <ScrollText size={15} />
+          <span>{t.log}</span>
+        </div>
+        <div className="log-list">
+          {state.logLines.length === 0 ? <div className="empty-list">{t.noLogEntries}</div> : state.logLines.map((line, index) => <div key={`${index}-${line}`}>{line}</div>)}
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="inspector-content">
+      <div className="section-title">
+        <History size={15} />
+        <span>{t.recentPlayback}</span>
+      </div>
+      <MediaList items={state.recentMedia} t={t} />
+    </div>
+  )
+}
+
+function Inspector({
+  state,
+  language,
+  onLanguageChange,
+  t
+}: {
+  state: PlayerState
+  language: UiLanguage
+  onLanguageChange: (language: UiLanguage) => void
+  t: Copy
+}): JSX.Element {
+  const tabs = inspectorTabs(t)
+
+  return (
+    <aside className={`inspector line-panel ${state.sidebarCollapsed ? 'is-collapsed' : ''}`} aria-hidden={state.sidebarCollapsed}>
+      <div className="inspector-head">
+        <div>
+          <div className="panel-title">{state.inspectorTab === 'settings' ? t.settings : t.inspector}</div>
+          <div className="panel-subtitle">{state.hasMedia ? state.mediaName : t.noMediaLoaded}</div>
+        </div>
+      </div>
+
+      {state.inspectorTab !== 'settings' && (
+        <div className="inspector-tabs">
+          {tabs.map((tab) => {
+            const Icon = tab.icon
+            const selected = state.inspectorTab === tab.key
+            return (
+              <button
+                key={tab.key}
+                className={`tab-button ${selected ? 'is-selected' : ''}`}
+                type="button"
+                title={tab.label}
+                onClick={() => postNativeCommand({ type: 'command', command: tab.command })}
+              >
+                <Icon size={14} />
+                <span>{tab.label}</span>
+              </button>
+            )
+          })}
+        </div>
+      )}
+
+      <InspectorContent state={state} language={language} onLanguageChange={onLanguageChange} t={t} />
+    </aside>
+  )
+}
+
+function TrackList({
+  tracks,
+  selectedTrack,
+  t,
+  onSelect
+}: {
+  tracks: TrackOption[]
+  selectedTrack: number
+  t: Copy
+  onSelect: (index: number) => void
+}): JSX.Element {
+  if (tracks.length === 0) {
+    return <div className="empty-list">{t.noItems}</div>
+  }
+
+  return (
+    <div className="track-list">
+      {tracks.map((track) => (
+        <button
+          key={track.index}
+          className={`track-option ${track.index === selectedTrack ? 'is-selected' : ''}`}
+          type="button"
+          onClick={() => onSelect(track.index)}
+        >
+          <span>{displayTrackLabel(track.label, t)}</span>
+          {track.detail && <small>{track.detail}</small>}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+function RangeControl({
+  label,
+  valueLabel,
+  children
+}: {
+  label: string
+  valueLabel: string
+  children: ReactNode
+}): JSX.Element {
+  return (
+    <label className="control-slider">
+      <div className="control-slider-head">
+        <span>{label}</span>
+        <strong>{valueLabel}</strong>
+      </div>
+      {children}
+    </label>
+  )
+}
+
+function SubtitlePopover({
+  state,
+  t,
+  open,
+  anchor
+}: {
+  state: PlayerState
+  t: Copy
+  open: boolean
+  anchor: RectSnapshot
+}): JSX.Element {
+  const [activePanel, setActivePanel] = useState<SubtitlePanel>('subtitles')
+  const selectedSubtitle = state.subtitleTracks.find((track) => track.index === state.subtitleSelectedTrack)
+  const selectedSubtitleLabel = selectedSubtitle ? displayTrackLabel(selectedSubtitle.label, t) : t.off
+  const selectedAudio = state.audioTracks.find((track) => track.index === state.audioSelectedTrack)
+  const selectedAudioLabel = selectedAudio ? displayTrackLabel(selectedAudio.label, t) : t.auto
+  const danmakuLabel = state.danmakuEnabled ? t.on : t.off
+  const layout = subtitlePopoverLayout(anchor)
+  const style = {
+    '--subtitle-anchor-left': `${anchor.left}px`,
+    '--subtitle-anchor-top': `${anchor.top}px`,
+    '--subtitle-anchor-width': `${anchor.width}px`,
+    '--subtitle-anchor-height': `${anchor.height}px`,
+    '--subtitle-anchor-right': `${anchor.left + anchor.width}px`,
+    '--subtitle-open-left': `${layout.left}px`,
+    '--subtitle-open-top': `${layout.top}px`,
+    '--subtitle-popover-width': `${layout.width}px`,
+    '--subtitle-popover-height': `${layout.height}px`
+  } as CSSProperties
+  const tabs = [
+    { key: 'subtitles' as SubtitlePanel, label: t.subtitles, value: selectedSubtitleLabel, icon: Captions },
+    { key: 'audio' as SubtitlePanel, label: t.audio, value: selectedAudioLabel, icon: Volume2 },
+    { key: 'danmaku' as SubtitlePanel, label: t.danmaku, value: danmakuLabel, icon: ScrollText }
+  ]
+
+  return (
+    <div
+      className={`subtitle-popover line-panel ${open ? 'is-open' : 'is-closing'}`}
+      style={style}
+      data-subtitle-popover="true"
+      role="dialog"
+      aria-label={t.subtitles}
+    >
+      <div className="subtitle-popover-content">
+        <div className="subtitle-tabs" role="tablist" aria-label={t.subtitles}>
+          {tabs.map((tab) => {
+            const Icon = tab.icon
+            const selected = activePanel === tab.key
+            return (
+              <button
+                key={tab.key}
+                className={`subtitle-tab ${selected ? 'is-selected' : ''}`}
+                type="button"
+                role="tab"
+                aria-selected={selected}
+                onClick={() => setActivePanel(tab.key)}
+              >
+                <Icon size={14} />
+                <span>{tab.label}</span>
+                <small>{tab.value}</small>
+              </button>
+            )
+          })}
+        </div>
+
+        <div className="subtitle-page-scroll">
+          {activePanel === 'subtitles' && (
+            <div className="subtitle-page">
+              <section className="subtitle-section">
+                <div className="control-title">{t.subtitleTracks}</div>
+                <TrackList
+                  tracks={state.subtitleTracks}
+                  selectedTrack={state.subtitleSelectedTrack}
+                  t={t}
+                  onSelect={(index) => postNativeCommand({ type: 'command', command: 'setSubtitleTrack', index })}
+                />
+              </section>
+
+              <button className="line-button text-button full-width-button" type="button" onClick={() => postNativeCommand({ type: 'command', command: 'openSubtitleFile' })}>
+                <FolderOpen size={15} />
+                <span>{t.addSubtitleFile}</span>
+              </button>
+
+              <section className="subtitle-section">
+                <RangeControl label={t.delay} valueLabel={formatDelay(state.subtitleDelayMs)}>
+                  <input
+                    className="simple-range"
+                    style={rangeStyle(clamp(state.subtitleDelayMs, -5000, 5000), -5000, 5000)}
+                    type="range"
+                    min={-5000}
+                    max={5000}
+                    step={100}
+                    value={clamp(state.subtitleDelayMs, -5000, 5000)}
+                    onChange={(event) => postNativeCommand({ type: 'command', command: 'setSubtitleDelay', delayMs: Number(event.currentTarget.value) })}
+                  />
+                </RangeControl>
+                <RangeControl label={t.subtitleSize} valueLabel={formatScale(state.subtitleFontScale)}>
+                  <input
+                    className="simple-range"
+                    style={rangeStyle(clamp(state.subtitleFontScale, 0.5, 2), 0.5, 2)}
+                    type="range"
+                    min={0.5}
+                    max={2}
+                    step={0.05}
+                    value={clamp(state.subtitleFontScale, 0.5, 2)}
+                    onChange={(event) => postNativeCommand({ type: 'command', command: 'setSubtitleFontScale', scale: Number(event.currentTarget.value) })}
+                  />
+                </RangeControl>
+                <RangeControl label={t.horizontalOffset} valueLabel={formatSignedPixels(state.subtitleOffsetX)}>
+                  <input
+                    className="simple-range"
+                    style={rangeStyle(clamp(state.subtitleOffsetX, -200, 200), -200, 200)}
+                    type="range"
+                    min={-200}
+                    max={200}
+                    step={5}
+                    value={clamp(state.subtitleOffsetX, -200, 200)}
+                    onChange={(event) => postNativeCommand({ type: 'command', command: 'setSubtitleOffset', x: Number(event.currentTarget.value), y: state.subtitleOffsetY })}
+                  />
+                </RangeControl>
+                <RangeControl label={t.verticalOffset} valueLabel={formatSignedPixels(state.subtitleOffsetY)}>
+                  <input
+                    className="simple-range"
+                    style={rangeStyle(clamp(state.subtitleOffsetY, -200, 200), -200, 200)}
+                    type="range"
+                    min={-200}
+                    max={200}
+                    step={5}
+                    value={clamp(state.subtitleOffsetY, -200, 200)}
+                    onChange={(event) => postNativeCommand({ type: 'command', command: 'setSubtitleOffset', x: state.subtitleOffsetX, y: Number(event.currentTarget.value) })}
+                  />
+                </RangeControl>
+              </section>
+            </div>
+          )}
+
+          {activePanel === 'audio' && (
+            <div className="subtitle-page">
+              <section className="subtitle-section">
+                <div className="control-title">{t.audioTracks}</div>
+                <TrackList
+                  tracks={state.audioTracks}
+                  selectedTrack={state.audioSelectedTrack}
+                  t={t}
+                  onSelect={(index) => postNativeCommand({ type: 'command', command: 'setAudioTrack', index })}
+                />
+              </section>
+
+              <section className="subtitle-section">
+                <RangeControl label={t.volume} valueLabel={formatPercent(state.volume * 100)}>
+                  <input
+                    className="simple-range"
+                    style={rangeStyle(clamp(state.volume * 100, 0, 100), 0, 100)}
+                    type="range"
+                    min={0}
+                    max={100}
+                    step={1}
+                    value={clamp(Math.round(state.volume * 100), 0, 100)}
+                    onChange={(event) => postNativeCommand({ type: 'command', command: 'setVolume', volume: Number(event.currentTarget.value) / 100 })}
+                  />
+                </RangeControl>
+              </section>
+            </div>
+          )}
+
+          {activePanel === 'danmaku' && (
+            <div className="subtitle-page">
+              <section className="subtitle-section">
+                <button
+                  className={`menu-action-row ${state.danmakuEnabled ? 'is-selected' : ''}`}
+                  type="button"
+                  onClick={() => postNativeCommand({ type: 'command', command: 'toggleDanmakuEnabled' })}
+                >
+                  <span>{t.enableDanmaku}</span>
+                  <strong>{state.danmakuEnabled ? t.on : t.off}</strong>
+                </button>
+                <button className="menu-action-row" type="button" onClick={() => postNativeCommand({ type: 'command', command: 'cycleDanmakuMode' })}>
+                  <span>{t.displayMode}</span>
+                  <strong>{danmakuModeLabel(state.danmakuMode, t)}</strong>
+                </button>
+              </section>
+
+              <section className="subtitle-section">
+                <RangeControl label={t.opacity} valueLabel={formatPercent(state.danmakuOpacityPercent)}>
+                  <input
+                    className="simple-range"
+                    style={rangeStyle(clamp(state.danmakuOpacityPercent, 20, 100), 20, 100)}
+                    type="range"
+                    min={20}
+                    max={100}
+                    step={5}
+                    value={clamp(state.danmakuOpacityPercent, 20, 100)}
+                    onChange={(event) => postNativeCommand({ type: 'command', command: 'setDanmakuOpacity', opacityPercent: Number(event.currentTarget.value) })}
+                  />
+                </RangeControl>
+                <RangeControl label={t.speed} valueLabel={formatPercent(state.danmakuSpeedPercent)}>
+                  <input
+                    className="simple-range"
+                    style={rangeStyle(clamp(state.danmakuSpeedPercent, 50, 200), 50, 200)}
+                    type="range"
+                    min={50}
+                    max={200}
+                    step={10}
+                    value={clamp(state.danmakuSpeedPercent, 50, 200)}
+                    onChange={(event) => postNativeCommand({ type: 'command', command: 'setDanmakuSpeed', speedPercent: Number(event.currentTarget.value) })}
+                  />
+                </RangeControl>
+              </section>
+
+              <button className="line-button text-button full-width-button subtitle-file-button" type="button" onClick={() => postNativeCommand({ type: 'command', command: 'openDanmakuFile' })}>
+                <FolderOpen size={15} />
+                <span>{t.addDanmakuFile}</span>
+                <small>{state.danmakuPath ? compactPath(state.danmakuPath, t.none) : t.fileTypes}</small>
+              </button>
+            </div>
+          )}
+        </div>
+        <div className="subtitle-footer" aria-hidden="true" />
+      </div>
+    </div>
+  )
+}
+
+function Transport({
+  state,
+  t,
+  transportRef,
+  subtitleButtonRef,
+  subtitleVisualActive,
+  onSubtitleMenu
+}: {
+  state: PlayerState
+  t: Copy
+  transportRef: Ref<HTMLElement>
+  subtitleButtonRef: Ref<HTMLButtonElement>
+  subtitleVisualActive: boolean
+  onSubtitleMenu: () => void
+}): JSX.Element {
+  const [volumeHover, setVolumeHover] = useState(false)
+  const [volumeDragging, setVolumeDragging] = useState(false)
+  const progress = useMemo(() => {
+    if (state.durationMs <= 0) return 0
+    return Math.max(0, Math.min(1000, Math.round((state.positionMs / state.durationMs) * 1000)))
+  }, [state.durationMs, state.positionMs])
+  const bufferedProgress = useMemo(() => {
+    if (state.durationMs <= 0) return progress
+    const buffered = Math.round((Math.max(state.bufferedEndMs, state.positionMs) / state.durationMs) * 1000)
+    return Math.max(progress, Math.min(1000, buffered))
+  }, [progress, state.bufferedEndMs, state.durationMs, state.positionMs])
+  const playing = state.playbackState === 'Playing'
+  const hdrButtonLabel = state.cmv4Available ? t.dolbyVision : t.hdr
+  const volumePercent = Math.round(state.volume * 100)
+  const showVolumePercent = volumeHover || volumeDragging
+  const progressStyle = {
+    '--progress': `${progress / 10}%`,
+    '--buffered': `${bufferedProgress / 10}%`
+  } as CSSProperties
+  const volumeStyle = {
+    '--volume-x': `${volumePercent}%`
+  } as CSSProperties
+
+  return (
+    <footer ref={transportRef} className="transport line-panel">
+      <div className="time-row">
+        <span>{formatTime(state.positionMs)}</span>
+        <span>{formatTime(state.durationMs)}</span>
+      </div>
+      <div className="progress-control" style={progressStyle}>
+        <div className="progress-track" aria-hidden="true">
+          <span className="progress-buffered" />
+          <span className="progress-played" />
+        </div>
+        <input
+          className="progress-slider"
+          type="range"
+          min={0}
+          max={1000}
+          value={progress}
+          disabled={!state.hasMedia || state.durationMs <= 0}
+          onChange={(event) => {
+            postNativeCommand({
+              type: 'command',
+              command: 'seekToRatio',
+              ratio: Number(event.currentTarget.value) / 1000
+            })
+          }}
+        />
+      </div>
+      <div className="transport-row">
+        <div className="transport-left">
+          <IconButton label={t.back10} disabled={!state.hasMedia} onClick={() => postNativeCommand({ type: 'command', command: 'back' })}>
+            <SkipBack size={18} />
+          </IconButton>
+          <IconButton label={playing ? t.pause : t.play} primary disabled={!state.hasMedia} onClick={() => postNativeCommand({ type: 'command', command: 'playPause' })}>
+            {playing ? <Pause size={22} fill="currentColor" /> : <Play size={22} fill="currentColor" />}
+          </IconButton>
+          <IconButton label={t.forward10} disabled={!state.hasMedia} onClick={() => postNativeCommand({ type: 'command', command: 'forward' })}>
+            <SkipForward size={18} />
+          </IconButton>
+          <IconButton label={t.stop} disabled={!state.hasMedia} onClick={() => postNativeCommand({ type: 'command', command: 'stop' })}>
+            <Square size={17} fill="currentColor" />
+          </IconButton>
+          <div
+            className={`volume-control ${showVolumePercent ? 'is-active' : ''}`}
+            onPointerEnter={() => setVolumeHover(true)}
+            onPointerLeave={() => setVolumeHover(false)}
+          >
+            <Volume2 size={17} />
+            <div className="volume-slider-wrap" data-volume={`${volumePercent}%`} style={volumeStyle}>
+              <input
+                aria-label={t.volume}
+                type="range"
+                min={0}
+                max={100}
+                value={volumePercent}
+                onPointerDown={() => setVolumeDragging(true)}
+                onPointerUp={() => setVolumeDragging(false)}
+                onPointerCancel={() => setVolumeDragging(false)}
+                onBlur={() => setVolumeDragging(false)}
+                onChange={(event) => {
+                  postNativeCommand({
+                    type: 'command',
+                    command: 'setVolume',
+                    volume: Number(event.currentTarget.value) / 100
+                  })
+                }}
+              />
+            </div>
+          </div>
+        </div>
+
+        <div className="transport-right">
+          {state.hdrAvailable && (
+            <button className={`line-button label-button ${state.hdrOutput ? 'is-active' : ''}`} type="button" onClick={() => postNativeCommand({ type: 'command', command: 'toggleHdr' })}>
+              {hdrButtonLabel}
+            </button>
+          )}
+          {state.cmv4Available && (
+            <button className={`line-button label-button ${state.cmv4Enabled ? 'is-active' : ''}`} type="button" onClick={() => postNativeCommand({ type: 'command', command: 'toggleCmv4' })}>
+              {t.enhanced}
+            </button>
+          )}
+          <IconButton label={t.subtitles} subtitleToggle buttonRef={subtitleButtonRef} onClick={onSubtitleMenu}>
+            {state.fullscreen && !subtitleVisualActive ? (
+              <Captions size={18} />
+            ) : (
+              <span className="subtitle-button-icon-space" aria-hidden="true" />
+            )}
+          </IconButton>
+          <IconButton label={state.fullscreen ? t.exitFullscreen : t.fullscreen} onClick={() => postNativeCommand({ type: 'command', command: 'toggleFullscreen' })}>
+            {state.fullscreen ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
+          </IconButton>
+        </div>
+      </div>
+    </footer>
+  )
+}
+
+export default function App(): JSX.Element {
+  const [state, setState] = useState<PlayerState>(EMPTY_STATE)
+  const [language, setLanguage] = useState<UiLanguage>(() => getInitialLanguage())
+  const [subtitlePopoverMounted, setSubtitlePopoverMounted] = useState(false)
+  const [subtitlePopoverOpen, setSubtitlePopoverOpen] = useState(false)
+  const [subtitleAnchor, setSubtitleAnchor] = useState<RectSnapshot>(DEFAULT_SUBTITLE_ANCHOR)
+  const [subtitleAnchorReady, setSubtitleAnchorReady] = useState(false)
+  const transportRef = useRef<HTMLElement | null>(null)
+  const subtitleButtonRef = useRef<HTMLButtonElement | null>(null)
+  const t = copy[language]
+  const subtitleVisualActive = subtitlePopoverMounted || subtitlePopoverOpen || state.subtitleMenuOpen
+
+  const captureSubtitleAnchor = (): RectSnapshot => {
+    const element = subtitleButtonRef.current
+    const anchor = rectSnapshotFromElement(element)
+    setSubtitleAnchor(anchor)
+    setSubtitleAnchorReady(Boolean(element))
+    return anchor
+  }
+
+  const syncSubtitleAnchor = (): void => {
+    const anchor = captureSubtitleAnchor()
+    if (subtitleButtonRef.current) {
+      postSubtitleGeometry(anchor)
+    }
+  }
+
+  useEffect(() => {
+    applyAppearanceSettings()
+    return subscribeNativeState(setState)
+  }, [])
+
+  useEffect(() => {
+    const updateAnchor = (): void => {
+      syncSubtitleAnchor()
+    }
+    updateAnchor()
+    window.addEventListener('resize', updateAnchor)
+    return () => window.removeEventListener('resize', updateAnchor)
+  }, [])
+
+  useLayoutEffect(() => {
+    syncSubtitleAnchor()
+  }, [state.fullscreen, state.fullscreenTransportVisible, state.sidebarCollapsed, subtitleVisualActive])
+
+  useEffect(() => {
+    const firstFrame = window.requestAnimationFrame(syncSubtitleAnchor)
+    const secondFrame = window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(syncSubtitleAnchor)
+    })
+    const settleTimer = window.setTimeout(syncSubtitleAnchor, 280)
+    return () => {
+      window.cancelAnimationFrame(firstFrame)
+      window.cancelAnimationFrame(secondFrame)
+      window.clearTimeout(settleTimer)
+    }
+  }, [state.fullscreen, state.fullscreenTransportVisible, state.sidebarCollapsed, subtitleVisualActive])
+
+  useEffect(() => {
+    const updateTransportGeometry = (): void => {
+      if (!transportRef.current) return
+      postTransportGeometry(layoutSnapshotFromElement(transportRef.current))
+    }
+    const frame = window.requestAnimationFrame(updateTransportGeometry)
+    window.addEventListener('resize', updateTransportGeometry)
+    return () => {
+      window.cancelAnimationFrame(frame)
+      window.removeEventListener('resize', updateTransportGeometry)
+    }
+  }, [state.fullscreen, state.fullscreenTransportVisible])
+
+  useEffect(() => {
+    document.documentElement.lang = language === 'zh' ? 'zh-CN' : 'en'
+    try {
+      window.localStorage.setItem(LANGUAGE_STORAGE_KEY, language)
+    } catch {
+      // Ignore storage failures inside constrained WebView profiles.
+    }
+  }, [language])
+
+  useEffect(() => {
+    if (state.subtitleMenuOpen) {
+      syncSubtitleAnchor()
+      setSubtitlePopoverOpen(true)
+    } else {
+      setSubtitlePopoverOpen(false)
+    }
+  }, [state.subtitleMenuOpen])
+
+  useEffect(() => {
+    if (subtitlePopoverOpen) {
+      setSubtitlePopoverMounted(true)
+      return undefined
+    }
+
+    const timeout = window.setTimeout(() => setSubtitlePopoverMounted(false), 260)
+    return () => window.clearTimeout(timeout)
+  }, [subtitlePopoverOpen])
+
+  const toggleSubtitleMenu = (): void => {
+    syncSubtitleAnchor()
+    setSubtitlePopoverOpen((open) => !open)
+    postNativeCommand({ type: 'command', command: 'subtitleMenu' })
+  }
+
+  const hideSubtitleMenu = (): void => {
+    syncSubtitleAnchor()
+    setSubtitlePopoverOpen(false)
+    postNativeCommand({ type: 'command', command: 'hideSubtitleMenu' })
+  }
+
+  return (
+    <div
+      className={`app-shell ${state.sidebarCollapsed ? 'inspector-collapsed' : ''} ${state.fullscreen ? 'is-fullscreen' : ''} ${state.fullscreenTransportVisible ? 'fullscreen-transport-visible' : ''}`}
+      onPointerDownCapture={(event) => {
+        if (!state.subtitleMenuOpen && !subtitlePopoverOpen) return
+        const target = event.target
+        if (target instanceof Element && target.closest('[data-subtitle-toggle="true"]')) return
+        if (target instanceof Element && target.closest('[data-subtitle-popover="true"]')) return
+        hideSubtitleMenu()
+      }}
+    >
+      <TopBar state={state} t={t} />
+      <section className="content-grid">
+        <VideoStage state={state} t={t} />
+        <Inspector state={state} language={language} onLanguageChange={setLanguage} t={t} />
+      </section>
+      {subtitlePopoverMounted && <SubtitlePopover state={state} t={t} open={subtitlePopoverOpen} anchor={subtitleAnchor} />}
+      {subtitleAnchorReady && (!state.fullscreen || subtitleVisualActive) && (
+        <button
+          className="subtitle-top-icon"
+          type="button"
+          aria-label={t.subtitles}
+          title={t.subtitles}
+          data-subtitle-toggle="true"
+          style={{
+            '--subtitle-anchor-left': `${subtitleAnchor.left}px`,
+            '--subtitle-anchor-top': `${subtitleAnchor.top}px`,
+            '--subtitle-anchor-width': `${subtitleAnchor.width}px`,
+            '--subtitle-anchor-height': `${subtitleAnchor.height}px`
+          } as CSSProperties}
+          onClick={toggleSubtitleMenu}
+        >
+          <Captions size={18} />
+        </button>
+      )}
+      <Transport
+        state={state}
+        t={t}
+        transportRef={transportRef}
+        subtitleButtonRef={subtitleButtonRef}
+        subtitleVisualActive={subtitleVisualActive}
+        onSubtitleMenu={toggleSubtitleMenu}
+      />
+    </div>
+  )
+}

@@ -1,5 +1,6 @@
 #include "AnvilPlayer/App/ffmpeg_video_decoder.h"
 
+#include "AnvilPlayer/App/libass_subtitle_renderer.h"
 #include "AnvilPlayer/App/string_util.h"
 
 extern "C" {
@@ -21,7 +22,9 @@ extern "C" {
 #include <cstring>
 #include <cwctype>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -856,6 +859,15 @@ bool IsSupportedExternalSubtitleExtension(const std::filesystem::path& path) {
            extension == L".vtt";
 }
 
+bool IsAssSubtitleExtension(const std::filesystem::path& path) {
+    const auto extension = ToLowerWide(path.extension().wstring());
+    return extension == L".ass" || extension == L".ssa";
+}
+
+bool IsAssSubtitleCodec(const AVCodecID codecId) {
+    return codecId == AV_CODEC_ID_ASS || codecId == AV_CODEC_ID_SSA;
+}
+
 bool StartsWithSubtitleStem(const std::wstring& candidateStem, const std::wstring& mediaStem) {
     if (candidateStem == mediaStem) {
         return true;
@@ -1120,6 +1132,10 @@ bool ValidSubtitleCanvas(const int width, const int height) {
            width <= kMaxSubtitleCanvasDimension &&
            height <= kMaxSubtitleCanvasDimension;
 }
+
+constexpr std::chrono::milliseconds kSubtitleCueRetention{30000};
+constexpr std::chrono::milliseconds kDefaultBitmapSubtitleDuration{5000};
+constexpr std::chrono::milliseconds kMaxBitmapSubtitleDuration{30000};
 
 std::optional<std::pair<int, int>> PgsCanvasFromPayload(const uint8_t* payload, const std::size_t payloadSize) {
     if (!payload || payloadSize < 4) {
@@ -1504,6 +1520,7 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
     hardwareFormatLogged_ = false;
     zeroCopyFallbackLogged_ = false;
     bitmapSubtitleLogged_ = false;
+    frameSubtitleBitmapLogged_ = false;
     dolbyVisionLibplaceboFailed_ = false;
     dolbyVisionLibplaceboFrameLogged_ = false;
     dolbyVisionDynamicMetadataLogged_ = false;
@@ -1544,6 +1561,10 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
     subtitleCanvasHeight_ = 0;
     subtitleCanvasLogged_ = false;
     subtitleBitmapSerial_ = 0;
+    subtitleAssActive_ = false;
+    subtitleAssExternalFullTrack_ = false;
+    subtitleAssLogged_ = false;
+    subtitleAssRenderer_.reset();
     externalSubtitlesActive_ = false;
     subtitleCues_.clear();
     externalSubtitleCues_.clear();
@@ -1556,6 +1577,8 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
     pendingSeekMs_.store(-1);
     playbackPaused_.store(false);
     pausedPositionMs_.store(startPosition.count());
+    seekFastResumeFramesRemaining_.store(0);
+    seekFastResumeLogged_.store(false);
     stopping_.store(false);
     schedulePrimed_ = false;
     {
@@ -1574,6 +1597,7 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
         latestFrame_.dynamicMetadataDetails.clear();
         latestFrame_.subtitleText.clear();
         latestFrame_.subtitleBitmaps.clear();
+        latestFrame_.subtitlesPrepared = false;
         frameQueue_.clear();
         stats_ = {};
         stats_.decoder = preferHardwareDecode_ ? L"ffmpeg_d3d11va_pending" : L"ffmpeg_software";
@@ -1590,12 +1614,17 @@ void FfmpegVideoDecoder::Stop() {
     notificationWindow_.store(nullptr);
     notificationMessage_.store(0);
     frameMessagePending_.store(false);
+    seekFastResumeFramesRemaining_.store(0);
+    seekFastResumeLogged_.store(false);
     if (decodeThread_.joinable()) {
         decodeThread_.join();
     }
     running_.store(false);
     clockCallback_ = {};
     sharedD3DDevice_.Reset();
+    subtitleAssRenderer_.reset();
+    subtitleAssActive_ = false;
+    subtitleAssExternalFullTrack_ = false;
 }
 
 bool FfmpegVideoDecoder::Seek(const std::chrono::milliseconds position) {
@@ -1606,6 +1635,10 @@ bool FfmpegVideoDecoder::Seek(const std::chrono::milliseconds position) {
     const auto clamped = std::max(position, std::chrono::milliseconds{0});
     pendingSeekMs_.store(clamped.count());
     frameMessagePending_.store(false);
+    if (!playbackPaused_.load()) {
+        seekFastResumeFramesRemaining_.store(kSeekFastResumeFrameCount);
+        seekFastResumeLogged_.store(false);
+    }
     {
         std::scoped_lock lock(mutex_);
         latestFrame_ = {};
@@ -1668,6 +1701,7 @@ void FfmpegVideoDecoder::ClearFrame() {
     latestFrame_.dynamicMetadataDetails.clear();
     latestFrame_.subtitleText.clear();
     latestFrame_.subtitleBitmaps.clear();
+    latestFrame_.subtitlesPrepared = false;
     frameQueue_.clear();
     stats_.queueDepth = 0;
     stats_.packetQueueDepth = 0;
@@ -2136,7 +2170,7 @@ void FfmpegVideoDecoder::DecodeLoop() {
                     continue;
                 }
 
-                if (packet->stream_index == subtitleStreamIndex && subtitleCodecCtx) {
+                if (packet->stream_index == subtitleStreamIndex && (subtitleCodecCtx || subtitleAssActive_)) {
                     DecodeSubtitlePacket(subtitleCodecCtx, packet, subtitleTimeBase);
                     av_packet_unref(packet);
                     continue;
@@ -2197,7 +2231,12 @@ void FfmpegVideoDecoder::DecodeLoop() {
             if (HasPendingSeek()) {
                 clearPacketQueue();
                 inputEof = false;
-                if (!ApplyPendingSeek(formatCtx, codecCtx, subtitleCodecCtx, enhancementCodecCtx)) {
+                if (!ApplyPendingSeek(formatCtx,
+                                      codecCtx,
+                                      subtitleCodecCtx,
+                                      enhancementCodecCtx,
+                                      videoStreamIndex,
+                                      streamTimeBase)) {
                     break;
                 }
                 packetTimelineEnd = startPosition_;
@@ -2218,8 +2257,11 @@ void FfmpegVideoDecoder::DecodeLoop() {
                 readAheadPackets(elOverlay ? kDolbyVisionEnhancementPausedPacketReadAheadBatch
                                            : kPausedPacketReadAheadBatch);
             } else if (!hasPreroll) {
-                readAheadPackets(elOverlay ? kDolbyVisionEnhancementStartupPacketReadAheadBatch
-                                           : kStartupPacketReadAheadBatch);
+                const bool seekFastResume = seekFastResumeFramesRemaining_.load() > 0;
+                readAheadPackets(seekFastResume
+                                     ? kSeekStartupPacketReadAheadBatch
+                                     : (elOverlay ? kDolbyVisionEnhancementStartupPacketReadAheadBatch
+                                                  : kStartupPacketReadAheadBatch));
             } else if (shouldReadPlayingPackets()) {
                 readAheadPackets(elOverlay ? kDolbyVisionEnhancementPlayingPacketReadAheadBatch
                                            : kPlayingPacketReadAheadBatch);
@@ -2423,6 +2465,91 @@ bool FfmpegVideoDecoder::OpenDolbyVisionEnhancementDecoder(AVFormatContext* form
     return true;
 }
 
+bool FfmpegVideoDecoder::EnsureAssSubtitleRenderer() {
+    if (!subtitleAssRenderer_) {
+        subtitleAssRenderer_ = std::make_unique<LibassSubtitleRenderer>(logSink_);
+    }
+    if (subtitleAssRenderer_->IsAvailable()) {
+        return true;
+    }
+    return subtitleAssRenderer_->Initialize(std::filesystem::current_path());
+}
+
+void FfmpegVideoDecoder::AddAssFontAttachments(AVFormatContext* formatCtx) {
+    if (!formatCtx || !subtitleAssRenderer_ || !subtitleAssRenderer_->IsAvailable()) {
+        return;
+    }
+
+    auto hasSuffix = [](const std::wstring& value, const std::wstring& suffix) {
+        return value.size() >= suffix.size() &&
+               value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+    };
+
+    int added = 0;
+    for (unsigned int index = 0; index < formatCtx->nb_streams; ++index) {
+        const AVStream* stream = formatCtx->streams[index];
+        const AVCodecParameters* parameters = stream ? stream->codecpar : nullptr;
+        if (!stream || !parameters ||
+            parameters->codec_type != AVMEDIA_TYPE_ATTACHMENT ||
+            !parameters->extradata ||
+            parameters->extradata_size <= 0) {
+            continue;
+        }
+
+        const AVDictionaryEntry* filename = av_dict_get(stream->metadata, "filename", nullptr, 0);
+        const AVDictionaryEntry* mimetype = av_dict_get(stream->metadata, "mimetype", nullptr, 0);
+        const std::wstring filenameWide = filename ? Utf8ToWide(filename->value) : L"attachment-" + std::to_wstring(index);
+        const std::wstring lowerFilename = ToLowerWide(filenameWide);
+        const std::wstring lowerMime = mimetype ? ToLowerWide(Utf8ToWide(mimetype->value)) : L"";
+        const bool looksLikeFont =
+            hasSuffix(lowerFilename, L".ttf") ||
+            hasSuffix(lowerFilename, L".otf") ||
+            hasSuffix(lowerFilename, L".ttc") ||
+            hasSuffix(lowerFilename, L".otc") ||
+            lowerMime.find(L"font") != std::wstring::npos ||
+            lowerMime.find(L"opentype") != std::wstring::npos ||
+            lowerMime.find(L"truetype") != std::wstring::npos;
+        if (!looksLikeFont) {
+            continue;
+        }
+
+        if (subtitleAssRenderer_->AddFont(WideToUtf8(filenameWide),
+                                          parameters->extradata,
+                                          parameters->extradata_size)) {
+            ++added;
+        }
+    }
+
+    if (added > 0) {
+        LogThread(LogLevel::Info, L"subtitle", L"libass_fonts attachments=" + std::to_wstring(added));
+    }
+}
+
+bool FfmpegVideoDecoder::ConfigureAssSubtitleStream(AVFormatContext* formatCtx, const AVStream* stream) {
+    const AVCodecParameters* parameters = stream ? stream->codecpar : nullptr;
+    if (!stream || !parameters || !IsAssSubtitleCodec(parameters->codec_id)) {
+        return false;
+    }
+    if (!EnsureAssSubtitleRenderer()) {
+        return false;
+    }
+
+    AddAssFontAttachments(formatCtx);
+    const uint8_t* extradata = parameters->extradata_size > 0 ? parameters->extradata : nullptr;
+    const int extradataSize = parameters->extradata_size > 0 ? parameters->extradata_size : 0;
+    if (!subtitleAssRenderer_->ConfigureTrackFromCodecPrivate(extradata, extradataSize)) {
+        return false;
+    }
+
+    subtitleAssActive_ = true;
+    subtitleAssExternalFullTrack_ = false;
+    LogThread(LogLevel::Info,
+              L"subtitle",
+              L"libass stream=embedded codec=" + Utf8ToWide(avcodec_get_name(parameters->codec_id)) +
+                  L" stream=" + std::to_wstring(stream->index));
+    return true;
+}
+
 bool FfmpegVideoDecoder::OpenSubtitleDecoder(AVFormatContext* formatCtx,
                                              int& subtitleStreamIndex,
                                              AVRational& subtitleTimeBase,
@@ -2443,16 +2570,37 @@ bool FfmpegVideoDecoder::OpenSubtitleDecoder(AVFormatContext* formatCtx,
         if (!stream || !parameters || parameters->codec_type != AVMEDIA_TYPE_SUBTITLE) {
             return false;
         }
+        const bool assStream = ConfigureAssSubtitleStream(formatCtx, stream);
         const AVCodec* codec = avcodec_find_decoder(parameters->codec_id);
         if (!codec) {
+            if (assStream) {
+                subtitleStreamIndex = streamIndex;
+                subtitleTimeBase = stream->time_base;
+                subtitleCodecCtx = nullptr;
+                LogThread(LogLevel::Info,
+                          L"subtitle",
+                          L"selected stream=" + std::to_wstring(streamIndex) +
+                              L" codec=" + Utf8ToWide(avcodec_get_name(parameters->codec_id)) +
+                              L" language=" + (StreamLanguage(stream).empty() ? L"-" : StreamLanguage(stream)) +
+                              L" renderer=libass decoder=raw_packet");
+                return true;
+            }
             return false;
         }
         AVCodecContext* context = avcodec_alloc_context3(codec);
         if (!context) {
+            if (assStream && subtitleAssRenderer_) {
+                subtitleAssActive_ = false;
+                subtitleAssRenderer_->ResetTrack();
+            }
             return false;
         }
         const int paramsError = avcodec_parameters_to_context(context, parameters);
         if (paramsError < 0) {
+            if (assStream && subtitleAssRenderer_) {
+                subtitleAssActive_ = false;
+                subtitleAssRenderer_->ResetTrack();
+            }
             avcodec_free_context(&context);
             return false;
         }
@@ -2464,7 +2612,11 @@ bool FfmpegVideoDecoder::OpenSubtitleDecoder(AVFormatContext* formatCtx,
                       L"subtitle",
                       L"decoder_open_failed stream=" + std::to_wstring(streamIndex) +
                           L" codec=" + Utf8ToWide(avcodec_get_name(parameters->codec_id)) +
-                          L" reason=" + FfmpegErrorString(openError));
+                      L" reason=" + FfmpegErrorString(openError));
+            if (assStream && subtitleAssRenderer_) {
+                subtitleAssActive_ = false;
+                subtitleAssRenderer_->ResetTrack();
+            }
             avcodec_free_context(&context);
             return false;
         }
@@ -2476,7 +2628,8 @@ bool FfmpegVideoDecoder::OpenSubtitleDecoder(AVFormatContext* formatCtx,
                   L"subtitle",
                   L"selected stream=" + std::to_wstring(streamIndex) +
                       L" codec=" + Utf8ToWide(avcodec_get_name(parameters->codec_id)) +
-                      L" language=" + (StreamLanguage(stream).empty() ? L"-" : StreamLanguage(stream)));
+                      L" language=" + (StreamLanguage(stream).empty() ? L"-" : StreamLanguage(stream)) +
+                      (assStream ? L" renderer=libass" : L""));
         return true;
     };
 
@@ -2526,7 +2679,57 @@ bool FfmpegVideoDecoder::OpenSubtitleDecoder(AVFormatContext* formatCtx,
     return false;
 }
 
+bool FfmpegVideoDecoder::DecodeExternalAssSubtitleFile(const std::filesystem::path& subtitlePath) {
+    if (!IsAssSubtitleExtension(subtitlePath) || !EnsureAssSubtitleRenderer()) {
+        return false;
+    }
+
+    std::ifstream file(subtitlePath, std::ios::binary | std::ios::ate);
+    if (!file) {
+        LogThread(LogLevel::Warning,
+                  L"subtitle",
+                  L"external_ass_open_failed file=" + subtitlePath.filename().wstring());
+        return false;
+    }
+
+    const std::streamoff size = file.tellg();
+    if (size <= 0) {
+        LogThread(LogLevel::Warning,
+                  L"subtitle",
+                  L"external_ass_empty file=" + subtitlePath.filename().wstring());
+        return false;
+    }
+    file.seekg(0, std::ios::beg);
+    std::vector<uint8_t> bytes(static_cast<std::size_t>(size));
+    if (!file.read(reinterpret_cast<char*>(bytes.data()), size)) {
+        LogThread(LogLevel::Warning,
+                  L"subtitle",
+                  L"external_ass_read_failed file=" + subtitlePath.filename().wstring());
+        return false;
+    }
+
+    if (!subtitleAssRenderer_->ConfigureTrackFromMemory(bytes.data(), bytes.size())) {
+        LogThread(LogLevel::Warning,
+                  L"subtitle",
+                  L"external_ass_parse_failed file=" + subtitlePath.filename().wstring());
+        return false;
+    }
+
+    subtitleAssActive_ = true;
+    subtitleAssExternalFullTrack_ = true;
+    subtitleCues_.clear();
+    LogThread(LogLevel::Info,
+              L"subtitle",
+              L"libass external file=" + subtitlePath.filename().wstring() +
+                  L" bytes=" + std::to_wstring(bytes.size()));
+    return true;
+}
+
 bool FfmpegVideoDecoder::DecodeExternalSubtitleFile(const std::filesystem::path& subtitlePath) {
+    if (DecodeExternalAssSubtitleFile(subtitlePath)) {
+        return true;
+    }
+
     AVFormatContext* subtitleFormatCtx = nullptr;
     AVCodecContext* subtitleCodecCtx = nullptr;
     AVPacket* packet = nullptr;
@@ -3220,10 +3423,9 @@ bool FfmpegVideoDecoder::TryPublishDoviLibplaceboFrame(AVFrame* frame,
                 ? L"dolby_vision_libplacebo+trim"
                 : L"dolby_vision_libplacebo";
         queued.dynamicMetadataDetails = DoviFrameSummary(inputDovi.get());
-        queued.subtitleText = SubtitleTextForPts(pts);
-        queued.subtitleBitmaps = SubtitleBitmapsForPts(pts, outW, outH);
         queued.pts = pts;
         queued.serial = ++serial;
+        RefreshFrameSubtitles(queued);
 
         if (!dolbyVisionLibplaceboFrameLogged_) {
             dolbyVisionLibplaceboFrameLogged_ = true;
@@ -3497,10 +3699,9 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
             } else if (enhancementOverlayPath) {
                 dolbyVisionEnhancementStartupMisses_ = 0;
             }
-            queued.subtitleText = SubtitleTextForPts(pts);
-            queued.subtitleBitmaps = SubtitleBitmapsForPts(pts, srcW, srcH);
             queued.pts = pts;
             queued.serial = ++serial;
+            RefreshFrameSubtitles(queued);
             const bool logFirstDoviQueue = !dolbyVisionFirstQueueLogged_;
             if (logFirstDoviQueue) {
                 LogThread(LogLevel::Debug,
@@ -3508,8 +3709,7 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
                           L"dolby_vision_yuv_queue_ready serial=" + std::to_wstring(queued.serial) +
                               L" pts_ms=" + std::to_wstring(queued.pts.count()) +
                               L" fel_overlay=" + (queued.HasEnhancementYuv() ? L"yes" : L"no") +
-                              L" subtitles_text=" + (queued.subtitleText.empty() ? L"no" : L"yes") +
-                              L" subtitles_bitmap=" + (queued.subtitleBitmaps.empty() ? L"no" : L"yes"));
+                              L" subtitles_deferred=true");
             }
             if (oneShotFrame_) {
                 return PublishImmediateFrame(std::move(queued));
@@ -3568,10 +3768,9 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
             queued.dynamicMetadataDetails = DoviFrameSummary(queued.dovi.get());
         }
     }
-    queued.subtitleText = SubtitleTextForPts(pts);
-    queued.subtitleBitmaps = SubtitleBitmapsForPts(pts, srcW, srcH);
     queued.pts = pts;
     queued.serial = ++serial;
+    RefreshFrameSubtitles(queued);
     if (oneShotFrame_) {
         return PublishImmediateFrame(std::move(queued));
     }
@@ -3633,8 +3832,6 @@ bool FfmpegVideoDecoder::TryBuildD3DTextureFrame(AVFrame* frame, std::chrono::mi
             out.dynamicMetadataDetails = DoviFrameSummary(out.dovi.get());
         }
     }
-    out.subtitleText = SubtitleTextForPts(pts);
-    out.subtitleBitmaps = SubtitleBitmapsForPts(pts, out.width, out.height);
     out.hardwareFrameRef = std::shared_ptr<AVFrame>(retained, [](AVFrame* value) {
         if (value) {
             av_frame_free(&value);
@@ -3642,6 +3839,7 @@ bool FfmpegVideoDecoder::TryBuildD3DTextureFrame(AVFrame* frame, std::chrono::mi
     });
     out.pts = pts;
     out.serial = ++serial;
+    RefreshFrameSubtitles(out);
 
     {
         std::scoped_lock lock(mutex_);
@@ -3654,6 +3852,7 @@ bool FfmpegVideoDecoder::TryBuildD3DTextureFrame(AVFrame* frame, std::chrono::mi
 }
 
 bool FfmpegVideoDecoder::PublishImmediateFrame(NativeVideoFrame&& frame) {
+    RefreshFrameSubtitles(frame);
     {
         std::scoped_lock lock(mutex_);
         stats_.queueDepth = 0;
@@ -3683,7 +3882,9 @@ bool FfmpegVideoDecoder::HasPendingSeek() const {
 bool FfmpegVideoDecoder::ApplyPendingSeek(AVFormatContext* formatCtx,
                                           AVCodecContext* codecCtx,
                                           AVCodecContext* subtitleCodecCtx,
-                                          AVCodecContext* enhancementCodecCtx) {
+                                          AVCodecContext* enhancementCodecCtx,
+                                          const int videoStreamIndex,
+                                          const AVRational videoTimeBase) {
     const auto target = TakePendingSeek();
     if (!target.has_value()) {
         return true;
@@ -3696,12 +3897,30 @@ bool FfmpegVideoDecoder::ApplyPendingSeek(AVFormatContext* formatCtx,
     if (playbackPaused_.load()) {
         pausedPositionMs_.store(target->count());
     }
-    const int64_t seekTarget = static_cast<int64_t>(target->count()) * AV_TIME_BASE / 1000;
-    LogThread(LogLevel::Info, L"decoder", L"runtime_seek target=" + anvil::playback::FormatTimecode(*target));
-    int seekError = av_seek_frame(formatCtx, -1, seekTarget, AVSEEK_FLAG_BACKWARD);
-    if (seekError < 0) {
-        seekError = avformat_seek_file(formatCtx, -1, INT64_MIN, seekTarget, INT64_MAX, 0);
+    const auto seekStart = std::chrono::steady_clock::now();
+    const int64_t globalSeekTarget = static_cast<int64_t>(target->count()) * AV_TIME_BASE / 1000;
+    std::wstring seekMethod = L"global";
+    int seekError = AVERROR(EINVAL);
+    if (videoStreamIndex >= 0 && videoTimeBase.num > 0 && videoTimeBase.den > 0) {
+        const int64_t videoSeekTarget = av_rescale_q(target->count(), AVRational{1, 1000}, videoTimeBase);
+        seekError = av_seek_frame(formatCtx, videoStreamIndex, videoSeekTarget, AVSEEK_FLAG_BACKWARD);
+        seekMethod = L"video_stream";
     }
+    if (seekError < 0) {
+        seekMethod = L"global";
+        seekError = av_seek_frame(formatCtx, -1, globalSeekTarget, AVSEEK_FLAG_BACKWARD);
+    }
+    if (seekError < 0) {
+        seekMethod = L"global_file";
+        seekError = avformat_seek_file(formatCtx, -1, INT64_MIN, globalSeekTarget, INT64_MAX, 0);
+    }
+    const auto seekElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - seekStart).count();
+    LogThread(seekError < 0 ? LogLevel::Warning : LogLevel::Info,
+              L"decoder",
+              L"runtime_seek target=" + anvil::playback::FormatTimecode(*target) +
+                  L" method=" + seekMethod +
+                  L" seek_ms=" + std::to_wstring(seekElapsedMs));
     if (seekError < 0) {
         LogThread(LogLevel::Warning, L"decoder", L"runtime_seek failed reason=" + FfmpegErrorString(seekError));
         return true;
@@ -3734,6 +3953,13 @@ bool FfmpegVideoDecoder::ApplyPendingSeek(AVFormatContext* formatCtx,
     } else {
         subtitleCues_.clear();
     }
+    if (subtitleAssRenderer_) {
+        if (subtitleAssActive_ && !subtitleAssExternalFullTrack_) {
+            subtitleAssRenderer_->FlushEvents();
+        } else {
+            subtitleAssRenderer_->ResetRenderCache();
+        }
+    }
 
     {
         std::scoped_lock lock(mutex_);
@@ -3758,7 +3984,30 @@ bool FfmpegVideoDecoder::ApplyPendingSeek(AVFormatContext* formatCtx,
 bool FfmpegVideoDecoder::DecodeSubtitlePacket(AVCodecContext* subtitleCodecCtx,
                                               const AVPacket* packet,
                                               const AVRational subtitleTimeBase) {
-    if (!subtitleCodecCtx || !packet) {
+    if (!packet) {
+        return false;
+    }
+
+    if (subtitleAssActive_ && !subtitleAssExternalFullTrack_) {
+        const auto pts = PacketTimestamp(packet, subtitleTimeBase).value_or(std::chrono::milliseconds{0});
+        const auto duration = PacketDuration(packet, subtitleTimeBase).value_or(std::chrono::milliseconds{4000});
+        if (subtitleAssRenderer_ &&
+            subtitleAssRenderer_->ProcessPacket(packet->data, packet->size, pts, duration)) {
+            {
+                std::scoped_lock lock(mutex_);
+                for (auto& frame : frameQueue_) {
+                    frame.subtitlesPrepared = false;
+                }
+            }
+            if (RefreshLatestFrameSubtitles()) {
+                NotifyFrameReady();
+            }
+            return true;
+        }
+        return false;
+    }
+
+    if (!subtitleCodecCtx) {
         return false;
     }
 
@@ -3797,17 +4046,21 @@ bool FfmpegVideoDecoder::DecodeSubtitlePacket(AVCodecContext* subtitleCodecCtx,
     const auto basePts = SubtitlePacketBasePts(subtitle, packet, subtitleTimeBase);
     auto start = basePts + std::chrono::milliseconds{subtitle.start_display_time};
     auto end = basePts + std::chrono::milliseconds{subtitle.end_display_time};
-    if (end <= start) {
+    const std::wstring text = SubtitleTextFromDecoded(subtitle);
+    auto bitmaps = SubtitleBitmapsFromDecoded(subtitle, canvasWidth, canvasHeight, subtitleBitmapSerial_);
+    const bool decodedDurationLooksInvalid =
+        end <= start ||
+        (!bitmaps.empty() && isPgsSubtitle && end - start > kMaxBitmapSubtitleDuration);
+    if (decodedDurationLooksInvalid) {
         if (const auto duration = PacketDuration(packet, subtitleTimeBase);
             duration.has_value() && *duration > std::chrono::milliseconds{0}) {
             end = start + *duration;
+        } else if (isPgsSubtitle) {
+            end = start + kDefaultBitmapSubtitleDuration;
         } else {
             end = start + std::chrono::seconds{4};
         }
     }
-
-    const std::wstring text = SubtitleTextFromDecoded(subtitle);
-    auto bitmaps = SubtitleBitmapsFromDecoded(subtitle, canvasWidth, canvasHeight, subtitleBitmapSerial_);
     if (!bitmaps.empty() && !subtitleCanvasLogged_ && ValidSubtitleCanvas(canvasWidth, canvasHeight)) {
         subtitleCanvasLogged_ = true;
         LogThread(LogLevel::Debug,
@@ -3816,25 +4069,31 @@ bool FfmpegVideoDecoder::DecodeSubtitlePacket(AVCodecContext* subtitleCodecCtx,
                       L" source=" + canvasSource);
     }
     if (text.empty() && bitmaps.empty()) {
-        if (isPgsSubtitle) {
-            TrimActiveBitmapSubtitleCues(start);
-        }
         avsubtitle_free(&subtitle);
         return true;
     }
     if (!bitmaps.empty() && !bitmapSubtitleLogged_) {
         bitmapSubtitleLogged_ = true;
-        LogThread(LogLevel::Info, L"subtitle", L"bitmap_overlay active=true rects=" + std::to_wstring(bitmaps.size()));
+        LogThread(LogLevel::Info,
+                  L"subtitle",
+                  L"bitmap_overlay active=true rects=" + std::to_wstring(bitmaps.size()) +
+                      L" start=" + anvil::playback::FormatTimecode(start) +
+                      L" end=" + anvil::playback::FormatTimecode(end));
     }
 
     if (!bitmaps.empty() && isPgsSubtitle) {
         TrimActiveBitmapSubtitleCues(start);
     }
 
+    bool refreshedLatestFrame = false;
     if (end > startPosition_) {
         subtitleCues_.push_back(NativeSubtitleCue{start, end, text, std::move(bitmaps)});
+        refreshedLatestFrame = RefreshQueuedFrameSubtitles();
     }
     avsubtitle_free(&subtitle);
+    if (refreshedLatestFrame) {
+        NotifyFrameReady();
+    }
     return true;
 }
 
@@ -3844,16 +4103,109 @@ void FfmpegVideoDecoder::TrimActiveBitmapSubtitleCues(const std::chrono::millise
             cue.end = time;
         }
     }
-    while (!subtitleCues_.empty() && subtitleCues_.front().end <= time) {
+}
+
+void FfmpegVideoDecoder::PruneExpiredSubtitleCues(const std::chrono::milliseconds effectivePts) {
+    while (!subtitleCues_.empty() && subtitleCues_.front().end + kSubtitleCueRetention <= effectivePts) {
         subtitleCues_.pop_front();
     }
 }
 
+void FfmpegVideoDecoder::RefreshFrameSubtitles(NativeVideoFrame& frame, const bool force) {
+    if (!frame.HasContent()) {
+        return;
+    }
+    if (!force && frame.subtitlesPrepared) {
+        return;
+    }
+    frame.subtitleText = SubtitleTextForPts(frame.pts);
+    const bool seekFastResumeFrame =
+        !force &&
+        seekFastResumeFramesRemaining_.load() > 0;
+    const bool skipAssForSeek = seekFastResumeFrame && subtitleAssActive_;
+    frame.subtitleBitmaps = SubtitleBitmapsForPts(frame.pts, frame.width, frame.height, !skipAssForSeek);
+    if (seekFastResumeFrame) {
+        seekFastResumeFramesRemaining_.fetch_sub(1);
+        if (!seekFastResumeLogged_.exchange(true)) {
+            LogThread(LogLevel::Debug,
+                      L"subtitle",
+                      L"seek_fast_resume frames=" +
+                          std::to_wstring(kSeekFastResumeFrameCount) +
+                          L" skip_ass=" + std::wstring(skipAssForSeek ? L"true" : L"false") +
+                          L" first_pts=" + anvil::playback::FormatTimecode(frame.pts));
+        }
+    }
+    frame.subtitlesPrepared = true;
+    if (!frame.subtitleBitmaps.empty() && !frameSubtitleBitmapLogged_) {
+        frameSubtitleBitmapLogged_ = true;
+        LogThread(LogLevel::Debug,
+                  L"subtitle",
+                  L"frame_bitmap matched pts=" + anvil::playback::FormatTimecode(frame.pts) +
+                  L" rects=" + std::to_wstring(frame.subtitleBitmaps.size()));
+    }
+}
+
+bool FfmpegVideoDecoder::RefreshLatestFrameSubtitles() {
+    auto bitmapFingerprint = [](const std::vector<NativeSubtitleBitmap>& bitmaps) {
+        uint64_t fingerprint = static_cast<uint64_t>(bitmaps.size());
+        for (const auto& bitmap : bitmaps) {
+            fingerprint ^= bitmap.serial + 0x9e3779b97f4a7c15ull + (fingerprint << 6) + (fingerprint >> 2);
+            fingerprint ^= static_cast<uint64_t>(std::max(bitmap.x, 0)) << 1;
+            fingerprint ^= static_cast<uint64_t>(std::max(bitmap.y, 0)) << 17;
+            fingerprint ^= static_cast<uint64_t>(std::max(bitmap.width, 0)) << 33;
+            fingerprint ^= static_cast<uint64_t>(std::max(bitmap.height, 0)) << 49;
+        }
+        return fingerprint;
+    };
+
+    std::scoped_lock lock(mutex_);
+    if (!latestFrame_.HasContent()) {
+        return false;
+    }
+    const std::wstring previousText = latestFrame_.subtitleText;
+    const uint64_t previousBitmapFingerprint = bitmapFingerprint(latestFrame_.subtitleBitmaps);
+    RefreshFrameSubtitles(latestFrame_, true);
+    return latestFrame_.subtitleText != previousText ||
+           bitmapFingerprint(latestFrame_.subtitleBitmaps) != previousBitmapFingerprint;
+}
+
+bool FfmpegVideoDecoder::RefreshQueuedFrameSubtitles() {
+    auto bitmapFingerprint = [](const std::vector<NativeSubtitleBitmap>& bitmaps) {
+        uint64_t fingerprint = static_cast<uint64_t>(bitmaps.size());
+        for (const auto& bitmap : bitmaps) {
+            fingerprint ^= bitmap.serial + 0x9e3779b97f4a7c15ull + (fingerprint << 6) + (fingerprint >> 2);
+            fingerprint ^= static_cast<uint64_t>(std::max(bitmap.x, 0)) << 1;
+            fingerprint ^= static_cast<uint64_t>(std::max(bitmap.y, 0)) << 17;
+            fingerprint ^= static_cast<uint64_t>(std::max(bitmap.width, 0)) << 33;
+            fingerprint ^= static_cast<uint64_t>(std::max(bitmap.height, 0)) << 49;
+        }
+        return fingerprint;
+    };
+
+    auto refreshChanged = [&](NativeVideoFrame& frame) {
+        const std::wstring previousText = frame.subtitleText;
+        const uint64_t previousBitmapFingerprint = bitmapFingerprint(frame.subtitleBitmaps);
+        RefreshFrameSubtitles(frame, true);
+        return frame.subtitleText != previousText ||
+               bitmapFingerprint(frame.subtitleBitmaps) != previousBitmapFingerprint;
+    };
+
+    bool latestChanged = false;
+    std::scoped_lock lock(mutex_);
+    if (latestFrame_.HasContent()) {
+        latestChanged = refreshChanged(latestFrame_);
+    }
+    if (subtitleAssActive_) {
+        return latestChanged;
+    }
+    for (auto& frame : frameQueue_) {
+        refreshChanged(frame);
+    }
+    return latestChanged;
+}
+
 std::wstring FfmpegVideoDecoder::SubtitleTextForPts(const std::chrono::milliseconds pts) {
     const auto effectivePts = pts - subtitleDelay_;
-    while (!subtitleCues_.empty() && subtitleCues_.front().end <= effectivePts) {
-        subtitleCues_.pop_front();
-    }
 
     std::wstring text;
     for (const auto& cue : subtitleCues_) {
@@ -3869,17 +4221,28 @@ std::wstring FfmpegVideoDecoder::SubtitleTextForPts(const std::chrono::milliseco
 
 std::vector<NativeSubtitleBitmap> FfmpegVideoDecoder::SubtitleBitmapsForPts(const std::chrono::milliseconds pts,
                                                                             const int frameWidth,
-                                                                            const int frameHeight) {
+                                                                            const int frameHeight,
+                                                                            const bool includeAss) {
     const auto effectivePts = pts - subtitleDelay_;
-    while (!subtitleCues_.empty() && subtitleCues_.front().end <= effectivePts) {
-        subtitleCues_.pop_front();
-    }
 
     std::vector<NativeSubtitleBitmap> bitmaps;
     for (const auto& cue : subtitleCues_) {
         if (cue.start <= effectivePts && effectivePts < cue.end) {
             bitmaps.insert(bitmaps.end(), cue.bitmaps.begin(), cue.bitmaps.end());
         }
+    }
+    if (includeAss && subtitleAssActive_ && subtitleAssRenderer_) {
+        auto assBitmaps = subtitleAssRenderer_->Render(effectivePts, frameWidth, frameHeight, subtitleBitmapSerial_);
+        if (!assBitmaps.empty() && !subtitleAssLogged_) {
+            subtitleAssLogged_ = true;
+            LogThread(LogLevel::Info,
+                      L"subtitle",
+                      L"libass_bitmap_overlay active=true rects=" + std::to_wstring(assBitmaps.size()) +
+                          L" frame=" + std::to_wstring(frameWidth) + L"x" + std::to_wstring(frameHeight));
+        }
+        bitmaps.insert(bitmaps.end(),
+                       std::make_move_iterator(assBitmaps.begin()),
+                       std::make_move_iterator(assBitmaps.end()));
     }
     return bitmaps;
 }
@@ -4420,6 +4783,21 @@ void FfmpegVideoDecoder::ScheduleDueFrames() {
         stats_.clockPosition = clock.position;
         stats_.usingAudioClock = clock.usingAudioClock;
 
+        auto frameEarlyTolerance = [&]() {
+            auto tolerance = kMaxFrameEarlyTolerance;
+            std::chrono::milliseconds cadence{0};
+            if (frameQueue_.size() >= 2) {
+                const auto measured = frameQueue_[1].pts - frameQueue_[0].pts;
+                if (measured > std::chrono::milliseconds{0} && measured < kMaxMeasuredFrameCadence) {
+                    cadence = measured;
+                    tolerance = std::clamp(measured / 4, kMinFrameEarlyTolerance, kMaxFrameEarlyTolerance);
+                }
+            }
+            stats_.frameCadenceMs = static_cast<int>(cadence.count());
+            stats_.earlyToleranceMs = static_cast<int>(tolerance.count());
+            return tolerance;
+        };
+
         while (!frameQueue_.empty()) {
             const NativeVideoFrame& front = frameQueue_.front();
             const auto earlyBy = front.pts - clock.position;
@@ -4431,7 +4809,8 @@ void FfmpegVideoDecoder::ScheduleDueFrames() {
                 continue;
             }
 
-            const bool frameIsDue = earlyBy <= kFrameEarlyTolerance;
+            const auto earlyTolerance = frameEarlyTolerance();
+            const bool frameIsDue = earlyBy <= earlyTolerance;
             if (!frameIsDue) {
                 break;
             }
@@ -4441,9 +4820,10 @@ void FfmpegVideoDecoder::ScheduleDueFrames() {
             UpdateBufferedStatsLocked();
 
             const bool anotherFrameDue = !frameQueue_.empty() &&
-                (frameQueue_.front().pts - clock.position) <= kFrameEarlyTolerance;
+                (frameQueue_.front().pts - clock.position) <= earlyTolerance;
             if (anotherFrameDue) {
                 ++stats_.droppedLate;
+                ++stats_.droppedSuperseded;
                 continue;
             }
 
@@ -4453,6 +4833,8 @@ void FfmpegVideoDecoder::ScheduleDueFrames() {
         }
 
         if (hasFrame) {
+            PruneExpiredSubtitleCues(clock.position - subtitleDelay_);
+            RefreshFrameSubtitles(frameToPublish);
             stats_.driftMs = static_cast<int>((frameToPublish.pts - clock.position).count());
             ++stats_.rendered;
             firstPublishedFrame = stats_.rendered == 1;

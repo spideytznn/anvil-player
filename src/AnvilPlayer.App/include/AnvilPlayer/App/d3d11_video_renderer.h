@@ -9,12 +9,16 @@
 #include <d3d10.h>
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
+#include <dxgi1_3.h>
 #include <dcomp.h>
 #include <windows.h>
 
 #include <wrl/client.h>
 
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -29,6 +33,8 @@ struct D3D11RenderStats {
     uint64_t hardwareSrvCacheHits = 0;
     uint64_t hardwareSrvCacheMisses = 0;
     uint64_t subtitleSurfaceRebuilds = 0;
+    uint64_t subtitleBitmapRects = 0;
+    uint64_t subtitleBitmapPixels = 0;
     uint64_t totalRenderUs = 0;
     uint64_t maxRenderUs = 0;
     uint64_t colorPipelineUs = 0;
@@ -37,6 +43,13 @@ struct D3D11RenderStats {
     uint64_t subtitleUs = 0;
     uint64_t presentUs = 0;
     uint64_t maxPresentUs = 0;
+    uint64_t presentSyncFrames = 0;
+    uint64_t frameLatencyWaits = 0;
+    uint64_t frameLatencyWaitTimeouts = 0;
+    uint64_t frameLatencyWaitUs = 0;
+    uint64_t maxFrameLatencyWaitUs = 0;
+    uint64_t frameStatsSamples = 0;
+    uint64_t frameStatsDisjoint = 0;
 };
 
 // D3D11 video renderer. Owns device/swapchain/VS+PS+NV12-PS pipeline, a
@@ -80,12 +93,16 @@ private:
     void UpdateDoviConstants(const NativeVideoFrame& frame);
     bool ApplySwapChainColorSpace(DXGI_COLOR_SPACE_TYPE colorSpace, const anvil::playback::VideoColorMetadata& color);
     void ApplyHdrMetadata(const anvil::playback::VideoColorMetadata& color);
+    bool ConfigureFramePacing();
+    void WaitForFrameLatencyObject(bool collectStats);
+    void PresentFrame(UINT syncInterval, bool collectStats, std::chrono::steady_clock::time_point stageStart);
     bool UpdateHardwareTexture(const NativeVideoFrame& frame);
     void UpdateTexture(const NativeVideoFrame& frame);
     bool UpdateYuvTexture(const NativeVideoFrame& frame);
     bool UpdateEnhancementYuvTexture(const NativeVideoFrame& frame);
     bool UpdateSubtitleOverlay(const NativeVideoFrame& frame, const D3D11_VIEWPORT& videoViewport);
     void DrawSubtitleOverlay();
+    bool DrawSubtitleBitmapOverlays(const NativeVideoFrame& frame, const D3D11_VIEWPORT& videoViewport);
     void ReleaseAll();
     void LogHardwareTextureFailureOnce(const std::wstring& message);
     void LogInfo(const std::wstring& message) const;
@@ -100,6 +117,21 @@ private:
         Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> uv;
     };
 
+    struct SubtitleTextureCacheEntry {
+        uint64_t serial = 0;
+        int width = 0;
+        int height = 0;
+        int stride = 0;
+        std::shared_ptr<const std::vector<uint8_t>> pixels;
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> srv;
+        uint64_t lastUsedFrame = 0;
+        std::size_t bytes = 0;
+    };
+
+    SubtitleTextureCacheEntry* EnsureSubtitleBitmapTexture(const NativeSubtitleBitmap& bitmap);
+    void PruneSubtitleTextureCache();
+
     HWND host_ = nullptr;
     LogSinkPtr logSink_;
     Microsoft::WRL::ComPtr<IDXGIFactory2> factory_;
@@ -112,6 +144,8 @@ private:
     // sibling overlay windows (e.g. the subtitle menu popup) render correctly
     // on top of it, which a HWND-bound flip-model swap chain would occlude.
     bool useComposition_ = false;
+    HANDLE frameLatencyWaitable_ = nullptr;
+    bool framePacingLogged_ = false;
     Microsoft::WRL::ComPtr<IDCompositionDevice> dcompDevice_;
     Microsoft::WRL::ComPtr<IDCompositionTarget> dcompTarget_;
     Microsoft::WRL::ComPtr<IDCompositionVisual> dcompVisual_;
@@ -120,10 +154,12 @@ private:
     Microsoft::WRL::ComPtr<ID3D11VertexShader> vs_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> ps_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> psNv12_;
+    Microsoft::WRL::ComPtr<ID3D11PixelShader> psSubtitle_;
     Microsoft::WRL::ComPtr<ID3D11SamplerState> sampler_;
     Microsoft::WRL::ComPtr<ID3D11BlendState> subtitleBlend_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> colorConstants_;
     Microsoft::WRL::ComPtr<ID3D11Buffer> doviConstants_;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> subtitleConstants_;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> texture_;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> srv_;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> hwSrvY_;
@@ -143,6 +179,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Texture2D> subtitleTexture_;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> subtitleSrv_;
     std::vector<HardwareSrvCacheEntry> hardwareSrvCache_;
+    std::vector<SubtitleTextureCacheEntry> subtitleTextureCache_;
     D3D11_VIEWPORT viewport_{};
     int textureW_ = 0;
     int textureH_ = 0;
@@ -165,6 +202,8 @@ private:
     bool hdrColorSpaceFailureLogged_ = false;
     bool dolbyVisionMetadataLogged_ = false;
     bool felOverlayLogged_ = false;
+    bool subtitleBitmapOverlayLogged_ = false;
+    uint64_t subtitleDrawFrame_ = 0;
     bool doviEnabledLastFrame_ = false;  // tracks DV state to skip non-DV updates
     std::wstring activePipelineLabel_;
     uint64_t activePipelineSignature_ = 0;

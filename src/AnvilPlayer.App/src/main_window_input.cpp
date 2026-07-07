@@ -168,13 +168,12 @@ void MainWindow::OnMouseMove(const int x, const int y) {
         lastFullscreenCursorClient_ = point;
         hasLastFullscreenCursorClient_ = true;
     }
-    const bool fullscreenTransportActive = fullscreen_ &&
-                                           ShouldShowFullscreenTransport(controller_.Snapshot());
-    if (fullscreen_ &&
-        (fullscreenTransportActive ||
-         IsFullscreenTransportActivationPoint(point) ||
-         ContainsPoint(transportBar_, point))) {
-        ShowFullscreenTransport();
+    const bool fullscreenActivationPoint = fullscreen_ && IsFullscreenTransportActivationPoint(point);
+    const bool fullscreenTransportHit = fullscreen_ &&
+                                        (ContainsPoint(transportBar_, point) ||
+                                         IsPointInSubtitleMenu(point));
+    if (fullscreen_ && (fullscreenActivationPoint || fullscreenTransportHit)) {
+        ShowFullscreenTransport(fullscreenActivationPoint ? L"mouse_move_activation" : L"mouse_move_transport");
     }
 
     if (draggingSettingsScrollThumb_) {
@@ -184,7 +183,7 @@ void MainWindow::OnMouseMove(const int x, const int y) {
     if (draggingVolume_) {
         UpdateVolumeDrag(point);
         if (fullscreen_) {
-            ShowFullscreenTransport();
+            ShowFullscreenTransport(L"volume_drag");
         }
         return;
     }
@@ -224,10 +223,7 @@ void MainWindow::OnMouseMove(const int x, const int y) {
 
     SetProgressHover(ContainsPoint(ProgressHitRect(), point));
     const bool volumeHovered = ContainsPoint(VolumeSliderHitRect(), point);
-    if (volumeSliderHovered_ != volumeHovered) {
-        volumeSliderHovered_ = volumeHovered;
-        InvalidateTransportArea();
-    }
+    SetVolumeSliderHover(volumeHovered);
     const int subtitleHit = HitSubtitleMenuItem(point);
     if (subtitleHit != hoveredSubtitleMenuItem_) {
         hoveredSubtitleMenuItem_ = subtitleHit;
@@ -241,6 +237,12 @@ void MainWindow::OnMouseMove(const int x, const int y) {
 
     int hit = HitButton(point);
     if (hit != hoveredButton_) {
+        if (hoveredButton_ >= 0) {
+            SetButtonHoverTarget(hoveredButton_, false);
+        }
+        if (hit >= 0) {
+            SetButtonHoverTarget(hit, true);
+        }
         hoveredButton_ = hit;
         InvalidateFullscreenOverlay();
         InvalidateRect(hwnd_, nullptr, FALSE);
@@ -261,7 +263,7 @@ void MainWindow::OnLeftButtonDown(const int x, const int y) {
         (!fullscreenTransportWasHidden ||
          IsFullscreenTransportActivationPoint(point) ||
          ContainsPoint(transportBar_, point))) {
-        ShowFullscreenTransport();
+        ShowFullscreenTransport(fullscreenTransportWasHidden ? L"left_down_reveal" : L"left_down_transport");
         if (fullscreenTransportWasHidden) {
             return;
         }
@@ -410,6 +412,7 @@ void MainWindow::OnLeftButtonDown(const int x, const int y) {
 
     const int hit = HitButton(point);
     if (hit >= 0) {
+        TriggerButtonPress(hit);
         Execute(buttons_[static_cast<std::size_t>(hit)].command);
         return;
     }
@@ -424,6 +427,9 @@ void MainWindow::OnLeftButtonDown(const int x, const int y) {
         }
         if (BeginHdrToneCurveDrag(point)) {
             return;
+        }
+        if (HasHdrToneCurveSelection()) {
+            ClearHdrToneCurveSelection();
         }
         if (ContainsPoint(hdrToneCurvePlot_, point)) {
             return;
@@ -448,7 +454,7 @@ void MainWindow::OnLeftButtonUp(const int x, const int y) {
     if (draggingVolume_) {
         EndVolumeDrag(POINT{x, y});
         if (fullscreen_) {
-            ShowFullscreenTransport();
+            ShowFullscreenTransport(L"volume_drag_end");
         }
         return;
     }
@@ -468,7 +474,7 @@ void MainWindow::OnLeftButtonUp(const int x, const int y) {
         dragSeekPosition_ = PositionFromProgressX(x);
         CommitProgressDrag();
         if (fullscreen_) {
-            ShowFullscreenTransport();
+            ShowFullscreenTransport(L"progress_drag_end");
         }
         return;
     }
@@ -502,9 +508,9 @@ void MainWindow::OnMouseWheel(const int delta, POINT screenPoint) {
         if (std::abs(steps) > 0.001) {
             ApplyVolume(snapshot.volume + steps * 0.05, true);
         }
-        volumeSliderHovered_ = true;
+        SetVolumeSliderHover(true);
         if (fullscreen_) {
-            ShowFullscreenTransport();
+            ShowFullscreenTransport(L"wheel_volume");
         }
         InvalidateTransportArea();
         return;
@@ -863,6 +869,7 @@ bool MainWindow::ApplyVolume(const double volume, const bool restartExternalNow)
         volumeDragChanged_ = true;
     }
     InvalidateTransportArea();
+    PostWebUiState();
     return true;
 }
 
@@ -873,7 +880,7 @@ bool MainWindow::BeginVolumeDrag(const POINT point) {
 
     draggingVolume_ = true;
     volumeDragChanged_ = false;
-    volumeSliderHovered_ = true;
+    SetVolumeSliderHover(true);
     SetCapture(hwnd_);
     UpdateVolumeDrag(point);
     InvalidateTransportArea();
@@ -904,6 +911,7 @@ void MainWindow::EndVolumeDrag(const POINT point) {
         RestartPlaybackIfPlaying();
     }
     volumeDragChanged_ = false;
+    SetVolumeSliderHover(ContainsPoint(VolumeSliderHitRect(), point));
     InvalidateTransportArea();
 }
 
@@ -914,6 +922,7 @@ void MainWindow::CancelVolumeDrag() {
 
     draggingVolume_ = false;
     volumeDragChanged_ = false;
+    SetVolumeSliderHover(false);
     InvalidateTransportArea();
 }
 
@@ -1136,20 +1145,6 @@ bool MainWindow::BeginHdrToneCurveDrag(const POINT point) {
         return true;
     }
 
-    if (HasHdrToneCurveSelection() && ContainsPoint(hdrToneCurvePlot_, point)) {
-        int anchor = -1;
-        for (std::size_t index = 1; index < selectedHdrToneCurvePoints_.size(); ++index) {
-            if (selectedHdrToneCurvePoints_[index]) {
-                anchor = static_cast<int>(index);
-                break;
-            }
-        }
-        if (anchor > 0) {
-            StartHdrToneCurveDrag(anchor, true, point);
-            return true;
-        }
-    }
-
     return false;
 }
 
@@ -1356,7 +1351,115 @@ void MainWindow::ApplyLiveHdrToneCurveSettings() {
     EnsureLayout();
     InvalidateTransportArea();
     InvalidateFullscreenOverlay();
-    InvalidateRect(hwnd_, nullptr, FALSE);
+    InvalidateHdrToneCurveEditor();
+    PostWebUiState();
+}
+
+void MainWindow::ApplyHdrToneCurvePoint(const int pointIndex, const double outputNits) {
+    auto settings = controller_.Settings();
+    if (!HdrToneCurveAvailable(settings) ||
+        pointIndex <= 0 ||
+        pointIndex >= static_cast<int>(settings.video.hdrToneCurve.size())) {
+        return;
+    }
+
+    auto& curve = settings.video.hdrToneCurve;
+    NormalizeHdrToneCurveForEditing(curve);
+
+    const std::size_t index = static_cast<std::size_t>(pointIndex);
+    const double minOutput = curve[index - 1].outputNits;
+    const double maxOutput = index + 1 < curve.size()
+                                 ? curve[index + 1].outputNits
+                                 : kHdrToneCurveMaxNits;
+    const double nextOutput = std::clamp(RoundToneCurveNits(outputNits),
+                                         minOutput,
+                                         std::max(minOutput, maxOutput));
+    if (std::abs(nextOutput - curve[index].outputNits) < 0.5) {
+        return;
+    }
+
+    curve[index].outputNits = nextOutput;
+    settings.video.peakBrightnessNits =
+        static_cast<int>(std::clamp(curve.back().outputNits, 100.0, kHdrToneCurveMaxNits));
+    controller_.ApplySettings(settings);
+    ApplyLiveHdrToneCurveSettings();
+}
+
+void MainWindow::ApplyHdrToneCurvePoints(
+    const std::array<double, anvil::playback::kHdrToneCurvePointCount>& outputNits,
+    const std::array<bool, anvil::playback::kHdrToneCurvePointCount>& hasOutput) {
+    auto settings = controller_.Settings();
+    if (!HdrToneCurveAvailable(settings)) {
+        return;
+    }
+
+    auto& curve = settings.video.hdrToneCurve;
+    NormalizeHdrToneCurveForEditing(curve);
+
+    std::array<double, anvil::playback::kHdrToneCurvePointCount> nextOutputs{};
+    for (std::size_t index = 0; index < curve.size(); ++index) {
+        nextOutputs[index] = curve[index].outputNits;
+    }
+
+    bool hasAnyOutput = false;
+    for (std::size_t index = 1; index < curve.size() && index < hasOutput.size(); ++index) {
+        if (!hasOutput[index]) {
+            continue;
+        }
+        nextOutputs[index] = RoundToneCurveNits(outputNits[index]);
+        hasAnyOutput = true;
+    }
+    if (!hasAnyOutput) {
+        return;
+    }
+
+    std::size_t segmentIndex = 1;
+    while (segmentIndex < curve.size() && segmentIndex < hasOutput.size()) {
+        if (!hasOutput[segmentIndex]) {
+            ++segmentIndex;
+            continue;
+        }
+
+        const std::size_t start = segmentIndex;
+        while (segmentIndex + 1 < curve.size() &&
+               segmentIndex + 1 < hasOutput.size() &&
+               hasOutput[segmentIndex + 1]) {
+            ++segmentIndex;
+        }
+        const std::size_t end = segmentIndex;
+        const double lower = nextOutputs[start - 1];
+        const double upper = end + 1 < curve.size()
+                                 ? nextOutputs[end + 1]
+                                 : kHdrToneCurveMaxNits;
+        const double boundedUpper = std::max(lower, upper);
+
+        for (std::size_t index = start; index <= end; ++index) {
+            nextOutputs[index] = std::clamp(nextOutputs[index], lower, boundedUpper);
+            if (index > start) {
+                nextOutputs[index] = std::max(nextOutputs[index], nextOutputs[index - 1]);
+            }
+        }
+        ++segmentIndex;
+    }
+
+    bool changed = false;
+    for (std::size_t index = 1; index < curve.size() && index < hasOutput.size(); ++index) {
+        if (!hasOutput[index]) {
+            continue;
+        }
+        if (std::abs(nextOutputs[index] - curve[index].outputNits) >= 0.5) {
+            curve[index].outputNits = nextOutputs[index];
+            changed = true;
+        }
+    }
+    if (!changed) {
+        return;
+    }
+
+    settings.video.peakBrightnessNits =
+        static_cast<int>(std::clamp(curve.back().outputNits, 100.0, kHdrToneCurveMaxNits));
+    controller_.ApplySettings(settings);
+    ApplyLiveHdrToneCurveSettings();
 }
 
 void MainWindow::BeginVideoPress(const POINT point) {
@@ -1382,7 +1485,7 @@ void MainWindow::CompleteVideoLongPress() {
     videoPressLongActive_ = true;
     SetTemporaryPlaybackRate(2.0);
     if (fullscreen_ && ShouldShowFullscreenTransport(snapshot)) {
-        ShowFullscreenTransport();
+        ShowFullscreenTransport(L"video_long_press");
     }
 }
 
@@ -1477,7 +1580,7 @@ void MainWindow::OnKeyDown(const WPARAM key) {
         break;
     }
     if (refreshFullscreenTransport && fullscreen_) {
-        ShowFullscreenTransport();
+        ShowFullscreenTransport(L"key_down");
     }
     InvalidateFullscreenOverlay();
     InvalidateRect(hwnd_, nullptr, FALSE);
@@ -1499,7 +1602,7 @@ void MainWindow::ApplySubtitleSelection(const int selectedTrackIndex) {
         updated.media.has_value() &&
         updated.media->hasVideo &&
         backend_ == PlaybackBackend::NativeFfmpegD3D11) {
-        RefreshPausedNativeFrame(updated);
+        RefreshPausedNativeFrame(updated, true);
     } else {
         RestartPlaybackIfPlaying();
     }
@@ -1508,6 +1611,7 @@ void MainWindow::ApplySubtitleSelection(const int selectedTrackIndex) {
     InvalidateTransportArea();
     InvalidateFullscreenOverlay();
     InvalidateRect(hwnd_, nullptr, FALSE);
+    PostWebUiState();
 }
 
 void MainWindow::ApplyAudioSelection(const int selectedTrackIndex) {
@@ -1553,7 +1657,7 @@ void MainWindow::ApplySubtitleDelayDelta(const int deltaMs) {
         updated.media.has_value() &&
         updated.media->hasVideo &&
         backend_ == PlaybackBackend::NativeFfmpegD3D11) {
-        RefreshPausedNativeFrame(updated);
+        RefreshPausedNativeFrame(updated, true);
     } else {
         RestartPlaybackIfPlaying();
     }
@@ -1705,6 +1809,7 @@ void MainWindow::ToggleDolbyVisionHdrOutput() {
     InvalidateTransportArea();
     InvalidateFullscreenOverlay();
     InvalidateRect(hwnd_, nullptr, FALSE);
+    PostWebUiState();
 }
 
 void MainWindow::ToggleDolbyVisionCmv4Approx() {
@@ -1737,6 +1842,7 @@ void MainWindow::ToggleDolbyVisionCmv4Approx() {
         UpdateWindow(fullscreenOverlay_);
     }
     UpdateWindow(hwnd_);
+    PostWebUiState();
 }
 
 void MainWindow::ShowSubtitleMenu() {
@@ -1766,7 +1872,7 @@ void MainWindow::ShowSubtitleMenu() {
     hoveredSubtitleMenuItem_ = -1;
     SetSubtitleMenuTarget(true);
     if (fullscreen_) {
-        ShowFullscreenTransport();
+        ShowFullscreenTransport(L"subtitle_menu_show");
     }
 }
 

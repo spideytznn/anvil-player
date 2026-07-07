@@ -65,6 +65,15 @@ struct VideoColorConstants {
 
 static_assert(sizeof(VideoColorConstants) % 16 == 0);
 
+constexpr DWORD kFrameLatencyWaitTimeoutMs = 8;
+constexpr UINT kVideoPresentSyncInterval = 1;
+
+struct SubtitleShaderConstants {
+    float uvRect[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+};
+
+static_assert(sizeof(SubtitleShaderConstants) % 16 == 0);
+
 // Dolby Vision reshaping constants uploaded to the GPU each frame.
 //
 // Layout (HLSL cbuffer, must match the shader-side declaration in psNv12Src).
@@ -563,111 +572,6 @@ int CountSubtitleLines(const std::wstring& text) {
     return static_cast<int>(std::count(text.begin(), text.end(), L'\n')) + 1;
 }
 
-std::wstring SubtitleBitmapKey(const std::vector<NativeSubtitleBitmap>& bitmaps) {
-    if (bitmaps.empty()) {
-        return {};
-    }
-
-    std::wostringstream stream;
-    for (const auto& bitmap : bitmaps) {
-        stream << bitmap.serial << L':'
-               << bitmap.x << L',' << bitmap.y << L','
-               << bitmap.width << L'x' << bitmap.height << L','
-               << bitmap.canvasWidth << L'x' << bitmap.canvasHeight << L';';
-    }
-    return stream.str();
-}
-
-uint8_t BlendPremultipliedChannel(const uint8_t source, const uint8_t destination, const uint8_t inverseAlpha) {
-    return static_cast<uint8_t>(source + (static_cast<unsigned int>(destination) * inverseAlpha + 127) / 255);
-}
-
-uint8_t SampleBilinearChannel(const uint8_t* sourcePixels,
-                              const int sourceStride,
-                              const int sourceWidth,
-                              const int sourceHeight,
-                              const double sourceX,
-                              const double sourceY,
-                              const int channel) {
-    const double clampedX = std::clamp(sourceX, 0.0, static_cast<double>(sourceWidth - 1));
-    const double clampedY = std::clamp(sourceY, 0.0, static_cast<double>(sourceHeight - 1));
-    const int x0 = static_cast<int>(std::floor(clampedX));
-    const int y0 = static_cast<int>(std::floor(clampedY));
-    const int x1 = std::min(x0 + 1, sourceWidth - 1);
-    const int y1 = std::min(y0 + 1, sourceHeight - 1);
-    const double tx = clampedX - static_cast<double>(x0);
-    const double ty = clampedY - static_cast<double>(y0);
-
-    const uint8_t* p00 = sourcePixels + static_cast<std::size_t>(sourceStride) * y0 + static_cast<std::size_t>(x0) * 4;
-    const uint8_t* p10 = sourcePixels + static_cast<std::size_t>(sourceStride) * y0 + static_cast<std::size_t>(x1) * 4;
-    const uint8_t* p01 = sourcePixels + static_cast<std::size_t>(sourceStride) * y1 + static_cast<std::size_t>(x0) * 4;
-    const uint8_t* p11 = sourcePixels + static_cast<std::size_t>(sourceStride) * y1 + static_cast<std::size_t>(x1) * 4;
-
-    const double top = static_cast<double>(p00[channel]) * (1.0 - tx) + static_cast<double>(p10[channel]) * tx;
-    const double bottom = static_cast<double>(p01[channel]) * (1.0 - tx) + static_cast<double>(p11[channel]) * tx;
-    const auto value = static_cast<long>(std::lround(top * (1.0 - ty) + bottom * ty));
-    return static_cast<uint8_t>(std::clamp<long>(value, 0, 255));
-}
-
-void BlendSubtitleBitmap(std::vector<uint8_t>& destination,
-                         const int destinationWidth,
-                         const int destinationHeight,
-                         const NativeSubtitleBitmap& source,
-                         const D3D11_VIEWPORT& videoViewport,
-                         const int frameWidth,
-                         const int frameHeight,
-                         const int offsetXPx,
-                         const int offsetYPx) {
-    if (!source.HasPixels() || destinationWidth <= 0 || destinationHeight <= 0) {
-        return;
-    }
-
-    const int canvasWidth = source.canvasWidth > 0 ? source.canvasWidth : frameWidth;
-    const int canvasHeight = source.canvasHeight > 0 ? source.canvasHeight : frameHeight;
-    if (canvasWidth <= 0 || canvasHeight <= 0 || videoViewport.Width <= 0.0f || videoViewport.Height <= 0.0f) {
-        return;
-    }
-
-    const double scaleX = static_cast<double>(videoViewport.Width) / static_cast<double>(canvasWidth);
-    const double scaleY = static_cast<double>(videoViewport.Height) / static_cast<double>(canvasHeight);
-    const int destLeft = static_cast<int>(std::round(videoViewport.TopLeftX + static_cast<float>(source.x) * scaleX)) + offsetXPx;
-    const int destTop = static_cast<int>(std::round(videoViewport.TopLeftY + static_cast<float>(source.y) * scaleY)) + offsetYPx;
-    const int destWidth = std::max(1, static_cast<int>(std::round(static_cast<double>(source.width) * scaleX)));
-    const int destHeight = std::max(1, static_cast<int>(std::round(static_cast<double>(source.height) * scaleY)));
-    const int clippedLeft = std::clamp(destLeft, 0, destinationWidth);
-    const int clippedTop = std::clamp(destTop, 0, destinationHeight);
-    const int clippedRight = std::clamp(destLeft + destWidth, 0, destinationWidth);
-    const int clippedBottom = std::clamp(destTop + destHeight, 0, destinationHeight);
-    if (clippedRight <= clippedLeft || clippedBottom <= clippedTop) {
-        return;
-    }
-
-    const uint8_t* sourcePixels = source.bgra->data();
-    for (int y = clippedTop; y < clippedBottom; ++y) {
-        const double sourceY = ((static_cast<double>(y - destTop) + 0.5) *
-                                static_cast<double>(source.height) / static_cast<double>(destHeight)) - 0.5;
-        for (int x = clippedLeft; x < clippedRight; ++x) {
-            const double sourceX = ((static_cast<double>(x - destLeft) + 0.5) *
-                                    static_cast<double>(source.width) / static_cast<double>(destWidth)) - 0.5;
-            const uint8_t blue = SampleBilinearChannel(sourcePixels, source.stride, source.width, source.height, sourceX, sourceY, 0);
-            const uint8_t green = SampleBilinearChannel(sourcePixels, source.stride, source.width, source.height, sourceX, sourceY, 1);
-            const uint8_t red = SampleBilinearChannel(sourcePixels, source.stride, source.width, source.height, sourceX, sourceY, 2);
-            const uint8_t alpha = SampleBilinearChannel(sourcePixels, source.stride, source.width, source.height, sourceX, sourceY, 3);
-            if (alpha == 0) {
-                continue;
-            }
-
-            uint8_t* destinationPixel = destination.data() +
-                                        (static_cast<std::size_t>(destinationWidth) * y + x) * 4;
-            const uint8_t inverseAlpha = static_cast<uint8_t>(255 - alpha);
-            destinationPixel[0] = BlendPremultipliedChannel(blue, destinationPixel[0], inverseAlpha);
-            destinationPixel[1] = BlendPremultipliedChannel(green, destinationPixel[1], inverseAlpha);
-            destinationPixel[2] = BlendPremultipliedChannel(red, destinationPixel[2], inverseAlpha);
-            destinationPixel[3] = BlendPremultipliedChannel(alpha, destinationPixel[3], inverseAlpha);
-        }
-    }
-}
-
 float SubtitleFontPixels(const D3D11_VIEWPORT& videoViewport, const double fontScale) {
     const float base = std::clamp(videoViewport.Height * 0.048f, 20.0f, 54.0f);
     return base * static_cast<float>(std::clamp(fontScale, 0.5, 2.0));
@@ -726,27 +630,49 @@ bool D3D11VideoRenderer::Initialize(HWND host) {
     // Prefer a composition swap chain: DWM composites the video surface so GDI
     // sibling overlay windows (subtitle menu popup) render on top of it. A
     // HWND-bound flip-model swap chain would occlude those overlays. Composition
-    // swap chains do not support ALLOW_MODE_SWITCH, so Flags must be 0 here.
-    desc.Flags = 0;
+    // swap chains do not support ALLOW_MODE_SWITCH, but can use the frame
+    // latency waitable flag on systems/drivers that expose it.
+    desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
     hr = factory_->CreateSwapChainForComposition(device_.Get(), &desc, nullptr, &swapChain_);
     if (SUCCEEDED(hr) && swapChain_ && CreateComposition()) {
         useComposition_ = true;
-        LogInfo(L"swap chain created via CreateSwapChainForComposition + DirectComposition");
+        LogInfo(L"swap chain created via CreateSwapChainForComposition + DirectComposition waitable=true");
     } else {
-        // Fallback to a HWND-bound flip-model swap chain on systems/drivers
-        // without composition support. Behavior reverts to the previous one
-        // (overlay occlusion may recur on such systems).
         swapChain_.Reset();
         dcompVisual_.Reset();
         dcompTarget_.Reset();
         dcompDevice_.Reset();
         useComposition_ = false;
-        desc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
-        hr = factory_->CreateSwapChainForHwnd(device_.Get(), host_, &desc, nullptr, nullptr, &swapChain_);
-        if (FAILED(hr)) { LogHr(L"CreateSwapChainForHwnd", hr); return false; }
-        LogInfo(L"swap chain created via CreateSwapChainForHwnd (composition fallback)");
+
+        desc.Flags = 0;
+        hr = factory_->CreateSwapChainForComposition(device_.Get(), &desc, nullptr, &swapChain_);
+        if (SUCCEEDED(hr) && swapChain_ && CreateComposition()) {
+            useComposition_ = true;
+            LogInfo(L"swap chain created via CreateSwapChainForComposition + DirectComposition waitable=false");
+        } else {
+            // Fallback to a HWND-bound flip-model swap chain on systems/drivers
+            // without composition support. Behavior reverts to the previous one
+            // (overlay occlusion may recur on such systems).
+            swapChain_.Reset();
+            dcompVisual_.Reset();
+            dcompTarget_.Reset();
+            dcompDevice_.Reset();
+            useComposition_ = false;
+
+            desc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+            hr = factory_->CreateSwapChainForHwnd(device_.Get(), host_, &desc, nullptr, nullptr, &swapChain_);
+            if (SUCCEEDED(hr)) {
+                LogInfo(L"swap chain created via CreateSwapChainForHwnd (composition fallback) waitable=true");
+            } else {
+                desc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+                hr = factory_->CreateSwapChainForHwnd(device_.Get(), host_, &desc, nullptr, nullptr, &swapChain_);
+                if (FAILED(hr)) { LogHr(L"CreateSwapChainForHwnd", hr); return false; }
+                LogInfo(L"swap chain created via CreateSwapChainForHwnd (composition fallback) waitable=false");
+            }
+        }
     }
 
+    ConfigureFramePacing();
     if (!CreateRenderTarget()) return false;
     if (!CreatePipeline()) return false;
     ApplySwapChainColorSpace(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, mediaColor_);
@@ -790,8 +716,18 @@ void D3D11VideoRenderer::OnResize() {
     rtv_.Reset();
     // Composition swap chains do not use ALLOW_MODE_SWITCH; only set it for the
     // HWND-bound fallback path.
-    const UINT resizeFlags = useComposition_ ? 0 : DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
-    const HRESULT hr = swapChain_->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, resizeFlags);
+    UINT resizeFlags = useComposition_ ? 0 : DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+    if (frameLatencyWaitable_) {
+        resizeFlags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    }
+    HRESULT hr = swapChain_->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, resizeFlags);
+    if (FAILED(hr) && frameLatencyWaitable_) {
+        CloseHandle(frameLatencyWaitable_);
+        frameLatencyWaitable_ = nullptr;
+        resizeFlags &= ~DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        LogInfo(L"frame pacing waitable disabled after ResizeBuffers failure");
+        hr = swapChain_->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, resizeFlags);
+    }
     if (FAILED(hr)) { LogHr(L"ResizeBuffers", hr); return; }
     CreateRenderTarget();
     viewport_.Width = static_cast<float>(width);
@@ -819,6 +755,100 @@ D3D11RenderStats D3D11VideoRenderer::TakeRenderStats() {
     return stats;
 }
 
+bool D3D11VideoRenderer::ConfigureFramePacing() {
+    if (frameLatencyWaitable_) {
+        CloseHandle(frameLatencyWaitable_);
+        frameLatencyWaitable_ = nullptr;
+    }
+    if (!swapChain_) {
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<IDXGISwapChain2> swapChain2;
+    if (FAILED(swapChain_.As(&swapChain2)) || !swapChain2) {
+        if (!framePacingLogged_) {
+            framePacingLogged_ = true;
+            LogInfo(L"frame pacing waitable=unavailable reason=swapchain2");
+        }
+        return false;
+    }
+
+    const HRESULT latencyHr = swapChain2->SetMaximumFrameLatency(1);
+    if (FAILED(latencyHr)) {
+        LogHr(L"SetMaximumFrameLatency swapchain", latencyHr);
+    }
+
+    frameLatencyWaitable_ = swapChain2->GetFrameLatencyWaitableObject();
+    if (!frameLatencyWaitable_) {
+        if (!framePacingLogged_) {
+            framePacingLogged_ = true;
+            LogInfo(L"frame pacing waitable=unavailable reason=no_handle present_sync_interval=1");
+        }
+        return false;
+    }
+
+    if (!framePacingLogged_) {
+        framePacingLogged_ = true;
+        LogInfo(L"frame pacing waitable=active max_frame_latency=1 present_sync_interval=1");
+    }
+    return true;
+}
+
+void D3D11VideoRenderer::WaitForFrameLatencyObject(const bool collectStats) {
+    if (!frameLatencyWaitable_) {
+        return;
+    }
+
+    const auto waitStart = collectStats ? std::chrono::steady_clock::now()
+                                        : std::chrono::steady_clock::time_point{};
+    const DWORD result = WaitForSingleObjectEx(frameLatencyWaitable_, kFrameLatencyWaitTimeoutMs, TRUE);
+    if (!collectStats) {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const uint64_t waitUs = ElapsedMicroseconds(waitStart, now);
+    ++renderStats_.frameLatencyWaits;
+    renderStats_.frameLatencyWaitUs += waitUs;
+    renderStats_.maxFrameLatencyWaitUs = std::max(renderStats_.maxFrameLatencyWaitUs, waitUs);
+    if (result == WAIT_TIMEOUT || result == WAIT_FAILED) {
+        ++renderStats_.frameLatencyWaitTimeouts;
+    }
+}
+
+void D3D11VideoRenderer::PresentFrame(const UINT syncInterval,
+                                      const bool collectStats,
+                                      const std::chrono::steady_clock::time_point stageStart) {
+    if (!swapChain_) {
+        return;
+    }
+
+    const HRESULT presentHr = swapChain_->Present(syncInterval, 0);
+    if (FAILED(presentHr)) {
+        LogHr(L"Present", presentHr);
+    }
+
+    if (!collectStats) {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const uint64_t presentUs = ElapsedMicroseconds(stageStart, now);
+    renderStats_.presentUs += presentUs;
+    renderStats_.maxPresentUs = std::max(renderStats_.maxPresentUs, presentUs);
+    if (syncInterval > 0) {
+        ++renderStats_.presentSyncFrames;
+    }
+
+    DXGI_FRAME_STATISTICS frameStatistics{};
+    const HRESULT statisticsHr = swapChain_->GetFrameStatistics(&frameStatistics);
+    if (SUCCEEDED(statisticsHr)) {
+        ++renderStats_.frameStatsSamples;
+    } else if (statisticsHr == DXGI_ERROR_FRAME_STATISTICS_DISJOINT) {
+        ++renderStats_.frameStatsDisjoint;
+    }
+}
+
 void D3D11VideoRenderer::Render(const NativeVideoFrame& frame) {
     if (!device_ || !context_ || !swapChain_) return;
     if (((frame.dovi && frame.dovi->valid) ||
@@ -836,6 +866,7 @@ void D3D11VideoRenderer::Render(const NativeVideoFrame& frame) {
     }
     constexpr uint64_t kSlowRenderFrameThresholdUs = 33000;
     const bool collectStats = diagnosticsEnabled_;
+    WaitForFrameLatencyObject(collectStats);
     const auto renderStart = collectStats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto stageStart = renderStart;
 
@@ -925,29 +956,28 @@ void D3D11VideoRenderer::Render(const NativeVideoFrame& frame) {
         ID3D11ShaderResourceView* nullView[1] = {};
         context_->PSSetShaderResources(0, 1, nullView);
     }
-    const bool drewSubtitle = UpdateSubtitleOverlay(frame, drawViewport);
-    if (drewSubtitle) {
+    const bool drewTextSubtitle = UpdateSubtitleOverlay(frame, drawViewport);
+    if (drewTextSubtitle) {
         DrawSubtitleOverlay();
     }
+    const bool drewBitmapSubtitle = DrawSubtitleBitmapOverlays(frame, drawViewport);
+    const bool drewSubtitle = drewTextSubtitle || drewBitmapSubtitle;
     if (collectStats) {
         const auto now = std::chrono::steady_clock::now();
         renderStats_.subtitleUs += ElapsedMicroseconds(stageStart, now);
         stageStart = now;
     }
 
-    swapChain_->Present(0, 0);
+    PresentFrame(kVideoPresentSyncInterval, collectStats, stageStart);
     if (collectStats) {
         const auto now = std::chrono::steady_clock::now();
-        const uint64_t presentUs = ElapsedMicroseconds(stageStart, now);
         const uint64_t totalUs = ElapsedMicroseconds(renderStart, now);
         ++renderStats_.frames;
         if (hasHardwareTexture) ++renderStats_.hardwareFrames;
         if (hasBgraTexture) ++renderStats_.bgraFrames;
         if (drewSubtitle) ++renderStats_.subtitleFrames;
         if (totalUs > kSlowRenderFrameThresholdUs) ++renderStats_.slowFrames;
-        renderStats_.presentUs += presentUs;
         renderStats_.totalRenderUs += totalUs;
-        renderStats_.maxPresentUs = std::max(renderStats_.maxPresentUs, presentUs);
         renderStats_.maxRenderUs = std::max(renderStats_.maxRenderUs, totalUs);
     }
 }
@@ -956,6 +986,7 @@ void D3D11VideoRenderer::Clear() {
     if (!device_ || !context_ || !swapChain_ || !rtv_) return;
     ResetRenderStats();
     hardwareSrvCache_.clear();
+    subtitleTextureCache_.clear();
     hwSrvUV_.Reset();
     hwSrvY_.Reset();
     float clearColor[4] = {0.02f, 0.03f, 0.04f, 1.0f};
@@ -1796,10 +1827,19 @@ bool D3D11VideoRenderer::CreatePipeline() {
         "  }\n"
         "  return float4(saturate(rgb), 1.0);\n"
         "}\n";
+    const char* psSubtitleSrc =
+        "Texture2D<float4> tex : register(t0);\n"
+        "SamplerState samp : register(s0);\n"
+        "cbuffer SubtitleConstants : register(b0) { float4 uvRect; };\n"
+        "float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_Target {\n"
+        "  float2 sourceUv = lerp(uvRect.xy, uvRect.zw, saturate(uv));\n"
+        "  return tex.Sample(samp, sourceUv);\n"
+        "}\n";
 
     Microsoft::WRL::ComPtr<ID3DBlob> vsBlob;
     Microsoft::WRL::ComPtr<ID3DBlob> psBlob;
     Microsoft::WRL::ComPtr<ID3DBlob> psNv12Blob;
+    Microsoft::WRL::ComPtr<ID3DBlob> psSubtitleBlob;
     Microsoft::WRL::ComPtr<ID3DBlob> errors;
     if (FAILED(D3DCompile(vsSrc, static_cast<SIZE_T>(std::strlen(vsSrc)), nullptr, nullptr, nullptr, "main", "vs_5_0", 0, 0, &vsBlob, &errors))) {
         LogHr(L"D3DCompile vs", E_FAIL);
@@ -1817,9 +1857,14 @@ bool D3D11VideoRenderer::CreatePipeline() {
         LogHr(L"D3DCompile ps nv12", E_FAIL);
         return false;
     }
+    if (FAILED(D3DCompile(psSubtitleSrc, static_cast<SIZE_T>(std::strlen(psSubtitleSrc)), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &psSubtitleBlob, &errors))) {
+        LogHr(L"D3DCompile ps subtitle", E_FAIL);
+        return false;
+    }
     if (FAILED(device_->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &vs_))) return false;
     if (FAILED(device_->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &ps_))) return false;
     if (FAILED(device_->CreatePixelShader(psNv12Blob->GetBufferPointer(), psNv12Blob->GetBufferSize(), nullptr, &psNv12_))) return false;
+    if (FAILED(device_->CreatePixelShader(psSubtitleBlob->GetBufferPointer(), psSubtitleBlob->GetBufferSize(), nullptr, &psSubtitle_))) return false;
 
     D3D11_SAMPLER_DESC samplerDesc{};
     samplerDesc.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
@@ -1857,6 +1902,12 @@ bool D3D11VideoRenderer::CreatePipeline() {
         LogHr(L"CreateBuffer dovi", doviHr);
         return false;
     }
+
+    D3D11_BUFFER_DESC subtitleConstantsDesc{};
+    subtitleConstantsDesc.ByteWidth = sizeof(SubtitleShaderConstants);
+    subtitleConstantsDesc.Usage = D3D11_USAGE_DEFAULT;
+    subtitleConstantsDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    if (FAILED(device_->CreateBuffer(&subtitleConstantsDesc, nullptr, &subtitleConstants_))) return false;
     return true;
 }
 
@@ -2725,11 +2776,210 @@ bool D3D11VideoRenderer::UpdateEnhancementYuvTexture(const NativeVideoFrame& fra
     return true;
 }
 
+D3D11VideoRenderer::SubtitleTextureCacheEntry* D3D11VideoRenderer::EnsureSubtitleBitmapTexture(
+    const NativeSubtitleBitmap& bitmap) {
+    if (!device_ || !bitmap.HasPixels()) {
+        return nullptr;
+    }
+
+    for (auto& entry : subtitleTextureCache_) {
+        if (entry.serial == bitmap.serial &&
+            entry.width == bitmap.width &&
+            entry.height == bitmap.height &&
+            entry.stride == bitmap.stride &&
+            entry.pixels == bitmap.bgra &&
+            entry.srv) {
+            entry.lastUsedFrame = subtitleDrawFrame_;
+            return &entry;
+        }
+    }
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = static_cast<UINT>(bitmap.width);
+    desc.Height = static_cast<UINT>(bitmap.height);
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+    D3D11_SUBRESOURCE_DATA initialData{};
+    initialData.pSysMem = bitmap.bgra->data();
+    initialData.SysMemPitch = static_cast<UINT>(bitmap.stride);
+
+    SubtitleTextureCacheEntry entry{};
+    entry.serial = bitmap.serial;
+    entry.width = bitmap.width;
+    entry.height = bitmap.height;
+    entry.stride = bitmap.stride;
+    entry.pixels = bitmap.bgra;
+    entry.lastUsedFrame = subtitleDrawFrame_;
+    entry.bytes = bitmap.bgra->size();
+
+    const HRESULT textureHr = device_->CreateTexture2D(&desc, &initialData, &entry.texture);
+    if (FAILED(textureHr)) {
+        LogHr(L"CreateTexture2D subtitle bitmap", textureHr);
+        return nullptr;
+    }
+    const HRESULT srvHr = device_->CreateShaderResourceView(entry.texture.Get(), nullptr, &entry.srv);
+    if (FAILED(srvHr)) {
+        LogHr(L"CreateShaderResourceView subtitle bitmap", srvHr);
+        return nullptr;
+    }
+    if (diagnosticsEnabled_) {
+        ++renderStats_.subtitleSurfaceRebuilds;
+    }
+
+    subtitleTextureCache_.push_back(std::move(entry));
+    return &subtitleTextureCache_.back();
+}
+
+void D3D11VideoRenderer::PruneSubtitleTextureCache() {
+    constexpr std::size_t kMaxSubtitleTextureEntries = 512;
+    constexpr std::size_t kMaxSubtitleTextureBytes = 96ull * 1024ull * 1024ull;
+
+    auto cacheBytes = [this]() {
+        std::size_t total = 0;
+        for (const auto& entry : subtitleTextureCache_) {
+            total += entry.bytes;
+        }
+        return total;
+    };
+
+    while (subtitleTextureCache_.size() > kMaxSubtitleTextureEntries ||
+           cacheBytes() > kMaxSubtitleTextureBytes) {
+        auto oldest = std::min_element(subtitleTextureCache_.begin(),
+                                       subtitleTextureCache_.end(),
+                                       [](const SubtitleTextureCacheEntry& lhs,
+                                          const SubtitleTextureCacheEntry& rhs) {
+                                           return lhs.lastUsedFrame < rhs.lastUsedFrame;
+                                       });
+        if (oldest == subtitleTextureCache_.end() || oldest->lastUsedFrame == subtitleDrawFrame_) {
+            break;
+        }
+        subtitleTextureCache_.erase(oldest);
+    }
+}
+
+bool D3D11VideoRenderer::DrawSubtitleBitmapOverlays(const NativeVideoFrame& frame,
+                                                    const D3D11_VIEWPORT& videoViewport) {
+    if (!context_ ||
+        !subtitleBlend_ ||
+        !vs_ ||
+        !psSubtitle_ ||
+        !sampler_ ||
+        !subtitleConstants_ ||
+        frame.subtitleBitmaps.empty() ||
+        viewport_.Width <= 0.0f ||
+        viewport_.Height <= 0.0f ||
+        videoViewport.Width <= 0.0f ||
+        videoViewport.Height <= 0.0f) {
+        return false;
+    }
+
+    ++subtitleDrawFrame_;
+    if (subtitleDrawFrame_ == 0) {
+        subtitleDrawFrame_ = 1;
+    }
+
+    bool drew = false;
+    float blendFactor[4] = {};
+    context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context_->VSSetShader(vs_.Get(), nullptr, 0);
+    context_->PSSetShader(psSubtitle_.Get(), nullptr, 0);
+    context_->PSSetSamplers(0, 1, sampler_.GetAddressOf());
+    context_->OMSetBlendState(subtitleBlend_.Get(), blendFactor, 0xffffffff);
+
+    const double surfaceLeft = viewport_.TopLeftX;
+    const double surfaceTop = viewport_.TopLeftY;
+    const double surfaceRight = viewport_.TopLeftX + viewport_.Width;
+    const double surfaceBottom = viewport_.TopLeftY + viewport_.Height;
+
+    int attemptedRects = 0;
+    uint64_t attemptedPixels = 0;
+    for (const auto& bitmap : frame.subtitleBitmaps) {
+        if (!bitmap.HasPixels()) {
+            continue;
+        }
+        const int canvasWidth = bitmap.canvasWidth > 0 ? bitmap.canvasWidth : frame.width;
+        const int canvasHeight = bitmap.canvasHeight > 0 ? bitmap.canvasHeight : frame.height;
+        if (canvasWidth <= 0 || canvasHeight <= 0) {
+            continue;
+        }
+
+        auto* entry = EnsureSubtitleBitmapTexture(bitmap);
+        if (!entry || !entry->srv) {
+            continue;
+        }
+
+        const double scaleX = static_cast<double>(videoViewport.Width) / static_cast<double>(canvasWidth);
+        const double scaleY = static_cast<double>(videoViewport.Height) / static_cast<double>(canvasHeight);
+        const double destLeft = static_cast<double>(videoViewport.TopLeftX) + static_cast<double>(bitmap.x) * scaleX +
+                                static_cast<double>(subtitleSettings_.offsetXPx);
+        const double destTop = static_cast<double>(videoViewport.TopLeftY) + static_cast<double>(bitmap.y) * scaleY +
+                               static_cast<double>(subtitleSettings_.offsetYPx);
+        const double destWidth = std::max(1.0, static_cast<double>(bitmap.width) * scaleX);
+        const double destHeight = std::max(1.0, static_cast<double>(bitmap.height) * scaleY);
+        const double destRight = destLeft + destWidth;
+        const double destBottom = destTop + destHeight;
+
+        const double clippedLeft = std::clamp(destLeft, surfaceLeft, surfaceRight);
+        const double clippedTop = std::clamp(destTop, surfaceTop, surfaceBottom);
+        const double clippedRight = std::clamp(destRight, surfaceLeft, surfaceRight);
+        const double clippedBottom = std::clamp(destBottom, surfaceTop, surfaceBottom);
+        if (clippedRight <= clippedLeft || clippedBottom <= clippedTop) {
+            continue;
+        }
+
+        SubtitleShaderConstants constants{};
+        constants.uvRect[0] = static_cast<float>((clippedLeft - destLeft) / destWidth);
+        constants.uvRect[1] = static_cast<float>((clippedTop - destTop) / destHeight);
+        constants.uvRect[2] = static_cast<float>((clippedRight - destLeft) / destWidth);
+        constants.uvRect[3] = static_cast<float>((clippedBottom - destTop) / destHeight);
+        context_->UpdateSubresource(subtitleConstants_.Get(), 0, nullptr, &constants, 0, 0);
+        ID3D11Buffer* constantBuffers[1] = {subtitleConstants_.Get()};
+        context_->PSSetConstantBuffers(0, 1, constantBuffers);
+
+        D3D11_VIEWPORT bitmapViewport{};
+        bitmapViewport.TopLeftX = static_cast<float>(clippedLeft);
+        bitmapViewport.TopLeftY = static_cast<float>(clippedTop);
+        bitmapViewport.Width = static_cast<float>(clippedRight - clippedLeft);
+        bitmapViewport.Height = static_cast<float>(clippedBottom - clippedTop);
+        bitmapViewport.MinDepth = 0.0f;
+        bitmapViewport.MaxDepth = 1.0f;
+        context_->RSSetViewports(1, &bitmapViewport);
+
+        ID3D11ShaderResourceView* srv = entry->srv.Get();
+        context_->PSSetShaderResources(0, 1, &srv);
+        context_->Draw(3, 0);
+        drew = true;
+        ++attemptedRects;
+        attemptedPixels += static_cast<uint64_t>(bitmap.width) * static_cast<uint64_t>(bitmap.height);
+    }
+
+    ID3D11ShaderResourceView* nullSrv[1] = {};
+    context_->PSSetShaderResources(0, 1, nullSrv);
+    ID3D11Buffer* nullConstants[1] = {};
+    context_->PSSetConstantBuffers(0, 1, nullConstants);
+    context_->OMSetBlendState(nullptr, blendFactor, 0xffffffff);
+    context_->RSSetViewports(1, &viewport_);
+    PruneSubtitleTextureCache();
+    if (diagnosticsEnabled_ && drew) {
+        renderStats_.subtitleBitmapRects += static_cast<uint64_t>(attemptedRects);
+        renderStats_.subtitleBitmapPixels += attemptedPixels;
+    }
+
+    if (drew && !subtitleBitmapOverlayLogged_) {
+        subtitleBitmapOverlayLogged_ = true;
+        LogInfo(L"subtitle_bitmap_overlay gpu=active rects=" + std::to_wstring(attemptedRects));
+    }
+    return drew;
+}
+
 bool D3D11VideoRenderer::UpdateSubtitleOverlay(const NativeVideoFrame& frame, const D3D11_VIEWPORT& videoViewport) {
     const std::wstring& text = frame.subtitleText;
-    const auto& bitmaps = frame.subtitleBitmaps;
-    const std::wstring bitmapKey = SubtitleBitmapKey(bitmaps);
-    if (!device_ || !context_ || (text.empty() && bitmaps.empty()) || viewport_.Width <= 0.0f || viewport_.Height <= 0.0f) {
+    if (!device_ || !context_ || text.empty() || viewport_.Width <= 0.0f || viewport_.Height <= 0.0f) {
         activeSubtitleText_.clear();
         activeSubtitleBitmapKey_.clear();
         return false;
@@ -2737,11 +2987,8 @@ bool D3D11VideoRenderer::UpdateSubtitleOverlay(const NativeVideoFrame& frame, co
 
     const RECT videoRect = ViewportRect(videoViewport);
     const bool textChanged = text != activeSubtitleText_;
-    const bool bitmapsChanged = bitmapKey != activeSubtitleBitmapKey_;
-    const bool bitmapBecameActive = bitmapsChanged && activeSubtitleBitmapKey_.empty() && !bitmapKey.empty();
     if (subtitleSrv_ &&
         text == activeSubtitleText_ &&
-        bitmapKey == activeSubtitleBitmapKey_ &&
         RectEquals(videoRect, activeSubtitleViewport_) &&
         std::abs(activeSubtitleFontScale_ - subtitleSettings_.fontScale) < 0.001 &&
         activeSubtitleOffsetXPx_ == subtitleSettings_.offsetXPx &&
@@ -2754,21 +3001,22 @@ bool D3D11VideoRenderer::UpdateSubtitleOverlay(const NativeVideoFrame& frame, co
 
     const int surfaceWidth = std::max(1, static_cast<int>(std::round(viewport_.Width)));
     const int surfaceHeight = std::max(1, static_cast<int>(std::round(viewport_.Height)));
-    Gdiplus::Bitmap bitmap(surfaceWidth, surfaceHeight, PixelFormat32bppPARGB);
-    if (bitmap.GetLastStatus() != Gdiplus::Ok) {
-        return false;
-    }
-
-    Gdiplus::Graphics graphics(&bitmap);
-    graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
-    graphics.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
-    graphics.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
-    graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
-    graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
-
     const int lineCount = CountSubtitleLines(text);
+    std::vector<uint8_t> pixels(static_cast<std::size_t>(surfaceWidth) * static_cast<std::size_t>(surfaceHeight) * 4, 0);
     if (!text.empty()) {
+        Gdiplus::Bitmap bitmap(surfaceWidth, surfaceHeight, PixelFormat32bppPARGB);
+        if (bitmap.GetLastStatus() != Gdiplus::Ok) {
+            return false;
+        }
+
+        Gdiplus::Graphics graphics(&bitmap);
+        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+        graphics.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
+        graphics.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
+        graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+        graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
+
         const float fontPixels = SubtitleFontPixels(videoViewport, subtitleSettings_.fontScale);
         const float maxTextWidth = std::max(1.0f, videoViewport.Width * 0.84f);
         const float marginBottom = std::clamp(videoViewport.Height * 0.085f, 22.0f, 86.0f);
@@ -2803,37 +3051,24 @@ bool D3D11VideoRenderer::UpdateSubtitleOverlay(const NativeVideoFrame& frame, co
         Gdiplus::SolidBrush fill(Gdiplus::Color(245, 255, 255, 255));
         graphics.DrawPath(&outline, &textPath);
         graphics.FillPath(&fill, &textPath);
-    }
 
-    Gdiplus::BitmapData bitmapData{};
-    Gdiplus::Rect lockRect(0, 0, surfaceWidth, surfaceHeight);
-    if (bitmap.LockBits(&lockRect, Gdiplus::ImageLockModeRead, PixelFormat32bppPARGB, &bitmapData) != Gdiplus::Ok) {
-        return false;
-    }
+        Gdiplus::BitmapData bitmapData{};
+        Gdiplus::Rect lockRect(0, 0, surfaceWidth, surfaceHeight);
+        if (bitmap.LockBits(&lockRect, Gdiplus::ImageLockModeRead, PixelFormat32bppPARGB, &bitmapData) != Gdiplus::Ok) {
+            return false;
+        }
 
-    std::vector<uint8_t> pixels(static_cast<std::size_t>(surfaceWidth) * static_cast<std::size_t>(surfaceHeight) * 4);
-    const auto* source = static_cast<const uint8_t*>(bitmapData.Scan0);
-    const int sourceStride = bitmapData.Stride;
-    for (int y = 0; y < surfaceHeight; ++y) {
-        const uint8_t* sourceRow = sourceStride >= 0
-                                       ? source + static_cast<std::size_t>(sourceStride) * y
-                                       : source + static_cast<std::size_t>(-sourceStride) * (surfaceHeight - 1 - y);
-        std::memcpy(pixels.data() + static_cast<std::size_t>(surfaceWidth) * 4 * y,
-                    sourceRow,
-                    static_cast<std::size_t>(surfaceWidth) * 4);
-    }
-    bitmap.UnlockBits(&bitmapData);
-
-    for (const auto& subtitleBitmap : bitmaps) {
-        BlendSubtitleBitmap(pixels,
-                            surfaceWidth,
-                            surfaceHeight,
-                            subtitleBitmap,
-                            videoViewport,
-                            frame.width,
-                            frame.height,
-                            subtitleSettings_.offsetXPx,
-                            subtitleSettings_.offsetYPx);
+        const auto* source = static_cast<const uint8_t*>(bitmapData.Scan0);
+        const int sourceStride = bitmapData.Stride;
+        for (int y = 0; y < surfaceHeight; ++y) {
+            const uint8_t* sourceRow = sourceStride >= 0
+                                           ? source + static_cast<std::size_t>(sourceStride) * y
+                                           : source + static_cast<std::size_t>(-sourceStride) * (surfaceHeight - 1 - y);
+            std::memcpy(pixels.data() + static_cast<std::size_t>(surfaceWidth) * 4 * y,
+                        sourceRow,
+                        static_cast<std::size_t>(surfaceWidth) * 4);
+        }
+        bitmap.UnlockBits(&bitmapData);
     }
 
     if (!subtitleTexture_ || subtitleTextureW_ != surfaceWidth || subtitleTextureH_ != surfaceHeight || !subtitleSrv_) {
@@ -2877,28 +3112,33 @@ bool D3D11VideoRenderer::UpdateSubtitleOverlay(const NativeVideoFrame& frame, co
     context_->Unmap(subtitleTexture_.Get(), 0);
 
     activeSubtitleText_ = text;
-    activeSubtitleBitmapKey_ = bitmapKey;
+    activeSubtitleBitmapKey_.clear();
     activeSubtitleViewport_ = videoRect;
     activeSubtitleFontScale_ = subtitleSettings_.fontScale;
     activeSubtitleOffsetXPx_ = subtitleSettings_.offsetXPx;
     activeSubtitleOffsetYPx_ = subtitleSettings_.offsetYPx;
-    if (textChanged || bitmapBecameActive) {
+    if (textChanged) {
         LogInfo(L"subtitle_overlay active=true lines=" + std::to_wstring(lineCount) +
-                L" bitmap_rects=" + std::to_wstring(bitmaps.size()) +
+                L" bitmap_rects=0" +
                 L" surface=" + std::to_wstring(surfaceWidth) + L"x" + std::to_wstring(surfaceHeight));
     }
     return true;
 }
 
 void D3D11VideoRenderer::DrawSubtitleOverlay() {
-    if (!context_ || !subtitleSrv_ || !subtitleBlend_ || !vs_ || !ps_) {
+    if (!context_ || !subtitleSrv_ || !subtitleBlend_ || !vs_ || !psSubtitle_ || !subtitleConstants_) {
         return;
     }
+
+    SubtitleShaderConstants constants{};
+    context_->UpdateSubresource(subtitleConstants_.Get(), 0, nullptr, &constants, 0, 0);
+    ID3D11Buffer* constantBuffers[1] = {subtitleConstants_.Get()};
+    context_->PSSetConstantBuffers(0, 1, constantBuffers);
 
     context_->RSSetViewports(1, &viewport_);
     context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     context_->VSSetShader(vs_.Get(), nullptr, 0);
-    context_->PSSetShader(ps_.Get(), nullptr, 0);
+    context_->PSSetShader(psSubtitle_.Get(), nullptr, 0);
     context_->PSSetShaderResources(0, 1, subtitleSrv_.GetAddressOf());
     context_->PSSetSamplers(0, 1, sampler_.GetAddressOf());
     float blendFactor[4] = {};
@@ -2907,11 +3147,14 @@ void D3D11VideoRenderer::DrawSubtitleOverlay() {
     context_->OMSetBlendState(nullptr, blendFactor, 0xffffffff);
     ID3D11ShaderResourceView* nullView[1] = {};
     context_->PSSetShaderResources(0, 1, nullView);
+    ID3D11Buffer* nullConstants[1] = {};
+    context_->PSSetConstantBuffers(0, 1, nullConstants);
 }
 
 void D3D11VideoRenderer::ReleaseAll() {
     ResetRenderStats();
     hardwareSrvCache_.clear();
+    subtitleTextureCache_.clear();
     subtitleSrv_.Reset();
     subtitleTexture_.Reset();
     hwSrvUV_.Reset();
@@ -2931,10 +3174,12 @@ void D3D11VideoRenderer::ReleaseAll() {
     textureW_ = 0;
     textureH_ = 0;
     textureFormat_ = DXGI_FORMAT_UNKNOWN;
+    subtitleConstants_.Reset();
     colorConstants_.Reset();
     doviConstants_.Reset();
     subtitleBlend_.Reset();
     sampler_.Reset();
+    psSubtitle_.Reset();
     psNv12_.Reset();
     ps_.Reset();
     vs_.Reset();
@@ -2947,12 +3192,19 @@ void D3D11VideoRenderer::ReleaseAll() {
     dcompTarget_.Reset();
     dcompDevice_.Reset();
     useComposition_ = false;
+    if (frameLatencyWaitable_) {
+        CloseHandle(frameLatencyWaitable_);
+        frameLatencyWaitable_ = nullptr;
+    }
+    framePacingLogged_ = false;
     swapChain_.Reset();
     context_.Reset();
     adapter_.Reset();
     device_.Reset();
     factory_.Reset();
     hardwareTextureFailureLogged_ = false;
+    subtitleBitmapOverlayLogged_ = false;
+    subtitleDrawFrame_ = 0;
     subtitleTextureW_ = 0;
     subtitleTextureH_ = 0;
     activeSubtitleText_.clear();
