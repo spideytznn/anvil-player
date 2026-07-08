@@ -260,6 +260,37 @@ bool WasapiAudioPlayer::Resume(const std::chrono::milliseconds position) {
     return true;
 }
 
+void WasapiAudioPlayer::HoldPacketStream(const std::chrono::milliseconds position) {
+    if (!packetInputMode_.load()) {
+        Pause(position);
+        return;
+    }
+    if (!running_.load()) {
+        SetPlaybackClockRunning(false);
+        return;
+    }
+
+    const auto clamped = std::max(position, std::chrono::milliseconds{0});
+    pausePositionMs_.store(clamped.count());
+    paused_.store(true);
+    ResetPlaybackClock(clamped);
+    SetPlaybackClockRunning(false);
+    packetCv_.notify_all();
+}
+
+bool WasapiAudioPlayer::ResumePacketStream() {
+    if (!packetInputMode_.load()) {
+        return Resume(std::chrono::milliseconds{std::max<int64_t>(0, pausePositionMs_.load())});
+    }
+    if (!running_.load()) {
+        return false;
+    }
+
+    paused_.store(false);
+    packetCv_.notify_all();
+    return true;
+}
+
 bool WasapiAudioPlayer::Seek(const std::chrono::milliseconds position) {
     if (!running_.load()) {
         return false;

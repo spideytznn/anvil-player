@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <string>
 
 namespace anvil::playback {
 
@@ -26,6 +27,7 @@ public:
     void SeekRelative(std::chrono::milliseconds delta);
     void SetVolume(double volume);
     void SetPlaybackRate(double rate);
+    void SetError(std::wstring message);
     void UpdateClock();
     void SyncClock(std::chrono::milliseconds position);
 

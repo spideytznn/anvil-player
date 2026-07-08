@@ -26,6 +26,7 @@ extern "C" {
 #include <iomanip>
 #include <iterator>
 #include <limits>
+#include <new>
 #include <optional>
 #include <sstream>
 #include <system_error>
@@ -1526,6 +1527,7 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
                                const std::chrono::milliseconds startPosition,
                                HWND notificationWindow,
                                const UINT notificationMessage,
+                               const UINT failureMessage,
                                ClockCallback clockCallback,
                                const bool preferHardwareDecode,
                                ID3D11Device* sharedD3DDevice,
@@ -1561,6 +1563,7 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
     receiveEagainLogCount_ = 0;
     receiveEofLogged_ = false;
     sendPacketFailureLogged_ = false;
+    sendPacketBackpressureLogged_ = false;
     bitmapSubtitleLogged_ = false;
     frameSubtitleBitmapLogged_ = false;
     dolbyVisionLibplaceboFailed_ = false;
@@ -1616,6 +1619,7 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
     fallbackClockBasePts_ = std::chrono::milliseconds{0};
     notificationWindow_.store(notificationWindow);
     notificationMessage_.store(notificationMessage);
+    failureMessage_.store(failureMessage);
     frameMessagePending_.store(false);
     pendingSeekMs_.store(-1);
     interruptReturnCount_.store(0);
@@ -1624,6 +1628,7 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
     seekFastResumeFramesRemaining_.store(0);
     seekFastResumeLogged_.store(false);
     seekClockHoldFramesRemaining_.store(0);
+    seekPrerollPending_.store(false);
     seekRecoveryTargetMs_.store(startPosition.count() > 0 ? startPosition.count() : -1);
     seekRecoveryDropLogged_.store(false);
     stopping_.store(false);
@@ -1648,6 +1653,7 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
         frameQueue_.clear();
         stats_ = {};
         stats_.decoder = preferHardwareDecode_ ? L"ffmpeg_d3d11va_pending" : L"ffmpeg_software";
+        seekPrerollStartedAt_ = {};
     }
     running_.store(true);
     decodeThread_ = std::thread([this]() { DecodeLoop(); });
@@ -1660,10 +1666,12 @@ void FfmpegVideoDecoder::Stop() {
     playbackPaused_.store(false);
     notificationWindow_.store(nullptr);
     notificationMessage_.store(0);
+    failureMessage_.store(0);
     frameMessagePending_.store(false);
     seekFastResumeFramesRemaining_.store(0);
     seekFastResumeLogged_.store(false);
     seekClockHoldFramesRemaining_.store(0);
+    seekPrerollPending_.store(false);
     seekRecoveryTargetMs_.store(-1);
     seekRecoveryDropLogged_.store(false);
     if (decodeThread_.joinable()) {
@@ -1683,11 +1691,13 @@ bool FfmpegVideoDecoder::Seek(const std::chrono::milliseconds position) {
     }
 
     const auto clamped = std::max(position, std::chrono::milliseconds{0});
+    const bool prerollAfterSeek = !playbackPaused_.load();
     pendingSeekMs_.store(clamped.count());
     frameMessagePending_.store(false);
     seekRecoveryTargetMs_.store(clamped.count());
     seekRecoveryDropLogged_.store(false);
-    if (!playbackPaused_.load()) {
+    seekPrerollPending_.store(prerollAfterSeek);
+    if (prerollAfterSeek) {
         seekFastResumeFramesRemaining_.store(kSeekFastResumeFrameCount);
         seekClockHoldFramesRemaining_.store(kSeekClockHoldFrameCount);
         seekFastResumeLogged_.store(false);
@@ -1709,8 +1719,10 @@ bool FfmpegVideoDecoder::Seek(const std::chrono::milliseconds position) {
         stats_.fallbackReason = fallbackReason;
         stats_.usingHardwareDecode = usingHardware;
         stats_.networkBytesPerSecond = networkBytesPerSecond;
-        stats_.buffering = networkMedia;
+        stats_.buffering = networkMedia || prerollAfterSeek;
         stats_.clockPosition = clamped;
+        seekPrerollStartedAt_ = prerollAfterSeek ? std::chrono::steady_clock::now()
+                                                 : std::chrono::steady_clock::time_point{};
         UpdateBufferedStatsLocked();
     }
     return true;
@@ -1749,6 +1761,8 @@ bool FfmpegVideoDecoder::LatestFrame(NativeVideoFrame& frame) const {
 
 void FfmpegVideoDecoder::ClearFrame() {
     std::scoped_lock lock(mutex_);
+    seekPrerollPending_.store(false);
+    seekPrerollStartedAt_ = {};
     latestFrame_.bgra.reset();
     latestFrame_.yuv = {};
     latestFrame_.serial = 0;
@@ -1947,6 +1961,12 @@ void FfmpegVideoDecoder::DecodeLoop() {
     uint64_t serial = 0;
     bool firstPacketSeen = false;
     bool audioPacketSinkActive = false;
+    bool startupComplete = false;
+    std::wstring startupFailure;
+    auto failStartup = [&](std::wstring message) {
+        startupFailure = std::move(message);
+        LogThreadError(startupFailure);
+    };
 
     const std::string pathUtf8 = WideToUtf8(path_.wstring());
     const bool networkSource = IsNetworkMediaPath(path_);
@@ -1954,7 +1974,7 @@ void FfmpegVideoDecoder::DecodeLoop() {
     do {
         formatCtx = avformat_alloc_context();
         if (!formatCtx) {
-            LogThreadError(L"avformat_alloc_context failed");
+            failStartup(L"avformat_alloc_context failed");
             break;
         }
         formatCtx->interrupt_callback.callback = &FfmpegVideoDecoder::InterruptCallback;
@@ -1982,12 +2002,12 @@ void FfmpegVideoDecoder::DecodeLoop() {
         const int openResult = avformat_open_input(&formatCtx, pathUtf8.c_str(), nullptr, &options);
         av_dict_free(&options);
         if (openResult < 0) {
-            LogThreadError(L"avformat_open_input failed: " + FfmpegErrorString(openResult));
+            failStartup(L"avformat_open_input failed: " + FfmpegErrorString(openResult));
             break;
         }
         const int streamInfoResult = avformat_find_stream_info(formatCtx, nullptr);
         if (streamInfoResult < 0) {
-            LogThreadError(L"avformat_find_stream_info failed: " + FfmpegErrorString(streamInfoResult));
+            failStartup(L"avformat_find_stream_info failed: " + FfmpegErrorString(streamInfoResult));
             break;
         }
         if (networkSource) {
@@ -2005,7 +2025,7 @@ void FfmpegVideoDecoder::DecodeLoop() {
         }
         videoStreamIndex = SelectVideoStream(formatCtx);
         if (videoStreamIndex < 0) {
-            LogThreadError(L"no video stream found");
+            failStartup(L"no video stream found");
             break;
         }
         streamTimeBase = formatCtx->streams[videoStreamIndex]->time_base;
@@ -2081,7 +2101,7 @@ void FfmpegVideoDecoder::DecodeLoop() {
 
         const AVCodec* codec = avcodec_find_decoder(codecpar->codec_id);
         if (!codec) {
-            LogThreadError(L"avcodec_find_decoder failed");
+            failStartup(L"avcodec_find_decoder failed");
             break;
         }
         streamColorMetadata_ = BuildColorMetadata(codecpar);
@@ -2149,6 +2169,7 @@ void FfmpegVideoDecoder::DecodeLoop() {
         }
 
         if (!OpenVideoDecoder(codec, codecpar, codecCtx, hwDeviceCtx)) {
+            startupFailure = L"video decoder open failed";
             break;
         }
         if (networkSource) {
@@ -2161,6 +2182,7 @@ void FfmpegVideoDecoder::DecodeLoop() {
         softwareFrame = av_frame_alloc();
         packet = av_packet_alloc();
         if (!frame || !softwareFrame || !packet) {
+            failStartup(L"av frame allocation failed");
             break;
         }
         if (enhancementCodecCtx) {
@@ -2174,6 +2196,7 @@ void FfmpegVideoDecoder::DecodeLoop() {
                 dolbyVisionEnhancementActive_ = false;
             }
         }
+        startupComplete = true;
 
         const bool skipNetworkNearStartSeek =
             networkSource && startPosition_ < std::chrono::seconds{1};
@@ -2489,6 +2512,8 @@ void FfmpegVideoDecoder::DecodeLoop() {
             }
             firstPacketSeen = true;
             int eagainCount = 0;
+            int backpressureCount = 0;
+            constexpr int kSendPacketBackpressureRetries = 250;
             while (!stopping_.load() && !HasPendingSeek()) {
                 const int sendResult = avcodec_send_packet(codecCtx, cached.packet);
                 if (sendResult == AVERROR(EAGAIN)) {
@@ -2498,6 +2523,32 @@ void FfmpegVideoDecoder::DecodeLoop() {
                     if (++eagainCount > 8) {
                         return true;
                     }
+                    continue;
+                }
+                if (sendResult == AVERROR(ENOMEM)) {
+                    if (!sendPacketBackpressureLogged_) {
+                        sendPacketBackpressureLogged_ = true;
+                        LogThread(LogLevel::Debug,
+                                  L"decoder",
+                                  L"send_packet_backpressure reason=" + FfmpegErrorString(sendResult) +
+                                      L" pts_ms=" + std::to_wstring(cached.pts.count()));
+                    }
+                    ScheduleDueFrames();
+                    if (!ReceiveFrames(codecCtx, swsCtx, frame, softwareFrame, bgraBuffer, streamTimeBase, serial)) {
+                        return false;
+                    }
+                    if (++backpressureCount > kSendPacketBackpressureRetries) {
+                        if (!sendPacketFailureLogged_) {
+                            sendPacketFailureLogged_ = true;
+                            LogThread(LogLevel::Warning,
+                                      L"decoder",
+                                      L"send_packet_failed reason=" + FfmpegErrorString(sendResult) +
+                                          L" pts_ms=" + std::to_wstring(cached.pts.count()) +
+                                          L" retries=" + std::to_wstring(backpressureCount));
+                        }
+                        return true;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds{1});
                     continue;
                 }
                 if (sendResult < 0) {
@@ -2545,6 +2596,8 @@ void FfmpegVideoDecoder::DecodeLoop() {
                 continue;
             }
 
+            const bool decodedNearCapacity = !paused && hasPreroll && decodedQueueNearCapacity();
+
             if (paused) {
                 readAheadPackets(elOverlay ? kDolbyVisionEnhancementPausedPacketReadAheadBatch
                                            : kPausedPacketReadAheadBatch);
@@ -2556,13 +2609,13 @@ void FfmpegVideoDecoder::DecodeLoop() {
                                                   : kStartupPacketReadAheadBatch));
             } else if (shouldReadPlayingPackets()) {
                 readAheadPackets(elOverlay ? kDolbyVisionEnhancementPlayingPacketReadAheadBatch
-                                           : kPlayingPacketReadAheadBatch);
+                                           : (decodedNearCapacity ? 1 : kPlayingPacketReadAheadBatch));
             }
             if (HasPendingSeek()) {
                 continue;
             }
 
-            if (!paused && hasPreroll && decodedQueueNearCapacity() && shouldReadPlayingPackets()) {
+            if (decodedNearCapacity) {
                 std::this_thread::sleep_for(std::chrono::milliseconds{1});
                 continue;
             }
@@ -2619,6 +2672,9 @@ void FfmpegVideoDecoder::DecodeLoop() {
     doviLibplaceboFilter_.reset();
     DrainQueuedFrames();
     running_.store(false);
+    if (!startupComplete && !startupFailure.empty()) {
+        NotifyDecodeFailure(startupFailure);
+    }
 }
 
 bool FfmpegVideoDecoder::OpenVideoDecoder(const AVCodec* codec,
@@ -4281,6 +4337,12 @@ bool FfmpegVideoDecoder::ApplyPendingSeek(AVFormatContext* formatCtx,
                   L" seek_ms=" + std::to_wstring(seekElapsedMs));
     if (seekError < 0) {
         LogThread(LogLevel::Warning, L"decoder", L"runtime_seek failed reason=" + FfmpegErrorString(seekError));
+        seekPrerollPending_.store(false);
+        {
+            std::scoped_lock lock(mutex_);
+            stats_.buffering = false;
+            seekPrerollStartedAt_ = {};
+        }
         return true;
     }
 
@@ -4324,6 +4386,7 @@ bool FfmpegVideoDecoder::ApplyPendingSeek(AVFormatContext* formatCtx,
 
     {
         std::scoped_lock lock(mutex_);
+        const bool prerollAfterSeek = !playbackPaused_.load();
         latestFrame_ = {};
         frameQueue_.clear();
         schedulePrimed_ = false;
@@ -4337,7 +4400,10 @@ bool FfmpegVideoDecoder::ApplyPendingSeek(AVFormatContext* formatCtx,
         stats_.clockPosition = *target;
         stats_.driftMs = 0;
         stats_.rendered = 0;
-        stats_.buffering = true;
+        stats_.buffering = prerollAfterSeek;
+        seekPrerollStartedAt_ = prerollAfterSeek ? std::chrono::steady_clock::now()
+                                                 : std::chrono::steady_clock::time_point{};
+        seekPrerollPending_.store(prerollAfterSeek);
         UpdateBufferedStatsLocked();
     }
     seekRecoveryTargetMs_.store(target->count());
@@ -5113,6 +5179,51 @@ void FfmpegVideoDecoder::UpdateBufferedStatsLocked() {
                                                          stats_.bufferedEnd - decodedStart)));
 }
 
+bool FfmpegVideoDecoder::SeekPrerollReadyLocked() const {
+    if (!seekPrerollPending_.load() || playbackPaused_.load()) {
+        return true;
+    }
+    if (frameQueue_.empty()) {
+        return false;
+    }
+
+    const bool softwareFrame = frameQueue_.front().HasYuv() || frameQueue_.front().HasPixels();
+    const auto maxQueueDepth = MaxQueueDepthForFrame(frameQueue_.front());
+    const auto effectiveMaxQueueDepth = maxQueueDepth > 1 ? maxQueueDepth - 1 : maxQueueDepth;
+    const auto minQueuedFrames = softwareFrame
+                                     ? std::min(kSeekPrerollSoftwareMinQueuedFrames,
+                                                effectiveMaxQueueDepth)
+                                     : kSeekPrerollMinQueuedFrames;
+    const auto minReadAhead = softwareFrame ? kSeekPrerollSoftwareMinReadAhead
+                                            : kSeekPrerollMinReadAhead;
+    const auto timeout = softwareFrame ? kSeekPrerollSoftwareTimeout
+                                       : kSeekPrerollTimeout;
+    const auto minDecodedSpan = softwareFrame ? std::chrono::milliseconds{300}
+                                              : std::chrono::milliseconds{160};
+    const auto decodedSpan = frameQueue_.back().pts - frameQueue_.front().pts;
+    const bool queuedFramesReady = frameQueue_.size() >= minQueuedFrames;
+    const bool videoReady = softwareFrame
+                                ? queuedFramesReady
+                                : (queuedFramesReady || decodedSpan >= minDecodedSpan);
+    const bool readAheadReady =
+        stats_.readAheadDuration >= minReadAhead ||
+        (!softwareFrame && stats_.packetQueueDepth >= kSeekPrerollMinPacketDepth);
+    if (videoReady && readAheadReady) {
+        return true;
+    }
+
+    if (seekPrerollStartedAt_.time_since_epoch().count() <= 0) {
+        return false;
+    }
+    if (std::chrono::steady_clock::now() - seekPrerollStartedAt_ < timeout) {
+        return false;
+    }
+    if (softwareFrame) {
+        return videoReady && stats_.readAheadDuration >= kSeekPrerollSoftwareTimeoutMinReadAhead;
+    }
+    return true;
+}
+
 bool FfmpegVideoDecoder::EnqueueFrame(NativeVideoFrame&& frame) {
     while (!stopping_.load()) {
         if (HasPendingSeek()) {
@@ -5124,7 +5235,7 @@ bool FfmpegVideoDecoder::EnqueueFrame(NativeVideoFrame&& frame) {
             std::scoped_lock lock(mutex_);
             if (HasQueueCapacityLocked(frame)) {
                 frameQueue_.push_back(std::move(frame));
-                stats_.buffering = false;
+                stats_.buffering = seekPrerollPending_.load();
                 UpdateBufferedStatsLocked();
                 queued = true;
             } else if (playbackPaused_.load()) {
@@ -5158,7 +5269,11 @@ void FfmpegVideoDecoder::ScheduleDueFrames() {
     NativeVideoFrame frameToPublish;
     bool hasFrame = false;
     bool firstPublishedFrame = false;
+    bool seekPrerollReleased = false;
     std::size_t publishedQueueDepth = 0;
+    std::size_t seekPrerollQueueDepth = 0;
+    int seekPrerollReadAheadMs = 0;
+    int seekPrerollWaitMs = 0;
     std::chrono::milliseconds publishedClockPosition{0};
 
     {
@@ -5166,6 +5281,25 @@ void FfmpegVideoDecoder::ScheduleDueFrames() {
         if (frameQueue_.empty()) {
             UpdateBufferedStatsLocked();
             return;
+        }
+
+        if (seekPrerollPending_.load()) {
+            UpdateBufferedStatsLocked();
+            if (!SeekPrerollReadyLocked()) {
+                stats_.buffering = true;
+                return;
+            }
+            seekPrerollPending_.store(false);
+            seekPrerollReleased = true;
+            seekPrerollQueueDepth = frameQueue_.size();
+            seekPrerollReadAheadMs = static_cast<int>(stats_.readAheadDuration.count());
+            if (seekPrerollStartedAt_.time_since_epoch().count() > 0) {
+                seekPrerollWaitMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - seekPrerollStartedAt_).count());
+            }
+            seekPrerollStartedAt_ = {};
+            stats_.buffering = false;
+            schedulePrimed_ = false;
         }
 
         const bool seekClockHold = seekClockHoldFramesRemaining_.load() > 0;
@@ -5246,6 +5380,13 @@ void FfmpegVideoDecoder::ScheduleDueFrames() {
     }
 
     if (hasFrame) {
+        if (seekPrerollReleased) {
+            LogThread(LogLevel::Debug,
+                      L"decoder",
+                      L"seek_preroll_ready frames=" + std::to_wstring(seekPrerollQueueDepth) +
+                          L" read_ahead_ms=" + std::to_wstring(seekPrerollReadAheadMs) +
+                          L" wait_ms=" + std::to_wstring(seekPrerollWaitMs));
+        }
         if (firstPublishedFrame) {
             LogThread(LogLevel::Debug,
                       L"decoder",
@@ -5286,6 +5427,22 @@ void FfmpegVideoDecoder::NotifyFrameReady() {
         return;
     }
     PostMessageW(window, message, 0, 0);
+}
+
+void FfmpegVideoDecoder::NotifyDecodeFailure(const std::wstring& message) const {
+    const HWND window = notificationWindow_.load();
+    const UINT failureMessage = failureMessage_.load();
+    if (!window || failureMessage == 0 || oneShotFrame_ || stopping_.load()) {
+        return;
+    }
+
+    auto* payload = new (std::nothrow) NativeDecodeFailure{path_, message};
+    if (!payload) {
+        return;
+    }
+    if (!PostMessageW(window, failureMessage, 0, reinterpret_cast<LPARAM>(payload))) {
+        delete payload;
+    }
 }
 
 void FfmpegVideoDecoder::SetDecodeBackend(const std::wstring& decoder, const bool usingHardware, const std::wstring& fallbackReason) {

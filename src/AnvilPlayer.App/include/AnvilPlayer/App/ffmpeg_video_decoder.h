@@ -175,6 +175,11 @@ struct NativeAudioPacketSink {
     }
 };
 
+struct NativeDecodeFailure {
+    std::filesystem::path path;
+    std::wstring message;
+};
+
 // Native in-process FFmpeg video decoder. Demux+decode on a worker thread,
 // optional D3D11VA hardware decode (zero-copy via a shared device, with
 // CPU-transfer fallback), swscale -> BGRA for software frames, frame queue
@@ -194,6 +199,7 @@ public:
                std::chrono::milliseconds startPosition,
                HWND notificationWindow,
                UINT notificationMessage,
+               UINT failureMessage = 0,
                ClockCallback clockCallback = {},
                bool preferHardwareDecode = false,
                ID3D11Device* sharedD3DDevice = nullptr,
@@ -241,7 +247,7 @@ public:
 private:
     // Queue depth is selected per frame type: hardware texture refs are cheap,
     // while CPU BGRA/YUV frames can be tens of MB each for 4K+ sources.
-    static constexpr std::size_t kMaxHardwareQueuedFrames = 16;
+    static constexpr std::size_t kMaxHardwareQueuedFrames = 6;
     static constexpr std::size_t kMaxYuvQueuedFrames = 10;
     static constexpr std::size_t kMaxSmallBgraQueuedFrames = 12;
     static constexpr std::size_t kMaxLargeBgraQueuedFrames = 6;
@@ -250,7 +256,7 @@ private:
     static constexpr std::size_t kMaxPacketReadAheadBytes = 1024ull * 1024ull * 1024ull;
     static constexpr std::size_t kMaxReusableBgraBuffers = 12;
     static constexpr int kStartupPacketReadAheadBatch = 4;
-    static constexpr int kPlayingPacketReadAheadBatch = 12;
+    static constexpr int kPlayingPacketReadAheadBatch = 4;
     static constexpr int kPausedPacketReadAheadBatch = 256;
     static constexpr std::chrono::milliseconds kPlayingPacketReadAheadTarget{15000};
     static constexpr int kDolbyVisionEnhancementStartupPacketReadAheadBatch = 6;
@@ -265,7 +271,15 @@ private:
     static constexpr std::chrono::milliseconds kMaxMeasuredFrameCadence{250};
     static constexpr int kSeekStartupPacketReadAheadBatch = 1;
     static constexpr int kSeekFastResumeFrameCount = 4;
-    static constexpr int kSeekClockHoldFrameCount = 48;
+    static constexpr int kSeekClockHoldFrameCount = 0;
+    static constexpr std::size_t kSeekPrerollMinQueuedFrames = 4;
+    static constexpr std::size_t kSeekPrerollSoftwareMinQueuedFrames = 9;
+    static constexpr std::size_t kSeekPrerollMinPacketDepth = 24;
+    static constexpr std::chrono::milliseconds kSeekPrerollMinReadAhead{1200};
+    static constexpr std::chrono::milliseconds kSeekPrerollSoftwareMinReadAhead{15000};
+    static constexpr std::chrono::milliseconds kSeekPrerollTimeout{1800};
+    static constexpr std::chrono::milliseconds kSeekPrerollSoftwareTimeout{10000};
+    static constexpr std::chrono::milliseconds kSeekPrerollSoftwareTimeoutMinReadAhead{6000};
 
     struct NativeSubtitleCue {
         std::chrono::milliseconds start{0};
@@ -377,6 +391,7 @@ private:
     static std::size_t MaxQueueDepthForFrame(const NativeVideoFrame& frame);
     bool HasQueueCapacityLocked(const NativeVideoFrame& frame) const;
     void UpdateBufferedStatsLocked();
+    bool SeekPrerollReadyLocked() const;
 
     bool EnqueueFrame(NativeVideoFrame&& frame);
     void DrainQueuedFrames();
@@ -391,6 +406,7 @@ private:
     SchedulerClock CurrentSchedulerClockLocked(std::chrono::milliseconds firstQueuedPts);
 
     void NotifyFrameReady();
+    void NotifyDecodeFailure(const std::wstring& message) const;
     void SetDecodeBackend(const std::wstring& decoder, bool usingHardware, const std::wstring& fallbackReason);
     void LogThread(anvil::playback::LogLevel level, const std::wstring& category, const std::wstring& message) const;
     void LogThreadError(const std::wstring& message) const;
@@ -411,6 +427,7 @@ private:
     int receiveEagainLogCount_ = 0;
     bool receiveEofLogged_ = false;
     bool sendPacketFailureLogged_ = false;
+    bool sendPacketBackpressureLogged_ = false;
     bool bitmapSubtitleLogged_ = false;
     bool frameSubtitleBitmapLogged_ = false;
     anvil::playback::VideoColorMetadata streamColorMetadata_;
@@ -474,6 +491,7 @@ private:
     std::deque<NativeSubtitleCue> externalSubtitleCues_;
     std::optional<std::chrono::steady_clock::time_point> fallbackClockAnchor_;
     std::chrono::milliseconds fallbackClockBasePts_{0};
+    std::chrono::steady_clock::time_point seekPrerollStartedAt_{};
     mutable std::mutex mutex_;
     NativeVideoFrame latestFrame_;
     std::deque<NativeVideoFrame> frameQueue_;
@@ -483,6 +501,7 @@ private:
     std::atomic_bool running_{false};
     std::atomic<HWND> notificationWindow_{nullptr};
     std::atomic_uint notificationMessage_{0};
+    std::atomic_uint failureMessage_{0};
     std::atomic_bool frameMessagePending_{false};
     std::atomic<int64_t> pendingSeekMs_{-1};
     mutable std::atomic<int> interruptReturnCount_{0};
@@ -491,6 +510,7 @@ private:
     std::atomic<int> seekFastResumeFramesRemaining_{0};
     std::atomic_bool seekFastResumeLogged_{false};
     std::atomic<int> seekClockHoldFramesRemaining_{0};
+    std::atomic_bool seekPrerollPending_{false};
     std::atomic<int64_t> seekRecoveryTargetMs_{-1};
     std::atomic_bool seekRecoveryDropLogged_{false};
     std::atomic<int64_t> pausedPositionMs_{0};

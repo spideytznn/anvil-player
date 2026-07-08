@@ -1,7 +1,12 @@
-import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from 'react'
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import {
+  ArrowDownWideNarrow,
   ArrowLeft,
+  ArrowUpNarrowWide,
   Check,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   Clock3,
   Database,
   Film,
@@ -23,11 +28,20 @@ import {
   X
 } from 'lucide-react'
 import { applyAppearanceSettings } from './appearance'
-import { loadSavedEmbyConnection, saveSavedEmbyConnection } from './manager/connectionStorage'
+import { loadSavedEmbyConnections, saveSavedEmbyConnection, type SavedEmbyConnection } from './manager/connectionStorage'
 import { createEmptyLibraryClient } from './manager/mediaLibraryClient'
-import { loadEmbyLibrary, refreshEmbyLibrary, resolveEmbyPlaybackTarget, type EmbySession } from './manager/embyClient'
+import {
+  loadEmbyItemDetails,
+  loadEmbyLibrary,
+  refreshEmbyLibrary,
+  resolveEmbyPlaybackTarget,
+  savePendingEmbyPlaybackReport,
+  searchEmbyLibrary,
+  searchEmbyPersonLibrary,
+  type EmbySession
+} from './manager/embyClient'
 import { requestPlayerLaunch } from './manager/playerBridge'
-import type { LibraryHomeCard, LibraryHomeSection, LibrarySource, LibraryView, MediaFilterKey, MediaItem, NavKey, SortKey, SourceKind } from './manager/types'
+import type { LibraryHomeCard, LibraryHomeSection, LibrarySource, LibraryView, MediaFilterKey, MediaItem, NavKey, PersonCredit, SortKey, SortOrder, SourceKind } from './manager/types'
 import { postNativeCommand } from './nativeBridge'
 import {
   applyDocumentLanguage,
@@ -98,16 +112,14 @@ const smartNav: NavItem[] = [
 const viewTabs: Array<{ key: LibraryView; label: string }> = [
   { key: 'home', label: '全部' },
   { key: 'movies', label: '电影' },
-  { key: 'series', label: '剧集' },
-  { key: 'folders', label: '文件夹' }
+  { key: 'series', label: '剧集' }
 ]
 
-const mediaFilters: Array<{ key: MediaFilterKey; label: string }> = [
-  { key: 'all', label: '全部' },
-  { key: 'unwatched', label: '未看' },
-  { key: 'watched', label: '已看' },
-  { key: 'favorites', label: '收藏' },
-  { key: 'inProgress', label: '观看中' }
+const sortOptions: Array<{ key: SortKey; label: string }> = [
+  { key: 'recent', label: '最近添加' },
+  { key: 'title', label: '标题' },
+  { key: 'rating', label: '评分' },
+  { key: 'year', label: '发行年份' }
 ]
 
 function mediaTypeLabel(type: MediaItem['type']): string {
@@ -179,6 +191,51 @@ function homeCardViewId(card: LibraryHomeCard): string {
   return card.kind === 'view' && card.id.startsWith('view:') ? card.id.slice('view:'.length) : ''
 }
 
+function cleanJoin(values: string[], separator = ' · '): string {
+  return values.map((value) => value.trim()).filter(Boolean).join(separator)
+}
+
+const LIBRARY_VIEW_STATE_STORAGE_KEY = 'anvil-player.library.view-state.v1'
+
+interface LibraryViewState {
+  activeNav?: string
+}
+
+function defaultLibraryNav(connections: SavedEmbyConnection[]): NavKey {
+  const firstSourceId = connections.find((connection) => connection.sourceId)?.sourceId
+  return firstSourceId ? `source:${firstSourceId}` as NavKey : 'recent'
+}
+
+function isSavedLibraryNav(value: string, connections: SavedEmbyConnection[]): value is NavKey {
+  if (value.startsWith('source:')) {
+    const sourceId = value.slice('source:'.length)
+    return Boolean(sourceId && connections.some((connection) => connection.sourceId === sourceId))
+  }
+  return [...primaryNav, ...smartNav].some((item) => item.key === value)
+}
+
+function loadSavedLibraryNav(connections: SavedEmbyConnection[]): NavKey {
+  const fallback = defaultLibraryNav(connections)
+  try {
+    const raw = window.localStorage.getItem(LIBRARY_VIEW_STATE_STORAGE_KEY)
+    if (!raw) return fallback
+    const parsed: unknown = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object') return fallback
+    const activeNav = (parsed as LibraryViewState).activeNav
+    return typeof activeNav === 'string' && isSavedLibraryNav(activeNav, connections) ? activeNav : fallback
+  } catch {
+    return fallback
+  }
+}
+
+function saveLibraryNav(navKey: NavKey): void {
+  try {
+    window.localStorage.setItem(LIBRARY_VIEW_STATE_STORAGE_KEY, JSON.stringify({ activeNav: navKey }))
+  } catch {
+    // Restoring the last library source is a convenience only.
+  }
+}
+
 function SidebarButton(props: {
   item: NavItem
   activeNav: NavKey
@@ -197,6 +254,185 @@ function SidebarButton(props: {
   )
 }
 
+const TOOLBAR_SELECT_CLOSED_HEIGHT = 36
+const TOOLBAR_SELECT_DURATION_MS = 460
+const TOOLBAR_SELECT_EASING = 'cubic-bezier(0.19, 1, 0.22, 1)'
+
+type ToolbarSelectState = 'closed' | 'opening' | 'open' | 'closing'
+
+function ToolbarSelect<T extends string>(props: {
+  value: T
+  options: Array<{ key: T; label: string }>
+  ariaLabel: string
+  className?: string
+  statusIcon?: ReactNode
+  onChange: (value: T) => void
+}): JSX.Element {
+  const [selectState, setSelectState] = useState<ToolbarSelectState>('closed')
+  const menuId = useId()
+  const rootRef = useRef<HTMLDivElement | null>(null)
+  const panelRef = useRef<HTMLDivElement | null>(null)
+  const menuContentRef = useRef<HTMLDivElement | null>(null)
+  const animationRef = useRef<Animation | null>(null)
+  const selected = props.options.find((option) => option.key === props.value) ?? props.options[0]
+  const isMounted = selectState !== 'closed'
+  const isExpanded = selectState === 'opening' || selectState === 'open'
+  const isActive = selectState !== 'closed'
+  const className = ['toolbar-select', props.className ?? ''].filter(Boolean).join(' ')
+
+  function measureOpenHeight(): number {
+    return TOOLBAR_SELECT_CLOSED_HEIGHT + (menuContentRef.current?.offsetHeight ?? 0)
+  }
+
+  function openSelect(): void {
+    setSelectState((current) => current === 'open' || current === 'opening' ? current : 'opening')
+  }
+
+  function closeSelect(): void {
+    setSelectState((current) => current === 'closed' || current === 'closing' ? current : 'closing')
+  }
+
+  function toggleSelect(): void {
+    setSelectState((current) => current === 'open' || current === 'opening' ? 'closing' : 'opening')
+  }
+
+  function animatePanel(expand: boolean): void {
+    const panel = panelRef.current
+    if (!panel) return
+
+    animationRef.current?.cancel()
+    const fromHeight = panel.getBoundingClientRect().height || TOOLBAR_SELECT_CLOSED_HEIGHT
+    const toHeight = expand ? measureOpenHeight() : TOOLBAR_SELECT_CLOSED_HEIGHT
+    panel.style.height = `${fromHeight}px`
+
+    const prefersReducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false
+    const duration = prefersReducedMotion ? 1 : TOOLBAR_SELECT_DURATION_MS
+    const animation = panel.animate(
+      [
+        { height: `${fromHeight}px` },
+        { height: `${toHeight}px` }
+      ],
+      {
+        duration,
+        easing: TOOLBAR_SELECT_EASING,
+        fill: 'forwards'
+      }
+    )
+
+    animationRef.current = animation
+    animation.onfinish = () => {
+      animationRef.current = null
+      panel.style.height = expand ? `${toHeight}px` : ''
+      setSelectState(expand ? 'open' : 'closed')
+    }
+  }
+
+  useLayoutEffect(() => {
+    const panel = panelRef.current
+    if (!panel) return undefined
+
+    if (selectState === 'opening') {
+      animatePanel(true)
+    } else if (selectState === 'closing') {
+      animatePanel(false)
+    } else if (selectState === 'open') {
+      panel.style.height = `${measureOpenHeight()}px`
+    } else {
+      animationRef.current?.cancel()
+      animationRef.current = null
+      panel.style.height = ''
+    }
+
+    return undefined
+  }, [selectState, props.options])
+
+  useEffect(() => {
+    return () => animationRef.current?.cancel()
+  }, [])
+
+  useEffect(() => {
+    if (!isActive) return undefined
+    const onPointerDown = (event: PointerEvent): void => {
+      const target = event.target
+      if (target instanceof Node && rootRef.current?.contains(target)) return
+      closeSelect()
+    }
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') closeSelect()
+    }
+    window.addEventListener('pointerdown', onPointerDown)
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      window.removeEventListener('pointerdown', onPointerDown)
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  }, [isActive])
+
+  return (
+    <div
+      className={className}
+      data-active={isActive}
+      data-expanded={isExpanded}
+      data-state={selectState}
+      ref={rootRef}
+    >
+      <div className="toolbar-select-panel" ref={panelRef}>
+        <button
+          className="toolbar-select-trigger"
+          type="button"
+          aria-label={props.ariaLabel}
+          aria-controls={menuId}
+          aria-haspopup="listbox"
+          aria-expanded={isExpanded}
+          onClick={toggleSelect}
+          onKeyDown={(event) => {
+            if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+              event.preventDefault()
+              openSelect()
+            }
+          }}
+        >
+          <span className="toolbar-select-label">{selected?.label ?? ''}</span>
+          {props.statusIcon ? (
+            <span className="toolbar-select-status" aria-hidden="true">
+              {props.statusIcon}
+            </span>
+          ) : null}
+          <ChevronDown className="toolbar-select-chevron" size={16} />
+        </button>
+        {isMounted ? (
+          <div
+            className="toolbar-select-list"
+            id={menuId}
+            role="listbox"
+            aria-label={props.ariaLabel}
+            aria-hidden={!isExpanded}
+          >
+            <div className="toolbar-select-options" ref={menuContentRef}>
+              {props.options.map((option) => (
+                <button
+                  className={option.key === props.value ? 'is-selected' : ''}
+                  type="button"
+                  role="option"
+                  aria-selected={option.key === props.value}
+                  tabIndex={isExpanded ? 0 : -1}
+                  key={option.key}
+                  onClick={() => {
+                    props.onChange(option.key)
+                    closeSelect()
+                  }}
+                >
+                  <span>{option.label}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  )
+}
+
 function EmptyState(props: { icon: ReactNode; title: string; caption: string }): JSX.Element {
   return (
     <div className="library-empty-state">
@@ -207,18 +443,118 @@ function EmptyState(props: { icon: ReactNode; title: string; caption: string }):
   )
 }
 
+function HorizontalScroller(props: {
+  className: string
+  children: ReactNode
+  pageRatio?: number
+}): JSX.Element {
+  const scrollerRef = useRef<HTMLDivElement | null>(null)
+  const [scrollState, setScrollState] = useState({ canLeft: false, canRight: false })
+
+  function updateScrollState(): void {
+    const scroller = scrollerRef.current
+    if (!scroller) return
+    const maxScrollLeft = scroller.scrollWidth - scroller.clientWidth
+    setScrollState({
+      canLeft: scroller.scrollLeft > 2,
+      canRight: scroller.scrollLeft < maxScrollLeft - 2
+    })
+  }
+
+  function scrollPage(direction: -1 | 1): void {
+    const scroller = scrollerRef.current
+    if (!scroller) return
+    const distance = Math.max(160, scroller.clientWidth * (props.pageRatio ?? 0.72))
+    scroller.scrollBy({ left: direction * distance, behavior: 'smooth' })
+  }
+
+  useLayoutEffect(() => {
+    const scroller = scrollerRef.current
+    if (!scroller) return undefined
+
+    let frame = 0
+    const scheduleUpdate = (): void => {
+      window.cancelAnimationFrame(frame)
+      frame = window.requestAnimationFrame(updateScrollState)
+    }
+
+    scheduleUpdate()
+    scroller.addEventListener('scroll', scheduleUpdate, { passive: true })
+    window.addEventListener('resize', scheduleUpdate)
+    const observer = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(scheduleUpdate)
+    observer?.observe(scroller)
+
+    return () => {
+      window.cancelAnimationFrame(frame)
+      scroller.removeEventListener('scroll', scheduleUpdate)
+      window.removeEventListener('resize', scheduleUpdate)
+      observer?.disconnect()
+    }
+  }, [props.children])
+
+  const isScrollable = scrollState.canLeft || scrollState.canRight
+  const shellClassName = [
+    'horizontal-scroll-shell',
+    props.className.includes('library-home-grid') ? 'is-home-grid' : '',
+    props.className.includes('library-continue-row') ? 'is-continue-row' : '',
+    props.className.includes('library-episode-row') ? 'is-episode-row' : '',
+    props.className.includes('library-cast-row') ? 'is-cast-row' : '',
+    props.className.includes('library-similar-row') ? 'is-similar-row' : '',
+    props.className.includes('library-season-tabs') ? 'is-season-tabs' : ''
+  ].filter(Boolean).join(' ')
+
+  return (
+    <div
+      className={shellClassName}
+      data-scrollable={isScrollable}
+      data-can-left={scrollState.canLeft}
+      data-can-right={scrollState.canRight}
+      onPointerEnter={updateScrollState}
+    >
+      <div className={props.className} ref={scrollerRef}>
+        {props.children}
+      </div>
+      <div className="horizontal-scroll-edge is-left">
+        <button
+          className="horizontal-scroll-button"
+          type="button"
+          title="上一页"
+          aria-label="上一页"
+          disabled={!scrollState.canLeft}
+          onClick={() => scrollPage(-1)}
+        >
+          <ChevronLeft size={18} />
+        </button>
+      </div>
+      <div className="horizontal-scroll-edge is-right">
+        <button
+          className="horizontal-scroll-button"
+          type="button"
+          title="下一页"
+          aria-label="下一页"
+          disabled={!scrollState.canRight}
+          onClick={() => scrollPage(1)}
+        >
+          <ChevronRight size={18} />
+        </button>
+      </div>
+    </div>
+  )
+}
+
 function ContinueCard(props: {
   item: MediaItem
   selected: boolean
   onSelect: (id: string) => void
 }): JSX.Element {
+  const art = hasImageBackground(props.item.backdrop) ? props.item.backdrop : props.item.poster
   return (
     <button
       className={`library-continue-card ${props.selected ? 'is-selected' : ''}`}
       type="button"
       onClick={() => props.onSelect(props.item.id)}
     >
-      <div className="library-continue-art" style={{ background: props.item.backdrop }}>
+      <div className="library-continue-art" style={{ background: art }}>
         <span style={{ width: `${Math.round(props.item.progress * 100)}%` }} />
       </div>
       <strong>{props.item.title}</strong>
@@ -312,7 +648,7 @@ function LibraryHomeSections(props: {
             <span>{section.title}</span>
             <small>{section.cards.length}</small>
           </div>
-          <div className={`library-home-grid is-${section.layout}`}>
+          <HorizontalScroller className={`library-home-grid is-${section.layout}`}>
             {section.cards.map((card) => (
               <HomeCard
                 key={card.id}
@@ -323,7 +659,7 @@ function LibraryHomeSections(props: {
                 onSelectView={props.onSelectView}
               />
             ))}
-          </div>
+          </HorizontalScroller>
         </section>
       ))}
     </>
@@ -334,14 +670,55 @@ function DetailPanel(props: {
   item: MediaItem
   source: LibrarySource
   playIntent: string
+  isResolvingPlayback: boolean
   onPlayIntent: (item: MediaItem) => void
+  onSelectItem: (item: MediaItem) => void
+  onSearchPerson: (person: PersonCredit) => void
   onClose: () => void
 }): JSX.Element {
   const backdropStyle: CSSProperties = { background: props.item.backdrop }
+  const seasons = props.item.seasons ?? []
+  const [activeSeasonId, setActiveSeasonId] = useState('')
+  const activeSeason = seasons.find((season) => season.id === activeSeasonId) ?? seasons[0]
+  const seasonOptions = seasons.map((season) => ({ key: season.id, label: season.index }))
+  const activeSeasonSelectId = activeSeason?.id ?? seasonOptions[0]?.key ?? ''
+  const episodeRows = activeSeason?.episodes ?? props.item.episodes ?? []
+  const streamDetailValue = (type: 'video' | 'audio', label: string): string => {
+    const stream = props.item.streamSpecs?.find((row) => row.type === type)
+    return stream?.details.find((detail) => detail.label === label)?.value ?? ''
+  }
+  const compactCodec = (value: string): string => value.replace(/\./g, '').replace(/-/g, '')
+  const compactResolution = (value: string): string => {
+    const match = value.match(/x(\d{3,4})$/i)
+    return match ? `${match[1]}p` : value
+  }
+  const videoBrief = cleanJoin([
+    compactResolution(streamDetailValue('video', '分辨率') || props.item.quality),
+    compactCodec(streamDetailValue('video', '编码'))
+  ], ' ')
+  const audioStream = props.item.streamSpecs?.find((row) => row.type === 'audio')
+  const audioDefault = audioStream?.details.some((detail) => detail.label === '默认' && detail.value === '是')
+  const audioBrief = cleanJoin([
+    streamDetailValue('audio', '语言'),
+    compactCodec(streamDetailValue('audio', '编码')),
+    streamDetailValue('audio', '声道'),
+    audioDefault ? '(默认)' : ''
+  ], ' ')
+
+  useEffect(() => {
+    if (!seasons.length) {
+      if (activeSeasonId) setActiveSeasonId('')
+      return
+    }
+    if (!activeSeasonId || !seasons.some((season) => season.id === activeSeasonId)) {
+      setActiveSeasonId(seasons[0].id)
+    }
+  }, [activeSeasonId, seasons])
 
   return (
     <aside className="library-detail">
-      <div className="library-detail-backdrop" style={backdropStyle}>
+      <div className="library-detail-backdrop">
+        <div className="library-detail-backdrop-image" style={backdropStyle} />
         <button className="library-detail-close" type="button" title="关闭详情" onClick={props.onClose}>
           <X size={15} />
         </button>
@@ -358,7 +735,12 @@ function DetailPanel(props: {
 
       <div className="library-detail-body">
         <div className="library-detail-actions">
-          <button className="library-primary-action" type="button" onClick={() => props.onPlayIntent(props.item)}>
+          <button
+            className="library-primary-action"
+            type="button"
+            disabled={props.isResolvingPlayback}
+            onClick={() => props.onPlayIntent(props.item)}
+          >
             <Play size={16} />
             <span>{props.item.progress > 0 && props.item.progress < 1 ? '继续播放' : '播放'}</span>
           </button>
@@ -379,8 +761,19 @@ function DetailPanel(props: {
           </span>
           <span>{props.item.year}</span>
           <span>{props.item.runtime}</span>
-          <span>{props.item.quality}</span>
+          {!videoBrief && props.item.quality ? <span>{props.item.quality}</span> : null}
         </div>
+
+        {(videoBrief || audioBrief) ? (
+          <div className="library-media-brief">
+            {videoBrief ? (
+              <span><strong>视频</strong>{videoBrief}</span>
+            ) : null}
+            {audioBrief ? (
+              <span><strong>音频</strong>{audioBrief}</span>
+            ) : null}
+          </div>
+        ) : null}
 
         <div className="library-genre-row">
           {props.item.genres.map((genre) => <span key={genre}>{genre}</span>)}
@@ -404,18 +797,39 @@ function DetailPanel(props: {
           </div>
         </div>
 
-        {props.item.episodes?.length ? (
+        {seasons.length || props.item.episodes?.length ? (
           <section className="library-episode-section">
             <div className="library-section-heading">
-              <span>剧集</span>
-              <button type="button">
-                <ListFilter size={13} />
-                <span>排序</span>
-              </button>
+              <span>{seasons.length ? '分季分集' : '剧集'}</span>
+              <span className="library-section-count">共 {episodeRows.length} 集</span>
             </div>
-            <div className="library-episode-row">
-              {props.item.episodes.map((episode) => (
-                <button className="library-episode-card" type="button" key={episode.id}>
+            {seasons.length ? (
+              <div className="library-season-select-row">
+                {seasons.length > 1 ? (
+                  <ToolbarSelect
+                    className="library-season-select"
+                    value={activeSeasonSelectId}
+                    options={seasonOptions}
+                    ariaLabel="选择季"
+                    onChange={setActiveSeasonId}
+                  />
+                ) : (
+                  <span className="library-season-badge">{activeSeason?.index ?? 'S1'}</span>
+                )}
+              </div>
+            ) : null}
+            <HorizontalScroller className="library-episode-row">
+              {episodeRows.map((episode) => (
+                <button
+                  className="library-episode-card"
+                  type="button"
+                  disabled={props.isResolvingPlayback || !episode.item}
+                  key={episode.id}
+                  onClick={() => {
+                    if (!episode.item) return
+                    props.onPlayIntent(episode.item)
+                  }}
+                >
                   <div className="library-episode-thumb" style={{ background: episode.poster }}>
                     <Play size={18} />
                   </div>
@@ -424,10 +838,79 @@ function DetailPanel(props: {
                   <small>{episode.duration}</small>
                 </button>
               ))}
+            </HorizontalScroller>
+          </section>
+        ) : null}
+
+        {props.item.cast?.length ? (
+          <section className="library-detail-section">
+            <div className="library-section-heading">
+              <span>演职人员</span>
+            </div>
+            <HorizontalScroller className="library-cast-row">
+              {props.item.cast.map((person) => (
+                <button className="library-person-card" type="button" key={person.id} onClick={() => props.onSearchPerson(person)}>
+                  <div style={{ background: person.image }} />
+                  <strong>{person.name}</strong>
+                  <small>{person.role}</small>
+                </button>
+              ))}
+            </HorizontalScroller>
+          </section>
+        ) : null}
+
+        {props.item.similarItems?.length ? (
+          <section className="library-detail-section">
+            <div className="library-section-heading">
+              <span>更多类似</span>
+            </div>
+            <HorizontalScroller className="library-similar-row">
+              {props.item.similarItems.map((item) => (
+                <button className="library-similar-card" type="button" key={item.id} onClick={() => props.onSelectItem(item)}>
+                  <div style={{ background: item.poster }} />
+                  <strong>{item.title}</strong>
+                  <small>{item.year || item.runtime}</small>
+                </button>
+              ))}
+            </HorizontalScroller>
+          </section>
+        ) : null}
+
+        {props.item.streamSpecs?.length ? (
+          <section className="library-detail-section">
+            <div className="library-section-heading">
+              <span>媒体流信息</span>
+            </div>
+            <div className="library-stream-grid">
+              {props.item.streamSpecs.map((stream) => (
+                <div className="library-stream-card" key={stream.id}>
+                  <div className="library-stream-card-title">
+                    {stream.type === 'video' ? <Tv size={14} /> : stream.type === 'audio' ? <Database size={14} /> : <Languages size={14} />}
+                    <div>
+                      <strong>{stream.title}</strong>
+                      <span>{stream.subtitle}</span>
+                    </div>
+                  </div>
+                  <dl>
+                    {stream.details.map((detail) => (
+                      <div key={`${stream.id}:${detail.label}`}>
+                        <dt>{detail.label}</dt>
+                        <dd>{detail.value}</dd>
+                      </div>
+                    ))}
+                  </dl>
+                </div>
+              ))}
             </div>
           </section>
         ) : null}
       </div>
+
+      {props.isResolvingPlayback ? (
+        <div className="library-detail-loading" role="status" aria-label="正在解析播放">
+          <span />
+        </div>
+      ) : null}
     </aside>
   )
 }
@@ -567,7 +1050,9 @@ function LibrarySettingsPage(props: {
 }
 
 export default function LibraryApp(): JSX.Element {
-  const savedConnection = useMemo(() => loadSavedEmbyConnection(), [])
+  const savedConnections = useMemo(() => loadSavedEmbyConnections(), [])
+  const savedConnection = savedConnections[0]
+  const initialActiveNav = useMemo(() => loadSavedLibraryNav(savedConnections), [savedConnections])
   const savedAddress = useMemo(
     () => savedConnection ? parseServerAddress(savedConnection.serverUrl, 'http') : undefined,
     [savedConnection]
@@ -577,13 +1062,18 @@ export default function LibraryApp(): JSX.Element {
   const [sources, setSources] = useState<LibrarySource[]>([])
   const [allItems, setAllItems] = useState<MediaItem[]>([])
   const [visibleItems, setVisibleItems] = useState<MediaItem[]>([])
+  const [detailItemsById, setDetailItemsById] = useState<Map<string, MediaItem>>(() => new Map())
+  const [loadedDetailIds, setLoadedDetailIds] = useState<Set<string>>(() => new Set())
   const [continueItems, setContinueItems] = useState<MediaItem[]>([])
   const [homeSections, setHomeSections] = useState<LibraryHomeSection[]>([])
-  const [activeNav, setActiveNav] = useState<NavKey>(() => savedConnection?.sourceId ? `source:${savedConnection.sourceId}` as NavKey : 'recent')
+  const [activeNav, setActiveNav] = useState<NavKey>(initialActiveNav)
   const [activeView, setActiveView] = useState<LibraryView>('home')
   const [sortKey, setSortKey] = useState<SortKey>('recent')
+  const [sortOrder, setSortOrder] = useState<SortOrder>('descending')
   const [mediaFilter, setMediaFilter] = useState<MediaFilterKey>('all')
   const [query, setQuery] = useState('')
+  const [debouncedQuery, setDebouncedQuery] = useState('')
+  const [personSearch, setPersonSearch] = useState<{ sourceId: string; personId: string; name: string } | undefined>()
   const [activeLibraryViewId, setActiveLibraryViewId] = useState('')
   const [selectedId, setSelectedId] = useState('')
   const [isDetailOpen, setIsDetailOpen] = useState(false)
@@ -596,11 +1086,19 @@ export default function LibraryApp(): JSX.Element {
   const [username, setUsername] = useState(() => savedConnection?.username ?? '')
   const [password, setPassword] = useState('')
   const [ignoreCertificateErrors, setIgnoreCertificateErrors] = useState(() => savedConnection?.ignoreCertificateErrors ?? false)
-  const [embySession, setEmbySession] = useState<EmbySession | undefined>(() => savedConnection?.session)
+  const [embySessionsBySourceId, setEmbySessionsBySourceId] = useState<Map<string, EmbySession>>(() => new Map(
+    savedConnections
+      .filter((connection) => connection.session)
+      .map((connection) => [connection.sourceId, connection.session as EmbySession])
+  ))
   const [playIntent, setPlayIntent] = useState('')
+  const [resolvingPlayItemId, setResolvingPlayItemId] = useState('')
   const [isConnecting, setIsConnecting] = useState(false)
   const [connectTone, setConnectTone] = useState<'idle' | 'success' | 'error'>('idle')
   const [connectMessage, setConnectMessage] = useState('')
+  const [editingSourceId, setEditingSourceId] = useState('')
+  const homeSectionRefreshSourceIdsRef = useRef<Set<string>>(new Set())
+  const activeNavRef = useRef<NavKey>(initialActiveNav)
 
   useEffect(() => {
     applyAppearanceSettings()
@@ -610,6 +1108,13 @@ export default function LibraryApp(): JSX.Element {
     applyDocumentLanguage(language)
     saveUiLanguage(language)
   }, [language])
+
+  useEffect(() => {
+    activeNavRef.current = activeNav
+    if (sourceSetupMode === 'hidden') {
+      saveLibraryNav(activeNav)
+    }
+  }, [activeNav, sourceSetupMode])
 
   useEffect(() => {
     postNativeCommand({
@@ -623,13 +1128,12 @@ export default function LibraryApp(): JSX.Element {
     let cancelled = false
 
     async function loadInitialLibrary(): Promise<void> {
-      const initialNav = savedConnection?.sourceId ? `source:${savedConnection.sourceId}` as NavKey : 'recent'
       const [sourceRows, allRows, visibleRows, continueRows, homeRows] = await Promise.all([
         client.listSources(),
         client.listAllItems(),
-        client.listItems({ navKey: initialNav, view: 'home', search: '', sortKey: 'recent' }),
+        client.listItems({ navKey: initialActiveNav, view: 'home', search: '', sortKey: 'recent' }),
         client.getContinueWatching(),
-        client.listHomeSections(savedConnection?.sourceId)
+        client.listHomeSections()
       ])
       if (cancelled) return
       setSources(sourceRows)
@@ -643,89 +1147,114 @@ export default function LibraryApp(): JSX.Element {
     return () => {
       cancelled = true
     }
-  }, [client])
+  }, [client, initialActiveNav])
 
   useEffect(() => {
-    const connection = savedConnection
-    const session = connection?.session
-    if (!connection || !session) return
-    const savedSession = session
-    const savedConnectionName = connection.name
-    const savedIgnoreCertificateErrors = connection.ignoreCertificateErrors
-    const savedUsername = connection.username
+    const connections = savedConnections.filter((connection) => connection.session)
+    if (!connections.length) return undefined
     let cancelled = false
 
-    async function refreshSavedConnection(): Promise<void> {
-      try {
-        postNativeCommand({
-          type: 'command',
-          command: 'setAllowInsecureCertificates',
-          enabled: savedIgnoreCertificateErrors
-        })
-        const snapshot = await refreshEmbyLibrary(savedSession, savedConnectionName)
-        await client.upsertSourceItems(snapshot.source, snapshot.items, snapshot.homeSections)
+    async function refreshSavedConnections(): Promise<void> {
+      for (const connection of connections) {
+        const savedSession = connection.session as EmbySession
+        try {
+          postNativeCommand({
+            type: 'command',
+            command: 'setAllowInsecureCertificates',
+            enabled: connection.ignoreCertificateErrors
+          })
+          const snapshot = await refreshEmbyLibrary(savedSession, connection.name)
+          await client.upsertSourceItems(snapshot.source, snapshot.items, snapshot.homeSections)
 
-        saveSavedEmbyConnection({
-          sourceId: snapshot.source.id,
-          name: snapshot.source.name,
-          serverUrl: snapshot.session.apiBaseUrl,
-          username: snapshot.session.userName || savedUsername,
-          ignoreCertificateErrors: savedIgnoreCertificateErrors,
-          session: snapshot.session,
-          savedAt: Date.now()
-        })
+          saveSavedEmbyConnection({
+            sourceId: snapshot.source.id,
+            name: snapshot.source.name,
+            serverUrl: snapshot.session.apiBaseUrl,
+            username: snapshot.session.userName || connection.username,
+            ignoreCertificateErrors: connection.ignoreCertificateErrors,
+            session: snapshot.session,
+            savedAt: Date.now()
+          })
 
-        const sourceNav = `source:${snapshot.source.id}` as NavKey
-        const [sourceRows, allRows, continueRows, visibleRows, homeRows] = await Promise.all([
-          client.listSources(),
-          client.listAllItems(),
-          client.getContinueWatching(),
-          client.listItems({ navKey: sourceNav, view: 'home', search: '', sortKey: 'recent' }),
-          client.listHomeSections(snapshot.source.id)
-        ])
+          const [sourceRows, allRows, continueRows, homeRows] = await Promise.all([
+            client.listSources(),
+            client.listAllItems(),
+            client.getContinueWatching(),
+            client.listHomeSections()
+          ])
 
-        if (cancelled) return
-        setSources(sourceRows)
-        setAllItems(allRows)
-        setContinueItems(continueRows)
-        setVisibleItems(visibleRows)
-        setHomeSections(homeRows)
-        setActiveNav(sourceNav)
-        setActiveView('home')
-        setActiveLibraryViewId('')
-        setMediaFilter('all')
-        setQuery('')
-        setSelectedId(visibleRows[0]?.id ?? '')
-        setIsDetailOpen(false)
-        setConnectionName(snapshot.source.name)
-        setUsername(snapshot.session.userName || savedUsername)
-        setEmbySession(snapshot.session)
-        applyServerAddress(snapshot.session.apiBaseUrl)
-        setSourceSetupMode('hidden')
-      } catch (error) {
-        if (cancelled) return
-        setConnectTone('error')
-        setConnectMessage(`已加载本地缓存，刷新 Emby 失败：${errorText(error)}`)
+          if (cancelled) return
+          setSources(sourceRows)
+          setAllItems(allRows)
+          setContinueItems(continueRows)
+          setHomeSections(homeRows)
+          setEmbySessionsBySourceId((current) => {
+            const next = new Map(current)
+            next.set(snapshot.source.id, snapshot.session)
+            return next
+          })
+
+          if (connection.sourceId && connection.sourceId !== snapshot.source.id && activeNavRef.current === `source:${connection.sourceId}`) {
+            setActiveNav(`source:${snapshot.source.id}` as NavKey)
+          }
+        } catch (error) {
+          if (cancelled) return
+          debugLibraryPlayback(`emby saved refresh failed source=${connection.sourceId || connection.name} error=${errorText(error)}`)
+        }
       }
     }
 
-    void refreshSavedConnection()
+    void refreshSavedConnections()
     return () => {
       cancelled = true
     }
-  }, [client, savedConnection])
+  }, [client, savedConnections])
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedQuery(query), 220)
+    return () => window.clearTimeout(timer)
+  }, [query])
 
   useEffect(() => {
     let cancelled = false
     const activeSourceId = activeNav.startsWith('source:') ? activeNav.slice('source:'.length) : ''
     const activeSourceKind = activeSourceId ? sources.find((source) => source.id === activeSourceId)?.kind : undefined
+    const activeSession = activeSourceId ? embySessionsBySourceId.get(activeSourceId) : undefined
 
     async function loadVisibleItems(): Promise<void> {
+      if (activeSourceKind === 'Emby' && activeSession && debouncedQuery.trim()) {
+        try {
+          const rows = personSearch && personSearch.sourceId === activeSourceId && personSearch.name === debouncedQuery.trim()
+            ? await searchEmbyPersonLibrary(activeSession, {
+                id: personSearch.personId,
+                name: personSearch.name
+              }, {
+                libraryViewId: activeLibraryViewId || undefined,
+                view: activeView,
+                filterKey: mediaFilter,
+                sortKey,
+                sortOrder
+              })
+            : await searchEmbyLibrary(activeSession, debouncedQuery, {
+                libraryViewId: activeLibraryViewId || undefined,
+                view: activeView,
+                filterKey: mediaFilter,
+                sortKey,
+                sortOrder
+              })
+          if (!cancelled) setVisibleItems(rows)
+          return
+        } catch (error) {
+          debugLibraryPlayback(`emby search failed source=${activeSourceId} error=${errorText(error)}`)
+        }
+      }
+
       const rows = await client.listItems({
         navKey: activeNav,
         view: activeView,
-        search: query,
+        search: debouncedQuery,
         sortKey,
+        sortOrder,
         filterKey: mediaFilter,
         libraryViewId: activeSourceKind === 'Emby' ? activeLibraryViewId : undefined
       })
@@ -736,7 +1265,7 @@ export default function LibraryApp(): JSX.Element {
     return () => {
       cancelled = true
     }
-  }, [activeLibraryViewId, activeNav, activeView, client, mediaFilter, query, sortKey, sources])
+  }, [activeLibraryViewId, activeNav, activeView, client, debouncedQuery, embySessionsBySourceId, mediaFilter, personSearch, sortKey, sortOrder, sources])
 
   useEffect(() => {
     if (!visibleItems.length) {
@@ -766,18 +1295,13 @@ export default function LibraryApp(): JSX.Element {
     ? undefined
     : visibleItems.find((item) => item.id === selectedId)
       ?? allItems.find((item) => item.id === selectedId && (!activeSource || item.sourceId === activeSource.id))
+      ?? detailItemsById.get(selectedId)
       ?? (isActiveEmby ? undefined : visibleItems[0])
-  const embySource = sources.find((source) => source.kind === 'Emby')
-  const readyEmby = sources.find((source) => source.kind === 'Emby' && source.status === 'online')
-  const sourceScopedItems = activeSource
-    ? allItems.filter((item) => item.sourceId === activeSource.id)
-    : allItems.filter((item) => !embySourceIds.has(item.sourceId))
+  const selectedDetailItem = selectedItem ? detailItemsById.get(selectedItem.id) ?? selectedItem : undefined
+  const selectedDetailLoaded = Boolean(selectedItem && loadedDetailIds.has(selectedItem.id))
   const sourceScopedContinueItems = activeSource
     ? continueItems.filter((item) => item.sourceId === activeSource.id)
     : continueItems.filter((item) => !embySourceIds.has(item.sourceId))
-  const scopedItems = activeLibraryViewId && sourceScopedItems.some((item) => item.libraryViewId)
-    ? sourceScopedItems.filter((item) => item.libraryViewId === activeLibraryViewId)
-    : sourceScopedItems
   const scopedContinueItems = activeLibraryViewId && sourceScopedContinueItems.some((item) => item.libraryViewId)
     ? sourceScopedContinueItems.filter((item) => item.libraryViewId === activeLibraryViewId)
     : sourceScopedContinueItems
@@ -793,18 +1317,27 @@ export default function LibraryApp(): JSX.Element {
     && !query.trim()
     && mediaFilter === 'all'
     && sortKey === 'recent'
+    && sortOrder === 'descending'
     && scopedHomeSections.length
   )
   const showDetailPanel = Boolean(!isSourceSetup && selectedItem && (!isActiveEmby || isDetailOpen))
   const useMainOnlyLayout = Boolean(isSourceSetup || (isActiveEmby && !showDetailPanel))
-  const showContinueSection = Boolean(!isActiveEmby || mediaFilter === 'all')
-  const activeMediaFilter = mediaFilters.find((filter) => filter.key === mediaFilter)
+  const isInsideEmbyLibraryView = Boolean(isActiveEmby && activeLibraryViewId)
+  const showLibraryViewTabs = !isInsideEmbyLibraryView
+  const showContinueSection = Boolean(!isInsideEmbyLibraryView && (!isActiveEmby || mediaFilter === 'all'))
+  const showSortControl = Boolean(activeLibraryViewId || (!isActiveEmby && activeView !== 'home'))
   const listingBaseTitle = activeLibraryCard?.title ?? (activeSource ? `${activeSource.name} 主页` : navLabel(activeNav, sourceMap))
   const listingTitle = mediaFilter === 'all'
     ? listingBaseTitle
-    : `${listingBaseTitle} · ${mediaFilter === 'inProgress' ? '继续观看' : activeMediaFilter?.label ?? '筛选'}`
+    : `${listingBaseTitle} · ${mediaFilter === 'inProgress' ? '继续观看' : '筛选'}`
   const serverUrl = buildServerAddress(serverProtocol, serverHost, serverPort, serverPath)
-  const canConnectEmby = Boolean(serverHost.trim() && username.trim() && password)
+  const editingSavedConnection = editingSourceId
+    ? savedConnections.find((connection) => connection.sourceId === editingSourceId)
+    : undefined
+  const editingSession = editingSourceId
+    ? embySessionsBySourceId.get(editingSourceId) ?? editingSavedConnection?.session
+    : undefined
+  const canConnectEmby = Boolean(serverHost.trim() && username.trim() && (password || editingSession))
   const settingsLabels = settingsCopy[language]
   const pageEyebrow = sourceSetupMode === 'settings'
     ? settingsLabels.globalSettings
@@ -835,6 +1368,117 @@ export default function LibraryApp(): JSX.Element {
   }
   const sourceFor = (sourceId: string): LibrarySource => sourceMap.get(sourceId) ?? fallbackSource
 
+  useEffect(() => {
+    if (!selectedItem || !isDetailOpen || selectedDetailLoaded) return undefined
+    const source = sourceMap.get(selectedItem.sourceId)
+    const session = embySessionsBySourceId.get(selectedItem.sourceId)
+    if (source?.kind !== 'Emby' || !session) return undefined
+
+    const detailItem = selectedItem
+    const detailSession = session
+    let cancelled = false
+
+    async function loadSelectedDetail(): Promise<void> {
+      try {
+        debugLibraryPlayback(`emby detail load start item=${detailItem.id}`)
+        const detail = await loadEmbyItemDetails(detailSession, detailItem)
+        if (cancelled) return
+        setDetailItemsById((current) => {
+          const next = new Map(current)
+          next.set(detail.id, detail)
+          return next
+        })
+        setLoadedDetailIds((current) => {
+          const next = new Set(current)
+          next.add(detail.id)
+          return next
+        })
+        debugLibraryPlayback(`emby detail load ok item=${detailItem.id}`)
+      } catch (error) {
+        debugLibraryPlayback(`emby detail load failed item=${detailItem.id} error=${errorText(error)}`)
+      }
+    }
+
+    void loadSelectedDetail()
+    return () => {
+      cancelled = true
+    }
+  }, [embySessionsBySourceId, isDetailOpen, selectedDetailLoaded, selectedItem, sourceMap])
+
+  useEffect(() => {
+    if (!activeSource || activeSource.kind !== 'Emby') return undefined
+    if (activeLibraryViewId || activeView !== 'home' || query.trim() || mediaFilter !== 'all') return undefined
+    if (scopedHomeSections.length > 0) return undefined
+
+    const sourceId = activeSource.id
+    const session = embySessionsBySourceId.get(sourceId)
+    if (!session || homeSectionRefreshSourceIdsRef.current.has(sourceId)) return undefined
+
+    const refreshSession = session
+    const refreshSourceName = activeSource.name
+    homeSectionRefreshSourceIdsRef.current.add(sourceId)
+    let cancelled = false
+
+    async function refreshMissingHomeSections(): Promise<void> {
+      try {
+        debugLibraryPlayback(`emby home refresh start source=${sourceId}`)
+        const snapshot = await refreshEmbyLibrary(refreshSession, refreshSourceName)
+        await client.upsertSourceItems(snapshot.source, snapshot.items, snapshot.homeSections)
+
+        const saved = savedConnections.find((connection) => connection.sourceId === snapshot.source.id)
+        saveSavedEmbyConnection({
+          sourceId: snapshot.source.id,
+          name: snapshot.source.name,
+          serverUrl: snapshot.session.apiBaseUrl,
+          username: snapshot.session.userName || saved?.username || '',
+          ignoreCertificateErrors: saved?.ignoreCertificateErrors ?? ignoreCertificateErrors,
+          session: snapshot.session,
+          savedAt: Date.now()
+        })
+
+        const [sourceRows, allRows, continueRows, allHomeRows] = await Promise.all([
+          client.listSources(),
+          client.listAllItems(),
+          client.getContinueWatching(),
+          client.listHomeSections()
+        ])
+
+        if (cancelled) return
+        setSources(sourceRows)
+        setAllItems(allRows)
+        setContinueItems(continueRows)
+        setHomeSections(allHomeRows)
+        setEmbySessionsBySourceId((current) => {
+          const next = new Map(current)
+          next.set(snapshot.source.id, snapshot.session)
+          return next
+        })
+        if (sourceId !== snapshot.source.id && activeNavRef.current === `source:${sourceId}`) {
+          setActiveNav(`source:${snapshot.source.id}` as NavKey)
+        }
+        debugLibraryPlayback(`emby home refresh ok source=${sourceId} sections=${snapshot.homeSections.length}`)
+      } catch (error) {
+        debugLibraryPlayback(`emby home refresh failed source=${sourceId} error=${errorText(error)}`)
+      }
+    }
+
+    void refreshMissingHomeSections()
+    return () => {
+      cancelled = true
+    }
+  }, [
+    activeLibraryViewId,
+    activeSource,
+    activeView,
+    client,
+    embySessionsBySourceId,
+    ignoreCertificateErrors,
+    mediaFilter,
+    query,
+    savedConnections,
+    scopedHomeSections.length
+  ])
+
   function debugLibraryPlayback(message: string): void {
     postNativeCommand({
       type: 'command',
@@ -856,17 +1500,21 @@ export default function LibraryApp(): JSX.Element {
       return
     }
 
+    const embySession = embySessionsBySourceId.get(item.sourceId)
     if (!embySession) {
       setPlayIntent('Emby session is not ready. Reconnect this source first.')
       debugLibraryPlayback(`play blocked missing emby session id=${item.id}`)
       return
     }
 
+    setResolvingPlayItemId(item.id)
     setPlayIntent('Resolving Emby playback URL...')
     debugLibraryPlayback(`play resolve start id=${item.id}`)
     try {
       const target = await resolveEmbyPlaybackTarget(embySession, item)
       debugLibraryPlayback(`play resolve ok sourceId=${item.id} targetId=${target.itemId} url=${redactPlaybackUrl(target.url)}`)
+      const report = savePendingEmbyPlaybackReport(embySession, target)
+      debugLibraryPlayback(`play emby report pending targetId=${target.itemId} reportId=${report?.id ?? 'none'}`)
       postNativeCommand({ type: 'command', command: 'setWebUiRoute', route: 'player' })
       window.location.hash = '#/player'
       window.setTimeout(() => {
@@ -882,12 +1530,16 @@ export default function LibraryApp(): JSX.Element {
       const message = errorText(error)
       setPlayIntent(message)
       debugLibraryPlayback(`play resolve failed id=${item.id} error=${message}`)
+    } finally {
+      setResolvingPlayItemId((current) => current === item.id ? '' : current)
     }
   }
 
   function openSourcePicker(): void {
     setSourceSetupMode('select')
+    setEditingSourceId('')
     setActiveLibraryViewId('')
+    setPersonSearch(undefined)
     setSelectedId('')
     setIsDetailOpen(false)
     setPlayIntent('')
@@ -897,7 +1549,9 @@ export default function LibraryApp(): JSX.Element {
 
   function openSettings(): void {
     setSourceSetupMode('settings')
+    setEditingSourceId('')
     setActiveLibraryViewId('')
+    setPersonSearch(undefined)
     setSelectedId('')
     setIsDetailOpen(false)
     setPlayIntent('')
@@ -907,21 +1561,76 @@ export default function LibraryApp(): JSX.Element {
 
   function openEmbySetup(): void {
     setSourceSetupMode('emby')
+    setEditingSourceId('')
     setActiveLibraryViewId('')
+    setPersonSearch(undefined)
     setSelectedId('')
     setIsDetailOpen(false)
-    setConnectionName((current) => current || 'Emby')
+    setConnectionName('Emby')
+    setServerProtocol('http')
+    setServerHost('')
+    setServerPort('')
+    setServerPath('')
+    setUsername('')
+    setPassword('')
     setConnectTone('idle')
     setConnectMessage('')
   }
 
+  function openSourceEditor(sourceId: string): void {
+    const source = sourceMap.get(sourceId)
+    if (!source || source.kind !== 'Emby') return
+
+    const saved = savedConnections.find((connection) => connection.sourceId === sourceId)
+    const session = embySessionsBySourceId.get(sourceId) ?? saved?.session
+    const parsed = parseServerAddress(saved?.serverUrl || source.location, 'http')
+
+    setSourceSetupMode('emby')
+    setEditingSourceId(sourceId)
+    setActiveNav(`source:${sourceId}` as NavKey)
+    setActiveView('home')
+    setActiveLibraryViewId('')
+    setMediaFilter('all')
+    setSortKey('recent')
+    setSortOrder('descending')
+    setPersonSearch(undefined)
+    setQuery('')
+    setDebouncedQuery('')
+    setSelectedId('')
+    setIsDetailOpen(false)
+    setPlayIntent('')
+    setConnectionName(saved?.name || source.name)
+    setServerProtocol(parsed?.protocol ?? 'http')
+    setServerHost(parsed?.host ?? '')
+    setServerPort(parsed?.port ?? '')
+    setServerPath(parsed?.path ?? '')
+    setUsername(saved?.username || session?.userName || '')
+    setPassword('')
+    setIgnoreCertificateErrors(saved?.ignoreCertificateErrors ?? ignoreCertificateErrors)
+    setConnectTone('idle')
+    setConnectMessage('')
+  }
+
+  function closeEmbySetup(): void {
+    if (editingSourceId) {
+      selectNavigation(`source:${editingSourceId}` as NavKey)
+      return
+    }
+    setSourceSetupMode('select')
+  }
+
   function selectNavigation(navKey: NavKey): void {
     setSourceSetupMode('hidden')
+    setEditingSourceId('')
     setActiveNav(navKey)
     setActiveView('home')
     setActiveLibraryViewId('')
     setMediaFilter('all')
+    setSortKey('recent')
+    setSortOrder('descending')
+    setPersonSearch(undefined)
     setQuery('')
+    setDebouncedQuery('')
     setSelectedId('')
     setIsDetailOpen(false)
     setPlayIntent('')
@@ -933,11 +1642,46 @@ export default function LibraryApp(): JSX.Element {
     setPlayIntent('')
   }
 
+  function selectRelatedMediaItem(item: MediaItem): void {
+    setDetailItemsById((current) => {
+      const next = new Map(current)
+      next.set(item.id, item)
+      return next
+    })
+    setSelectedId(item.id)
+    setIsDetailOpen(true)
+    setPlayIntent('')
+  }
+
+  function searchCastPerson(person: PersonCredit, sourceId: string): void {
+    const name = person.name.trim()
+    if (!name) return
+    const source = sourceMap.get(sourceId)
+    setSourceSetupMode('hidden')
+    setEditingSourceId('')
+    if (source) {
+      setActiveNav(`source:${source.id}` as NavKey)
+    }
+    setActiveView('home')
+    setActiveLibraryViewId('')
+    setMediaFilter('all')
+    setSortKey('recent')
+    setSortOrder('descending')
+    setPersonSearch(source?.kind === 'Emby' ? { sourceId, personId: person.id, name } : undefined)
+    setQuery(name)
+    setDebouncedQuery(name)
+    setSelectedId('')
+    setIsDetailOpen(false)
+    setPlayIntent('')
+  }
+
   function openLibraryView(viewId: string): void {
     setActiveLibraryViewId(viewId)
     setActiveView('home')
     setMediaFilter('all')
     setSortKey('recent')
+    setSortOrder('descending')
+    setPersonSearch(undefined)
     setQuery('')
     setSelectedId('')
     setIsDetailOpen(false)
@@ -948,6 +1692,8 @@ export default function LibraryApp(): JSX.Element {
     setActiveView('home')
     setMediaFilter('inProgress')
     setSortKey('recent')
+    setSortOrder('descending')
+    setPersonSearch(undefined)
     setQuery('')
     setSelectedId('')
     setIsDetailOpen(false)
@@ -957,11 +1703,14 @@ export default function LibraryApp(): JSX.Element {
   function resetCurrentListing(): void {
     if (activeLibraryViewId) {
       setActiveLibraryViewId('')
-      setActiveView('home')
     }
+    setActiveView('home')
     setMediaFilter('all')
     setSortKey('recent')
+    setSortOrder('descending')
+    setPersonSearch(undefined)
     setQuery('')
+    setDebouncedQuery('')
     setSelectedId('')
     setIsDetailOpen(false)
     setPlayIntent('')
@@ -974,15 +1723,13 @@ export default function LibraryApp(): JSX.Element {
     setPlayIntent('')
   }
 
-  function changeMediaFilter(filter: MediaFilterKey): void {
-    setMediaFilter(filter)
-    setSelectedId('')
-    setIsDetailOpen(false)
-    setPlayIntent('')
-  }
-
   function changeSortKey(sort: SortKey): void {
-    setSortKey(sort)
+    if (sort === sortKey) {
+      setSortOrder((current) => current === 'descending' ? 'ascending' : 'descending')
+    } else {
+      setSortKey(sort)
+      setSortOrder('descending')
+    }
     setSelectedId('')
     setIsDetailOpen(false)
     setPlayIntent('')
@@ -1024,12 +1771,18 @@ export default function LibraryApp(): JSX.Element {
         command: 'setAllowInsecureCertificates',
         enabled: ignoreCertificateErrors
       })
-      const snapshot = await loadEmbyLibrary({
-        serverUrl,
-        username,
-        password,
-        displayName: connectionName
-      })
+      const snapshot = password
+        ? await loadEmbyLibrary({
+            serverUrl,
+            username,
+            password,
+            displayName: connectionName
+          })
+        : await refreshEmbyLibrary({
+            ...(editingSession as EmbySession),
+            apiBaseUrl: serverUrl,
+            userName: username.trim() || editingSession?.userName || ''
+          }, connectionName)
       await client.upsertSourceItems(snapshot.source, snapshot.items, snapshot.homeSections)
       saveSavedEmbyConnection({
         sourceId: snapshot.source.id,
@@ -1047,7 +1800,7 @@ export default function LibraryApp(): JSX.Element {
         client.listAllItems(),
         client.getContinueWatching(),
         client.listItems({ navKey: sourceNav, view: 'home', search: '', sortKey: 'recent' }),
-        client.listHomeSections(snapshot.source.id)
+        client.listHomeSections()
       ])
 
       setSources(sourceRows)
@@ -1059,14 +1812,22 @@ export default function LibraryApp(): JSX.Element {
       setActiveView('home')
       setActiveLibraryViewId('')
       setMediaFilter('all')
+      setSortKey('recent')
+      setSortOrder('descending')
+      setPersonSearch(undefined)
       setQuery('')
       setSelectedId(visibleRows[0]?.id ?? '')
       setIsDetailOpen(false)
       setConnectionName(snapshot.source.name)
-      setEmbySession(snapshot.session)
+      setEmbySessionsBySourceId((current) => {
+        const next = new Map(current)
+        next.set(snapshot.source.id, snapshot.session)
+        return next
+      })
       applyServerAddress(snapshot.session.apiBaseUrl)
       setPassword('')
       setSourceSetupMode('hidden')
+      setEditingSourceId('')
       setConnectTone('success')
       setConnectMessage(`已连接 ${snapshot.source.name}，加载 ${visibleRows.length} / ${snapshot.totalRecordCount} 条`)
     } catch (error) {
@@ -1126,24 +1887,27 @@ export default function LibraryApp(): JSX.Element {
                 <Plus size={13} />
               </button>
             </div>
-            <button
-              className={`library-nav-button ${sourceSetupMode === 'select' || sourceSetupMode === 'emby' ? 'is-active' : ''}`}
-              type="button"
-              onClick={openSourcePicker}
-            >
-              <Plus size={16} />
-              <span>添加媒体源</span>
-            </button>
             {sources.map((source) => {
               const key = `source:${source.id}` as NavKey
               return (
-                <SidebarButton
-                  key={source.id}
-                  item={{ key, label: source.name, icon: sourceIcon(source.kind) }}
-                  activeNav={activeNav}
-                  suppressActive={isSourceSetup}
-                  onSelect={selectNavigation}
-                />
+                <div className="library-source-nav-row" key={source.id}>
+                  <SidebarButton
+                    item={{ key, label: source.name, icon: sourceIcon(source.kind) }}
+                    activeNav={activeNav}
+                    suppressActive={isSourceSetup && editingSourceId !== source.id}
+                    onSelect={selectNavigation}
+                  />
+                  <button
+                    className={`library-source-edit-button ${editingSourceId === source.id ? 'is-active' : ''}`}
+                    type="button"
+                    title="编辑媒体源"
+                    aria-label={`编辑 ${source.name}`}
+                    disabled={source.kind !== 'Emby'}
+                    onClick={() => openSourceEditor(source.id)}
+                  >
+                    <MoreHorizontal size={15} />
+                  </button>
+                </div>
               )
             })}
           </div>
@@ -1178,6 +1942,7 @@ export default function LibraryApp(): JSX.Element {
                 <input
                   value={query}
                   onChange={(event) => {
+                    setPersonSearch(undefined)
                     setQuery(event.target.value)
                     setSelectedId('')
                     setIsDetailOpen(false)
@@ -1186,26 +1951,19 @@ export default function LibraryApp(): JSX.Element {
                   placeholder="搜索标题 / 类型 / 标签"
                 />
               </label>
-              <div className="library-toolbar-actions">
-                <button
-                  type="button"
-                  title={activeLibraryViewId ? '返回 Emby 媒体库' : '媒体库首页'}
-                  onClick={resetCurrentListing}
-                >
-                  <Grid3X3 size={16} />
-                </button>
-                <select value={mediaFilter} onChange={(event) => changeMediaFilter(event.target.value as MediaFilterKey)} aria-label="筛选">
-                  {mediaFilters.map((filter) => (
-                    <option value={filter.key} key={filter.key}>{filter.label}</option>
-                  ))}
-                </select>
-                <select value={sortKey} onChange={(event) => changeSortKey(event.target.value as SortKey)} aria-label="排序">
-                  <option value="recent">最近添加</option>
-                  <option value="title">标题</option>
-                  <option value="rating">评分</option>
-                  <option value="year">发行年份</option>
-                </select>
-              </div>
+              {showSortControl ? (
+                <div className="library-toolbar-actions">
+                  <ToolbarSelect
+                    value={sortKey}
+                    options={sortOptions}
+                    ariaLabel="排序"
+                    statusIcon={sortOrder === 'descending'
+                      ? <ArrowDownWideNarrow size={15} />
+                      : <ArrowUpNarrowWide size={15} />}
+                    onChange={changeSortKey}
+                  />
+                </div>
+              ) : null}
             </>
           ) : null}
         </section>
@@ -1221,7 +1979,7 @@ export default function LibraryApp(): JSX.Element {
                 <span>Emby</span>
                 <h2>连接服务器</h2>
               </div>
-              <button className="library-secondary-action" type="button" onClick={() => setSourceSetupMode('select')}>
+              <button className="library-secondary-action" type="button" onClick={closeEmbySetup}>
                 <ArrowLeft size={15} />
                 <span>返回</span>
               </button>
@@ -1304,36 +2062,7 @@ export default function LibraryApp(): JSX.Element {
           </section>
         ) : (
           <>
-            <section className="library-stats-row">
-              <div className="library-stat">
-                <span>片源</span>
-                <strong>{scopedItems.length}</strong>
-              </div>
-              <div className="library-stat">
-                <span>{activeSource ? '当前源' : '媒体源'}</span>
-                <strong>{activeSource ? sourceKindLabel(activeSource.kind) : sources.length}</strong>
-              </div>
-              <div className="library-stat">
-                <span>未看</span>
-                <strong>{scopedItems.filter((item) => !item.watched).length}</strong>
-              </div>
-              <div className={`library-connect-card ${activeSource?.status === 'online' || readyEmby ? 'is-ready' : ''}`}>
-                {sourceIcon(activeSource?.kind ?? 'Emby', 22)}
-                <div>
-                  <span>{activeSource ? sourceKindLabel(activeSource.kind) : 'Emby'}</span>
-                  <strong>
-                    {activeSource
-                      ? `${activeSource.name} · ${activeSource.status === 'online' ? '已接入' : '待连接'}`
-                      : readyEmby
-                        ? `${readyEmby.name} · 已接入`
-                        : embySource
-                          ? `${embySource.name} · 待连接`
-                          : '未配置'}
-                  </strong>
-                </div>
-              </div>
-            </section>
-
+            {showLibraryViewTabs ? (
             <section className="library-view-tabs" aria-label="媒体类型">
               {viewTabs.map((tab) => (
                 <button
@@ -1346,6 +2075,7 @@ export default function LibraryApp(): JSX.Element {
                 </button>
               ))}
             </section>
+            ) : null}
 
             {showContinueSection ? (
             <section className="library-continue">
@@ -1357,7 +2087,7 @@ export default function LibraryApp(): JSX.Element {
                 </button>
               </div>
               {scopedContinueItems.length ? (
-                <div className="library-continue-row">
+                <HorizontalScroller className="library-continue-row">
                   {scopedContinueItems.map((item) => (
                     <ContinueCard
                       key={item.id}
@@ -1366,7 +2096,7 @@ export default function LibraryApp(): JSX.Element {
                       onSelect={selectMediaItem}
                     />
                   ))}
-                </div>
+                </HorizontalScroller>
               ) : (
                 <EmptyState icon={<Clock3 size={24} />} title="暂无继续观看" caption="当前没有来自真实媒体源的播放进度" />
               )}
@@ -1411,11 +2141,14 @@ export default function LibraryApp(): JSX.Element {
         )}
       </main>
 
-      {showDetailPanel && selectedItem ? (
+      {showDetailPanel && selectedDetailItem ? (
         <DetailPanel
-          item={selectedItem}
-          source={sourceFor(selectedItem.sourceId)}
+          item={selectedDetailItem}
+          source={sourceFor(selectedDetailItem.sourceId)}
           playIntent={playIntent}
+          isResolvingPlayback={Boolean(resolvingPlayItemId)}
+          onSelectItem={selectRelatedMediaItem}
+          onSearchPerson={(person) => searchCastPerson(person, selectedDetailItem.sourceId)}
           onClose={() => {
             setIsDetailOpen(false)
             setSelectedId('')

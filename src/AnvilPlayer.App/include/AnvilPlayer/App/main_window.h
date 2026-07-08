@@ -253,6 +253,7 @@ private:
                             bool restart,
                             bool waitForPreroll = true);
     bool SeekNativeRuntime(const anvil::playback::PlaybackSessionSnapshot& snapshot);
+    void ResumeNativeSeekPrerollAudio(std::chrono::milliseconds position);
     bool PrepareNativeEnhancedPlaybackBeforePlay(const anvil::playback::PlaybackSessionSnapshot& snapshot);
     bool CaptureLatestNativeFrame();
     void RenderHeldNativeFrame(bool logRepaint = true);
@@ -359,6 +360,7 @@ private:
     bool nativeFrameHoldVisible_ = false;
     bool pendingPausedFrameRefresh_ = false;
     bool heldNativeFrameNeedsPresent_ = false;
+    bool nativeSeekPrerollHoldingAudio_ = false;
     std::thread runtimeStopThread_;
     std::atomic_bool runtimeStopAsyncInProgress_{false};
     std::atomic_bool runtimeStopAsyncClearFrame_{true};

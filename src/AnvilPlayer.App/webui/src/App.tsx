@@ -13,6 +13,7 @@ import {
   Monitor,
   Pause,
   Play,
+  AlertTriangle,
   RotateCcw,
   ScrollText,
   Settings,
@@ -23,6 +24,14 @@ import {
   Volume2
 } from 'lucide-react'
 import { applyAppearanceSettings } from './appearance'
+import {
+  clearPendingEmbyPlaybackReport,
+  loadPendingEmbyPlaybackReport,
+  reportEmbyPlaybackProgress,
+  reportEmbyPlaybackStarted,
+  reportEmbyPlaybackStopped,
+  type EmbyPlaybackReportRecord
+} from './manager/embyClient'
 import { applyDocumentLanguage, getInitialLanguage, saveUiLanguage, type UiLanguage } from './uiSettings'
 import {
   EMPTY_STATE,
@@ -81,6 +90,11 @@ const en = {
   paused: 'Paused',
   opening: 'Opening',
   error: 'Error',
+  playbackFailed: 'Playback failed',
+  playbackFailedHint: 'The player could not open this stream. The source may have rejected the request or the URL may have expired.',
+  errorDetails: 'Details',
+  retry: 'Retry',
+  backToLibrary: 'Back to library',
   hdrCurve: 'HDR Curve',
   reset: 'Reset',
   zoom: 'Zoom',
@@ -173,6 +187,11 @@ const zh: Record<keyof typeof en, string> = {
   paused: '已暂停',
   opening: '打开中',
   error: '错误',
+  playbackFailed: '播放失败',
+  playbackFailedHint: '播放器无法打开这个视频流，可能是片源拒绝访问或播放地址已经失效。',
+  errorDetails: '详情',
+  retry: '重试',
+  backToLibrary: '返回媒体库',
   hdrCurve: 'HDR 曲线',
   reset: '重置',
   zoom: '放大',
@@ -223,6 +242,144 @@ const copy = { en, zh }
 
 type Copy = Record<keyof typeof en, string>
 type SubtitlePanel = 'subtitles' | 'audio' | 'danmaku'
+
+const EMBY_PROGRESS_REPORT_INTERVAL_MS = 10_000
+
+interface ActiveEmbyPlaybackReport {
+  report: EmbyPlaybackReportRecord
+  matched: boolean
+  started: boolean
+  stopped: boolean
+  lastProgressAt: number
+  lastPositionMs: number
+  lastPlaybackState: string
+}
+
+function normalizePlaybackUrl(value: string): string {
+  try {
+    const url = new URL(value)
+    for (const key of [...url.searchParams.keys()]) {
+      if (/^(api_key|x-emby-token)$/i.test(key)) url.searchParams.delete(key)
+    }
+    return `${url.origin}${url.pathname}?${[...url.searchParams.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entryValue]) => `${key}=${entryValue}`)
+      .join('&')}`.replace(/\?$/, '').toLowerCase()
+  } catch {
+    return value.trim().replace(/\\/g, '/').toLowerCase()
+  }
+}
+
+function playbackPathMatchesEmbyReport(mediaPath: string, report: EmbyPlaybackReportRecord): boolean {
+  const media = normalizePlaybackUrl(mediaPath)
+  const target = normalizePlaybackUrl(report.target.url)
+  if (!media || !target) return false
+  if (media === target) return true
+
+  const itemId = report.target.itemId.toLowerCase()
+  return Boolean(itemId && media.includes(itemId) && target.includes(itemId))
+}
+
+function embyReportEventName(previousState: string, nextState: string): string {
+  if (previousState === 'Playing' && nextState === 'Paused') return 'Pause'
+  if (previousState === 'Paused' && nextState === 'Playing') return 'Unpause'
+  return 'TimeUpdate'
+}
+
+function debugEmbyPlaybackReport(message: string): void {
+  postNativeCommand({
+    type: 'command',
+    command: 'debugLog',
+    message: `emby playback report ${message}`
+  })
+}
+
+function stopActiveEmbyPlaybackReport(
+  active: ActiveEmbyPlaybackReport | null,
+  positionMs: number,
+  failed: boolean,
+  keepalive = false
+): void {
+  if (!active || active.stopped || !active.started) return
+  active.stopped = true
+  const stoppedAt = Math.max(positionMs, active.lastPositionMs)
+  clearPendingEmbyPlaybackReport(active.report.id)
+  void reportEmbyPlaybackStopped(active.report, stoppedAt, failed, keepalive)
+    .then(() => debugEmbyPlaybackReport(`stopped itemId=${active.report.target.itemId} positionMs=${Math.round(stoppedAt)}`))
+    .catch((error) => debugEmbyPlaybackReport(`stop failed itemId=${active.report.target.itemId} error=${error instanceof Error ? error.message : String(error)}`))
+}
+
+function useEmbyPlaybackReporting(state: PlayerState): void {
+  const activeRef = useRef<ActiveEmbyPlaybackReport | null>(null)
+
+  useEffect(() => {
+    activeRef.current = null
+    return () => {
+      stopActiveEmbyPlaybackReport(activeRef.current, activeRef.current?.lastPositionMs ?? 0, false, true)
+    }
+  }, [])
+
+  useEffect(() => {
+    let active = activeRef.current
+    if (!active) {
+      const pending = loadPendingEmbyPlaybackReport()
+      if (!pending) return
+      active = {
+        report: pending,
+        matched: false,
+        started: false,
+        stopped: false,
+        lastProgressAt: 0,
+        lastPositionMs: 0,
+        lastPlaybackState: ''
+      }
+      activeRef.current = active
+    }
+
+    if (active.stopped) return
+
+    const matched = active.matched || (state.hasMedia && playbackPathMatchesEmbyReport(state.mediaPath, active.report))
+    if (!matched) return
+    active.matched = true
+
+    const positionMs = Math.max(0, state.positionMs)
+    if (state.playbackState !== 'Stopped' && state.playbackState !== 'Empty') {
+      active.lastPositionMs = positionMs
+    }
+
+    if (!state.hasMedia || state.playbackState === 'Stopped' || state.playbackState === 'Empty' || state.playbackState === 'Error') {
+      stopActiveEmbyPlaybackReport(active, positionMs, state.playbackState === 'Error')
+      return
+    }
+
+    const now = Date.now()
+    const paused = state.playbackState === 'Paused'
+    const eventName = embyReportEventName(active.lastPlaybackState, state.playbackState)
+
+    if (!active.started && (state.playbackState === 'Playing' || state.playbackState === 'Paused' || state.playbackState === 'Ready')) {
+      active.started = true
+      active.lastProgressAt = now
+      active.lastPlaybackState = state.playbackState
+      void reportEmbyPlaybackStarted(active.report, positionMs)
+        .then(() => reportEmbyPlaybackProgress(active.report, positionMs, paused, 'TimeUpdate'))
+        .then(() => debugEmbyPlaybackReport(`started itemId=${active.report.target.itemId}`))
+        .catch((error) => debugEmbyPlaybackReport(`start failed itemId=${active.report.target.itemId} error=${error instanceof Error ? error.message : String(error)}`))
+      return
+    }
+
+    if (!active.started) return
+
+    const stateChanged = eventName !== 'TimeUpdate'
+    const due = now - active.lastProgressAt >= EMBY_PROGRESS_REPORT_INTERVAL_MS
+    if (stateChanged || due) {
+      active.lastProgressAt = now
+      void reportEmbyPlaybackProgress(active.report, positionMs, paused, eventName)
+        .catch((error) => debugEmbyPlaybackReport(`progress failed itemId=${active.report.target.itemId} error=${error instanceof Error ? error.message : String(error)}`))
+    }
+
+    active.lastPlaybackState = state.playbackState
+  }, [state])
+}
 
 function displayTrackLabel(label: string, t: Copy): string {
   switch (label) {
@@ -839,10 +996,37 @@ function TopBar({ state, t }: { state: PlayerState; t: Copy }): JSX.Element {
 }
 
 function VideoStage({ state, t }: { state: PlayerState; t: Copy }): JSX.Element {
+  const playbackFailed = state.hasMedia && state.playbackState === 'Error'
+  const failureMessage = state.lastError || t.playbackFailedHint
+
   return (
     <main className="video-shell">
       <div className="video-stage">
-        {state.hasMedia && state.buffering && (
+        {playbackFailed && (
+          <div className="playback-error-overlay" aria-live="assertive">
+            <div className="playback-error-panel">
+              <div className="playback-error-icon" aria-hidden="true">
+                <AlertTriangle size={30} />
+              </div>
+              <div className="playback-error-copy">
+                <strong>{t.playbackFailed}</strong>
+                <p>{t.playbackFailedHint}</p>
+                <small><span>{t.errorDetails}</span>{failureMessage}</small>
+              </div>
+              <div className="playback-error-actions">
+                <button className="line-button text-button" type="button" onClick={() => postNativeCommand({ type: 'command', command: 'playPause' })}>
+                  <RotateCcw size={15} />
+                  <span>{t.retry}</span>
+                </button>
+                <button className="line-button text-button" type="button" onClick={() => { window.location.hash = '#/library' }}>
+                  <Library size={15} />
+                  <span>{t.backToLibrary}</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+        {state.hasMedia && state.buffering && !playbackFailed && (
           <div className="buffering-overlay" aria-live="polite">
             <span className="buffering-spinner" aria-hidden="true" />
             <span className="buffering-copy">
@@ -1330,6 +1514,9 @@ function Transport({
 }): JSX.Element {
   const [volumeHover, setVolumeHover] = useState(false)
   const [volumeDragging, setVolumeDragging] = useState(false)
+  const [progressDragging, setProgressDragging] = useState(false)
+  const [progressDraft, setProgressDraft] = useState<number | null>(null)
+  const progressDraggingRef = useRef(false)
   const progress = useMemo(() => {
     if (state.durationMs <= 0) return 0
     return Math.max(0, Math.min(1000, Math.round((state.positionMs / state.durationMs) * 1000)))
@@ -1339,22 +1526,38 @@ function Transport({
     const buffered = Math.round((Math.max(state.bufferedEndMs, state.positionMs) / state.durationMs) * 1000)
     return Math.max(progress, Math.min(1000, buffered))
   }, [progress, state.bufferedEndMs, state.durationMs, state.positionMs])
+  const displayProgress = progressDragging && progressDraft !== null ? progressDraft : progress
+  const displayPositionMs = progressDragging && state.durationMs > 0
+    ? Math.round((state.durationMs * displayProgress) / 1000)
+    : state.positionMs
   const playing = state.playbackState === 'Playing'
   const hdrButtonLabel = state.cmv4Available ? t.dolbyVision : t.hdr
   const volumePercent = Math.round(state.volume * 100)
   const showVolumePercent = volumeHover || volumeDragging
   const progressStyle = {
-    '--progress': `${progress / 10}%`,
-    '--buffered': `${bufferedProgress / 10}%`
+    '--progress': `${displayProgress / 10}%`,
+    '--buffered': `${Math.max(displayProgress, bufferedProgress) / 10}%`
   } as CSSProperties
   const volumeStyle = {
     '--volume-x': `${volumePercent}%`
   } as CSSProperties
+  const clampProgress = (value: number): number => Math.max(0, Math.min(1000, Math.round(value)))
+  const commitProgress = (value: number): void => {
+    const next = clampProgress(value)
+    progressDraggingRef.current = false
+    setProgressDragging(false)
+    setProgressDraft(null)
+    postNativeCommand({
+      type: 'command',
+      command: 'seekToRatio',
+      ratio: next / 1000
+    })
+  }
 
   return (
     <footer ref={transportRef} className="transport line-panel">
       <div className="time-row">
-        <span>{formatTime(state.positionMs)}</span>
+        <span>{formatTime(displayPositionMs)}</span>
         <span>{formatTime(state.durationMs)}</span>
       </div>
       <div className="progress-control" style={progressStyle}>
@@ -1367,14 +1570,46 @@ function Transport({
           type="range"
           min={0}
           max={1000}
-          value={progress}
+          value={displayProgress}
           disabled={!state.hasMedia || state.durationMs <= 0}
+          onPointerDown={(event) => {
+            const next = clampProgress(Number(event.currentTarget.value))
+            progressDraggingRef.current = true
+            setProgressDragging(true)
+            setProgressDraft(next)
+            event.currentTarget.setPointerCapture(event.pointerId)
+          }}
+          onPointerUp={(event) => {
+            if (!progressDraggingRef.current) return
+            if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+              event.currentTarget.releasePointerCapture(event.pointerId)
+            }
+            commitProgress(Number(event.currentTarget.value))
+          }}
+          onPointerCancel={(event) => {
+            if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+              event.currentTarget.releasePointerCapture(event.pointerId)
+            }
+            progressDraggingRef.current = false
+            setProgressDragging(false)
+            setProgressDraft(null)
+          }}
+          onBlur={(event) => {
+            if (progressDraggingRef.current) {
+              commitProgress(Number(event.currentTarget.value))
+            }
+          }}
           onChange={(event) => {
-            postNativeCommand({
-              type: 'command',
-              command: 'seekToRatio',
-              ratio: Number(event.currentTarget.value) / 1000
-            })
+            const next = clampProgress(Number(event.currentTarget.value))
+            if (progressDraggingRef.current) {
+              setProgressDraft(next)
+            } else {
+              postNativeCommand({
+                type: 'command',
+                command: 'seekToRatio',
+                ratio: next / 1000
+              })
+            }
           }}
         />
       </div>
@@ -1459,6 +1694,7 @@ export default function App(): JSX.Element {
   const subtitleButtonRef = useRef<HTMLButtonElement | null>(null)
   const t = copy[language]
   const subtitleVisualActive = subtitlePopoverMounted || subtitlePopoverOpen || state.subtitleMenuOpen
+  useEmbyPlaybackReporting(state)
 
   const captureSubtitleAnchor = (): RectSnapshot => {
     const element = subtitleButtonRef.current

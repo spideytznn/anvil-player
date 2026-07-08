@@ -13,6 +13,7 @@
 #include <cwctype>
 #include <fstream>
 #include <iomanip>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <system_error>
@@ -969,6 +970,7 @@ std::wstring MainWindow::BuildWebUiStateJson() const {
     std::wostringstream json;
     json << L"{\"type\":\"state\",\"state\":{";
     json << L"\"playbackState\":\"" << JsonEscape(playbackState) << L"\",";
+    json << L"\"lastError\":\"" << JsonEscape(snapshot.lastError) << L"\",";
     json << L"\"mediaName\":\"" << JsonEscape(mediaName) << L"\",";
     json << L"\"mediaPath\":\"" << JsonEscape(mediaPath) << L"\",";
     json << L"\"hasMedia\":" << (snapshot.media.has_value() ? L"true" : L"false") << L",";
@@ -1503,13 +1505,20 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
             }
             NativeVideoFrame frame;
             const auto snapshot = controller_.Snapshot();
-            const bool shouldRenderFrame = snapshot.state == PlaybackState::Playing || pendingPausedFrameRefresh_;
+            const auto stats = nativeVideoDecoder_->Stats();
+            const bool nativeBuffering = snapshot.state == PlaybackState::Playing && stats.buffering;
+            if (!nativeBuffering) {
+                ResumeNativeSeekPrerollAudio(stats.clockPosition);
+            }
+            const bool shouldRenderFrame =
+                (snapshot.state == PlaybackState::Playing || pendingPausedFrameRefresh_) &&
+                !nativeBuffering;
             if (shouldRenderFrame && nativeVideoDecoder_->LatestFrame(frame) && d3dRenderer_) {
                 d3dRenderer_->Render(frame);
                 heldNativeFrame_ = frame;
                 heldNativeFrameNeedsPresent_ = false;
                 nativeFrameHoldVisible_ = false;
-                MaybeLogNativeSchedulerStats(nativeVideoDecoder_->Stats());
+                MaybeLogNativeSchedulerStats(stats);
                 if (pendingPausedFrameRefresh_) {
                     pendingPausedFrameRefresh_ = false;
                     nativeFrameHoldVisible_ = true;
@@ -1521,11 +1530,40 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
                 if (webUiActive_ && webUiPlayerRouteActive_) {
                     UpdateVideoHost();
                 }
+            } else if (nativeBuffering) {
+                MaybeLogNativeSchedulerStats(stats);
+                if (webUiActive_ && webUiPlayerRouteActive_) {
+                    UpdateVideoHost();
+                }
             }
             if (snapshot.state == PlaybackState::Playing) {
                 RenderPlaybackTick(snapshot, false);
             }
         }
+        return 0;
+    }
+    case kNativeVideoDecodeFailedMessage: {
+        std::unique_ptr<NativeDecodeFailure> failure(reinterpret_cast<NativeDecodeFailure*>(lParam));
+        const std::wstring message = failure && !failure->message.empty()
+                                         ? failure->message
+                                         : L"native video decoder failed";
+        const auto snapshot = controller_.Snapshot();
+        if (!snapshot.media.has_value() || (failure && snapshot.media->path != failure->path)) {
+            LogApp(LogLevel::Debug, L"ignored stale native decode failure message=" + message);
+            return 0;
+        }
+
+        LogApp(LogLevel::Error, L"native decode failed message=" + message);
+        StopRuntime();
+        controller_.SetError(message);
+        SetTemporaryPlaybackRate(1.0);
+        SetPlaybackTimer(false);
+        MarkLayoutDirty();
+        EnsureLayout();
+        InvalidateTransportArea();
+        InvalidateFullscreenOverlay();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        PostWebUiState();
         return 0;
     }
     case kRuntimeStopCompleteMessage:
@@ -2575,6 +2613,8 @@ void MainWindow::OnPlaybackTimerTick() {
             nativeBuffering = stats.buffering;
             if (nativeBuffering) {
                 controller_.SyncClock(stats.clockPosition);
+            } else {
+                ResumeNativeSeekPrerollAudio(stats.clockPosition);
             }
         }
     }
@@ -3029,12 +3069,40 @@ void MainWindow::StopRuntimeAsync(const bool clearVideoFrame) {
 }
 
 void MainWindow::StopRuntimeBackends() {
+    nativeSeekPrerollHoldingAudio_ = false;
     playbackPlayer_.Stop();
     videoDecoder_.Stop();
     if (nativeVideoDecoder_) {
         nativeVideoDecoder_->Stop();
     }
     audioPlayer_.Stop();
+}
+
+void MainWindow::ResumeNativeSeekPrerollAudio(const std::chrono::milliseconds position) {
+    if (!nativeSeekPrerollHoldingAudio_) {
+        return;
+    }
+    nativeSeekPrerollHoldingAudio_ = false;
+
+    const auto snapshot = controller_.Snapshot();
+    if (snapshot.state != PlaybackState::Playing ||
+        !snapshot.media.has_value() ||
+        !snapshot.media->hasAudio ||
+        !audioPlayer_.IsRunning()) {
+        return;
+    }
+
+    const auto settings = controller_.Settings();
+    if (settings.audio.selectedTrackIndex == anvil::playback::kAudioTrackOff) {
+        return;
+    }
+
+    const auto resumePosition = position.count() >= 0 ? position : snapshot.position;
+    audioPlayer_.SetPlaybackRate(snapshot.playbackRate);
+    const bool resumed = audioPlayer_.ResumePacketStream();
+    LogApp(resumed ? LogLevel::Debug : LogLevel::Warning,
+           L"native seek preroll resume audio=" + std::wstring(resumed ? L"true" : L"false") +
+               L" position=" + FormatTimecode(resumePosition));
 }
 
 void MainWindow::FinishRuntimeStopVisuals(const bool clearVideoFrame, const bool clearDecoderFrames) {
@@ -3222,6 +3290,7 @@ void MainWindow::EnsureVideoHost() {
 void MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
                                     const bool restart,
                                     const bool waitForPreroll) {
+    nativeSeekPrerollHoldingAudio_ = false;
     bool videoStarted = true;
     bool audioStarted = true;
     bool preferDolbyVisionHdrOutput = false;
@@ -3282,6 +3351,7 @@ void MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
                                                   snapshot.position,
                                                   hwnd_,
                                                   kNativeVideoFrameReadyMessage,
+                                                  kNativeVideoDecodeFailedMessage,
                                                   [this]() {
                                                       if (const auto audioClock = audioPlayer_.PlaybackClock()) {
                                                           return audioClock;
@@ -3377,6 +3447,12 @@ bool MainWindow::SeekNativeRuntime(const PlaybackSessionSnapshot& snapshot) {
         (!snapshot.media->hasVideo && !snapshot.media->hasAudio)) {
         return false;
     }
+    const auto runtimeSettings = controller_.Settings();
+    const bool useSharedNetworkDemuxer =
+        snapshot.media->hasVideo &&
+        snapshot.media->hasAudio &&
+        IsNetworkMediaPath(snapshot.media->path) &&
+        runtimeSettings.audio.selectedTrackIndex != anvil::playback::kAudioTrackOff;
     bool videoSeeked = true;
     if (snapshot.media->hasVideo) {
         videoSeeked = nativeVideoDecoder_ &&
@@ -3384,24 +3460,30 @@ bool MainWindow::SeekNativeRuntime(const PlaybackSessionSnapshot& snapshot) {
                       nativeVideoDecoder_->Seek(snapshot.position);
     }
     if (!videoSeeked) {
+        nativeSeekPrerollHoldingAudio_ = false;
         return false;
     }
 
     bool audioSeeked = true;
-    const auto runtimeSettings = controller_.Settings();
-    const bool useSharedNetworkDemuxer =
-        snapshot.media->hasVideo &&
-        snapshot.media->hasAudio &&
-        IsNetworkMediaPath(snapshot.media->path) &&
-        runtimeSettings.audio.selectedTrackIndex != anvil::playback::kAudioTrackOff;
     if (snapshot.media->hasAudio &&
         runtimeSettings.audio.selectedTrackIndex != anvil::playback::kAudioTrackOff) {
         if (useSharedNetworkDemuxer) {
+            audioPlayer_.SetPlaybackRate(snapshot.playbackRate);
+            if (snapshot.media->hasVideo && audioPlayer_.IsRunning()) {
+                audioPlayer_.HoldPacketStream(snapshot.position);
+                nativeSeekPrerollHoldingAudio_ = true;
+                LogApp(LogLevel::Debug,
+                       L"native seek preroll hold audio position=" + FormatTimecode(snapshot.position));
+            } else {
+                nativeSeekPrerollHoldingAudio_ = false;
+            }
             audioPlayer_.ResetPacketStream(snapshot.position);
             audioSeeked = true;
         } else if (audioPlayer_.IsRunning()) {
+            nativeSeekPrerollHoldingAudio_ = false;
             audioSeeked = audioPlayer_.Seek(snapshot.position);
         } else {
+            nativeSeekPrerollHoldingAudio_ = false;
             audioPlayer_.SetPlaybackRate(snapshot.playbackRate);
             audioSeeked = audioPlayer_.Start(snapshot.media->path,
                                              snapshot.position,
@@ -3409,9 +3491,11 @@ bool MainWindow::SeekNativeRuntime(const PlaybackSessionSnapshot& snapshot) {
                                              runtimeSettings.audio.selectedTrackIndex);
         }
     } else {
+        nativeSeekPrerollHoldingAudio_ = false;
         audioPlayer_.Stop();
     }
     if (!audioSeeked) {
+        nativeSeekPrerollHoldingAudio_ = false;
         return false;
     }
 
@@ -3496,6 +3580,7 @@ bool MainWindow::PrepareNativeEnhancedPlaybackBeforePlay(const PlaybackSessionSn
                                        snapshot.position,
                                        hwnd_,
                                        kNativeVideoFrameReadyMessage,
+                                       0,
                                        [this]() {
                                            if (const auto audioClock = audioPlayer_.PlaybackClock()) {
                                                return audioClock;
@@ -3610,6 +3695,7 @@ void MainWindow::RefreshPausedNativeFrame(const PlaybackSessionSnapshot& snapsho
                                                     snapshot.position,
                                                     hwnd_,
                                                     kNativeVideoFrameReadyMessage,
+                                                    0,
                                                     {},
                                                     preferHardwareDecode,
                                                     d3dRenderer_->Device(),
@@ -3750,6 +3836,7 @@ void MainWindow::UpdateInspectorMediaLists(const std::filesystem::path& path) {
 }
 
 void MainWindow::StartPlayback() {
+    nativeSeekPrerollHoldingAudio_ = false;
     const auto before = controller_.Snapshot();
     const auto beforeSettings = controller_.Settings();
     const bool nativeEnhancedPlaybackGate =
@@ -3837,6 +3924,7 @@ void MainWindow::StartPlayback() {
 }
 
 void MainWindow::PausePlayback() {
+    nativeSeekPrerollHoldingAudio_ = false;
     controller_.Pause();
     SetTemporaryPlaybackRate(1.0);
     const auto snapshot = controller_.Snapshot();

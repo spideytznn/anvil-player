@@ -1,4 +1,4 @@
-import type { LibraryHomeSection, LibraryQuery, LibrarySource, LibraryView, MediaFilterKey, MediaItem, NavKey, SortKey, SourceDraft } from './types'
+import type { LibraryHomeSection, LibraryQuery, LibrarySource, LibraryView, MediaFilterKey, MediaItem, NavKey, SortKey, SortOrder, SourceDraft } from './types'
 
 const LIBRARY_CACHE_KEY = 'anvil-player.library.cache.v1'
 
@@ -18,7 +18,7 @@ function filterByNav(items: MediaItem[], navKey: NavKey): MediaItem[] {
     return items.filter((item) => item.sourceId === sourceId)
   }
   switch (navKey) {
-    case 'continue': return items.filter((item) => item.progress > 0 && item.progress < 1)
+    case 'continue': return items.filter((item) => item.continueWatching || (item.progress > 0 && item.progress < 1))
     case 'recent': return items
     case 'movies': return items.filter((item) => item.type === 'movie')
     case 'series': return items.filter((item) => item.type === 'series')
@@ -53,22 +53,27 @@ function filterByMediaFilter(items: MediaItem[], filterKey: MediaFilterKey = 'al
     case 'unwatched': return items.filter((item) => !item.watched)
     case 'watched': return items.filter((item) => item.watched)
     case 'favorites': return items.filter((item) => item.favorite)
-    case 'inProgress': return items.filter((item) => item.progress > 0 && item.progress < 1)
+    case 'inProgress': return items.filter((item) => item.continueWatching || (item.progress > 0 && item.progress < 1))
     default: return items
   }
 }
 
-function sortItems(items: MediaItem[], sortKey: SortKey): MediaItem[] {
+function sortDirection(order: SortOrder | undefined): number {
+  return order === 'ascending' ? 1 : -1
+}
+
+function sortItems(items: MediaItem[], sortKey: SortKey, sortOrder?: SortOrder): MediaItem[] {
   const sorted = [...items]
+  const direction = sortDirection(sortOrder)
   switch (sortKey) {
     case 'title':
-      return sorted.sort((a, b) => a.title.localeCompare(b.title, 'zh-Hans-CN'))
+      return sorted.sort((a, b) => direction * a.title.localeCompare(b.title, 'zh-Hans-CN'))
     case 'rating':
-      return sorted.sort((a, b) => b.rating - a.rating)
+      return sorted.sort((a, b) => direction * (a.rating - b.rating))
     case 'year':
-      return sorted.sort((a, b) => b.year - a.year)
+      return sorted.sort((a, b) => direction * (a.year - b.year))
     default:
-      return sorted.sort((a, b) => a.addedDaysAgo - b.addedDaysAgo)
+      return sorted.sort((a, b) => direction * (b.addedDaysAgo - a.addedDaysAgo))
   }
 }
 
@@ -122,16 +127,62 @@ function loadCache(): LibraryCache {
   }
 }
 
+function compactItemForCache(item: MediaItem): MediaItem {
+  const {
+    cast,
+    episodes,
+    seasons,
+    similarItems,
+    streamSpecs,
+    studios,
+    tags,
+    ...cacheItem
+  } = item
+  return {
+    ...cacheItem,
+    genres: item.genres.slice(0, 8),
+    tagline: '',
+    overview: ''
+  }
+}
+
+function minimalItemForCache(item: MediaItem): MediaItem {
+  return {
+    ...compactItemForCache(item),
+    originalTitle: '',
+    country: '',
+    genres: item.genres.slice(0, 3),
+    videoSpec: '',
+    audioSpec: '',
+    tagline: '',
+    overview: '',
+    path: undefined
+  }
+}
+
 function saveCache(sources: LibrarySource[], items: MediaItem[], homeSections: LibraryHomeSection[]): void {
-  try {
-    window.localStorage.setItem(LIBRARY_CACHE_KEY, JSON.stringify({
+  const attempts: LibraryCache[] = [
+    {
       version: 1,
       sources,
-      items,
+      items: items.map(compactItemForCache),
       homeSections
-    } satisfies LibraryCache))
-  } catch {
-    // Keep the in-memory library usable when the WebView storage quota is full.
+    },
+    {
+      version: 1,
+      sources,
+      items: items.map(minimalItemForCache),
+      homeSections
+    }
+  ]
+
+  for (const payload of attempts) {
+    try {
+      window.localStorage.setItem(LIBRARY_CACHE_KEY, JSON.stringify(payload))
+      return
+    } catch {
+      // Retry with a smaller payload below; keep in-memory data usable if storage is full.
+    }
   }
 }
 
@@ -162,7 +213,8 @@ export function createEmptyLibraryClient(): MediaLibraryClient {
           ).filter((item) => matchesSearch(item, query.search)),
           query.filterKey
         ),
-        query.sortKey
+        query.sortKey,
+        query.sortOrder
       )
     },
 
@@ -177,7 +229,7 @@ export function createEmptyLibraryClient(): MediaLibraryClient {
     },
 
     async getContinueWatching() {
-      return items.filter((item) => item.progress > 0 && item.progress < 1)
+      return items.filter((item) => item.continueWatching || (item.progress > 0 && item.progress < 1))
     },
 
     async saveSourceDraft(draft) {

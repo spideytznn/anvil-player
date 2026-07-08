@@ -62,6 +62,8 @@ public:
     void Stop();
     void Pause(std::chrono::milliseconds position);
     bool Resume(std::chrono::milliseconds position);
+    void HoldPacketStream(std::chrono::milliseconds position);
+    bool ResumePacketStream();
     bool Seek(std::chrono::milliseconds position);
     void SetVolume(double volume);
     void SetPlaybackRate(double rate);

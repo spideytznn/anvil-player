@@ -210,22 +210,16 @@ input:focus-visible {
 
 .buffering-overlay {
   position: absolute;
-  left: 50%;
-  top: 50%;
+  inset: 0;
   z-index: 6;
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 12px;
-  min-width: 168px;
-  max-width: min(320px, calc(100% - 48px));
-  padding: 12px 14px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 8px;
-  background: rgba(7, 10, 15, 0.78);
-  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.34);
+  padding: 16px;
+  background: rgba(7, 10, 15, 0.86);
   color: var(--text);
   pointer-events: none;
-  transform: translate(-50%, -50%);
 }
 
 .buffering-spinner {
@@ -260,6 +254,80 @@ input:focus-visible {
 .buffering-copy small {
   color: var(--muted);
   font-size: 11px;
+}
+
+.playback-error-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 8;
+  display: grid;
+  place-items: center;
+  padding: 22px;
+  background:
+    radial-gradient(circle at center, rgba(189, 99, 79, 0.13), transparent 44%),
+    rgba(7, 10, 15, 0.9);
+  color: var(--text);
+}
+
+.playback-error-panel {
+  display: grid;
+  width: min(560px, 100%);
+  grid-template-columns: 44px minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.playback-error-icon {
+  display: grid;
+  width: 44px;
+  height: 44px;
+  place-items: center;
+  border: 1px solid rgba(223, 118, 95, 0.36);
+  border-radius: 10px;
+  background: rgba(223, 118, 95, 0.1);
+  color: var(--accent-strong);
+}
+
+.playback-error-copy {
+  display: grid;
+  min-width: 0;
+  gap: 7px;
+}
+
+.playback-error-copy strong {
+  font-size: 18px;
+  line-height: 1.2;
+}
+
+.playback-error-copy p,
+.playback-error-copy small {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.playback-error-copy p {
+  font-size: 13px;
+}
+
+.playback-error-copy small {
+  display: grid;
+  gap: 4px;
+  overflow-wrap: anywhere;
+  font-size: 11px;
+}
+
+.playback-error-copy small span {
+  color: var(--dim);
+  font-weight: 700;
+}
+
+.playback-error-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  grid-column: 2;
+  margin-top: 4px;
 }
 
 @keyframes buffering-spin {

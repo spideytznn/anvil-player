@@ -1,5 +1,6 @@
 export type LibraryView = 'home' | 'movies' | 'series' | 'folders'
 export type SortKey = 'recent' | 'title' | 'rating' | 'year'
+export type SortOrder = 'ascending' | 'descending'
 export type MediaFilterKey = 'all' | 'unwatched' | 'watched' | 'favorites' | 'inProgress'
 export type SourceKind = 'Emby' | 'Local' | 'WebDAV'
 export type SourceStatus = 'online' | 'draft'
@@ -33,6 +34,33 @@ export interface EpisodeItem {
   index: string
   duration: string
   poster: string
+  item?: MediaItem
+}
+
+export interface SeasonItem {
+  id: string
+  title: string
+  index: string
+  episodeCount: number
+  poster: string
+  episodes: EpisodeItem[]
+}
+
+export interface PersonCredit {
+  id: string
+  name: string
+  role: string
+  image: string
+}
+
+export interface MediaStreamSpec {
+  id: string
+  type: 'video' | 'audio' | 'subtitle'
+  title: string
+  subtitle: string
+  details: Array<{ label: string; value: string }>
+  isDefault?: boolean
+  isForced?: boolean
 }
 
 export interface MediaItem {
@@ -48,7 +76,10 @@ export interface MediaItem {
   genres: string[]
   country: string
   quality: string
+  videoSpec?: string
+  audioSpec?: string
   progress: number
+  continueWatching?: boolean
   watched: boolean
   favorite: boolean
   addedDaysAgo: number
@@ -57,6 +88,13 @@ export interface MediaItem {
   tagline: string
   overview: string
   episodes?: EpisodeItem[]
+  seasons?: SeasonItem[]
+  cast?: PersonCredit[]
+  similarItems?: MediaItem[]
+  streamSpecs?: MediaStreamSpec[]
+  studios?: string[]
+  tags?: string[]
+  path?: string
 }
 
 export interface LibraryHomeCard {
@@ -84,6 +122,7 @@ export interface LibraryQuery {
   view: LibraryView
   search: string
   sortKey: SortKey
+  sortOrder?: SortOrder
   filterKey?: MediaFilterKey
   libraryViewId?: string
 }

@@ -225,6 +225,17 @@ void PlayerController::SetPlaybackRate(const double rate) {
     Log(LogLevel::Info, L"transport", stream.str());
 }
 
+void PlayerController::SetError(std::wstring message) {
+    std::scoped_lock lock(mutex_);
+    if (!media_.has_value()) {
+        return;
+    }
+    CommitPositionLocked(CurrentPositionLocked());
+    state_ = PlaybackState::Error;
+    lastError_ = std::move(message);
+    Log(LogLevel::Error, L"transport", L"error " + lastError_);
+}
+
 void PlayerController::UpdateClock() {
     std::scoped_lock lock(mutex_);
     if (state_ != PlaybackState::Playing || !media_.has_value() || media_->duration.count() <= 0) {

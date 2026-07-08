@@ -1,5 +1,6 @@
 export interface PlayerState {
   playbackState: 'Empty' | 'Stopped' | 'Playing' | 'Paused' | 'Opening' | string
+  lastError: string
   mediaName: string
   mediaPath: string
   hasMedia: boolean
@@ -142,6 +143,7 @@ export type NativeCommand =
 
 export const EMPTY_STATE: PlayerState = {
   playbackState: 'Empty',
+  lastError: '',
   mediaName: 'No media loaded',
   mediaPath: '',
   hasMedia: false,
