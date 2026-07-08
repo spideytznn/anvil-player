@@ -6,7 +6,37 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$msbuild = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe"
+
+function Find-MSBuild {
+    $candidates = @()
+
+    $pathMsbuild = Get-Command MSBuild.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -First 1
+    if ($pathMsbuild) {
+        $candidates += $pathMsbuild
+    }
+
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (Test-Path -LiteralPath $vswhere) {
+        $installPaths = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+        if ($LASTEXITCODE -eq 0 -and $installPaths) {
+            foreach ($installPath in $installPaths) {
+                $candidates += Join-Path $installPath 'MSBuild\Current\Bin\MSBuild.exe'
+                $candidates += Join-Path $installPath 'MSBuild\Current\Bin\amd64\MSBuild.exe'
+            }
+        }
+    }
+
+    $candidates += @(
+        (Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin\MSBuild.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\2022\Enterprise\MSBuild\Current\Bin\MSBuild.exe')
+    )
+
+    return $candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+}
+
+$msbuild = Find-MSBuild
 $isccCandidates = @(
     @(
         (Get-Command ISCC.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -First 1),
@@ -15,8 +45,8 @@ $isccCandidates = @(
     ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
 )
 
-if (!(Test-Path -LiteralPath $msbuild)) {
-    throw "MSBuild not found: $msbuild"
+if (!$msbuild) {
+    throw 'MSBuild was not found. Install Visual Studio Build Tools or add MSBuild.exe to PATH.'
 }
 if ($isccCandidates.Count -eq 0) {
     throw 'Inno Setup compiler ISCC.exe was not found.'
@@ -59,6 +89,18 @@ if (!(Test-Path -LiteralPath (Join-Path $webViewExtract 'msedgewebview2.exe'))) 
             Move-Item -LiteralPath $flattened -Destination $webViewExtract
         }
     }
+}
+
+Write-Host "Building web UI..."
+$webUiRoot = Join-Path $root 'src\AnvilPlayer.App\webui'
+Push-Location $webUiRoot
+try {
+    npm run build
+    if ($LASTEXITCODE -ne 0) {
+        throw "npm run build failed with exit code $LASTEXITCODE"
+    }
+} finally {
+    Pop-Location
 }
 
 Write-Host "Building $Configuration|$Platform..."

@@ -3,6 +3,7 @@ import ReactDOM from 'react-dom/client'
 import App from './App'
 import LibraryApp from './LibraryApp'
 import { postNativeCommand } from './nativeBridge'
+import { installAutoHidingScrollbars } from './scrollbars'
 import './styles.css'
 
 function Root(): JSX.Element {
@@ -13,6 +14,8 @@ function Root(): JSX.Element {
     window.addEventListener('hashchange', onHashChange)
     return () => window.removeEventListener('hashchange', onHashChange)
   }, [])
+
+  React.useEffect(() => installAutoHidingScrollbars(), [])
 
   React.useEffect(() => {
     postNativeCommand({

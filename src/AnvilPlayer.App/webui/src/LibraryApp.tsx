@@ -33,6 +33,7 @@ import { createEmptyLibraryClient } from './manager/mediaLibraryClient'
 import {
   loadEmbyItemDetails,
   loadEmbyLibrary,
+  notifyPendingEmbyPlaybackReport,
   refreshEmbyLibrary,
   resolveEmbyPlaybackTarget,
   savePendingEmbyPlaybackReport,
@@ -50,6 +51,8 @@ import {
   type UiLanguage
 } from './uiSettings'
 import './library.css'
+
+const DEFAULT_MEDIA_POSTER = 'url("./default-media-poster.png") center / min(72%, 300px) auto no-repeat, linear-gradient(180deg, #111820, #05080d)'
 
 interface NavItem {
   key: NavKey
@@ -184,6 +187,10 @@ function posterMark(item: MediaItem): string {
 
 function hasImageBackground(background: string): boolean {
   return background.trim().startsWith('url(')
+}
+
+function mediaPosterBackground(background: string): string {
+  return hasImageBackground(background) ? background : DEFAULT_MEDIA_POSTER
 }
 
 function homeCardViewId(card: LibraryHomeCard): string {
@@ -548,13 +555,14 @@ function ContinueCard(props: {
   onSelect: (id: string) => void
 }): JSX.Element {
   const art = hasImageBackground(props.item.backdrop) ? props.item.backdrop : props.item.poster
+  const hasArt = hasImageBackground(art)
   return (
     <button
       className={`library-continue-card ${props.selected ? 'is-selected' : ''}`}
       type="button"
       onClick={() => props.onSelect(props.item.id)}
     >
-      <div className="library-continue-art" style={{ background: art }}>
+      <div className={`library-continue-art ${hasArt ? '' : 'has-default-media-poster'}`} style={{ background: mediaPosterBackground(art) }}>
         <span style={{ width: `${Math.round(props.item.progress * 100)}%` }} />
       </div>
       <strong>{props.item.title}</strong>
@@ -577,14 +585,9 @@ function MediaPoster(props: {
       type="button"
       onClick={() => props.onSelect(props.item.id)}
     >
-      <div className="library-poster-art" style={{ background: props.item.poster }}>
+      <div className={`library-poster-art ${hasPosterImage ? '' : 'has-default-media-poster'}`} style={{ background: mediaPosterBackground(props.item.poster) }}>
         <div className="library-poster-shine" />
         <span className="library-poster-type">{mediaTypeLabel(props.item.type)}</span>
-        {!hasPosterImage ? (
-          <span className="library-poster-empty">
-            <Film size={18} />
-          </span>
-        ) : null}
       </div>
       {props.item.progress > 0 && props.item.progress < 1 ? (
         <span className="library-progress-track">
@@ -608,6 +611,8 @@ function HomeCard(props: {
 }): JSX.Element {
   const viewId = homeCardViewId(props.card)
   const selectable = Boolean(props.card.itemId || viewId)
+  const hasCardImage = hasImageBackground(props.card.image)
+  const cardUsesDefaultPoster = props.card.kind !== 'view' && !hasCardImage
 
   return (
     <button
@@ -619,7 +624,10 @@ function HomeCard(props: {
       }}
       aria-disabled={!selectable}
     >
-      <div className="library-home-card-art" style={{ background: props.card.image }}>
+      <div
+        className={`library-home-card-art ${cardUsesDefaultPoster ? 'has-default-media-poster' : ''}`}
+        style={{ background: cardUsesDefaultPoster ? DEFAULT_MEDIA_POSTER : props.card.image }}
+      >
         <div className="library-poster-shine" />
         {props.card.kind === 'view' ? (
           <span className="library-home-view-icon">{sourceIcon('Emby', 16)}</span>
@@ -830,7 +838,7 @@ function DetailPanel(props: {
                     props.onPlayIntent(episode.item)
                   }}
                 >
-                  <div className="library-episode-thumb" style={{ background: episode.poster }}>
+                  <div className={`library-episode-thumb ${hasImageBackground(episode.poster) ? '' : 'has-default-media-poster'}`} style={{ background: mediaPosterBackground(episode.poster) }}>
                     <Play size={18} />
                   </div>
                   <span>{episode.index}</span>
@@ -867,7 +875,7 @@ function DetailPanel(props: {
             <HorizontalScroller className="library-similar-row">
               {props.item.similarItems.map((item) => (
                 <button className="library-similar-card" type="button" key={item.id} onClick={() => props.onSelectItem(item)}>
-                  <div style={{ background: item.poster }} />
+                  <div className={hasImageBackground(item.poster) ? '' : 'has-default-media-poster'} style={{ background: mediaPosterBackground(item.poster) }} />
                   <strong>{item.title}</strong>
                   <small>{item.year || item.runtime}</small>
                 </button>
@@ -1516,8 +1524,10 @@ export default function LibraryApp(): JSX.Element {
       const report = savePendingEmbyPlaybackReport(embySession, target)
       debugLibraryPlayback(`play emby report pending targetId=${target.itemId} reportId=${report?.id ?? 'none'}`)
       postNativeCommand({ type: 'command', command: 'setWebUiRoute', route: 'player' })
+      postNativeCommand({ type: 'command', command: 'inspectorMedia' })
       window.location.hash = '#/player'
       window.setTimeout(() => {
+        notifyPendingEmbyPlaybackReport(report?.id)
         postNativeCommand({
           type: 'command',
           command: 'openPath',
@@ -1948,7 +1958,7 @@ export default function LibraryApp(): JSX.Element {
                     setIsDetailOpen(false)
                     setPlayIntent('')
                   }}
-                  placeholder="搜索标题 / 类型 / 标签"
+                  placeholder="搜索关键字"
                 />
               </label>
               {showSortControl ? (

@@ -59,6 +59,8 @@ private:
     static LRESULT CALLBACK VideoHostProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK FullscreenOverlayProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK TransportOverlayProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK BufferingOverlayProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK BufferingHudOverlayProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK SubtitleMenuOverlayProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK HdrToneCurveWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     static void CALLBACK PlaybackTimerQueueProc(PVOID context, BOOLEAN timerOrWaitFired);
@@ -70,6 +72,10 @@ private:
     void LogApp(anvil::playback::LogLevel level, const std::wstring& message) const;
     void LogRuntime(anvil::playback::LogLevel level, const std::wstring& category, const std::wstring& message) const;
     void MaybeLogNativeSchedulerStats(const NativeVideoQueueStats& stats);
+    void ResetNativeBufferingWatchdog();
+    bool CheckNativeBufferingWatchdog(const anvil::playback::PlaybackSessionSnapshot& snapshot,
+                                      const NativeVideoQueueStats& stats);
+    void FailPlaybackRuntime(const std::wstring& message);
     void StartUiAnimationTimer() const;
     bool SidebarAnimationActive() const;
     void UpdateUiAnimations();
@@ -96,6 +102,9 @@ private:
     void HideFullscreenTransportIfIdle();
     void SetFullscreenTransportTarget(bool visible);
     std::wstring FullscreenTransportDebugState(const wchar_t* reason) const;
+    void MarkSettingsScrollbarActive();
+    void MarkSubtitleMenuScrollbarActive();
+    bool ScrollbarFadeActive(std::chrono::steady_clock::time_point now) const;
     void BeginVideoPress(POINT point);
     void CompleteVideoLongPress();
     void FinishVideoPress(POINT point);
@@ -149,6 +158,8 @@ private:
     void UpdateFullscreenOverlay();
     void EnsureTransportOverlay();
     void UpdateTransportOverlay();
+    void EnsureBufferingOverlay();
+    void UpdateBufferingOverlay(const NativeVideoQueueStats* statsOverride = nullptr);
     void EnsureSubtitleMenuOverlay();
     void UpdateSubtitleMenuOverlay();
     void EnsureHdrToneCurveWindow();
@@ -245,11 +256,18 @@ private:
     void StopRuntimeBackends();
     void FinishRuntimeStopVisuals(bool clearVideoFrame, bool clearDecoderFrames);
     void WaitForAsyncRuntimeStop();
-    void StartRuntime(const anvil::playback::PlaybackSessionSnapshot& snapshot,
+    bool RuntimeStopInProgress() const;
+    bool RuntimeBackendsRunning() const;
+    void ClearDeferredRuntimeStart();
+    void QueueDeferredRuntimeStart(bool restart, bool waitForPreroll);
+    void ContinueRuntimeAfterAsyncStop();
+    void RequestRuntimeStart(bool restart, bool waitForPreroll = false);
+    void QueuePausedNativeFrameRefresh(bool forceDecoderRestart);
+    bool StartRuntime(const anvil::playback::PlaybackSessionSnapshot& snapshot,
                       bool restart,
-                      bool waitForPreroll = true);
+                      bool waitForPreroll = false);
     void EnsureVideoHost();
-    void StartNativeRuntime(const anvil::playback::PlaybackSessionSnapshot& snapshot,
+    bool StartNativeRuntime(const anvil::playback::PlaybackSessionSnapshot& snapshot,
                             bool restart,
                             bool waitForPreroll = true);
     bool SeekNativeRuntime(const anvil::playback::PlaybackSessionSnapshot& snapshot);
@@ -266,7 +284,7 @@ private:
     void PausePlayback();
     void TogglePlayback();
     void StopPlayback();
-    void RestartPlaybackIfPlaying(bool waitForPreroll = true);
+    void RestartPlaybackIfPlaying(bool waitForPreroll = false);
     void SeekRelative(std::chrono::milliseconds delta);
     void SeekToPosition(std::chrono::milliseconds position);
     void SeekFromProgress(int x);
@@ -291,6 +309,7 @@ private:
     void Paint();
     void PaintFullscreenOverlay(HWND overlay);
     void PaintTransportOverlay(HWND overlay);
+    void RenderBufferingHudOverlay(const NativeVideoQueueStats& stats);
     void PaintSubtitleMenuOverlay(HWND overlay);
     void PaintHdrToneCurveWindow(HWND window);
     void DrawTopBar(HDC hdc, const anvil::playback::PlaybackSessionSnapshot& snapshot) const;
@@ -349,6 +368,8 @@ private:
     HWND videoHost_ = nullptr;
     HWND fullscreenOverlay_ = nullptr;
     HWND transportOverlay_ = nullptr;
+    HWND bufferingOverlay_ = nullptr;
+    HWND bufferingHudOverlay_ = nullptr;
     HWND subtitleMenuOverlay_ = nullptr;
     HWND hdrToneCurveWindow_ = nullptr;
     bool videoHostReady_ = false;
@@ -361,15 +382,25 @@ private:
     bool pendingPausedFrameRefresh_ = false;
     bool heldNativeFrameNeedsPresent_ = false;
     bool nativeSeekPrerollHoldingAudio_ = false;
+    bool bufferingOverlayVisible_ = false;
+    bool bufferingOverlayCreateFailedLogged_ = false;
+    bool bufferingOverlaySuppressedLogged_ = false;
+    NativeVideoQueueStats bufferingOverlayStats_{};
     std::thread runtimeStopThread_;
     std::atomic_bool runtimeStopAsyncInProgress_{false};
     std::atomic_bool runtimeStopAsyncClearFrame_{true};
+    bool deferredRuntimeStart_ = false;
+    bool deferredRuntimeRestart_ = false;
+    bool deferredRuntimeWaitForPreroll_ = false;
+    bool deferredPausedFrameRefresh_ = false;
+    bool deferredPausedFrameRefreshForceRestart_ = false;
     UINT_PTR nativeColorSettingsRefreshSerial_ = 0;
     bool nativeColorSettingsRefreshRequiresDecoderRefresh_ = false;
     std::optional<NativeVideoFrame> heldNativeFrame_;
     RECT lastVideoHostBounds_{};
     RECT lastFullscreenOverlayBounds_{};
     RECT lastTransportOverlayBounds_{};
+    RECT lastBufferingOverlayBounds_{};
     RECT lastSubtitleMenuOverlayBounds_{};
     bool trackingMouseLeave_ = false;
     bool hdrToneCurveWindowTrackingMouseLeave_ = false;
@@ -382,6 +413,15 @@ private:
     LONG previousExStyle_ = 0;
     WINDOWPLACEMENT previousPlacement_{sizeof(WINDOWPLACEMENT)};
     std::chrono::steady_clock::time_point lastNativeStatsLog_{};
+    std::chrono::steady_clock::time_point nativeBufferingStartedAt_{};
+    std::chrono::steady_clock::time_point nativeBufferingLastProgressAt_{};
+    uint64_t nativeBufferingLastRendered_ = 0;
+    std::size_t nativeBufferingLastQueueDepth_ = 0;
+    std::size_t nativeBufferingLastPacketDepth_ = 0;
+    std::size_t nativeBufferingLastPacketBytes_ = 0;
+    std::chrono::milliseconds nativeBufferingLastReadAhead_{0};
+    std::chrono::milliseconds nativeBufferingLastBufferedEnd_{0};
+    std::chrono::milliseconds nativeBufferingLastClockPosition_{0};
     RECT topBar_{};
     RECT videoSurface_{};
     RECT playbackSurface_{};
@@ -452,6 +492,8 @@ private:
     std::chrono::steady_clock::time_point subtitleMenuAnimationStartedAt_{};
     std::chrono::steady_clock::time_point volumeHoverAnimationStartedAt_{};
     std::chrono::steady_clock::time_point fullscreenTransportLastShownAt_{};
+    std::chrono::steady_clock::time_point settingsScrollLastActiveAt_{};
+    std::chrono::steady_clock::time_point subtitleMenuScrollLastActiveAt_{};
     std::chrono::steady_clock::time_point lastPlaybackUiRefreshAt_{};
     HANDLE playbackTimerQueueTimer_ = nullptr;
     POINT lastFullscreenCursorClient_{};

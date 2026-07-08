@@ -102,6 +102,8 @@ export interface EmbyPlaybackReportRecord {
   target: EmbyPlaybackTarget
 }
 
+export const EMBY_PLAYBACK_REPORT_PENDING_EVENT = 'anvil-emby-playback-report-pending'
+
 interface EmbyPublicInfo {
   Id?: string
   ServerName?: string
@@ -1042,10 +1044,15 @@ export function savePendingEmbyPlaybackReport(
   }
   try {
     window.localStorage.setItem(PLAYBACK_REPORT_STORAGE_KEY, JSON.stringify(report))
+    notifyPendingEmbyPlaybackReport(report.id)
     return report
   } catch {
     return undefined
   }
+}
+
+export function notifyPendingEmbyPlaybackReport(reportId?: string): void {
+  window.dispatchEvent(new CustomEvent(EMBY_PLAYBACK_REPORT_PENDING_EVENT, { detail: { reportId } }))
 }
 
 export function loadPendingEmbyPlaybackReport(): EmbyPlaybackReportRecord | undefined {
@@ -1074,8 +1081,16 @@ export function loadPendingEmbyPlaybackReport(): EmbyPlaybackReportRecord | unde
   }
 }
 
-export function clearPendingEmbyPlaybackReport(_reportId?: string): void {
+export function clearPendingEmbyPlaybackReport(reportId?: string): void {
   try {
+    if (reportId) {
+      const raw = window.localStorage.getItem(PLAYBACK_REPORT_STORAGE_KEY)
+      if (raw) {
+        const parsed = objectValue(JSON.parse(raw))
+        const currentId = stringValue(parsed?.id)
+        if (currentId && currentId !== reportId) return
+      }
+    }
     window.localStorage.removeItem(PLAYBACK_REPORT_STORAGE_KEY)
   } catch {
     // Best effort cleanup only.

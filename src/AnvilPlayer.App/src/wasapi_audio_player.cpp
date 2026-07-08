@@ -20,6 +20,13 @@ using anvil::playback::LogLevel;
 namespace {
 
 constexpr std::size_t kPacketStreamMaxQueueBytes = 24ull * 1024ull * 1024ull;
+constexpr auto kRuntimeSeekIoTimeout = std::chrono::milliseconds{4500};
+
+int64_t SteadyClockMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 
 std::chrono::milliseconds ScaleDuration(const std::chrono::milliseconds value, const double rate) {
     return std::chrono::milliseconds{
@@ -76,6 +83,7 @@ bool WasapiAudioPlayer::Start(const std::filesystem::path& mediaPath,
     paused_.store(false);
     pausePositionMs_.store(startPosition.count());
     pendingSeekMs_.store(-1);
+    ioInterruptAfterSteadyMs_.store(0);
     ResetPlaybackClock();
     {
         std::scoped_lock lock(stateMutex_);
@@ -134,6 +142,7 @@ bool WasapiAudioPlayer::StartPacketStream(const std::filesystem::path& mediaPath
     packetStreamEof_.store(false);
     pausePositionMs_.store(startPosition.count());
     pendingSeekMs_.store(-1);
+    ioInterruptAfterSteadyMs_.store(0);
     ResetPlaybackClock(startPosition);
     {
         std::scoped_lock lock(packetMutex_);
@@ -217,6 +226,7 @@ void WasapiAudioPlayer::Stop() {
     stopping_.store(true);
     paused_.store(false);
     pendingSeekMs_.store(-1);
+    ioInterruptAfterSteadyMs_.store(0);
     packetStreamEof_.store(true);
     packetCv_.notify_all();
     SignalStart(false);
@@ -309,7 +319,14 @@ void WasapiAudioPlayer::SetVolume(const double volume) {
 
 int WasapiAudioPlayer::InterruptCallback(void* opaque) {
     const auto* player = static_cast<const WasapiAudioPlayer*>(opaque);
-    return player && (player->stopping_.load() || player->paused_.load() || player->HasPendingSeek()) ? 1 : 0;
+    if (!player) {
+        return 0;
+    }
+    if (player->stopping_.load() || player->paused_.load() || player->HasPendingSeek()) {
+        return 1;
+    }
+    const int64_t interruptAfterMs = player->ioInterruptAfterSteadyMs_.load();
+    return interruptAfterMs > 0 && SteadyClockMs() >= interruptAfterMs ? 1 : 0;
 }
 
 void WasapiAudioPlayer::SetPlaybackRate(const double rate) {
@@ -735,21 +752,27 @@ bool WasapiAudioPlayer::ApplyPendingSeek(AVFormatContext* formatCtx,
     }
 
     const int64_t seekTarget = static_cast<int64_t>(target->count()) * AV_TIME_BASE / 1000;
+    const auto seekStart = std::chrono::steady_clock::now();
+    ioInterruptAfterSteadyMs_.store(SteadyClockMs() + kRuntimeSeekIoTimeout.count());
     int seekError = av_seek_frame(formatCtx, -1, seekTarget, AVSEEK_FLAG_BACKWARD);
     if (seekError < 0) {
         seekError = avformat_seek_file(formatCtx, -1, INT64_MIN, seekTarget, INT64_MAX, 0);
     }
+    ioInterruptAfterSteadyMs_.store(0);
+    const auto seekElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - seekStart).count();
     if (seekError < 0) {
-        LogError(L"runtime seek failed: " + FfmpegErrorString(seekError));
-        const HRESULT restartHr = audioClient->Start();
-        if (SUCCEEDED(restartHr)) {
-            audioClientStarted = true;
-            SetPlaybackClockRunning(true);
-        } else {
-            LogError(L"IAudioClient::Start after failed seek failed hr=0x" + HexHr(restartHr));
+        const bool seekInterrupted = seekError == AVERROR_EXIT ||
+                                     seekElapsedMs >= kRuntimeSeekIoTimeout.count();
+        LogError(L"runtime seek failed: " + FfmpegErrorString(seekError) +
+                 L" seek_ms=" + std::to_wstring(seekElapsedMs) +
+                 (seekInterrupted ? L" interrupted=true" : L""));
+        if (stopping_.load()) {
+            return false;
         }
-        return true;
+        return HasPendingSeek();
     }
+    LogInfo(L"runtime seek completed seek_ms=" + std::to_wstring(seekElapsedMs));
 
     avformat_flush(formatCtx);
     avcodec_flush_buffers(codecCtx);

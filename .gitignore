@@ -28,3 +28,4 @@ src/AnvilPlayer.App/webui/node_modules/
 src/AnvilPlayer.App/webui/dist/
 third_party/webview2/*.nupkg
 third_party/webview2/Microsoft.Web.WebView2.*/
+third_party/webview2-runtime/

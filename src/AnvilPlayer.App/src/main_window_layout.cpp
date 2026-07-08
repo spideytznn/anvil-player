@@ -1,5 +1,7 @@
 #include "AnvilPlayer/App/main_window.h"
 
+#include <dwmapi.h>
+
 #include <algorithm>
 #include <cmath>
 #include <initializer_list>
@@ -26,6 +28,57 @@ RECT LerpRect(const RECT& from, const RECT& to, const double amount) {
                     LerpInt(from.top, to.top, clamped),
                     LerpInt(from.right, to.right, clamped),
                     LerpInt(from.bottom, to.bottom, clamped));
+}
+
+struct AccentPolicy {
+    int accentState = 0;
+    int accentFlags = 0;
+    DWORD gradientColor = 0;
+    int animationId = 0;
+};
+
+struct WindowCompositionAttribData {
+    DWORD attribute = 0;
+    PVOID data = nullptr;
+    SIZE_T sizeOfData = 0;
+};
+
+bool EnableBackdropBlur(HWND hwnd) {
+    constexpr DWORD kWcaAccentPolicy = 19;
+    constexpr int kAccentEnableBlurBehind = 3;
+    constexpr int kAccentEnableAcrylicBlurBehind = 4;
+    constexpr DWORD kDarkFrostedTint = 0x52000000;
+
+    if (HMODULE user32 = GetModuleHandleW(L"user32.dll")) {
+        using SetWindowCompositionAttributeFn = BOOL(WINAPI*)(HWND, WindowCompositionAttribData*);
+        auto* setWindowCompositionAttribute =
+            reinterpret_cast<SetWindowCompositionAttributeFn>(GetProcAddress(user32, "SetWindowCompositionAttribute"));
+        if (setWindowCompositionAttribute) {
+            AccentPolicy policy{};
+            policy.accentState = kAccentEnableAcrylicBlurBehind;
+            policy.accentFlags = 2;
+            policy.gradientColor = kDarkFrostedTint;
+            WindowCompositionAttribData data{};
+            data.attribute = kWcaAccentPolicy;
+            data.data = &policy;
+            data.sizeOfData = sizeof(policy);
+            if (setWindowCompositionAttribute(hwnd, &data)) {
+                return true;
+            }
+
+            policy.accentState = kAccentEnableBlurBehind;
+            policy.accentFlags = 0;
+            policy.gradientColor = kDarkFrostedTint;
+            if (setWindowCompositionAttribute(hwnd, &data)) {
+                return true;
+            }
+        }
+    }
+
+    DWM_BLURBEHIND blur{};
+    blur.dwFlags = DWM_BB_ENABLE;
+    blur.fEnable = TRUE;
+    return SUCCEEDED(DwmEnableBlurBehindWindow(hwnd, &blur));
 }
 
 }  // namespace
@@ -746,9 +799,11 @@ void MainWindow::UpdateVideoHost() {
         if (!RectEquals(lastVideoHostBounds_, empty)) {
             lastVideoHostBounds_ = empty;
         }
+        UpdateBufferingOverlay();
         return;
     }
     if (SidebarAnimationActive() && !webUiActive_) {
+        UpdateBufferingOverlay();
         return;
     }
     RECT bounds = PlaybackSurfaceBounds();
@@ -757,6 +812,10 @@ void MainWindow::UpdateVideoHost() {
     }
     const auto snapshot = controller_.Snapshot();
     const bool nativeActive = nativeVideoDecoder_ && nativeVideoDecoder_->IsRunning();
+    const bool nativeBuffering = nativeActive &&
+                                 snapshot.media.has_value() &&
+                                 snapshot.media->hasVideo &&
+                                 nativeVideoDecoder_->Stats().buffering;
     const bool nativePausedFrame = backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
                                    snapshot.state == PlaybackState::Paused &&
                                    snapshot.media.has_value() &&
@@ -765,27 +824,8 @@ void MainWindow::UpdateVideoHost() {
                                  nativeFrameHoldVisible_ &&
                                  heldNativeFrame_.has_value();
     const bool nativeVideoVisible = nativeActive || nativePausedFrame || nativeHeldFrame;
-    const bool webUiBufferingOverlayVisible = webUiActive_ &&
-                                              webUiPlayerRouteActive_ &&
-                                              nativeActive &&
-                                              snapshot.media.has_value() &&
-                                              snapshot.media->hasVideo &&
-                                              nativeVideoDecoder_->Stats().buffering;
     const int w = RectWidth(bounds);
     const int h = RectHeight(bounds);
-    if (nativeVideoVisible && webUiBufferingOverlayVisible && w > 0 && h > 0) {
-        if (bounds.left != lastVideoHostBounds_.left ||
-            bounds.top != lastVideoHostBounds_.top ||
-            w != RectWidth(lastVideoHostBounds_) ||
-            h != RectHeight(lastVideoHostBounds_)) {
-            SetWindowPos(videoHost_, HWND_TOP, bounds.left, bounds.top, w, h, SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOREDRAW);
-            lastVideoHostBounds_ = bounds;
-        }
-        if (IsWindowVisible(videoHost_)) {
-            ShowWindow(videoHost_, SW_HIDE);
-        }
-        return;
-    }
     if (nativeVideoVisible && w > 0 && h > 0) {
         const bool wasVisible = IsWindowVisible(videoHost_) != FALSE;
         const bool boundsChanged = bounds.left != lastVideoHostBounds_.left ||
@@ -872,7 +912,7 @@ void MainWindow::UpdateVideoHost() {
         if (!wasVisible) {
             ShowWindow(videoHost_, SW_SHOW);
         }
-        if ((snapshot.state == PlaybackState::Paused || !nativeActive) &&
+        if ((snapshot.state == PlaybackState::Paused || !nativeActive || nativeBuffering) &&
             heldNativeFrame_.has_value() &&
             (resized || !wasVisible || heldNativeFrameNeedsPresent_)) {
             RenderHeldNativeFrame(false);
@@ -886,6 +926,7 @@ void MainWindow::UpdateVideoHost() {
             lastVideoHostBounds_ = empty;
         }
     }
+    UpdateBufferingOverlay();
 }
 
 void MainWindow::EnsureFullscreenOverlay() {
@@ -938,6 +979,270 @@ void MainWindow::EnsureTransportOverlay() {
         nullptr,
         instance_,
         this);
+}
+
+void MainWindow::EnsureBufferingOverlay() {
+    if (bufferingOverlay_ && bufferingHudOverlay_) {
+        return;
+    }
+
+    const auto registerOverlayClass = [&](const wchar_t* className, WNDPROC proc) -> bool {
+        WNDCLASSEXW existing{};
+        existing.cbSize = sizeof(existing);
+        if (GetClassInfoExW(instance_, className, &existing)) {
+            return true;
+        }
+
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.hInstance = instance_;
+        wc.lpfnWndProc = proc;
+        wc.lpszClassName = className;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = nullptr;
+        if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            if (!bufferingOverlayCreateFailedLogged_) {
+                LogApp(anvil::playback::LogLevel::Warning,
+                       std::wstring(L"buffering overlay class register failed class=") + className +
+                           L" error=" + std::to_wstring(GetLastError()));
+                bufferingOverlayCreateFailedLogged_ = true;
+            }
+            return false;
+        }
+        return true;
+    };
+
+    if (!bufferingOverlay_) {
+        if (!registerOverlayClass(kBufferingOverlayClassName, &MainWindow::BufferingOverlayProc)) {
+            return;
+        }
+
+        SetLastError(ERROR_SUCCESS);
+        bufferingOverlay_ = CreateWindowExW(
+            WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            kBufferingOverlayClassName,
+            L"",
+            WS_POPUP | WS_CLIPSIBLINGS,
+            0, 0, 1, 1,
+            hwnd_,
+            nullptr,
+            instance_,
+            this);
+
+        if (bufferingOverlay_) {
+            if (!EnableBackdropBlur(bufferingOverlay_)) {
+                LogApp(anvil::playback::LogLevel::Warning, L"buffering overlay blur unavailable");
+            }
+            LogApp(anvil::playback::LogLevel::Debug, L"buffering blur overlay window created");
+        } else if (!bufferingOverlayCreateFailedLogged_) {
+            LogApp(anvil::playback::LogLevel::Warning,
+                   L"buffering blur overlay create failed error=" + std::to_wstring(GetLastError()));
+            bufferingOverlayCreateFailedLogged_ = true;
+            return;
+        }
+    }
+
+    if (!bufferingHudOverlay_) {
+        if (!registerOverlayClass(kBufferingHudOverlayClassName, &MainWindow::BufferingHudOverlayProc)) {
+            return;
+        }
+
+        SetLastError(ERROR_SUCCESS);
+        bufferingHudOverlay_ = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            kBufferingHudOverlayClassName,
+            L"",
+            WS_POPUP | WS_CLIPSIBLINGS,
+            0, 0, 1, 1,
+            hwnd_,
+            nullptr,
+            instance_,
+            this);
+
+        if (bufferingHudOverlay_) {
+            LogApp(anvil::playback::LogLevel::Debug, L"buffering hud overlay window created");
+        } else if (!bufferingOverlayCreateFailedLogged_) {
+            LogApp(anvil::playback::LogLevel::Warning,
+                   L"buffering hud overlay create failed error=" + std::to_wstring(GetLastError()));
+            bufferingOverlayCreateFailedLogged_ = true;
+            return;
+        }
+    }
+
+    bufferingOverlayCreateFailedLogged_ = false;
+}
+
+void MainWindow::UpdateBufferingOverlay(const NativeVideoQueueStats* statsOverride) {
+    const auto hideOverlay = [&]() {
+        if (bufferingOverlayVisible_) {
+            LogApp(anvil::playback::LogLevel::Debug, L"buffering overlay hide");
+            bufferingOverlayVisible_ = false;
+        }
+        if (bufferingHudOverlay_) {
+            KillTimer(bufferingHudOverlay_, 1);
+            if (IsWindowVisible(bufferingHudOverlay_)) {
+                ShowWindow(bufferingHudOverlay_, SW_HIDE);
+            }
+        }
+        if (bufferingOverlay_) {
+            if (IsWindowVisible(bufferingOverlay_)) {
+                ShowWindow(bufferingOverlay_, SW_HIDE);
+            }
+        }
+        lastBufferingOverlayBounds_ = RECT{};
+    };
+
+    const auto snapshot = controller_.Snapshot();
+    NativeVideoQueueStats stats{};
+    bool hasStats = false;
+    if (statsOverride) {
+        stats = *statsOverride;
+        hasStats = true;
+    } else if (nativeVideoDecoder_) {
+        stats = nativeVideoDecoder_->Stats();
+        hasStats = true;
+    }
+    if (webUiActive_ && !webUiPlayerRouteActive_) {
+        hideOverlay();
+        return;
+    }
+    const bool nativeDecoderRunning = nativeVideoDecoder_ && nativeVideoDecoder_->IsRunning();
+    const bool statePlaying = snapshot.state == PlaybackState::Playing;
+    const bool hasVideoMedia = snapshot.media.has_value() && snapshot.media->hasVideo;
+    const bool nativeBuffering = backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+                                 nativeDecoderRunning &&
+                                 statePlaying &&
+                                 hasVideoMedia &&
+                                 hasStats &&
+                                 stats.buffering;
+    if (!nativeBuffering) {
+        if (hasStats && stats.buffering && !bufferingOverlaySuppressedLogged_) {
+            LogApp(anvil::playback::LogLevel::Debug,
+                   std::wstring(L"buffering overlay skip running=") + (nativeDecoderRunning ? L"true" : L"false") +
+                       L" playing=" + (statePlaying ? L"true" : L"false") +
+                       L" has_video=" + (hasVideoMedia ? L"true" : L"false") +
+                       L" webui=" + (webUiActive_ ? L"true" : L"false") +
+                       L" player_route=" + (webUiPlayerRouteActive_ ? L"true" : L"false"));
+            bufferingOverlaySuppressedLogged_ = true;
+        } else if (!stats.buffering) {
+            bufferingOverlaySuppressedLogged_ = false;
+        }
+        hideOverlay();
+        return;
+    }
+    bufferingOverlaySuppressedLogged_ = false;
+    bufferingOverlayStats_ = stats;
+
+    RECT overlayBounds = PlaybackSurfaceBounds();
+    if (webUiActive_ && !fullscreen_ && RectWidth(videoSurface_) > 0 && RectHeight(videoSurface_) > 0) {
+        overlayBounds = DeflateRectCopy(videoSurface_, Scale(5), Scale(5));
+    }
+    const int w = RectWidth(overlayBounds);
+    const int h = RectHeight(overlayBounds);
+    if (w <= 0 || h <= 0) {
+        hideOverlay();
+        return;
+    }
+
+    EnsureBufferingOverlay();
+    if (!bufferingOverlay_ || !bufferingHudOverlay_) {
+        hideOverlay();
+        return;
+    }
+
+    const bool wasVisible = IsWindowVisible(bufferingOverlay_) != FALSE &&
+                            IsWindowVisible(bufferingHudOverlay_) != FALSE;
+    const bool moved = overlayBounds.left != lastBufferingOverlayBounds_.left ||
+                       overlayBounds.top != lastBufferingOverlayBounds_.top ||
+                       w != RectWidth(lastBufferingOverlayBounds_) ||
+                       h != RectHeight(lastBufferingOverlayBounds_);
+    int hudWidth = std::min(w, Scale(220));
+    if (w >= Scale(96)) {
+        hudWidth = std::max(hudWidth, Scale(96));
+    }
+    int hudHeight = std::min(h, Scale(112));
+    if (h >= Scale(82)) {
+        hudHeight = std::max(hudHeight, Scale(82));
+    }
+
+    RECT windowBounds = overlayBounds;
+    MapWindowPoints(hwnd_, nullptr, reinterpret_cast<POINT*>(&windowBounds), 2);
+    if (moved || !wasVisible) {
+        const int hudLeft = windowBounds.left + (w - hudWidth) / 2;
+        const int hudTop = windowBounds.top + (h - hudHeight) / 2;
+        SetWindowPos(bufferingOverlay_,
+                     HWND_TOP,
+                     windowBounds.left,
+                     windowBounds.top,
+                     w,
+                     h,
+                     SWP_NOACTIVATE);
+        SetWindowPos(bufferingHudOverlay_,
+                     HWND_TOP,
+                     hudLeft,
+                     hudTop,
+                     hudWidth,
+                     hudHeight,
+                     SWP_NOACTIVATE);
+    } else {
+        SetWindowPos(bufferingOverlay_, HWND_TOP, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+        SetWindowPos(bufferingHudOverlay_, HWND_TOP, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+    }
+
+    const bool fullscreenTransportCutoutVisible =
+        fullscreen_ &&
+        (fullscreenTransportTarget_ > 0.0 || fullscreenTransportAmount_ > 0.01) &&
+        RectWidth(transportBar_) > 0 &&
+        RectHeight(transportBar_) > 0;
+    const bool regionChanged = moved || !wasVisible || fullscreenTransportCutoutVisible;
+    if (regionChanged) {
+        const auto createOverlayRegion = [&]() -> HRGN {
+            return fullscreen_
+                       ? CreateRectRgn(0, 0, w + 1, h + 1)
+                       : CreateRoundRectRgn(0, 0, w + 1, h + 1, Scale(8), Scale(8));
+        };
+        if (HRGN blurRegion = createOverlayRegion()) {
+            if (fullscreenTransportCutoutVisible) {
+                RECT cutout = transportBar_;
+                MapWindowPoints(hwnd_, nullptr, reinterpret_cast<POINT*>(&cutout), 2);
+                OffsetRect(&cutout, -windowBounds.left, -windowBounds.top);
+                InflateRect(&cutout, Scale(2), Scale(2));
+                if (HRGN cutoutRegion = CreateRoundRectRgn(cutout.left,
+                                                           cutout.top,
+                                                           cutout.right + 1,
+                                                           cutout.bottom + 1,
+                                                           Scale(12),
+                                                           Scale(12))) {
+                    CombineRgn(blurRegion, blurRegion, cutoutRegion, RGN_DIFF);
+                    DeleteObject(cutoutRegion);
+                }
+            }
+            if (!SetWindowRgn(bufferingOverlay_, blurRegion, TRUE)) {
+                DeleteObject(blurRegion);
+            }
+        }
+        if (HRGN hudRegion = CreateRectRgn(0, 0, hudWidth + 1, hudHeight + 1)) {
+            if (!SetWindowRgn(bufferingHudOverlay_, hudRegion, TRUE)) {
+                DeleteObject(hudRegion);
+            }
+        }
+        lastBufferingOverlayBounds_ = overlayBounds;
+    }
+
+    RenderBufferingHudOverlay(bufferingOverlayStats_);
+    SetTimer(bufferingHudOverlay_, 1, kUiAnimationTimerMs, nullptr);
+    if (!IsWindowVisible(bufferingOverlay_)) {
+        ShowWindow(bufferingOverlay_, SW_SHOWNOACTIVATE);
+    }
+    if (!IsWindowVisible(bufferingHudOverlay_)) {
+        ShowWindow(bufferingHudOverlay_, SW_SHOWNOACTIVATE);
+    }
+    if (!bufferingOverlayVisible_) {
+        LogApp(anvil::playback::LogLevel::Debug,
+               L"buffering overlay show bounds=" + std::to_wstring(w) + L"x" + std::to_wstring(h) +
+                   L" net_kbps=" + std::to_wstring(stats.networkBytesPerSecond / 1024));
+        bufferingOverlayVisible_ = true;
+    }
 }
 
 void MainWindow::UpdateTransportOverlay() {

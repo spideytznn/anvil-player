@@ -280,6 +280,10 @@ private:
     static constexpr std::chrono::milliseconds kSeekPrerollTimeout{1800};
     static constexpr std::chrono::milliseconds kSeekPrerollSoftwareTimeout{10000};
     static constexpr std::chrono::milliseconds kSeekPrerollSoftwareTimeoutMinReadAhead{6000};
+    static constexpr std::size_t kSeekPrerollEnhancementMinQueuedFrames = 2;
+    static constexpr std::chrono::milliseconds kSeekPrerollEnhancementMinReadAhead{900};
+    static constexpr std::chrono::milliseconds kSeekPrerollEnhancementTimeoutMinReadAhead{500};
+    static constexpr std::chrono::milliseconds kRuntimeSeekIoTimeout{4500};
 
     struct NativeSubtitleCue {
         std::chrono::milliseconds start{0};
@@ -458,6 +462,7 @@ private:
     bool dolbyVisionEnhancementFirstPackedLogged_ = false;
     bool dolbyVisionCpuReferenceLogged_ = false;
     bool dolbyVisionMultiPartitionFallbackLogged_ = false;
+    bool dolbyVisionEnhancementStartupFallbackLogged_ = false;
     int dolbyVisionEnhancementStartupMisses_ = 0;
     uint64_t dolbyVisionEnhancementLastDynamicMetadataFingerprint_ = 0;
     uint64_t dolbyVisionEnhancementFramesDecoded_ = 0;
@@ -504,6 +509,8 @@ private:
     std::atomic_uint failureMessage_{0};
     std::atomic_bool frameMessagePending_{false};
     std::atomic<int64_t> pendingSeekMs_{-1};
+    std::atomic_bool pendingSeekInterruptsEnabled_{false};
+    std::atomic<int64_t> ioInterruptAfterSteadyMs_{0};
     mutable std::atomic<int> interruptReturnCount_{0};
     std::atomic_bool playbackPaused_{false};
     std::atomic_bool enhancementPrerollWaitActive_{false};

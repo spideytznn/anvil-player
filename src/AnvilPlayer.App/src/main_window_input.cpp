@@ -488,18 +488,24 @@ void MainWindow::OnMouseWheel(const int delta, POINT screenPoint) {
     EnsureLayout();
     if ((subtitleMenuAmount_ > 0.01 || subtitleMenuTarget_ > 0.0) &&
         IsPointInSubtitleMenu(screenPoint) &&
-        subtitleMenuVisibleItemCount_ > 0 &&
-        static_cast<int>(subtitleMenuTracks_.size()) > subtitleMenuVisibleItemCount_) {
+        subtitleMenuVisibleItemCount_ > 0) {
+        const int trackCount = subtitleMenuPage_ == SubtitleMenuPage::Audio
+                                   ? static_cast<int>(audioMenuTracks_.size())
+                                   : static_cast<int>(subtitleMenuTracks_.size());
+        if (trackCount <= subtitleMenuVisibleItemCount_) {
+            return;
+        }
+        MarkSubtitleMenuScrollbarActive();
         const int direction = delta > 0 ? -1 : 1;
-        const int maxOffset = std::max(0, static_cast<int>(subtitleMenuTracks_.size()) - subtitleMenuVisibleItemCount_);
+        const int maxOffset = std::max(0, trackCount - subtitleMenuVisibleItemCount_);
         const int nextOffset = std::clamp(subtitleMenuScrollOffset_ + direction, 0, maxOffset);
         if (nextOffset != subtitleMenuScrollOffset_) {
             subtitleMenuScrollOffset_ = nextOffset;
             hoveredSubtitleMenuItem_ = HitSubtitleMenuItem(screenPoint);
-            InvalidateTransportArea();
-            InvalidateFullscreenOverlay();
-            InvalidateRect(hwnd_, nullptr, FALSE);
         }
+        InvalidateTransportArea();
+        InvalidateFullscreenOverlay();
+        InvalidateRect(hwnd_, nullptr, FALSE);
         return;
     }
     if (ContainsPoint(VolumeSliderHitRect(), screenPoint)) {
@@ -531,7 +537,9 @@ bool MainWindow::ScrollSettingsBy(const int delta) {
     }
 
     const int next = std::clamp(settingsScrollOffset_ + delta, 0, settingsScrollMax_);
+    MarkSettingsScrollbarActive();
     if (next == settingsScrollOffset_) {
+        InvalidateRect(hwnd_, nullptr, FALSE);
         return true;
     }
 
@@ -566,6 +574,7 @@ bool MainWindow::BeginSettingsScrollDrag(const POINT point) {
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
 
+    MarkSettingsScrollbarActive();
     draggingSettingsScrollThumb_ = true;
     settingsScrollDragStartY_ = point.y;
     settingsScrollDragStartOffset_ = settingsScrollOffset_;
@@ -591,10 +600,12 @@ void MainWindow::UpdateSettingsScrollDrag(const POINT point) {
         0,
         settingsScrollMax_);
     if (next == settingsScrollOffset_) {
+        MarkSettingsScrollbarActive();
         return;
     }
 
     settingsScrollOffset_ = next;
+    MarkSettingsScrollbarActive();
     MarkLayoutDirty();
     EnsureLayout();
     InvalidateRect(hwnd_, nullptr, FALSE);
@@ -606,10 +617,10 @@ void MainWindow::EndSettingsScrollDrag() {
     }
 
     draggingSettingsScrollThumb_ = false;
-    if (GetCapture() == HdrToneCurveInteractionWindow()) {
+    if (GetCapture() == hwnd_) {
         ReleaseCapture();
     }
-    InvalidateHdrToneCurveEditor();
+    InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
 void MainWindow::CancelSettingsScrollDrag() {
@@ -618,10 +629,10 @@ void MainWindow::CancelSettingsScrollDrag() {
     }
 
     draggingSettingsScrollThumb_ = false;
-    if (GetCapture() == HdrToneCurveInteractionWindow()) {
+    if (GetCapture() == hwnd_) {
         ReleaseCapture();
     }
-    InvalidateHdrToneCurveEditor();
+    InvalidateRect(hwnd_, nullptr, FALSE);
 }
 
 RECT MainWindow::ProgressHitRect() const {
@@ -1568,12 +1579,12 @@ void MainWindow::OnKeyDown(const WPARAM key) {
         CycleSubtitleTrack();
         break;
     case VK_ESCAPE:
-        if (subtitleMenuTarget_ > 0.0 || subtitleMenuAmount_ > 0.01) {
+        if (fullscreen_) {
+            ToggleFullscreen();
+        } else if (subtitleMenuTarget_ > 0.0 || subtitleMenuAmount_ > 0.01) {
             HideSubtitleMenu();
         } else if (hdrToneCurveExpanded_) {
             HideHdrToneCurveWindow();
-        } else if (fullscreen_) {
-            ToggleFullscreen();
         }
         break;
     default:
@@ -1860,6 +1871,7 @@ void MainWindow::ShowSubtitleMenu() {
     subtitleMenuTracks_ = SubtitleTrackMenuItems(snapshot.media);
     subtitleMenuVisibleItemCount_ = 0;
     subtitleMenuScrollOffset_ = 0;
+    subtitleMenuScrollLastActiveAt_ = {};
     const auto settings = controller_.Settings();
     const auto& selectedTracks = subtitleMenuPage_ == SubtitleMenuPage::Audio ? audioMenuTracks_ : subtitleMenuTracks_;
     const int selectedTrack = subtitleMenuPage_ == SubtitleMenuPage::Audio

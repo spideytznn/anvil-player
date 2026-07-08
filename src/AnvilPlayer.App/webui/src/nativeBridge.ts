@@ -80,6 +80,7 @@ export type NativeCommand =
   | { type: 'command'; command: 'forward' }
   | { type: 'command'; command: 'toggleSidebar' }
   | { type: 'command'; command: 'toggleFullscreen' }
+  | { type: 'command'; command: 'showFullscreenTransport' }
   | { type: 'command'; command: 'subtitleMenu' }
   | { type: 'command'; command: 'hideSubtitleMenu' }
   | { type: 'command'; command: 'settings' }

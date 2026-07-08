@@ -9,6 +9,8 @@ constexpr wchar_t kWindowClassName[] = L"AnvilPlayerWindow";
 constexpr wchar_t kVideoHostClassName[] = L"AnvilVideoHostWindow";
 constexpr wchar_t kFullscreenOverlayClassName[] = L"AnvilFullscreenOverlayWindow";
 constexpr wchar_t kTransportOverlayClassName[] = L"AnvilTransportOverlayWindow";
+constexpr wchar_t kBufferingOverlayClassName[] = L"AnvilBufferingOverlayWindow";
+constexpr wchar_t kBufferingHudOverlayClassName[] = L"AnvilBufferingHudOverlayWindow";
 constexpr wchar_t kSubtitleMenuOverlayClassName[] = L"AnvilSubtitleMenuOverlayWindow";
 constexpr wchar_t kHdrToneCurveWindowClassName[] = L"AnvilHdrToneCurveWindow";
 
@@ -17,10 +19,12 @@ constexpr UINT_PTR kPlaybackTimer = 1001;
 constexpr UINT_PTR kUiAnimationTimer = 1002;
 constexpr UINT_PTR kFullscreenChromeHideTimer = 1003;
 constexpr UINT_PTR kVideoPressTimer = 1004;
+constexpr UINT_PTR kScrollbarAutoHideTimer = 1005;
 constexpr UINT kIdlePlaybackTimerMs = 250;
 constexpr UINT kPlayingPlaybackTimerMs = 100;
 constexpr UINT kUiAnimationTimerMs = 16;
 constexpr UINT kVideoLongPressTimerMs = 320;
+constexpr UINT kScrollbarAutoHideTimerMs = 950;
 
 // Custom WM_APP messages posted from decode threads to the UI thread.
 constexpr UINT kVideoFrameReadyMessage = WM_APP + 1;

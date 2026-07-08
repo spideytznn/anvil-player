@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <cwctype>
 #include <sstream>
 #include <string>
@@ -18,6 +20,32 @@ using anvil::playback::PlayerSettings;
 using anvil::playback::ToDisplayString;
 
 namespace {
+
+constexpr auto kScrollbarVisibleDuration = std::chrono::milliseconds{650};
+constexpr auto kScrollbarFadeDuration = std::chrono::milliseconds{300};
+
+double ScrollbarOpacity(const std::chrono::steady_clock::time_point lastActiveAt,
+                        const bool dragging,
+                        const std::chrono::steady_clock::time_point now) {
+    if (dragging) {
+        return 1.0;
+    }
+    if (lastActiveAt.time_since_epoch().count() == 0) {
+        return 0.0;
+    }
+    const auto age = now - lastActiveAt;
+    if (age < kScrollbarVisibleDuration) {
+        return 1.0;
+    }
+    if (age >= kScrollbarVisibleDuration + kScrollbarFadeDuration) {
+        return 0.0;
+    }
+    const double t = static_cast<double>(
+                         std::chrono::duration_cast<std::chrono::milliseconds>(
+                             age - kScrollbarVisibleDuration).count()) /
+                     static_cast<double>(kScrollbarFadeDuration.count());
+    return 1.0 - std::clamp(t, 0.0, 1.0);
+}
 
 bool RectsIntersect(const RECT& a, const RECT& b) {
     RECT intersection{};
@@ -54,6 +82,11 @@ std::wstring PlaybackRateText(const double rate) {
     stream.precision(1);
     stream << rate << L"x";
     return stream.str();
+}
+
+std::wstring NetworkSpeedText(const uint64_t bytesPerSecond) {
+    const uint64_t kbps = bytesPerSecond / 1024;
+    return std::to_wstring(kbps) + L" KB/s";
 }
 
 std::wstring SubtitleSelectionText(const int selectedTrackIndex) {
@@ -420,6 +453,166 @@ void MainWindow::PaintFullscreenOverlay(HWND overlay) {
 
 void MainWindow::PaintTransportOverlay(HWND overlay) {
     PaintFullscreenOverlay(overlay);
+}
+
+void MainWindow::RenderBufferingHudOverlay(const NativeVideoQueueStats& stats) {
+    if (!bufferingHudOverlay_) {
+        return;
+    }
+
+    RECT client{};
+    GetClientRect(bufferingHudOverlay_, &client);
+    const int width = RectWidth(client);
+    const int height = RectHeight(client);
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+
+    RECT windowRect{};
+    if (!GetWindowRect(bufferingHudOverlay_, &windowRect)) {
+        return;
+    }
+
+    HDC screenDc = GetDC(nullptr);
+    if (!screenDc) {
+        return;
+    }
+
+    HDC memoryDc = CreateCompatibleDC(screenDc);
+    if (!memoryDc) {
+        ReleaseDC(nullptr, screenDc);
+        return;
+    }
+
+    BITMAPINFO bitmapInfo{};
+    bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bitmapInfo.bmiHeader.biWidth = width;
+    bitmapInfo.bmiHeader.biHeight = -height;
+    bitmapInfo.bmiHeader.biPlanes = 1;
+    bitmapInfo.bmiHeader.biBitCount = 32;
+    bitmapInfo.bmiHeader.biCompression = BI_RGB;
+
+    void* pixels = nullptr;
+    HBITMAP bitmap = CreateDIBSection(screenDc, &bitmapInfo, DIB_RGB_COLORS, &pixels, nullptr, 0);
+    if (!bitmap || !pixels) {
+        if (bitmap) {
+            DeleteObject(bitmap);
+        }
+        DeleteDC(memoryDc);
+        ReleaseDC(nullptr, screenDc);
+        return;
+    }
+
+    std::memset(pixels, 0, static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
+    HGDIOBJ oldBitmap = SelectObject(memoryDc, bitmap);
+
+    {
+        constexpr int kRenderScale = 3;
+        Gdiplus::Bitmap hudBitmap(width * kRenderScale, height * kRenderScale, PixelFormat32bppPARGB);
+        Gdiplus::Graphics graphics(&hudBitmap);
+        graphics.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+        graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        graphics.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
+        graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        graphics.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
+        graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+        graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
+        graphics.ScaleTransform(static_cast<Gdiplus::REAL>(kRenderScale),
+                                static_cast<Gdiplus::REAL>(kRenderScale));
+
+        const int spinnerRoom = std::max(Scale(32), height - Scale(52));
+        const int spinnerSize = std::clamp(spinnerRoom, Scale(38), Scale(48));
+        const int gap = Scale(12);
+        const int textHeight = Scale(22);
+        const int totalHeight = spinnerSize + gap + textHeight;
+        const int centerX = width / 2;
+        const int groupTop = std::max(Scale(10), (height - totalHeight) / 2);
+        const int spinnerLeft = centerX - spinnerSize / 2;
+        const int spinnerTop = groupTop;
+        const int penWidth = std::max(2, Scale(3));
+        const Gdiplus::REAL inset = static_cast<Gdiplus::REAL>(penWidth) * 0.5f + 1.0f;
+        const Gdiplus::RectF arcRect(static_cast<Gdiplus::REAL>(spinnerLeft) + inset,
+                                     static_cast<Gdiplus::REAL>(spinnerTop) + inset,
+                                     static_cast<Gdiplus::REAL>(spinnerSize) - inset * 2.0f,
+                                     static_cast<Gdiplus::REAL>(spinnerSize) - inset * 2.0f);
+
+        const COLORREF spinnerAccent = BlendColor(palette_.accent, RGB(255, 222, 214), 0.22);
+        Gdiplus::Pen track(Gdiplus::Color(38, 255, 255, 255), static_cast<Gdiplus::REAL>(penWidth));
+        track.SetStartCap(Gdiplus::LineCapRound);
+        track.SetEndCap(Gdiplus::LineCapRound);
+        graphics.DrawArc(&track, arcRect, 0.0f, 360.0f);
+
+        const auto now = std::chrono::steady_clock::now().time_since_epoch();
+        const double elapsedMs = static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
+        const double headAngle = std::fmod(elapsedMs * 0.31, 360.0);
+        const double tailDegrees = 226.0;
+        const int segmentCount = 28;
+        for (int index = 0; index < segmentCount; ++index) {
+            const double t = static_cast<double>(index + 1) / static_cast<double>(segmentCount);
+            const double eased = t * t;
+            const double segmentStart = headAngle - tailDegrees + tailDegrees * static_cast<double>(index) /
+                                                                     static_cast<double>(segmentCount);
+            const double segmentSpan = tailDegrees / static_cast<double>(segmentCount) * 0.94;
+            const BYTE alpha = static_cast<BYTE>(std::clamp(14.0 + eased * 205.0, 0.0, 255.0));
+            const COLORREF segmentColor = BlendColor(spinnerAccent, RGB(255, 238, 232), 0.10 + t * 0.18);
+            Gdiplus::Pen segmentPen(
+                Gdiplus::Color(alpha, GetRValue(segmentColor), GetGValue(segmentColor), GetBValue(segmentColor)),
+                static_cast<Gdiplus::REAL>(penWidth) * static_cast<Gdiplus::REAL>(0.78 + t * 0.12));
+            segmentPen.SetStartCap(Gdiplus::LineCapRound);
+            segmentPen.SetEndCap(Gdiplus::LineCapRound);
+            graphics.DrawArc(&segmentPen,
+                             arcRect,
+                             static_cast<Gdiplus::REAL>(segmentStart),
+                             static_cast<Gdiplus::REAL>(segmentSpan));
+        }
+
+        const int horizontalInset = Scale(24);
+        const int textWidth = std::max(1, std::min(Scale(260), width - horizontalInset * 2));
+        const Gdiplus::RectF textRect(static_cast<Gdiplus::REAL>(centerX - textWidth / 2),
+                                      static_cast<Gdiplus::REAL>(spinnerTop + spinnerSize + gap),
+                                      static_cast<Gdiplus::REAL>(textWidth),
+                                      static_cast<Gdiplus::REAL>(textHeight));
+        Gdiplus::FontFamily fontFamily(L"Segoe UI");
+        Gdiplus::Font detailFont(&fontFamily,
+                                 static_cast<Gdiplus::REAL>(Scale(13)),
+                                 Gdiplus::FontStyleBold,
+                                 Gdiplus::UnitPixel);
+        Gdiplus::StringFormat format;
+        format.SetAlignment(Gdiplus::StringAlignmentCenter);
+        format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+        format.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+        Gdiplus::SolidBrush textBrush(Gdiplus::Color(245, 238, 242, 249));
+        const std::wstring speedText = NetworkSpeedText(stats.networkBytesPerSecond);
+        graphics.DrawString(speedText.c_str(), -1, &detailFont, textRect, &format, &textBrush);
+
+        Gdiplus::Graphics outputGraphics(memoryDc);
+        outputGraphics.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
+        outputGraphics.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
+        outputGraphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        outputGraphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        Gdiplus::Rect destinationRect(0, 0, width, height);
+        outputGraphics.DrawImage(&hudBitmap,
+                                 destinationRect,
+                                 0,
+                                 0,
+                                 width * kRenderScale,
+                                 height * kRenderScale,
+                                 Gdiplus::UnitPixel);
+    }
+
+    POINT destination{windowRect.left, windowRect.top};
+    SIZE size{width, height};
+    POINT source{0, 0};
+    BLENDFUNCTION blend{};
+    blend.BlendOp = AC_SRC_OVER;
+    blend.SourceConstantAlpha = 255;
+    blend.AlphaFormat = AC_SRC_ALPHA;
+    UpdateLayeredWindow(bufferingHudOverlay_, screenDc, &destination, &size, memoryDc, &source, 0, &blend, ULW_ALPHA);
+
+    SelectObject(memoryDc, oldBitmap);
+    DeleteObject(bitmap);
+    DeleteDC(memoryDc);
+    ReleaseDC(nullptr, screenDc);
 }
 
 void MainWindow::PaintSubtitleMenuOverlay(HWND overlay) {
@@ -1399,13 +1592,21 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
     }
 
     const int listContentBottom = listTop + itemHeight * visibleItemCount;
-    if (visibleItemCount > 0 && count > visibleItemCount) {
+    const double scrollbarOpacity = ScrollbarOpacity(subtitleMenuScrollLastActiveAt_,
+                                                     false,
+                                                     std::chrono::steady_clock::now());
+    if (visibleItemCount > 0 &&
+        count > visibleItemCount &&
+        scrollbarOpacity > 0.02) {
+        const auto fadeScrollbar = [opacity, scrollbarOpacity](const COLORREF color) {
+            return FadeForOpacity(color, opacity * scrollbarOpacity);
+        };
         const RECT scrollTrack = MakeRect(subtitleMenu_.right - Scale(8),
                                           listTop + Scale(5),
                                           subtitleMenu_.right - Scale(5),
                                           listContentBottom - Scale(5));
         if (RectHeight(scrollTrack) > Scale(18)) {
-            FillRoundRect(hdc, scrollTrack, fade(BlendColor(panelLine, panel, 0.35)), Scale(2));
+            FillRoundRect(hdc, scrollTrack, fadeScrollbar(BlendColor(panelLine, panel, 0.35)), Scale(2));
             const int trackHeight = RectHeight(scrollTrack);
             const int thumbHeight = std::clamp(static_cast<int>(std::round(
                                              static_cast<double>(trackHeight) *
@@ -1423,7 +1624,7 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
                                         thumbTop,
                                         scrollTrack.right,
                                         thumbTop + thumbHeight);
-            FillRoundRect(hdc, thumb, fade(panelMuted), Scale(2));
+            FillRoundRect(hdc, thumb, fadeScrollbar(panelMuted), Scale(2));
         }
     }
 
@@ -1982,13 +2183,20 @@ void MainWindow::DrawSettingsScrollbar(HDC hdc) const {
         RectHeight(settingsScrollThumb_) <= 0) {
         return;
     }
+    const double scrollbarOpacity = ScrollbarOpacity(settingsScrollLastActiveAt_,
+                                                     draggingSettingsScrollThumb_,
+                                                     std::chrono::steady_clock::now());
+    if (scrollbarOpacity <= 0.02) {
+        return;
+    }
 
-    FillRoundRect(hdc, settingsScrollTrack_, RGB(10, 12, 16), Scale(3));
+    FillRoundRect(hdc, settingsScrollTrack_, FadeForOpacity(RGB(10, 12, 16), scrollbarOpacity), Scale(3));
     FillRoundRect(hdc,
                   settingsScrollThumb_,
-                  draggingSettingsScrollThumb_
-                      ? BlendColor(palette_.accent, palette_.text, 0.16)
-                      : BlendColor(palette_.borderStrong, palette_.muted, 0.24),
+                  FadeForOpacity(draggingSettingsScrollThumb_
+                                     ? BlendColor(palette_.accent, palette_.text, 0.16)
+                                     : BlendColor(palette_.borderStrong, palette_.muted, 0.24),
+                                 scrollbarOpacity),
                   Scale(3));
 }
 

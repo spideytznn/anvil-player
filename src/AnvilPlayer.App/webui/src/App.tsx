@@ -26,6 +26,7 @@ import {
 import { applyAppearanceSettings } from './appearance'
 import {
   clearPendingEmbyPlaybackReport,
+  EMBY_PLAYBACK_REPORT_PENDING_EVENT,
   loadPendingEmbyPlaybackReport,
   reportEmbyPlaybackProgress,
   reportEmbyPlaybackStarted,
@@ -243,7 +244,7 @@ const copy = { en, zh }
 type Copy = Record<keyof typeof en, string>
 type SubtitlePanel = 'subtitles' | 'audio' | 'danmaku'
 
-const EMBY_PROGRESS_REPORT_INTERVAL_MS = 10_000
+const EMBY_PROGRESS_REPORT_INTERVAL_MS = 5_000
 
 interface ActiveEmbyPlaybackReport {
   report: EmbyPlaybackReportRecord
@@ -253,6 +254,12 @@ interface ActiveEmbyPlaybackReport {
   lastProgressAt: number
   lastPositionMs: number
   lastPlaybackState: string
+}
+
+interface PlaybackUrlIdentity {
+  normalized: string
+  itemId: string
+  mediaSourceId: string
 }
 
 function normalizePlaybackUrl(value: string): string {
@@ -270,14 +277,61 @@ function normalizePlaybackUrl(value: string): string {
   }
 }
 
+function urlSearchParam(url: URL, name: string): string {
+  const lowerName = name.toLowerCase()
+  for (const [key, value] of url.searchParams.entries()) {
+    if (key.toLowerCase() === lowerName) return value.trim().toLowerCase()
+  }
+  return ''
+}
+
+function decodeUrlPart(value: string): string {
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return value
+  }
+}
+
+function playbackUrlIdentity(value: string): PlaybackUrlIdentity {
+  const normalized = normalizePlaybackUrl(value)
+  try {
+    const url = new URL(value)
+    const pathMatch = /\/(?:videos|items)\/([^/?#]+)|\/users\/[^/?#]+\/items\/([^/?#]+)/i.exec(url.pathname)
+    const itemId = decodeUrlPart(pathMatch?.[1] ?? pathMatch?.[2] ?? '').trim().toLowerCase()
+    return {
+      normalized,
+      itemId: itemId || urlSearchParam(url, 'ItemId'),
+      mediaSourceId: urlSearchParam(url, 'MediaSourceId')
+    }
+  } catch {
+    return {
+      normalized,
+      itemId: '',
+      mediaSourceId: ''
+    }
+  }
+}
+
+function sameToken(left?: string, right?: string): boolean {
+  const a = left?.trim().toLowerCase() ?? ''
+  const b = right?.trim().toLowerCase() ?? ''
+  return Boolean(a && b && a === b)
+}
+
 function playbackPathMatchesEmbyReport(mediaPath: string, report: EmbyPlaybackReportRecord): boolean {
-  const media = normalizePlaybackUrl(mediaPath)
-  const target = normalizePlaybackUrl(report.target.url)
-  if (!media || !target) return false
-  if (media === target) return true
+  const media = playbackUrlIdentity(mediaPath)
+  const target = playbackUrlIdentity(report.target.url)
+  if (!media.normalized || !target.normalized) return false
+  if (media.normalized === target.normalized) return true
 
   const itemId = report.target.itemId.toLowerCase()
-  return Boolean(itemId && media.includes(itemId) && target.includes(itemId))
+  if (sameToken(itemId, media.itemId) || sameToken(itemId, target.itemId)) return true
+  if (sameToken(media.itemId, target.itemId)) {
+    const mediaSourceId = report.target.mediaSourceId?.toLowerCase() ?? ''
+    return !mediaSourceId || !media.mediaSourceId || sameToken(mediaSourceId, media.mediaSourceId)
+  }
+  return Boolean(itemId && media.normalized.includes(itemId) && target.normalized.includes(itemId))
 }
 
 function embyReportEventName(previousState: string, nextState: string): string {
@@ -300,17 +354,37 @@ function stopActiveEmbyPlaybackReport(
   failed: boolean,
   keepalive = false
 ): void {
-  if (!active || active.stopped || !active.started) return
+  if (!active || active.stopped) return
   active.stopped = true
   const stoppedAt = Math.max(positionMs, active.lastPositionMs)
+  active.lastPositionMs = stoppedAt
   clearPendingEmbyPlaybackReport(active.report.id)
-  void reportEmbyPlaybackStopped(active.report, stoppedAt, failed, keepalive)
+  if (!active.started) return
+  const finalProgress = stoppedAt > 0 && !keepalive
+    ? reportEmbyPlaybackProgress(active.report, stoppedAt, false, failed ? 'PlaybackError' : 'TimeUpdate')
+      .catch((error) => debugEmbyPlaybackReport(`final progress failed itemId=${active.report.target.itemId} error=${error instanceof Error ? error.message : String(error)}`))
+    : Promise.resolve()
+  void finalProgress
+    .then(() => reportEmbyPlaybackStopped(active.report, stoppedAt, failed, keepalive))
     .then(() => debugEmbyPlaybackReport(`stopped itemId=${active.report.target.itemId} positionMs=${Math.round(stoppedAt)}`))
     .catch((error) => debugEmbyPlaybackReport(`stop failed itemId=${active.report.target.itemId} error=${error instanceof Error ? error.message : String(error)}`))
 }
 
+function createActiveEmbyPlaybackReport(report: EmbyPlaybackReportRecord): ActiveEmbyPlaybackReport {
+  return {
+    report,
+    matched: false,
+    started: false,
+    stopped: false,
+    lastProgressAt: 0,
+    lastPositionMs: 0,
+    lastPlaybackState: ''
+  }
+}
+
 function useEmbyPlaybackReporting(state: PlayerState): void {
   const activeRef = useRef<ActiveEmbyPlaybackReport | null>(null)
+  const [pendingPulse, setPendingPulse] = useState(0)
 
   useEffect(() => {
     activeRef.current = null
@@ -320,25 +394,60 @@ function useEmbyPlaybackReporting(state: PlayerState): void {
   }, [])
 
   useEffect(() => {
+    const refreshPending = (): void => setPendingPulse((value) => value + 1)
+    window.addEventListener(EMBY_PLAYBACK_REPORT_PENDING_EVENT, refreshPending)
+    const retryTimer = window.setInterval(refreshPending, 1000)
+    refreshPending()
+    return () => {
+      window.removeEventListener(EMBY_PLAYBACK_REPORT_PENDING_EVENT, refreshPending)
+      window.clearInterval(retryTimer)
+    }
+  }, [])
+
+  useEffect(() => {
     let active = activeRef.current
-    if (!active) {
-      const pending = loadPendingEmbyPlaybackReport()
-      if (!pending) return
-      active = {
-        report: pending,
-        matched: false,
-        started: false,
-        stopped: false,
-        lastProgressAt: 0,
-        lastPositionMs: 0,
-        lastPlaybackState: ''
+    if (active?.stopped) {
+      activeRef.current = null
+      active = null
+    }
+    const pending = loadPendingEmbyPlaybackReport()
+    const pendingPathMatches = Boolean(pending && state.hasMedia && playbackPathMatchesEmbyReport(state.mediaPath, pending))
+    const activePathMatches = Boolean(active && state.hasMedia && playbackPathMatchesEmbyReport(state.mediaPath, active.report))
+
+    if (active && pending && pending.id !== active.report.id && (!active.started || !active.matched || pendingPathMatches || (active.matched && state.hasMedia && !activePathMatches))) {
+      if (active.started) {
+        stopActiveEmbyPlaybackReport(active, active.lastPositionMs, false)
       }
+      active = createActiveEmbyPlaybackReport(pending)
+      activeRef.current = active
+      debugEmbyPlaybackReport(`pending itemId=${pending.target.itemId}`)
+    }
+
+    if (!active) {
+      if (!pending) return
+      active = createActiveEmbyPlaybackReport(pending)
       activeRef.current = active
     }
 
-    if (active.stopped) return
+    if (active.stopped) {
+      activeRef.current = null
+      return
+    }
 
-    const matched = active.matched || (state.hasMedia && playbackPathMatchesEmbyReport(state.mediaPath, active.report))
+    if (active.matched && state.hasMedia && !activePathMatches) {
+      const replacement = pending && pending.id !== active.report.id && pendingPathMatches ? pending : undefined
+      stopActiveEmbyPlaybackReport(active, active.lastPositionMs, false)
+      if (!replacement) {
+        activeRef.current = null
+        return
+      }
+      active = createActiveEmbyPlaybackReport(replacement)
+      activeRef.current = active
+      debugEmbyPlaybackReport(`switched itemId=${replacement.target.itemId}`)
+    }
+
+    const nextActivePathMatches = state.hasMedia && playbackPathMatchesEmbyReport(state.mediaPath, active.report)
+    const matched = active.matched || nextActivePathMatches
     if (!matched) return
     active.matched = true
 
@@ -378,7 +487,7 @@ function useEmbyPlaybackReporting(state: PlayerState): void {
     }
 
     active.lastPlaybackState = state.playbackState
-  }, [state])
+  }, [pendingPulse, state])
 }
 
 function displayTrackLabel(label: string, t: Copy): string {
@@ -998,6 +1107,7 @@ function TopBar({ state, t }: { state: PlayerState; t: Copy }): JSX.Element {
 function VideoStage({ state, t }: { state: PlayerState; t: Copy }): JSX.Element {
   const playbackFailed = state.hasMedia && state.playbackState === 'Error'
   const failureMessage = state.lastError || t.playbackFailedHint
+  const nativeRuntime = state.backendLabel.toLowerCase().includes('native') || state.runtimeLabel.toLowerCase().includes('native')
 
   return (
     <main className="video-shell">
@@ -1026,7 +1136,7 @@ function VideoStage({ state, t }: { state: PlayerState; t: Copy }): JSX.Element 
             </div>
           </div>
         )}
-        {state.hasMedia && state.buffering && !playbackFailed && (
+        {state.hasMedia && state.buffering && !playbackFailed && !nativeRuntime && (
           <div className="buffering-overlay" aria-live="polite">
             <span className="buffering-spinner" aria-hidden="true" />
             <span className="buffering-copy">
@@ -1692,6 +1802,7 @@ export default function App(): JSX.Element {
   const [subtitleAnchorReady, setSubtitleAnchorReady] = useState(false)
   const transportRef = useRef<HTMLElement | null>(null)
   const subtitleButtonRef = useRef<HTMLButtonElement | null>(null)
+  const lastFullscreenTransportRevealAt = useRef(0)
   const t = copy[language]
   const subtitleVisualActive = subtitlePopoverMounted || subtitlePopoverOpen || state.subtitleMenuOpen
   useEmbyPlaybackReporting(state)
@@ -1715,6 +1826,16 @@ export default function App(): JSX.Element {
     applyAppearanceSettings()
     return subscribeNativeState(setState)
   }, [])
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (!state.fullscreen || event.key !== 'Escape') return
+      event.preventDefault()
+      postNativeCommand({ type: 'command', command: 'toggleFullscreen' })
+    }
+    window.addEventListener('keydown', onKeyDown, true)
+    return () => window.removeEventListener('keydown', onKeyDown, true)
+  }, [state.fullscreen])
 
   useEffect(() => {
     const updateAnchor = (): void => {
@@ -1791,9 +1912,23 @@ export default function App(): JSX.Element {
     postNativeCommand({ type: 'command', command: 'hideSubtitleMenu' })
   }
 
+  const revealFullscreenTransport = (event: PointerEvent<HTMLDivElement>): void => {
+    if (!state.fullscreen) return
+
+    const activationHeight = Math.max(96, Math.min(140, window.innerHeight * 0.14))
+    if (event.clientY < window.innerHeight - activationHeight) return
+
+    const now = window.performance.now()
+    if (now - lastFullscreenTransportRevealAt.current < 220) return
+
+    lastFullscreenTransportRevealAt.current = now
+    postNativeCommand({ type: 'command', command: 'showFullscreenTransport' })
+  }
+
   return (
     <div
       className={`app-shell ${state.sidebarCollapsed ? 'inspector-collapsed' : ''} ${state.fullscreen ? 'is-fullscreen' : ''} ${state.fullscreenTransportVisible ? 'fullscreen-transport-visible' : ''}`}
+      onPointerMoveCapture={revealFullscreenTransport}
       onPointerDownCapture={(event) => {
         if (!state.subtitleMenuOpen && !subtitlePopoverOpen) return
         const target = event.target

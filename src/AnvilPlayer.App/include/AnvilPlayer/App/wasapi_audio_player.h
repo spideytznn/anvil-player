@@ -223,6 +223,7 @@ private:
     std::atomic_bool packetStreamEof_{false};
     std::atomic<int64_t> pausePositionMs_{0};
     std::atomic<int64_t> pendingSeekMs_{-1};
+    std::atomic<int64_t> ioInterruptAfterSteadyMs_{0};
     std::mutex packetMutex_;
     std::condition_variable packetCv_;
     std::deque<AVPacket*> packetQueue_;

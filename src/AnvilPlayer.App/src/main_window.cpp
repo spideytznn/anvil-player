@@ -40,7 +40,11 @@ constexpr auto kButtonHoverAnimationDuration = std::chrono::milliseconds{180};
 constexpr auto kButtonPressAnimationDuration = std::chrono::milliseconds{220};
 constexpr auto kVolumeHoverAnimationDuration = std::chrono::milliseconds{180};
 constexpr auto kWebUiProgressUpdateInterval = std::chrono::milliseconds{100};
+constexpr auto kNativeBufferingNoProgressTimeout = std::chrono::seconds{18};
+constexpr auto kNativeBufferingHardTimeout = std::chrono::seconds{45};
 constexpr auto kFullscreenTransportHideDelay = std::chrono::seconds{5};
+constexpr auto kScrollbarVisibleDuration = std::chrono::milliseconds{650};
+constexpr auto kScrollbarFadeDuration = std::chrono::milliseconds{300};
 constexpr int kFullscreenTransportActivationHeight = 110;
 constexpr std::size_t kMaxRecentMedia = 12;
 
@@ -1109,6 +1113,8 @@ void MainWindow::HandleWebUiMessage(const std::wstring_view message) {
         ToggleSidebar();
     } else if (MessageContains(message, L"\"command\":\"toggleFullscreen\"")) {
         ToggleFullscreen();
+    } else if (MessageContains(message, L"\"command\":\"showFullscreenTransport\"")) {
+        ShowFullscreenTransport(L"web_ui_activation");
     } else if (MessageContains(message, L"\"command\":\"subtitleGeometry\"")) {
         const double scale = std::clamp(ReadJsonNumber(message, L"scale").value_or(1.0), 0.25, 4.0);
         const auto scaled = [scale](const std::optional<double>& value) {
@@ -1316,6 +1322,9 @@ LRESULT CALLBACK MainWindow::VideoHostProc(HWND hwnd, UINT message, WPARAM wPara
         MapWindowPoints(hwnd, window->hwnd_, &point, 1);
         return SendMessageW(window->hwnd_, message, wParam, MAKELPARAM(point.x, point.y));
     }
+    if (window && (message == WM_KEYDOWN || message == WM_SYSKEYDOWN) && wParam == VK_ESCAPE) {
+        return SendMessageW(window->hwnd_, message, wParam, lParam);
+    }
 
     if (message == WM_ERASEBKGND) {
         return 1;
@@ -1347,6 +1356,9 @@ LRESULT CALLBACK MainWindow::FullscreenOverlayProc(HWND hwnd, UINT message, WPAR
         return SendMessageW(window->hwnd_, message, wParam, MAKELPARAM(point.x, point.y));
     }
     if (window && message == WM_MOUSEWHEEL) {
+        return SendMessageW(window->hwnd_, message, wParam, lParam);
+    }
+    if (window && (message == WM_KEYDOWN || message == WM_SYSKEYDOWN) && wParam == VK_ESCAPE) {
         return SendMessageW(window->hwnd_, message, wParam, lParam);
     }
 
@@ -1388,6 +1400,9 @@ LRESULT CALLBACK MainWindow::TransportOverlayProc(HWND hwnd, UINT message, WPARA
     if (window && message == WM_MOUSEWHEEL) {
         return SendMessageW(window->hwnd_, message, wParam, lParam);
     }
+    if (window && (message == WM_KEYDOWN || message == WM_SYSKEYDOWN) && wParam == VK_ESCAPE) {
+        return SendMessageW(window->hwnd_, message, wParam, lParam);
+    }
 
     if (window && message == WM_PAINT) {
         window->PaintTransportOverlay(hwnd);
@@ -1404,6 +1419,62 @@ LRESULT CALLBACK MainWindow::TransportOverlayProc(HWND hwnd, UINT message, WPARA
 
     if (message == WM_ERASEBKGND) {
         return 1;
+    }
+
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+LRESULT CALLBACK MainWindow::BufferingOverlayProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    MainWindow* window = nullptr;
+    if (message == WM_NCCREATE) {
+        auto* createStruct = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        window = static_cast<MainWindow*>(createStruct->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(window));
+    } else {
+        window = reinterpret_cast<MainWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    }
+
+    if (message == WM_NCHITTEST) {
+        return HTTRANSPARENT;
+    }
+    if (message == WM_ERASEBKGND) {
+        return 1;
+    }
+    if (message == WM_PAINT) {
+        PAINTSTRUCT paint{};
+        BeginPaint(hwnd, &paint);
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
+
+    return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+LRESULT CALLBACK MainWindow::BufferingHudOverlayProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    MainWindow* window = nullptr;
+    if (message == WM_NCCREATE) {
+        auto* createStruct = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        window = static_cast<MainWindow*>(createStruct->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(window));
+    } else {
+        window = reinterpret_cast<MainWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    }
+
+    if (message == WM_NCHITTEST) {
+        return HTTRANSPARENT;
+    }
+    if (message == WM_ERASEBKGND) {
+        return 1;
+    }
+    if (window && message == WM_TIMER) {
+        window->RenderBufferingHudOverlay(window->bufferingOverlayStats_);
+        return 0;
+    }
+    if (message == WM_PAINT) {
+        PAINTSTRUCT paint{};
+        BeginPaint(hwnd, &paint);
+        EndPaint(hwnd, &paint);
+        return 0;
     }
 
     return DefWindowProcW(hwnd, message, wParam, lParam);
@@ -1535,6 +1606,7 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
                 if (webUiActive_ && webUiPlayerRouteActive_) {
                     UpdateVideoHost();
                 }
+                UpdateBufferingOverlay(&stats);
             }
             if (snapshot.state == PlaybackState::Playing) {
                 RenderPlaybackTick(snapshot, false);
@@ -1554,21 +1626,12 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
         }
 
         LogApp(LogLevel::Error, L"native decode failed message=" + message);
-        StopRuntime();
-        controller_.SetError(message);
-        SetTemporaryPlaybackRate(1.0);
-        SetPlaybackTimer(false);
-        MarkLayoutDirty();
-        EnsureLayout();
-        InvalidateTransportArea();
-        InvalidateFullscreenOverlay();
-        InvalidateRect(hwnd_, nullptr, FALSE);
-        PostWebUiState();
+        FailPlaybackRuntime(message);
         return 0;
     }
     case kRuntimeStopCompleteMessage:
         WaitForAsyncRuntimeStop();
-        PostWebUiState();
+        ContinueRuntimeAfterAsyncStop();
         return 0;
     case kOpenPathMessage: {
         std::unique_ptr<std::filesystem::path> path(reinterpret_cast<std::filesystem::path*>(lParam));
@@ -1662,6 +1725,12 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
     case WM_KEYDOWN:
         OnKeyDown(wParam);
         return 0;
+    case WM_SYSKEYDOWN:
+        if (wParam == VK_ESCAPE) {
+            OnKeyDown(wParam);
+            return 0;
+        }
+        break;
     case WM_DROPFILES:
         OnDropFiles(reinterpret_cast<HDROP>(wParam));
         return 0;
@@ -1690,6 +1759,13 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
             CompleteVideoLongPress();
             return 0;
         }
+        if (wParam == kScrollbarAutoHideTimer) {
+            KillTimer(hwnd_, kScrollbarAutoHideTimer);
+            InvalidateTransportArea();
+            InvalidateFullscreenOverlay();
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return 0;
+        }
         if (wParam == kPlaybackTimer) {
             OnPlaybackTimerTick();
             return 0;
@@ -1704,6 +1780,7 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
         KillTimer(hwnd_, kUiAnimationTimer);
         KillTimer(hwnd_, kFullscreenChromeHideTimer);
         KillTimer(hwnd_, kVideoPressTimer);
+        KillTimer(hwnd_, kScrollbarAutoHideTimer);
         DragAcceptFiles(hwnd_, FALSE);
         SetTemporaryPlaybackRate(1.0);
         if (hdrToneCurveWindow_) {
@@ -1965,6 +2042,100 @@ void MainWindow::MaybeLogNativeSchedulerStats(const NativeVideoQueueStats& stats
     LogRuntime(LogLevel::Debug, L"renderer", renderMessage);
 }
 
+void MainWindow::ResetNativeBufferingWatchdog() {
+    nativeBufferingStartedAt_ = {};
+    nativeBufferingLastProgressAt_ = {};
+    nativeBufferingLastRendered_ = 0;
+    nativeBufferingLastQueueDepth_ = 0;
+    nativeBufferingLastPacketDepth_ = 0;
+    nativeBufferingLastPacketBytes_ = 0;
+    nativeBufferingLastReadAhead_ = std::chrono::milliseconds{0};
+    nativeBufferingLastBufferedEnd_ = std::chrono::milliseconds{0};
+    nativeBufferingLastClockPosition_ = std::chrono::milliseconds{0};
+}
+
+bool MainWindow::CheckNativeBufferingWatchdog(const PlaybackSessionSnapshot& snapshot,
+                                              const NativeVideoQueueStats& stats) {
+    if (snapshot.state != PlaybackState::Playing || !stats.buffering) {
+        ResetNativeBufferingWatchdog();
+        return false;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const bool firstSample = nativeBufferingStartedAt_.time_since_epoch().count() == 0;
+    const bool progressed =
+        firstSample ||
+        stats.rendered != nativeBufferingLastRendered_ ||
+        stats.queueDepth != nativeBufferingLastQueueDepth_ ||
+        stats.packetQueueDepth != nativeBufferingLastPacketDepth_ ||
+        stats.packetQueueBytes != nativeBufferingLastPacketBytes_ ||
+        stats.readAheadDuration != nativeBufferingLastReadAhead_ ||
+        stats.bufferedEnd != nativeBufferingLastBufferedEnd_ ||
+        stats.clockPosition != nativeBufferingLastClockPosition_;
+
+    if (firstSample) {
+        nativeBufferingStartedAt_ = now;
+    }
+    if (progressed) {
+        nativeBufferingLastProgressAt_ = now;
+        nativeBufferingLastRendered_ = stats.rendered;
+        nativeBufferingLastQueueDepth_ = stats.queueDepth;
+        nativeBufferingLastPacketDepth_ = stats.packetQueueDepth;
+        nativeBufferingLastPacketBytes_ = stats.packetQueueBytes;
+        nativeBufferingLastReadAhead_ = stats.readAheadDuration;
+        nativeBufferingLastBufferedEnd_ = stats.bufferedEnd;
+        nativeBufferingLastClockPosition_ = stats.clockPosition;
+        return false;
+    }
+
+    const auto waitingFor = now - nativeBufferingStartedAt_;
+    const auto noProgressFor = nativeBufferingLastProgressAt_.time_since_epoch().count() == 0
+                                   ? waitingFor
+                                   : now - nativeBufferingLastProgressAt_;
+    if (waitingFor < kNativeBufferingHardTimeout &&
+        noProgressFor < kNativeBufferingNoProgressTimeout) {
+        return false;
+    }
+
+    std::wstring message =
+        L"Playback stalled while waiting for native frames at " +
+        FormatTimecode(stats.clockPosition) +
+        L" decoder=" + stats.decoder +
+        L" rendered=" + std::to_wstring(stats.rendered) +
+        L" queue=" + std::to_wstring(stats.queueDepth) +
+        L" packets=" + std::to_wstring(stats.packetQueueDepth) +
+        L" read_ahead_ms=" + std::to_wstring(stats.readAheadDuration.count()) +
+        L" wait_ms=" + std::to_wstring(
+            std::chrono::duration_cast<std::chrono::milliseconds>(waitingFor).count()) +
+        L" no_progress_ms=" + std::to_wstring(
+            std::chrono::duration_cast<std::chrono::milliseconds>(noProgressFor).count());
+    FailPlaybackRuntime(message);
+    return true;
+}
+
+void MainWindow::FailPlaybackRuntime(const std::wstring& message) {
+    LogApp(LogLevel::Error, L"playback runtime failed message=" + message);
+    ClearDeferredRuntimeStart();
+    deferredPausedFrameRefresh_ = false;
+    deferredPausedFrameRefreshForceRestart_ = false;
+    if (RuntimeStopInProgress()) {
+        controller_.SetPlaybackRate(1.0);
+        temporaryRateActive_ = false;
+    } else {
+        SetTemporaryPlaybackRate(1.0);
+    }
+    StopRuntimeAsync(true);
+    controller_.SetError(message);
+    SetPlaybackTimer(false);
+    ResetNativeBufferingWatchdog();
+    MarkLayoutDirty();
+    EnsureLayout();
+    InvalidateTransportArea();
+    InvalidateFullscreenOverlay();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    PostWebUiState();
+}
+
 void MainWindow::StartUiAnimationTimer() const {
     if (hwnd_) {
         SetTimer(hwnd_, kUiAnimationTimer, kUiAnimationTimerMs, nullptr);
@@ -2175,6 +2346,7 @@ void MainWindow::UpdateUiAnimations() {
         std::abs(fullscreenTransportAmount_ - previousFullscreenTransportAmount) > 0.0001;
     const bool subtitleMenuValueChanged = std::abs(subtitleMenuAmount_ - previousSubtitleMenuAmount) > 0.0001;
     const bool volumeHoverValueChanged = std::abs(volumeHoverAmount_ - previousVolumeHoverAmount) > 0.0001;
+    const bool scrollbarFadeActive = ScrollbarFadeActive(now);
 
     if (sidebarValueChanged || fullscreenTransportValueChanged || subtitleMenuValueChanged) {
         MarkLayoutDirty();
@@ -2213,6 +2385,11 @@ void MainWindow::UpdateUiAnimations() {
     if (subtitleMenuValueChanged) {
         UpdateVideoHost();
         UpdateSubtitleMenuOverlay();
+        InvalidateTransportArea();
+        InvalidateFullscreenOverlay();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+    if (scrollbarFadeActive) {
         InvalidateTransportArea();
         InvalidateFullscreenOverlay();
         InvalidateRect(hwnd_, nullptr, FALSE);
@@ -2257,7 +2434,8 @@ void MainWindow::UpdateUiAnimations() {
         fullscreenTransportComplete &&
         subtitleMenuComplete &&
         volumeHoverComplete &&
-        commandAnimationsComplete) {
+        commandAnimationsComplete &&
+        !scrollbarFadeActive) {
         KillTimer(hwnd_, kUiAnimationTimer);
     } else {
         StartUiAnimationTimer();
@@ -2535,6 +2713,28 @@ void MainWindow::SetFullscreenTransportTarget(const bool visible) {
     PostWebUiState();
 }
 
+void MainWindow::MarkSettingsScrollbarActive() {
+    settingsScrollLastActiveAt_ = std::chrono::steady_clock::now();
+    SetTimer(hwnd_, kScrollbarAutoHideTimer, kScrollbarAutoHideTimerMs, nullptr);
+    StartUiAnimationTimer();
+}
+
+void MainWindow::MarkSubtitleMenuScrollbarActive() {
+    subtitleMenuScrollLastActiveAt_ = std::chrono::steady_clock::now();
+    SetTimer(hwnd_, kScrollbarAutoHideTimer, kScrollbarAutoHideTimerMs, nullptr);
+    StartUiAnimationTimer();
+}
+
+bool MainWindow::ScrollbarFadeActive(const std::chrono::steady_clock::time_point now) const {
+    const auto active = [now](const std::chrono::steady_clock::time_point lastActiveAt) {
+        return lastActiveAt.time_since_epoch().count() != 0 &&
+               now - lastActiveAt < kScrollbarVisibleDuration + kScrollbarFadeDuration;
+    };
+    return draggingSettingsScrollThumb_ ||
+           active(settingsScrollLastActiveAt_) ||
+           active(subtitleMenuScrollLastActiveAt_);
+}
+
 void MainWindow::SetTemporaryPlaybackRate(const double rate) {
     const auto snapshot = controller_.Snapshot();
     if (!snapshot.media.has_value()) {
@@ -2603,22 +2803,41 @@ void MainWindow::SetPlaybackTimer(const bool playing) {
 
 void MainWindow::OnPlaybackTimerTick() {
     bool nativeBuffering = false;
+    const bool runtimeTransition = RuntimeStopInProgress() || deferredRuntimeStart_;
     if (backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
         nativeVideoDecoder_) {
         const auto current = controller_.Snapshot();
         if (current.state == PlaybackState::Playing &&
             current.media.has_value() &&
             current.media->hasVideo) {
-            const auto stats = nativeVideoDecoder_->Stats();
-            nativeBuffering = stats.buffering;
-            if (nativeBuffering) {
-                controller_.SyncClock(stats.clockPosition);
+            if (!nativeVideoDecoder_->IsRunning()) {
+                const auto remaining =
+                    current.media->duration.count() > 0
+                        ? current.media->duration - current.position
+                        : std::chrono::milliseconds{0};
+                if (runtimeTransition) {
+                    nativeBuffering = true;
+                } else if (remaining > std::chrono::seconds{2} || current.media->duration.count() <= 0) {
+                    FailPlaybackRuntime(L"Native video decoder stopped before playback completed at " +
+                                        FormatTimecode(current.position));
+                    return;
+                }
             } else {
-                ResumeNativeSeekPrerollAudio(stats.clockPosition);
+                const auto stats = nativeVideoDecoder_->Stats();
+                nativeBuffering = stats.buffering;
+                if (nativeBuffering) {
+                    controller_.SyncClock(stats.clockPosition);
+                    if (CheckNativeBufferingWatchdog(current, stats)) {
+                        return;
+                    }
+                } else {
+                    ResetNativeBufferingWatchdog();
+                    ResumeNativeSeekPrerollAudio(stats.clockPosition);
+                }
             }
         }
     }
-    if (!nativeBuffering) {
+    if (!nativeBuffering && !runtimeTransition) {
         controller_.UpdateClock();
     }
     const auto snapshot = controller_.Snapshot();
@@ -2635,17 +2854,63 @@ void MainWindow::OnPlaybackTimerTick() {
             MaybeLogNativeSchedulerStats(nativeVideoDecoder_->Stats());
             InvalidateRect(hwnd_, &transportBar_, FALSE);
             InvalidateFullscreenOverlay();
+            UpdateBufferingOverlay();
             PostWebUiState(false);
             return;
         }
         // Paused keeps the freeze frame captured by PausePlayback; other
         // stopped states clear the runtime frame as before.
         const bool keepFrame = (snapshot.state == PlaybackState::Paused);
-        StopRuntime(keepFrame ? false : true);
+        if (RuntimeBackendsRunning()) {
+            StopRuntimeAsync(keepFrame ? false : true);
+        } else {
+            FinishRuntimeStopVisuals(keepFrame ? false : true, true);
+        }
         SetPlaybackTimer(false);
         InvalidateRect(hwnd_, nullptr, FALSE);
         PostWebUiState();
     } else {
+        if (snapshot.media.has_value()) {
+            const auto remaining =
+                snapshot.media->duration.count() > 0
+                    ? snapshot.media->duration - snapshot.position
+                    : std::chrono::milliseconds{0};
+            const bool beforeEnd = remaining > std::chrono::seconds{2} ||
+                                   snapshot.media->duration.count() <= 0;
+            if (beforeEnd && !runtimeTransition) {
+                if (backend_ == PlaybackBackend::EmbeddedFfplay &&
+                    !playbackPlayer_.IsRunning()) {
+                    FailPlaybackRuntime(L"External FFplay process exited before playback completed at " +
+                                        FormatTimecode(snapshot.position));
+                    return;
+                }
+                if (backend_ == PlaybackBackend::RawFrameBridge &&
+                    snapshot.media->hasVideo &&
+                    !videoDecoder_.IsRunning()) {
+                    FailPlaybackRuntime(L"Internal video decoder stopped before playback completed at " +
+                                        FormatTimecode(snapshot.position));
+                    return;
+                }
+
+                const auto runtimeSettings = controller_.Settings();
+                const bool audioRequired =
+                    snapshot.media->hasAudio &&
+                    runtimeSettings.audio.selectedTrackIndex != anvil::playback::kAudioTrackOff;
+                const bool audioOwnedByNativeVideoDemuxer =
+                    backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+                    snapshot.media->hasVideo &&
+                    snapshot.media->hasAudio &&
+                    IsNetworkMediaPath(snapshot.media->path);
+                if (audioRequired &&
+                    backend_ != PlaybackBackend::EmbeddedFfplay &&
+                    !audioOwnedByNativeVideoDemuxer &&
+                    !audioPlayer_.IsRunning()) {
+                    FailPlaybackRuntime(L"Audio renderer stopped before playback completed at " +
+                                        FormatTimecode(snapshot.position));
+                    return;
+                }
+            }
+        }
         if (backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
             nativeVideoDecoder_ &&
             nativeVideoDecoder_->IsRunning() &&
@@ -2656,6 +2921,7 @@ void MainWindow::OnPlaybackTimerTick() {
             if (webUiActive_ && webUiPlayerRouteActive_) {
                 UpdateVideoHost();
             }
+            UpdateBufferingOverlay(&stats);
         }
         RenderPlaybackTick(snapshot);
         PostWebUiState(false);
@@ -3070,6 +3336,7 @@ void MainWindow::StopRuntimeAsync(const bool clearVideoFrame) {
 
 void MainWindow::StopRuntimeBackends() {
     nativeSeekPrerollHoldingAudio_ = false;
+    ResetNativeBufferingWatchdog();
     playbackPlayer_.Stop();
     videoDecoder_.Stop();
     if (nativeVideoDecoder_) {
@@ -3126,6 +3393,7 @@ void MainWindow::FinishRuntimeStopVisuals(const bool clearVideoFrame, const bool
             ShowWindow(videoHost_, SW_HIDE);
         }
     }
+    UpdateBufferingOverlay();
 }
 
 void MainWindow::WaitForAsyncRuntimeStop() {
@@ -3137,6 +3405,115 @@ void MainWindow::WaitForAsyncRuntimeStop() {
         LogApp(LogLevel::Debug, L"runtime async stop complete");
         FinishRuntimeStopVisuals(runtimeStopAsyncClearFrame_.load(), true);
     }
+}
+
+bool MainWindow::RuntimeStopInProgress() const {
+    return runtimeStopAsyncInProgress_.load();
+}
+
+bool MainWindow::RuntimeBackendsRunning() const {
+    return playbackPlayer_.IsRunning() ||
+           videoDecoder_.IsRunning() ||
+           audioPlayer_.IsRunning() ||
+           (nativeVideoDecoder_ && nativeVideoDecoder_->IsRunning());
+}
+
+void MainWindow::ClearDeferredRuntimeStart() {
+    deferredRuntimeStart_ = false;
+    deferredRuntimeRestart_ = false;
+    deferredRuntimeWaitForPreroll_ = false;
+}
+
+void MainWindow::QueueDeferredRuntimeStart(const bool restart, const bool waitForPreroll) {
+    if (!deferredRuntimeStart_) {
+        deferredRuntimeWaitForPreroll_ = waitForPreroll;
+    } else {
+        deferredRuntimeWaitForPreroll_ = deferredRuntimeWaitForPreroll_ && waitForPreroll;
+    }
+    deferredRuntimeStart_ = true;
+    deferredRuntimeRestart_ = deferredRuntimeRestart_ || restart;
+    deferredPausedFrameRefresh_ = false;
+    deferredPausedFrameRefreshForceRestart_ = false;
+}
+
+void MainWindow::QueuePausedNativeFrameRefresh(const bool forceDecoderRestart) {
+    deferredPausedFrameRefresh_ = true;
+    deferredPausedFrameRefreshForceRestart_ =
+        deferredPausedFrameRefreshForceRestart_ || forceDecoderRestart;
+}
+
+void MainWindow::RequestRuntimeStart(const bool restart, const bool waitForPreroll) {
+    const auto snapshot = controller_.Snapshot();
+    if (snapshot.state != PlaybackState::Playing ||
+        !snapshot.media.has_value() ||
+        (!snapshot.media->hasVideo && !snapshot.media->hasAudio)) {
+        ClearDeferredRuntimeStart();
+        return;
+    }
+
+    deferredPausedFrameRefresh_ = false;
+    deferredPausedFrameRefreshForceRestart_ = false;
+    if (RuntimeStopInProgress()) {
+        QueueDeferredRuntimeStart(restart, waitForPreroll);
+        LogApp(LogLevel::Debug,
+               L"runtime start deferred while stop is pending restart=" +
+                   std::wstring(restart ? L"true" : L"false"));
+        SetPlaybackTimer(true);
+        return;
+    }
+
+    if (RuntimeBackendsRunning()) {
+        QueueDeferredRuntimeStart(restart, waitForPreroll);
+        LogApp(LogLevel::Debug,
+               L"runtime restart queued restart=" +
+                   std::wstring(restart ? L"true" : L"false"));
+        StopRuntimeAsync(false);
+        SetPlaybackTimer(true);
+        return;
+    }
+
+    if (StartRuntime(snapshot, restart, waitForPreroll)) {
+        SetPlaybackTimer(true);
+    }
+}
+
+void MainWindow::ContinueRuntimeAfterAsyncStop() {
+    const bool startRequested = deferredRuntimeStart_;
+    bool restart = deferredRuntimeRestart_;
+    const bool waitForPreroll = deferredRuntimeWaitForPreroll_;
+    const bool refreshPausedFrame = deferredPausedFrameRefresh_;
+    const bool forcePausedFrameRefresh = deferredPausedFrameRefreshForceRestart_;
+    ClearDeferredRuntimeStart();
+    deferredPausedFrameRefresh_ = false;
+    deferredPausedFrameRefreshForceRestart_ = false;
+
+    const auto snapshot = controller_.Snapshot();
+    if (snapshot.state == PlaybackState::Playing &&
+        snapshot.media.has_value() &&
+        (snapshot.media->hasVideo || snapshot.media->hasAudio)) {
+        if (!startRequested) {
+            restart = true;
+        }
+        if (StartRuntime(snapshot, restart, waitForPreroll)) {
+            SetPlaybackTimer(true);
+        }
+    } else {
+        SetPlaybackTimer(false);
+        if (snapshot.state == PlaybackState::Paused &&
+            refreshPausedFrame &&
+            snapshot.media.has_value() &&
+            snapshot.media->hasVideo &&
+            backend_ == PlaybackBackend::NativeFfmpegD3D11) {
+            RefreshPausedNativeFrame(snapshot, forcePausedFrameRefresh);
+        }
+    }
+
+    MarkLayoutDirty();
+    EnsureLayout();
+    InvalidateTransportArea();
+    InvalidateFullscreenOverlay();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    PostWebUiState();
 }
 
 bool MainWindow::CaptureLatestNativeFrame() {
@@ -3172,16 +3549,24 @@ void MainWindow::RenderHeldNativeFrame(const bool logRepaint) {
     heldNativeFrameNeedsPresent_ = false;
 }
 
-void MainWindow::StartRuntime(const PlaybackSessionSnapshot& snapshot,
+bool MainWindow::StartRuntime(const PlaybackSessionSnapshot& snapshot,
                               const bool restart,
                               const bool waitForPreroll) {
     if (!snapshot.media.has_value()) {
-        return;
+        return false;
     }
 
     pendingPausedFrameRefresh_ = false;
-    WaitForAsyncRuntimeStop();
-    StopRuntime(false);
+    ResetNativeBufferingWatchdog();
+    if (RuntimeStopInProgress()) {
+        QueueDeferredRuntimeStart(restart, waitForPreroll);
+        return false;
+    }
+    if (RuntimeBackendsRunning()) {
+        QueueDeferredRuntimeStart(restart, waitForPreroll);
+        StopRuntimeAsync(false);
+        return false;
+    }
 
     if (backend_ == PlaybackBackend::EmbeddedFfplay) {
         const bool started = playbackPlayer_.Start(hwnd_,
@@ -3193,12 +3578,15 @@ void MainWindow::StartRuntime(const PlaybackSessionSnapshot& snapshot,
         LogApp(started ? (restart ? LogLevel::Debug : LogLevel::Info) : LogLevel::Error,
                std::wstring(L"external ffplay playback ") + (restart ? L"restart=" : L"start=") + (started ? L"true" : L"false"));
         LogApp(LogLevel::Debug, L"ffplay command=" + playbackPlayer_.LastCommandLine());
-        return;
+        if (!started) {
+            FailPlaybackRuntime(L"External FFplay failed to start");
+            return false;
+        }
+        return true;
     }
 
     if (backend_ == PlaybackBackend::NativeFfmpegD3D11) {
-        StartNativeRuntime(snapshot, restart, waitForPreroll);
-        return;
+        return StartNativeRuntime(snapshot, restart, waitForPreroll);
     }
 
     // RawFrameBridge (--internal-playback): legacy ffmpeg raw-pipe path.
@@ -3232,6 +3620,13 @@ void MainWindow::StartRuntime(const PlaybackSessionSnapshot& snapshot,
     if (snapshot.media->hasAudio) {
         LogApp(LogLevel::Debug, L"wasapi audio=" + audioPlayer_.LastStatus());
     }
+    if (!videoStarted || !audioStarted) {
+        FailPlaybackRuntime(L"Internal playback runtime failed to start video=" +
+                            std::wstring(videoStarted ? L"true" : L"false") +
+                            L" audio=" + std::wstring(audioStarted ? L"true" : L"false"));
+        return false;
+    }
+    return true;
 }
 
 void MainWindow::EnsureVideoHost() {
@@ -3287,7 +3682,7 @@ void MainWindow::EnsureVideoHost() {
     LogApp(LogLevel::Info, L"native video host window created");
 }
 
-void MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
+bool MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
                                     const bool restart,
                                     const bool waitForPreroll) {
     nativeSeekPrerollHoldingAudio_ = false;
@@ -3438,6 +3833,13 @@ void MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
     if (snapshot.media->hasAudio) {
         LogApp(LogLevel::Debug, L"wasapi audio=" + audioPlayer_.LastStatus());
     }
+    if (!videoStarted || !audioStarted) {
+        FailPlaybackRuntime(L"Native playback runtime failed to start video=" +
+                            std::wstring(videoStarted ? L"true" : L"false") +
+                            L" audio=" + std::wstring(audioStarted ? L"true" : L"false"));
+        return false;
+    }
+    return true;
 }
 
 bool MainWindow::SeekNativeRuntime(const PlaybackSessionSnapshot& snapshot) {
@@ -3447,6 +3849,7 @@ bool MainWindow::SeekNativeRuntime(const PlaybackSessionSnapshot& snapshot) {
         (!snapshot.media->hasVideo && !snapshot.media->hasAudio)) {
         return false;
     }
+    ResetNativeBufferingWatchdog();
     const auto runtimeSettings = controller_.Settings();
     const bool useSharedNetworkDemuxer =
         snapshot.media->hasVideo &&
@@ -3500,8 +3903,8 @@ bool MainWindow::SeekNativeRuntime(const PlaybackSessionSnapshot& snapshot) {
     }
 
     pendingPausedFrameRefresh_ = false;
-    nativeFrameHoldVisible_ = false;
-    heldNativeFrameNeedsPresent_ = false;
+    nativeFrameHoldVisible_ = heldNativeFrame_.has_value();
+    heldNativeFrameNeedsPresent_ = heldNativeFrame_.has_value() && heldNativeFrame_->HasContent();
     lastNativeStatsLog_ = {};
     if (d3dRenderer_) {
         d3dRenderer_->ResetRenderStats();
@@ -3509,6 +3912,7 @@ bool MainWindow::SeekNativeRuntime(const PlaybackSessionSnapshot& snapshot) {
     if (webUiActive_ && webUiPlayerRouteActive_) {
         UpdateVideoHost();
     }
+    UpdateBufferingOverlay();
     LogApp(LogLevel::Debug, L"native runtime seek position=" + FormatTimecode(snapshot.position));
     SetPlaybackTimer(true);
     return true;
@@ -3642,6 +4046,10 @@ void MainWindow::RefreshPausedNativeFrame(const PlaybackSessionSnapshot& snapsho
         !nativeVideoDecoder_) {
         return;
     }
+    if (RuntimeStopInProgress()) {
+        QueuePausedNativeFrameRefresh(forceDecoderRestart);
+        return;
+    }
 
     if (!forceDecoderRestart && d3dRenderer_) {
         const auto settings = controller_.Settings();
@@ -3668,7 +4076,11 @@ void MainWindow::RefreshPausedNativeFrame(const PlaybackSessionSnapshot& snapsho
     if (forceDecoderRestart) {
         LogApp(LogLevel::Debug, L"paused native frame refresh requires decoder restart");
     }
-    StopRuntime(false);
+    if (RuntimeBackendsRunning()) {
+        QueuePausedNativeFrameRefresh(forceDecoderRestart);
+        StopRuntimeAsync(false);
+        return;
+    }
     nativeFrameHoldVisible_ = heldNativeFrame_.has_value();
     pendingPausedFrameRefresh_ = true;
     heldNativeFrameNeedsPresent_ = false;
@@ -3722,8 +4134,20 @@ void MainWindow::RefreshPausedNativeFrame(const PlaybackSessionSnapshot& snapsho
 
 void MainWindow::OpenPath(const std::filesystem::path& path, const bool autoplay) {
     LogApp(LogLevel::Info, L"open path=" + path.wstring());
-    SetTemporaryPlaybackRate(1.0);
-    StopRuntime();
+    ClearDeferredRuntimeStart();
+    deferredPausedFrameRefresh_ = false;
+    deferredPausedFrameRefreshForceRestart_ = false;
+    if (RuntimeStopInProgress()) {
+        controller_.SetPlaybackRate(1.0);
+        temporaryRateActive_ = false;
+    } else {
+        SetTemporaryPlaybackRate(1.0);
+    }
+    if (RuntimeBackendsRunning() || RuntimeStopInProgress()) {
+        StopRuntimeAsync(true);
+    } else {
+        FinishRuntimeStopVisuals(true, true);
+    }
     SetPlaybackTimer(false);
     RefreshCapabilityCache();
     const bool opened = controller_.OpenMedia(path, false);
@@ -3837,28 +4261,9 @@ void MainWindow::UpdateInspectorMediaLists(const std::filesystem::path& path) {
 
 void MainWindow::StartPlayback() {
     nativeSeekPrerollHoldingAudio_ = false;
+    deferredPausedFrameRefresh_ = false;
+    deferredPausedFrameRefreshForceRestart_ = false;
     const auto before = controller_.Snapshot();
-    const auto beforeSettings = controller_.Settings();
-    const bool nativeEnhancedPlaybackGate =
-        backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
-        before.state == PlaybackState::Paused &&
-        before.media.has_value() &&
-        before.media->hasVideo &&
-        NativeCmv4ToggleRequiresDecoderRestart(before) &&
-        Cmv4ApproxActiveForPlayback(before, beforeSettings.video) &&
-        beforeSettings.video.dolbyVision != anvil::playback::DolbyVisionMode::Off;
-    if (nativeEnhancedPlaybackGate && !PrepareNativeEnhancedPlaybackBeforePlay(before)) {
-        InvalidateTransportArea();
-        InvalidateFullscreenOverlay();
-        PostWebUiState();
-        return;
-    }
-
-    const bool nativeRuntimePreparedBeforePlay =
-        nativeEnhancedPlaybackGate &&
-        nativeVideoDecoder_ &&
-        nativeVideoDecoder_->IsRunning() &&
-        !nativeVideoDecoder_->OneShotFrame();
 
     controller_.Play();
     const auto snapshot = controller_.Snapshot();
@@ -3869,8 +4274,9 @@ void MainWindow::StartPlayback() {
         const auto settings = controller_.Settings();
         const bool enhancedPlaybackNeedsRestart = NativeCmv4ToggleNeedsDecoderRefresh(snapshot, settings.video);
         const bool resumedNativeRuntime =
-            (before.state == PlaybackState::Paused || nativeRuntimePreparedBeforePlay) &&
+            before.state == PlaybackState::Paused &&
             backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+            !RuntimeStopInProgress() &&
             nativeVideoDecoder_ &&
             nativeVideoDecoder_->IsRunning() &&
             !nativeVideoDecoder_->OneShotFrame() &&
@@ -3897,6 +4303,10 @@ void MainWindow::StartPlayback() {
                 }
                 LogApp(audioStarted ? LogLevel::Debug : LogLevel::Warning,
                        L"native paused runtime resume audio=" + std::wstring(audioStarted ? L"true" : L"false"));
+                if (!audioStarted) {
+                    FailPlaybackRuntime(L"Native audio failed to resume");
+                    return;
+                }
             } else {
                 audioPlayer_.Stop();
             }
@@ -3911,7 +4321,7 @@ void MainWindow::StartPlayback() {
                            L" enhanced_decoder=" +
                            std::wstring(nativeVideoDecoder_->DolbyVisionEnhancementDecodeEnabled() ? L"true" : L"false"));
             }
-            StartRuntime(snapshot, false);
+            RequestRuntimeStart(false, false);
         }
         SetPlaybackTimer(true);
     }
@@ -3925,10 +4335,18 @@ void MainWindow::StartPlayback() {
 
 void MainWindow::PausePlayback() {
     nativeSeekPrerollHoldingAudio_ = false;
+    ClearDeferredRuntimeStart();
     controller_.Pause();
-    SetTemporaryPlaybackRate(1.0);
+    if (RuntimeStopInProgress()) {
+        controller_.SetPlaybackRate(1.0);
+        temporaryRateActive_ = false;
+    } else {
+        SetTemporaryPlaybackRate(1.0);
+    }
     const auto snapshot = controller_.Snapshot();
-    if (backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+    if (RuntimeStopInProgress()) {
+        SetPlaybackTimer(false);
+    } else if (backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
         nativeVideoDecoder_ &&
         nativeVideoDecoder_->IsRunning() &&
         d3dRenderer_) {
@@ -3950,7 +4368,7 @@ void MainWindow::PausePlayback() {
         }
         audioPlayer_.Pause(snapshot.position);
     } else {
-        StopRuntime(false);
+        StopRuntimeAsync(false);
     }
     SetPlaybackTimer(false);
     MarkLayoutDirty();
@@ -3971,9 +4389,17 @@ void MainWindow::TogglePlayback() {
 }
 
 void MainWindow::StopPlayback() {
+    ClearDeferredRuntimeStart();
+    deferredPausedFrameRefresh_ = false;
+    deferredPausedFrameRefreshForceRestart_ = false;
     controller_.Stop();
-    SetTemporaryPlaybackRate(1.0);
-    StopRuntime();
+    if (RuntimeStopInProgress()) {
+        controller_.SetPlaybackRate(1.0);
+        temporaryRateActive_ = false;
+    } else {
+        SetTemporaryPlaybackRate(1.0);
+    }
+    StopRuntimeAsync(true);
     SetPlaybackTimer(false);
     MarkLayoutDirty();
     EnsureLayout();
@@ -3988,8 +4414,7 @@ void MainWindow::RestartPlaybackIfPlaying(const bool waitForPreroll) {
     if (snapshot.state == PlaybackState::Playing &&
         snapshot.media.has_value() &&
         (snapshot.media->hasVideo || snapshot.media->hasAudio)) {
-        StartRuntime(snapshot, true, waitForPreroll);
-        SetPlaybackTimer(true);
+        RequestRuntimeStart(true, waitForPreroll);
     }
 }
 
@@ -3997,13 +4422,16 @@ void MainWindow::SeekRelative(const std::chrono::milliseconds delta) {
     const auto before = controller_.Snapshot();
     controller_.SeekRelative(delta);
     const auto after = controller_.Snapshot();
-    if (before.state == PlaybackState::Paused &&
+    if (after.state == PlaybackState::Paused &&
         after.media.has_value() &&
         after.media->hasVideo &&
         backend_ == PlaybackBackend::NativeFfmpegD3D11) {
         RefreshPausedNativeFrame(after);
-    } else if (!(before.state == PlaybackState::Playing && SeekNativeRuntime(after))) {
-        RestartPlaybackIfPlaying();
+    } else if (after.state == PlaybackState::Playing &&
+               !(before.state == PlaybackState::Playing &&
+                 !RuntimeStopInProgress() &&
+                 SeekNativeRuntime(after))) {
+        RestartPlaybackIfPlaying(false);
     }
     InvalidateRect(hwnd_, nullptr, FALSE);
     PostWebUiState();
@@ -4013,13 +4441,16 @@ void MainWindow::SeekToPosition(const std::chrono::milliseconds position) {
     const auto before = controller_.Snapshot();
     controller_.Seek(position);
     const auto after = controller_.Snapshot();
-    if (before.state == PlaybackState::Paused &&
+    if (after.state == PlaybackState::Paused &&
         after.media.has_value() &&
         after.media->hasVideo &&
         backend_ == PlaybackBackend::NativeFfmpegD3D11) {
         RefreshPausedNativeFrame(after);
-    } else if (!(before.state == PlaybackState::Playing && SeekNativeRuntime(after))) {
-        RestartPlaybackIfPlaying();
+    } else if (after.state == PlaybackState::Playing &&
+               !(before.state == PlaybackState::Playing &&
+                 !RuntimeStopInProgress() &&
+                 SeekNativeRuntime(after))) {
+        RestartPlaybackIfPlaying(false);
     }
     InvalidateFullscreenOverlay();
     InvalidateRect(hwnd_, nullptr, FALSE);
@@ -4089,6 +4520,11 @@ void MainWindow::ToggleFullscreen() {
     ApplyWindowChrome();
     MarkLayoutDirty();
     EnsureLayout();
+    if (fullscreen_ &&
+        hasLastFullscreenCursorClient_ &&
+        IsFullscreenTransportActivationPoint(lastFullscreenCursorClient_)) {
+        ShowFullscreenTransport(L"enter_fullscreen_activation");
+    }
     InvalidateRect(hwnd_, nullptr, FALSE);
     PostWebUiState();
 }
