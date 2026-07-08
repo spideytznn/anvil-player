@@ -1,5 +1,6 @@
 export type LibraryView = 'home' | 'movies' | 'series' | 'folders'
 export type SortKey = 'recent' | 'title' | 'rating' | 'year'
+export type MediaFilterKey = 'all' | 'unwatched' | 'watched' | 'favorites' | 'inProgress'
 export type SourceKind = 'Emby' | 'Local' | 'WebDAV'
 export type SourceStatus = 'online' | 'draft'
 
@@ -43,6 +44,7 @@ export interface MediaItem {
   rating: number
   runtime: string
   sourceId: string
+  libraryViewId?: string
   genres: string[]
   country: string
   quality: string
@@ -57,11 +59,33 @@ export interface MediaItem {
   episodes?: EpisodeItem[]
 }
 
+export interface LibraryHomeCard {
+  id: string
+  sourceId: string
+  title: string
+  subtitle: string
+  image: string
+  kind: 'view' | 'item'
+  viewId?: string
+  mediaType?: MediaItem['type']
+  itemId?: string
+}
+
+export interface LibraryHomeSection {
+  id: string
+  sourceId: string
+  title: string
+  layout: 'landscape' | 'poster'
+  cards: LibraryHomeCard[]
+}
+
 export interface LibraryQuery {
   navKey: NavKey
   view: LibraryView
   search: string
   sortKey: SortKey
+  filterKey?: MediaFilterKey
+  libraryViewId?: string
 }
 
 export interface SourceDraft {

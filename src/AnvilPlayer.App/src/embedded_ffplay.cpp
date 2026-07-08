@@ -4,6 +4,7 @@
 #include "AnvilPlayer/App/ui_draw.h"
 
 #include <algorithm>
+#include <cwctype>
 #include <system_error>
 
 namespace anvil::app {
@@ -48,6 +49,15 @@ std::filesystem::path FfplayExecutablePath() {
     }
 
     return L"ffplay.exe";
+}
+
+bool IsNetworkMediaPath(const std::filesystem::path& path) {
+    std::wstring value = path.wstring();
+    std::transform(value.begin(), value.end(), value.begin(), [](const wchar_t ch) {
+        return static_cast<wchar_t>(std::towlower(ch));
+    });
+    return value.rfind(L"http://", 0) == 0 ||
+           value.rfind(L"https://", 0) == 0;
 }
 
 std::wstring DolbyVisionLibplaceboFilter() {
@@ -104,10 +114,11 @@ bool EmbeddedFfplayPlayer::Start(HWND parent,
     const int volumePercent = std::clamp(static_cast<int>(volume * 100.0 + 0.5), 0, 100);
     const int playbackWidth = std::max(1, RectWidth(bounds));
     const int playbackHeight = std::max(1, RectHeight(bounds));
+    const bool networkMedia = IsNetworkMediaPath(mediaPath);
     std::wstring commandLine =
         QuoteArgument(FfplayExecutablePath().wstring()) +
-        L" -hide_banner -loglevel error -autoexit "
-        L"-framedrop -noborder "
+        L" -hide_banner -loglevel warning -autoexit "
+        L"-hwaccel d3d11va -framedrop -noborder "
         L"-window_title " +
         QuoteArgument(windowTitle_) +
         L" -x " +
@@ -117,6 +128,17 @@ bool EmbeddedFfplayPlayer::Start(HWND parent,
         L" -ss " +
         FormatFfmpegSeekTime(startPosition) +
         L" -volume " + std::to_wstring(volumePercent);
+    if (networkMedia) {
+        commandLine +=
+            L" -rw_timeout 15000000"
+            L" -seekable 1"
+            L" -http_seekable 1"
+            L" -reconnect_on_network_error 1"
+            L" -reconnect_streamed 1"
+            L" -reconnect_delay_max 2"
+            L" -user_agent " +
+            QuoteArgument(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36");
+    }
     if (useLibplaceboDolbyVision) {
         commandLine += L" -vf " + QuoteArgument(DolbyVisionLibplaceboFilter());
     }
@@ -200,7 +222,18 @@ void EmbeddedFfplayPlayer::SetBounds(const RECT bounds) {
     std::scoped_lock lock(windowMutex_);
     pendingBounds_ = bounds;
     if (childWindow_ && IsWindow(childWindow_)) {
-        MoveWindow(childWindow_, bounds.left, bounds.top, RectWidth(bounds), RectHeight(bounds), TRUE);
+        if (RectWidth(bounds) <= 0 || RectHeight(bounds) <= 0) {
+            ShowWindow(childWindow_, SW_HIDE);
+            return;
+        }
+        SetWindowPos(childWindow_,
+                     HWND_TOP,
+                     bounds.left,
+                     bounds.top,
+                     RectWidth(bounds),
+                     RectHeight(bounds),
+                     SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        ShowWindow(childWindow_, SW_SHOWNOACTIVATE);
     }
 }
 
@@ -250,16 +283,23 @@ void EmbeddedFfplayPlayer::AttachWindow(HWND parent, HWND child, RECT bounds) {
         }
     }
 
-    MoveWindow(child, bounds.left, bounds.top, RectWidth(bounds), RectHeight(bounds), TRUE);
+    const int width = RectWidth(bounds);
+    const int height = RectHeight(bounds);
+    if (width <= 0 || height <= 0) {
+        MoveWindow(child, 0, 0, 1, 1, TRUE);
+        ShowWindow(child, SW_HIDE);
+        return;
+    }
+
     SetWindowPos(child,
-                 HWND_BOTTOM,
+                 HWND_TOP,
                  bounds.left,
                  bounds.top,
-                 RectWidth(bounds),
-                 RectHeight(bounds),
+                 width,
+                 height,
                  SWP_NOACTIVATE | SWP_FRAMECHANGED);
-    // Reveal only after the child is correctly parented, sized, and below
-    // the main UI in z-order.
+    // Reveal only after the child is correctly parented and sized. WebView is
+    // opaque, so external playback has to sit above the playback surface.
     ShowWindow(child, SW_SHOWNOACTIVATE);
 }
 

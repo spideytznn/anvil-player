@@ -153,10 +153,26 @@ struct NativeVideoQueueStats {
     int driftMs = 0;
     int frameCadenceMs = 0;
     int earlyToleranceMs = 0;
+    bool buffering = false;
+    uint64_t networkBytesPerSecond = 0;
     bool usingAudioClock = false;
     bool usingHardwareDecode = false;
     std::wstring decoder = L"ffmpeg_software";
     std::wstring fallbackReason;
+};
+
+struct NativeAudioPacketSink {
+    int selectedTrackIndex = anvil::playback::kAudioTrackOff;
+    std::function<bool(const AVCodecParameters*, AVRational, std::chrono::milliseconds, int)> start;
+    std::function<bool(const AVPacket*)> pushPacket;
+    std::function<void(std::chrono::milliseconds)> reset;
+    std::function<void()> endOfStream;
+
+    bool Enabled() const {
+        return selectedTrackIndex != anvil::playback::kAudioTrackOff &&
+               static_cast<bool>(start) &&
+               static_cast<bool>(pushPacket);
+    }
 };
 
 // Native in-process FFmpeg video decoder. Demux+decode on a worker thread,
@@ -189,7 +205,8 @@ public:
                std::filesystem::path externalSubtitlePath = {},
                bool oneShotFrame = false,
                bool preferDolbyVisionHdrOutput = false,
-               bool enableDolbyVisionEnhancementDecode = false);
+               bool enableDolbyVisionEnhancementDecode = false,
+               NativeAudioPacketSink audioPacketSink = {});
 
     void Stop();
     bool Seek(std::chrono::milliseconds position);
@@ -248,6 +265,7 @@ private:
     static constexpr std::chrono::milliseconds kMaxMeasuredFrameCadence{250};
     static constexpr int kSeekStartupPacketReadAheadBatch = 1;
     static constexpr int kSeekFastResumeFrameCount = 4;
+    static constexpr int kSeekClockHoldFrameCount = 48;
 
     struct NativeSubtitleCue {
         std::chrono::milliseconds start{0};
@@ -331,7 +349,7 @@ private:
                                                             int frameHeight,
                                                             bool includeAss = true);
 
-    bool ShouldDropSeekPreroll(std::chrono::milliseconds pts) const;
+    bool ShouldDropSeekPreroll(std::chrono::milliseconds pts);
 
     static std::chrono::milliseconds FramePts(const AVFrame* frame, AVRational timeBase);
     static AVPixelFormat HardwareFrameSoftwareFormat(const AVFrame* frame);
@@ -387,6 +405,12 @@ private:
     bool hardwareDecodeActive_ = false;
     bool hardwareFormatLogged_ = false;
     bool zeroCopyFallbackLogged_ = false;
+    bool firstDecodedFrameLogged_ = false;
+    bool firstHardwareFrameLogged_ = false;
+    bool firstCpuTransferFrameLogged_ = false;
+    int receiveEagainLogCount_ = 0;
+    bool receiveEofLogged_ = false;
+    bool sendPacketFailureLogged_ = false;
     bool bitmapSubtitleLogged_ = false;
     bool frameSubtitleBitmapLogged_ = false;
     anvil::playback::VideoColorMetadata streamColorMetadata_;
@@ -431,6 +455,7 @@ private:
     std::deque<DolbyVisionEnhancementFrame> dolbyVisionEnhancementFrames_;
     std::wstring preferredSubtitleLanguage_ = L"Auto";
     int selectedSubtitleTrackIndex_ = anvil::playback::kSubtitleTrackAuto;
+    NativeAudioPacketSink audioPacketSink_;
     std::chrono::milliseconds subtitleDelay_{0};
     bool autoLoadExternalSubtitles_ = true;
     std::filesystem::path externalSubtitlePath_;
@@ -460,10 +485,14 @@ private:
     std::atomic_uint notificationMessage_{0};
     std::atomic_bool frameMessagePending_{false};
     std::atomic<int64_t> pendingSeekMs_{-1};
+    mutable std::atomic<int> interruptReturnCount_{0};
     std::atomic_bool playbackPaused_{false};
     std::atomic_bool enhancementPrerollWaitActive_{false};
     std::atomic<int> seekFastResumeFramesRemaining_{0};
     std::atomic_bool seekFastResumeLogged_{false};
+    std::atomic<int> seekClockHoldFramesRemaining_{0};
+    std::atomic<int64_t> seekRecoveryTargetMs_{-1};
+    std::atomic_bool seekRecoveryDropLogged_{false};
     std::atomic<int64_t> pausedPositionMs_{0};
     std::thread decodeThread_;
 };

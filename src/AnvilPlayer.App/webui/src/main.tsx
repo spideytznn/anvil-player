@@ -2,6 +2,7 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import App from './App'
 import LibraryApp from './LibraryApp'
+import { postNativeCommand } from './nativeBridge'
 import './styles.css'
 
 function Root(): JSX.Element {
@@ -12,6 +13,14 @@ function Root(): JSX.Element {
     window.addEventListener('hashchange', onHashChange)
     return () => window.removeEventListener('hashchange', onHashChange)
   }, [])
+
+  React.useEffect(() => {
+    postNativeCommand({
+      type: 'command',
+      command: 'setWebUiRoute',
+      route: hash.startsWith('#/player') ? 'player' : 'library'
+    })
+  }, [hash])
 
   if (hash.startsWith('#/player')) {
     return <App />

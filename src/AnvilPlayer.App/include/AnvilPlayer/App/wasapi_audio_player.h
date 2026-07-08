@@ -20,6 +20,7 @@ extern "C" {
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -46,6 +47,17 @@ public:
                std::chrono::milliseconds startPosition,
                double volume,
                int selectedAudioTrackIndex = anvil::playback::kAudioTrackAuto);
+
+    bool StartPacketStream(const std::filesystem::path& mediaPath,
+                           const AVCodecParameters* codecParameters,
+                           AVRational timeBase,
+                           std::chrono::milliseconds startPosition,
+                           double volume,
+                           int streamIndex);
+
+    bool QueuePacket(const AVPacket* packet);
+    void ResetPacketStream(std::chrono::milliseconds position);
+    void MarkPacketStreamEof();
 
     void Stop();
     void Pause(std::chrono::milliseconds position);
@@ -115,6 +127,13 @@ private:
                           const WasapiFormat& outputFormat,
                           uint64_t& submittedFrames,
                           bool& audioClientStarted);
+    bool ApplyPendingPacketSeek(AVCodecContext* codecCtx,
+                                SwrContext*& swrCtx,
+                                ResamplerState& resamplerState,
+                                IAudioClient* audioClient,
+                                const WasapiFormat& outputFormat,
+                                uint64_t& submittedFrames,
+                                bool& audioClientStarted);
 
     bool InitializeWasapi(Microsoft::WRL::ComPtr<IAudioClient>& audioClient,
                           Microsoft::WRL::ComPtr<IAudioRenderClient>& renderClient,
@@ -131,7 +150,8 @@ private:
                        const WasapiFormat& outputFormat,
                        IAudioRenderClient* renderClient,
                        IAudioClient* audioClient,
-                       uint64_t& submittedFrames);
+                       uint64_t& submittedFrames,
+                       bool& audioClientStarted);
 
     void DrainDecoder(AVCodecContext* codecCtx,
                       SwrContext*& swrCtx,
@@ -141,7 +161,8 @@ private:
                       const WasapiFormat& outputFormat,
                       IAudioRenderClient* renderClient,
                       IAudioClient* audioClient,
-                      uint64_t& submittedFrames);
+                      uint64_t& submittedFrames,
+                      bool& audioClientStarted);
 
     bool RenderFrame(AVFrame* frame,
                      AVRational timeBase,
@@ -150,14 +171,16 @@ private:
                      const WasapiFormat& outputFormat,
                      IAudioRenderClient* renderClient,
                      IAudioClient* audioClient,
-                     uint64_t& submittedFrames);
+                     uint64_t& submittedFrames,
+                     bool& audioClientStarted);
 
     bool WritePcm(IAudioRenderClient* renderClient,
                   IAudioClient* audioClient,
                   const WasapiFormat& outputFormat,
                   const uint8_t* data,
                   UINT32 frames,
-                  uint64_t& submittedFrames);
+                  uint64_t& submittedFrames,
+                  bool& audioClientStarted);
 
     void ApplyVolume(std::vector<uint8_t>& pcm, AVSampleFormat format) const;
     bool ShouldDropSeekPreroll(const AVFrame* frame, AVRational timeBase, const WasapiFormat& outputFormat) const;
@@ -165,6 +188,8 @@ private:
     static std::chrono::milliseconds FrameDuration(const AVFrame* frame, const WasapiFormat& outputFormat);
 
     void DrainWasapi(IAudioClient* audioClient) const;
+    AVPacket* TakeQueuedPacket();
+    void ClearPacketQueueLocked();
 
     void ResetPlaybackClock();
     void ResetPlaybackClock(std::chrono::milliseconds position);
@@ -183,14 +208,23 @@ private:
     std::filesystem::path path_;
     std::chrono::milliseconds startPosition_{0};
     int selectedAudioTrackIndex_ = anvil::playback::kAudioTrackAuto;
+    int packetStreamIndex_ = -1;
+    AVRational packetTimeBase_{1, 1};
+    AVCodecParameters* packetCodecParameters_ = nullptr;
     LogSinkPtr logSink_;
     std::atomic<double> volume_{1.0};
     std::atomic<double> playbackRate_{1.0};
     std::atomic_bool stopping_{false};
     std::atomic_bool running_{false};
     std::atomic_bool paused_{false};
+    std::atomic_bool packetInputMode_{false};
+    std::atomic_bool packetStreamEof_{false};
     std::atomic<int64_t> pausePositionMs_{0};
     std::atomic<int64_t> pendingSeekMs_{-1};
+    std::mutex packetMutex_;
+    std::condition_variable packetCv_;
+    std::deque<AVPacket*> packetQueue_;
+    std::size_t packetQueueBytes_ = 0;
     mutable std::mutex stateMutex_;
     std::condition_variable startCv_;
     bool startResolved_ = false;

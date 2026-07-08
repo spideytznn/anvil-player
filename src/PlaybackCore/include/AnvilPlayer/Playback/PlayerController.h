@@ -27,6 +27,7 @@ public:
     void SetVolume(double volume);
     void SetPlaybackRate(double rate);
     void UpdateClock();
+    void SyncClock(std::chrono::milliseconds position);
 
     PlaybackSessionSnapshot Snapshot() const;
     CapabilityReport CollectCapabilityReport() const;

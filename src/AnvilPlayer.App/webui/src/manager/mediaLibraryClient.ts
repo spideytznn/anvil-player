@@ -1,11 +1,15 @@
-import type { LibraryQuery, LibrarySource, LibraryView, MediaItem, NavKey, SortKey, SourceDraft } from './types'
+import type { LibraryHomeSection, LibraryQuery, LibrarySource, LibraryView, MediaFilterKey, MediaItem, NavKey, SortKey, SourceDraft } from './types'
+
+const LIBRARY_CACHE_KEY = 'anvil-player.library.cache.v1'
 
 export interface MediaLibraryClient {
   listSources: () => Promise<LibrarySource[]>
+  listAllItems: () => Promise<MediaItem[]>
   listItems: (query: LibraryQuery) => Promise<MediaItem[]>
+  listHomeSections: (sourceId?: string) => Promise<LibraryHomeSection[]>
   getContinueWatching: () => Promise<MediaItem[]>
   saveSourceDraft: (draft: SourceDraft) => Promise<LibrarySource>
-  upsertSourceItems: (source: LibrarySource, sourceItems: MediaItem[]) => Promise<void>
+  upsertSourceItems: (source: LibrarySource, sourceItems: MediaItem[], sourceHomeSections?: LibraryHomeSection[]) => Promise<void>
 }
 
 function filterByNav(items: MediaItem[], navKey: NavKey): MediaItem[] {
@@ -34,6 +38,22 @@ function filterByView(items: MediaItem[], view: LibraryView): MediaItem[] {
     case 'movies': return items.filter((item) => item.type === 'movie')
     case 'series': return items.filter((item) => item.type === 'series')
     case 'folders': return items.filter((item) => item.type === 'folder')
+    default: return items
+  }
+}
+
+function filterByLibraryView(items: MediaItem[], libraryViewId?: string): MediaItem[] {
+  if (!libraryViewId) return items
+  if (!items.some((item) => item.libraryViewId)) return items
+  return items.filter((item) => item.libraryViewId === libraryViewId)
+}
+
+function filterByMediaFilter(items: MediaItem[], filterKey: MediaFilterKey = 'all'): MediaItem[] {
+  switch (filterKey) {
+    case 'unwatched': return items.filter((item) => !item.watched)
+    case 'watched': return items.filter((item) => item.watched)
+    case 'favorites': return items.filter((item) => item.favorite)
+    case 'inProgress': return items.filter((item) => item.progress > 0 && item.progress < 1)
     default: return items
   }
 }
@@ -69,20 +89,91 @@ function sourceIdFromName(name: string): string {
   return `source-${normalized || Date.now()}`
 }
 
+function localLibraryItems(items: MediaItem[], sources: LibrarySource[]): MediaItem[] {
+  const embySourceIds = new Set(sources.filter((source) => source.kind === 'Emby').map((source) => source.id))
+  return items.filter((item) => !embySourceIds.has(item.sourceId))
+}
+
+interface LibraryCache {
+  version: 1
+  sources: LibrarySource[]
+  items: MediaItem[]
+  homeSections: LibraryHomeSection[]
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object'
+}
+
+function loadCache(): LibraryCache {
+  try {
+    const raw = window.localStorage.getItem(LIBRARY_CACHE_KEY)
+    if (!raw) throw new Error('empty cache')
+    const parsed: unknown = JSON.parse(raw)
+    if (!isObject(parsed)) throw new Error('invalid cache')
+    return {
+      version: 1,
+      sources: Array.isArray(parsed.sources) ? parsed.sources as LibrarySource[] : [],
+      items: Array.isArray(parsed.items) ? parsed.items as MediaItem[] : [],
+      homeSections: Array.isArray(parsed.homeSections) ? parsed.homeSections as LibraryHomeSection[] : []
+    }
+  } catch {
+    return { version: 1, sources: [], items: [], homeSections: [] }
+  }
+}
+
+function saveCache(sources: LibrarySource[], items: MediaItem[], homeSections: LibraryHomeSection[]): void {
+  try {
+    window.localStorage.setItem(LIBRARY_CACHE_KEY, JSON.stringify({
+      version: 1,
+      sources,
+      items,
+      homeSections
+    } satisfies LibraryCache))
+  } catch {
+    // Keep the in-memory library usable when the WebView storage quota is full.
+  }
+}
+
 export function createEmptyLibraryClient(): MediaLibraryClient {
-  let sources: LibrarySource[] = []
-  let items: MediaItem[] = []
+  const cached = loadCache()
+  let sources: LibrarySource[] = cached.sources
+  let items: MediaItem[] = cached.items
+  let homeSections: LibraryHomeSection[] = cached.homeSections
 
   return {
     async listSources() {
       return [...sources]
     },
 
+    async listAllItems() {
+      return [...items]
+    },
+
     async listItems(query) {
+      const queryItems = query.navKey.startsWith('source:')
+        ? items
+        : localLibraryItems(items, sources)
       return sortItems(
-        filterByView(filterByNav(items, query.navKey), query.view).filter((item) => matchesSearch(item, query.search)),
+        filterByMediaFilter(
+          filterByView(
+            filterByLibraryView(filterByNav(queryItems, query.navKey), query.libraryViewId),
+            query.view
+          ).filter((item) => matchesSearch(item, query.search)),
+          query.filterKey
+        ),
         query.sortKey
       )
+    },
+
+    async listHomeSections(sourceId) {
+      const rows = sourceId
+        ? homeSections.filter((section) => section.sourceId === sourceId)
+        : homeSections
+      return rows.map((section) => ({
+        ...section,
+        cards: [...section.cards]
+      }))
     },
 
     async getContinueWatching() {
@@ -104,15 +195,21 @@ export function createEmptyLibraryClient(): MediaLibraryClient {
       } else {
         sources = [source, ...sources]
       }
+      saveCache(sources, items, homeSections)
       return source
     },
 
-    async upsertSourceItems(source, sourceItems) {
+    async upsertSourceItems(source, sourceItems, sourceHomeSections = []) {
       sources = [source, ...sources.filter((candidate) => candidate.id !== source.id)]
       items = [
         ...items.filter((item) => item.sourceId !== source.id),
         ...sourceItems.map((item) => ({ ...item, sourceId: source.id }))
       ]
+      homeSections = [
+        ...homeSections.filter((section) => section.sourceId !== source.id),
+        ...sourceHomeSections
+      ]
+      saveCache(sources, items, homeSections)
     }
   }
 }

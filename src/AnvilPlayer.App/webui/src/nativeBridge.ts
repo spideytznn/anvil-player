@@ -8,6 +8,8 @@ export interface PlayerState {
   positionMs: number
   durationMs: number
   bufferedEndMs: number
+  buffering: boolean
+  networkKbps: number
   volume: number
   runtimeLabel: string
   backendLabel: string
@@ -68,6 +70,9 @@ export interface HdrToneCurvePoint {
 export type NativeCommand =
   | { type: 'command'; command: 'open' }
   | { type: 'command'; command: 'openPath'; path: string }
+  | { type: 'command'; command: 'debugLog'; message: string }
+  | { type: 'command'; command: 'setWebUiRoute'; route: 'player' | 'library' }
+  | { type: 'command'; command: 'setAllowInsecureCertificates'; enabled: boolean }
   | { type: 'command'; command: 'playPause' }
   | { type: 'command'; command: 'stop' }
   | { type: 'command'; command: 'back' }
@@ -145,6 +150,8 @@ export const EMPTY_STATE: PlayerState = {
   positionMs: 0,
   durationMs: 0,
   bufferedEndMs: 0,
+  buffering: false,
+  networkKbps: 0,
   volume: 1,
   runtimeLabel: 'Native FFmpeg',
   backendLabel: 'Native FFmpeg / D3D11',

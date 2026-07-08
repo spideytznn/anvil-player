@@ -208,6 +208,66 @@ input:focus-visible {
   gap: 8px;
 }
 
+.buffering-overlay {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 168px;
+  max-width: min(320px, calc(100% - 48px));
+  padding: 12px 14px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  background: rgba(7, 10, 15, 0.78);
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.34);
+  color: var(--text);
+  pointer-events: none;
+  transform: translate(-50%, -50%);
+}
+
+.buffering-spinner {
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  border: 2px solid rgba(255, 255, 255, 0.18);
+  border-top-color: var(--accent-strong);
+  border-radius: 50%;
+  animation: buffering-spin 900ms linear infinite;
+}
+
+.buffering-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.buffering-copy strong,
+.buffering-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.buffering-copy strong {
+  font-size: 13px;
+  line-height: 1.2;
+}
+
+.buffering-copy small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+@keyframes buffering-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .empty-play {
   display: flex;
   width: 74px;

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cwctype>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -17,6 +18,8 @@ using anvil::playback::FormatTimecode;
 using anvil::playback::LogLevel;
 
 namespace {
+
+constexpr std::size_t kPacketStreamMaxQueueBytes = 24ull * 1024ull * 1024ull;
 
 std::chrono::milliseconds ScaleDuration(const std::chrono::milliseconds value, const double rate) {
     return std::chrono::milliseconds{
@@ -36,6 +39,15 @@ std::chrono::milliseconds FramesToMediaDuration(const uint64_t frames, const UIN
         (static_cast<long double>(frames) * 1000.0L * static_cast<long double>(rate)) /
         static_cast<long double>(sampleRate);
     return std::chrono::milliseconds{static_cast<long long>(std::llround(milliseconds))};
+}
+
+bool IsNetworkMediaPath(const std::filesystem::path& path) {
+    auto value = path.wstring();
+    std::transform(value.begin(), value.end(), value.begin(), [](const wchar_t ch) {
+        return static_cast<wchar_t>(std::towlower(ch));
+    });
+    return value.rfind(L"http://", 0) == 0 ||
+           value.rfind(L"https://", 0) == 0;
 }
 
 }  // namespace
@@ -89,15 +101,137 @@ bool WasapiAudioPlayer::Start(const std::filesystem::path& mediaPath,
     return started;
 }
 
+bool WasapiAudioPlayer::StartPacketStream(const std::filesystem::path& mediaPath,
+                                          const AVCodecParameters* codecParameters,
+                                          const AVRational timeBase,
+                                          const std::chrono::milliseconds startPosition,
+                                          const double volume,
+                                          const int streamIndex) {
+    Stop();
+    if (mediaPath.empty() || !codecParameters || codecParameters->codec_type != AVMEDIA_TYPE_AUDIO) {
+        return false;
+    }
+
+    packetCodecParameters_ = avcodec_parameters_alloc();
+    if (!packetCodecParameters_) {
+        return false;
+    }
+    const int copyError = avcodec_parameters_copy(packetCodecParameters_, codecParameters);
+    if (copyError < 0) {
+        avcodec_parameters_free(&packetCodecParameters_);
+        LogError(L"packet stream codec copy failed: " + FfmpegErrorString(copyError));
+        return false;
+    }
+
+    path_ = mediaPath;
+    startPosition_ = startPosition;
+    selectedAudioTrackIndex_ = streamIndex;
+    packetStreamIndex_ = streamIndex;
+    packetTimeBase_ = timeBase;
+    volume_.store(std::clamp(volume, 0.0, 1.0));
+    paused_.store(false);
+    packetInputMode_.store(true);
+    packetStreamEof_.store(false);
+    pausePositionMs_.store(startPosition.count());
+    pendingSeekMs_.store(-1);
+    ResetPlaybackClock(startPosition);
+    {
+        std::scoped_lock lock(packetMutex_);
+        ClearPacketQueueLocked();
+    }
+    {
+        std::scoped_lock lock(stateMutex_);
+        startResolved_ = false;
+        startSucceeded_ = false;
+        lastStatus_ = L"wasapi packet pcm initializing";
+    }
+
+    stopping_.store(false);
+    running_.store(true);
+    playbackThread_ = std::thread([this]() { PlaybackLoop(); });
+
+    std::unique_lock lock(stateMutex_);
+    const bool resolved = startCv_.wait_for(lock, std::chrono::seconds(3), [this]() {
+        return startResolved_;
+    });
+    const bool started = resolved && startSucceeded_;
+    lock.unlock();
+
+    if (!started) {
+        Stop();
+    }
+    return started;
+}
+
+bool WasapiAudioPlayer::QueuePacket(const AVPacket* packet) {
+    if (!packetInputMode_.load() || stopping_.load() || !packet) {
+        return false;
+    }
+    AVPacket* copy = av_packet_clone(packet);
+    if (!copy) {
+        return false;
+    }
+
+    std::unique_lock lock(packetMutex_);
+    if (packetQueueBytes_ >= kPacketStreamMaxQueueBytes) {
+        packetCv_.wait_for(lock, std::chrono::milliseconds{2}, [this]() {
+            return stopping_.load() ||
+                   packetQueueBytes_ < kPacketStreamMaxQueueBytes;
+        });
+    }
+    if (stopping_.load() || !packetInputMode_.load() || packetQueueBytes_ >= kPacketStreamMaxQueueBytes) {
+        av_packet_free(&copy);
+        return false;
+    }
+    packetQueueBytes_ += static_cast<std::size_t>(std::max(0, copy->size));
+    packetQueue_.push_back(copy);
+    packetCv_.notify_all();
+    return true;
+}
+
+void WasapiAudioPlayer::ResetPacketStream(const std::chrono::milliseconds position) {
+    if (!packetInputMode_.load()) {
+        Seek(position);
+        return;
+    }
+    pendingSeekMs_.store(std::max<int64_t>(0, position.count()));
+    pausePositionMs_.store(std::max<int64_t>(0, position.count()));
+    packetStreamEof_.store(false);
+    {
+        std::scoped_lock lock(packetMutex_);
+        ClearPacketQueueLocked();
+    }
+    ResetPlaybackClock(position);
+    packetCv_.notify_all();
+}
+
+void WasapiAudioPlayer::MarkPacketStreamEof() {
+    if (!packetInputMode_.load()) {
+        return;
+    }
+    packetStreamEof_.store(true);
+    packetCv_.notify_all();
+}
+
 void WasapiAudioPlayer::Stop() {
     stopping_.store(true);
     paused_.store(false);
     pendingSeekMs_.store(-1);
+    packetStreamEof_.store(true);
+    packetCv_.notify_all();
     SignalStart(false);
     if (playbackThread_.joinable()) {
         playbackThread_.join();
     }
     running_.store(false);
+    packetInputMode_.store(false);
+    {
+        std::scoped_lock lock(packetMutex_);
+        ClearPacketQueueLocked();
+    }
+    if (packetCodecParameters_) {
+        avcodec_parameters_free(&packetCodecParameters_);
+    }
     SetPlaybackClockRunning(false);
 }
 
@@ -230,47 +364,78 @@ void WasapiAudioPlayer::PlaybackLoop() {
         running_.store(false);
     };
 
+    const bool packetInput = packetInputMode_.load();
+
     do {
         const std::string pathUtf8 = WideToUtf8(path_.wstring());
-        formatCtx = avformat_alloc_context();
-        if (!formatCtx) {
-            LogError(L"avformat_alloc_context failed");
-            break;
-        }
-        formatCtx->interrupt_callback.callback = &WasapiAudioPlayer::InterruptCallback;
-        formatCtx->interrupt_callback.opaque = this;
-        int error = avformat_open_input(&formatCtx, pathUtf8.c_str(), nullptr, nullptr);
-        if (error < 0) {
-            LogError(L"avformat_open_input failed: " + FfmpegErrorString(error));
-            break;
-        }
-        error = avformat_find_stream_info(formatCtx, nullptr);
-        if (error < 0) {
-            LogError(L"avformat_find_stream_info failed: " + FfmpegErrorString(error));
-            break;
-        }
-        if (selectedAudioTrackIndex_ >= 0 &&
-            selectedAudioTrackIndex_ < static_cast<int>(formatCtx->nb_streams) &&
-            formatCtx->streams[selectedAudioTrackIndex_] &&
-            formatCtx->streams[selectedAudioTrackIndex_]->codecpar &&
-            formatCtx->streams[selectedAudioTrackIndex_]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-            audioStreamIndex = selectedAudioTrackIndex_;
-        } else {
-            if (selectedAudioTrackIndex_ >= 0) {
-                LogInfo(L"requested audio stream unavailable stream=" + std::to_wstring(selectedAudioTrackIndex_) +
-                        L" fallback=auto");
+        const bool networkSource = IsNetworkMediaPath(path_);
+        const AVCodecParameters* inputCodecParameters = nullptr;
+        if (packetInput) {
+            if (!packetCodecParameters_) {
+                LogError(L"packet stream missing codec parameters");
+                break;
             }
-            audioStreamIndex = av_find_best_stream(formatCtx, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
-        }
-        if (audioStreamIndex < 0) {
-            LogError(L"no audio stream found");
-            break;
-        }
-        LogInfo(L"audio stream=" + std::to_wstring(audioStreamIndex));
+            audioStreamIndex = packetStreamIndex_;
+            audioTimeBase = packetTimeBase_;
+            inputCodecParameters = packetCodecParameters_;
+            LogInfo(L"packet audio stream=" + std::to_wstring(audioStreamIndex));
+        } else {
+            formatCtx = avformat_alloc_context();
+            if (!formatCtx) {
+                LogError(L"avformat_alloc_context failed");
+                break;
+            }
+            formatCtx->interrupt_callback.callback = &WasapiAudioPlayer::InterruptCallback;
+            formatCtx->interrupt_callback.opaque = this;
+            AVDictionary* options = nullptr;
+            if (networkSource) {
+                av_dict_set(&options, "rw_timeout", "15000000", 0);
+                av_dict_set(&options, "seekable", "0", 0);
+                av_dict_set(&options,
+                            "user_agent",
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+                            0);
+                av_dict_set(&options, "reconnect_on_network_error", "1", 0);
+                av_dict_set(&options, "reconnect_streamed", "1", 0);
+                av_dict_set(&options, "reconnect_delay_max", "2", 0);
+                av_dict_set(&options, "reconnect_max_retries", "2", 0);
+                LogInfo(L"network open mode=linear_stream seekable=0");
+            }
+            int error = avformat_open_input(&formatCtx, pathUtf8.c_str(), nullptr, &options);
+            av_dict_free(&options);
+            if (error < 0) {
+                LogError(L"avformat_open_input failed: " + FfmpegErrorString(error));
+                break;
+            }
+            error = avformat_find_stream_info(formatCtx, nullptr);
+            if (error < 0) {
+                LogError(L"avformat_find_stream_info failed: " + FfmpegErrorString(error));
+                break;
+            }
+            if (selectedAudioTrackIndex_ >= 0 &&
+                selectedAudioTrackIndex_ < static_cast<int>(formatCtx->nb_streams) &&
+                formatCtx->streams[selectedAudioTrackIndex_] &&
+                formatCtx->streams[selectedAudioTrackIndex_]->codecpar &&
+                formatCtx->streams[selectedAudioTrackIndex_]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                audioStreamIndex = selectedAudioTrackIndex_;
+            } else {
+                if (selectedAudioTrackIndex_ >= 0) {
+                    LogInfo(L"requested audio stream unavailable stream=" + std::to_wstring(selectedAudioTrackIndex_) +
+                            L" fallback=auto");
+                }
+                audioStreamIndex = av_find_best_stream(formatCtx, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+            }
+            if (audioStreamIndex < 0) {
+                LogError(L"no audio stream found");
+                break;
+            }
+            LogInfo(L"audio stream=" + std::to_wstring(audioStreamIndex));
 
-        const AVStream* audioStream = formatCtx->streams[audioStreamIndex];
-        audioTimeBase = audioStream->time_base;
-        const AVCodec* codec = avcodec_find_decoder(audioStream->codecpar->codec_id);
+            const AVStream* audioStream = formatCtx->streams[audioStreamIndex];
+            audioTimeBase = audioStream->time_base;
+            inputCodecParameters = audioStream->codecpar;
+        }
+        const AVCodec* codec = avcodec_find_decoder(inputCodecParameters->codec_id);
         if (!codec) {
             LogError(L"avcodec_find_decoder failed");
             break;
@@ -280,7 +445,7 @@ void WasapiAudioPlayer::PlaybackLoop() {
             LogError(L"avcodec_alloc_context3 failed");
             break;
         }
-        error = avcodec_parameters_to_context(codecCtx, audioStream->codecpar);
+        int error = avcodec_parameters_to_context(codecCtx, inputCodecParameters);
         if (error < 0) {
             LogError(L"avcodec_parameters_to_context failed: " + FfmpegErrorString(error));
             break;
@@ -303,7 +468,9 @@ void WasapiAudioPlayer::PlaybackLoop() {
             break;
         }
 
-        if (startPosition_.count() > 0) {
+        const bool skipNetworkNearStartSeek =
+            networkSource && startPosition_ < std::chrono::seconds{1};
+        if (!packetInput && startPosition_.count() > 0 && !skipNetworkNearStartSeek) {
             const int64_t target = static_cast<int64_t>(startPosition_.count()) * AV_TIME_BASE / 1000;
             LogInfo(L"seek target=" + FormatTimecode(startPosition_));
             const int seekError = av_seek_frame(formatCtx, -1, target, AVSEEK_FLAG_BACKWARD);
@@ -311,16 +478,22 @@ void WasapiAudioPlayer::PlaybackLoop() {
                 LogError(L"av_seek_frame failed: " + FfmpegErrorString(seekError));
             }
             avcodec_flush_buffers(codecCtx);
+        } else if (!packetInput && startPosition_.count() > 0 && skipNetworkNearStartSeek) {
+            LogInfo(L"seek skipped reason=network_near_start target=" + FormatTimecode(startPosition_));
         }
 
-        HRESULT hr = audioClient->Start();
-        if (FAILED(hr)) {
-            LogError(L"IAudioClient::Start failed hr=0x" + HexHr(hr));
-            break;
+        if (!packetInput) {
+            HRESULT hr = audioClient->Start();
+            if (FAILED(hr)) {
+                LogError(L"IAudioClient::Start failed hr=0x" + HexHr(hr));
+                break;
+            }
+            audioClientStarted = true;
+            UpdatePlaybackClock(outputFormat, submittedFrames, 0);
+            SetPlaybackClockRunning(true);
+        } else {
+            SetPlaybackClockRunning(false);
         }
-        audioClientStarted = true;
-        UpdatePlaybackClock(outputFormat, submittedFrames, 0);
-        SetPlaybackClockRunning(true);
         {
             std::scoped_lock lock(stateMutex_);
             lastStatus_ = outputFormat.description;
@@ -331,15 +504,64 @@ void WasapiAudioPlayer::PlaybackLoop() {
             if (!HandlePause(audioClient.Get(), outputFormat, submittedFrames, audioClientStarted)) {
                 break;
             }
-            if (!ApplyPendingSeek(formatCtx,
-                                  codecCtx,
-                                  swrCtx,
-                                  resamplerState,
-                                  audioClient.Get(),
-                                  outputFormat,
-                                  submittedFrames,
-                                  audioClientStarted)) {
+            const bool seekApplied = packetInput
+                                         ? ApplyPendingPacketSeek(codecCtx,
+                                                                  swrCtx,
+                                                                  resamplerState,
+                                                                  audioClient.Get(),
+                                                                  outputFormat,
+                                                                  submittedFrames,
+                                                                  audioClientStarted)
+                                         : ApplyPendingSeek(formatCtx,
+                                                            codecCtx,
+                                                            swrCtx,
+                                                            resamplerState,
+                                                            audioClient.Get(),
+                                                            outputFormat,
+                                                            submittedFrames,
+                                                            audioClientStarted);
+            if (!seekApplied) {
                 break;
+            }
+
+            if (packetInput) {
+                AVPacket* queuedPacket = TakeQueuedPacket();
+                if (!queuedPacket) {
+                    if (packetStreamEof_.load()) {
+                        avcodec_send_packet(codecCtx, nullptr);
+                        DrainDecoder(codecCtx,
+                                     swrCtx,
+                                     frame,
+                                     audioTimeBase,
+                                     resamplerState,
+                                     outputFormat,
+                                     renderClient.Get(),
+                                     audioClient.Get(),
+                                     submittedFrames,
+                                     audioClientStarted);
+                        break;
+                    }
+                    continue;
+                }
+
+                const int sendResult = avcodec_send_packet(codecCtx, queuedPacket);
+                av_packet_free(&queuedPacket);
+                if (sendResult < 0 && sendResult != AVERROR(EAGAIN)) {
+                    continue;
+                }
+                if (!ReceiveFrames(codecCtx,
+                                   swrCtx,
+                                   frame,
+                                   audioTimeBase,
+                                   resamplerState,
+                                   outputFormat,
+                                   renderClient.Get(),
+                                   audioClient.Get(),
+                                   submittedFrames,
+                                   audioClientStarted)) {
+                    break;
+                }
+                continue;
             }
 
             const int readResult = av_read_frame(formatCtx, packet);
@@ -359,7 +581,16 @@ void WasapiAudioPlayer::PlaybackLoop() {
                     continue;
                 }
                 avcodec_send_packet(codecCtx, nullptr);
-                DrainDecoder(codecCtx, swrCtx, frame, audioTimeBase, resamplerState, outputFormat, renderClient.Get(), audioClient.Get(), submittedFrames);
+                DrainDecoder(codecCtx,
+                             swrCtx,
+                             frame,
+                             audioTimeBase,
+                             resamplerState,
+                             outputFormat,
+                             renderClient.Get(),
+                             audioClient.Get(),
+                             submittedFrames,
+                             audioClientStarted);
                 break;
             }
 
@@ -374,7 +605,16 @@ void WasapiAudioPlayer::PlaybackLoop() {
                 continue;
             }
 
-            if (!ReceiveFrames(codecCtx, swrCtx, frame, audioTimeBase, resamplerState, outputFormat, renderClient.Get(), audioClient.Get(), submittedFrames)) {
+            if (!ReceiveFrames(codecCtx,
+                               swrCtx,
+                               frame,
+                               audioTimeBase,
+                               resamplerState,
+                               outputFormat,
+                               renderClient.Get(),
+                               audioClient.Get(),
+                               submittedFrames,
+                               audioClientStarted)) {
                 break;
             }
         }
@@ -500,6 +740,45 @@ bool WasapiAudioPlayer::ApplyPendingSeek(AVFormatContext* formatCtx,
     return true;
 }
 
+bool WasapiAudioPlayer::ApplyPendingPacketSeek(AVCodecContext* codecCtx,
+                                               SwrContext*& swrCtx,
+                                               ResamplerState& resamplerState,
+                                               IAudioClient* audioClient,
+                                               const WasapiFormat& outputFormat,
+                                               uint64_t& submittedFrames,
+                                               bool& audioClientStarted) {
+    const auto target = TakePendingSeek();
+    if (!target.has_value()) {
+        return true;
+    }
+    if (!codecCtx || !audioClient) {
+        return false;
+    }
+
+    startPosition_ = *target;
+    LogInfo(L"packet runtime seek target=" + FormatTimecode(*target));
+    if (audioClientStarted) {
+        audioClient->Stop();
+        audioClient->Reset();
+        audioClientStarted = false;
+    }
+    {
+        std::scoped_lock lock(packetMutex_);
+        ClearPacketQueueLocked();
+    }
+    packetStreamEof_.store(false);
+    avcodec_flush_buffers(codecCtx);
+    if (swrCtx) {
+        swr_free(&swrCtx);
+    }
+    resamplerState = {};
+    submittedFrames = 0;
+    ResetPlaybackClock(*target);
+    SetPlaybackClockRunning(false);
+    packetCv_.notify_all();
+    return true;
+}
+
 bool WasapiAudioPlayer::InitializeWasapi(Microsoft::WRL::ComPtr<IAudioClient>& audioClient,
                                          Microsoft::WRL::ComPtr<IAudioRenderClient>& renderClient,
                                          WasapiFormat& outputFormat,
@@ -617,7 +896,8 @@ bool WasapiAudioPlayer::ReceiveFrames(AVCodecContext* codecCtx,
                                       const WasapiFormat& outputFormat,
                                       IAudioRenderClient* renderClient,
                                       IAudioClient* audioClient,
-                                      uint64_t& submittedFrames) {
+                                      uint64_t& submittedFrames,
+                                      bool& audioClientStarted) {
     while (!stopping_.load() && !paused_.load() && !HasPendingSeek()) {
         const int ret = avcodec_receive_frame(codecCtx, frame);
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
@@ -627,7 +907,15 @@ bool WasapiAudioPlayer::ReceiveFrames(AVCodecContext* codecCtx,
             LogError(L"avcodec_receive_frame failed: " + FfmpegErrorString(ret));
             return false;
         }
-        if (!RenderFrame(frame, timeBase, swrCtx, resamplerState, outputFormat, renderClient, audioClient, submittedFrames)) {
+        if (!RenderFrame(frame,
+                         timeBase,
+                         swrCtx,
+                         resamplerState,
+                         outputFormat,
+                         renderClient,
+                         audioClient,
+                         submittedFrames,
+                         audioClientStarted)) {
             return false;
         }
     }
@@ -642,7 +930,8 @@ void WasapiAudioPlayer::DrainDecoder(AVCodecContext* codecCtx,
                                      const WasapiFormat& outputFormat,
                                      IAudioRenderClient* renderClient,
                                      IAudioClient* audioClient,
-                                     uint64_t& submittedFrames) {
+                                     uint64_t& submittedFrames,
+                                     bool& audioClientStarted) {
     while (!stopping_.load() && !paused_.load() && !HasPendingSeek()) {
         const int ret = avcodec_receive_frame(codecCtx, frame);
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
@@ -651,7 +940,15 @@ void WasapiAudioPlayer::DrainDecoder(AVCodecContext* codecCtx,
         if (ret < 0) {
             return;
         }
-        if (!RenderFrame(frame, timeBase, swrCtx, resamplerState, outputFormat, renderClient, audioClient, submittedFrames)) {
+        if (!RenderFrame(frame,
+                         timeBase,
+                         swrCtx,
+                         resamplerState,
+                         outputFormat,
+                         renderClient,
+                         audioClient,
+                         submittedFrames,
+                         audioClientStarted)) {
             return;
         }
     }
@@ -664,7 +961,8 @@ bool WasapiAudioPlayer::RenderFrame(AVFrame* frame,
                                     const WasapiFormat& outputFormat,
                                     IAudioRenderClient* renderClient,
                                     IAudioClient* audioClient,
-                                    uint64_t& submittedFrames) {
+                                    uint64_t& submittedFrames,
+                                    bool& audioClientStarted) {
     if (!frame || frame->nb_samples <= 0 || !renderClient || !audioClient) {
         return true;
     }
@@ -764,7 +1062,13 @@ bool WasapiAudioPlayer::RenderFrame(AVFrame* frame,
                               static_cast<std::size_t>(bytesPerSample);
     pcm.resize(bytes);
     ApplyVolume(pcm, outputFormat.sampleFormat);
-    return WritePcm(renderClient, audioClient, outputFormat, pcm.data(), static_cast<UINT32>(convertedSamples), submittedFrames);
+    return WritePcm(renderClient,
+                    audioClient,
+                    outputFormat,
+                    pcm.data(),
+                    static_cast<UINT32>(convertedSamples),
+                    submittedFrames,
+                    audioClientStarted);
 }
 
 bool WasapiAudioPlayer::WritePcm(IAudioRenderClient* renderClient,
@@ -772,7 +1076,8 @@ bool WasapiAudioPlayer::WritePcm(IAudioRenderClient* renderClient,
                                  const WasapiFormat& outputFormat,
                                  const uint8_t* data,
                                  UINT32 frames,
-                                 uint64_t& submittedFrames) {
+                                 uint64_t& submittedFrames,
+                                 bool& audioClientStarted) {
     UINT32 offsetFrames = 0;
     while (offsetFrames < frames && !stopping_.load() && !paused_.load() && !HasPendingSeek()) {
         UINT32 bufferFrames = 0;
@@ -788,7 +1093,9 @@ bool WasapiAudioPlayer::WritePcm(IAudioRenderClient* renderClient,
             LogError(L"IAudioClient::GetCurrentPadding failed hr=0x" + HexHr(hr));
             return false;
         }
-        UpdatePlaybackClock(outputFormat, submittedFrames, padding);
+        if (audioClientStarted) {
+            UpdatePlaybackClock(outputFormat, submittedFrames, padding);
+        }
 
         const UINT32 available = bufferFrames > padding ? bufferFrames - padding : 0;
         if (available == 0) {
@@ -817,6 +1124,14 @@ bool WasapiAudioPlayer::WritePcm(IAudioRenderClient* renderClient,
 
         offsetFrames += framesToWrite;
         submittedFrames += framesToWrite;
+        if (!audioClientStarted) {
+            hr = audioClient->Start();
+            if (FAILED(hr)) {
+                LogError(L"IAudioClient::Start after packet preroll failed hr=0x" + HexHr(hr));
+                return false;
+            }
+            audioClientStarted = true;
+        }
         UpdatePlaybackClock(outputFormat, submittedFrames, padding + framesToWrite);
     }
     return !stopping_.load();
@@ -905,6 +1220,31 @@ void WasapiAudioPlayer::DrainWasapi(IAudioClient* audioClient) const {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+}
+
+AVPacket* WasapiAudioPlayer::TakeQueuedPacket() {
+    std::unique_lock lock(packetMutex_);
+    if (packetQueue_.empty() && !packetStreamEof_.load() && !stopping_.load() && !paused_.load() && !HasPendingSeek()) {
+        packetCv_.wait_for(lock, std::chrono::milliseconds{10});
+    }
+    if (packetQueue_.empty()) {
+        return nullptr;
+    }
+    AVPacket* packet = packetQueue_.front();
+    packetQueue_.pop_front();
+    const std::size_t bytes = static_cast<std::size_t>(std::max(0, packet ? packet->size : 0));
+    packetQueueBytes_ = packetQueueBytes_ >= bytes ? packetQueueBytes_ - bytes : 0;
+    packetCv_.notify_all();
+    return packet;
+}
+
+void WasapiAudioPlayer::ClearPacketQueueLocked() {
+    for (AVPacket* packet : packetQueue_) {
+        av_packet_free(&packet);
+    }
+    packetQueue_.clear();
+    packetQueueBytes_ = 0;
+    packetCv_.notify_all();
 }
 
 void WasapiAudioPlayer::ResetPlaybackClock() {

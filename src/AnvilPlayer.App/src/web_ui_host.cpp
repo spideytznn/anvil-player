@@ -7,6 +7,7 @@
 #include <WebView2.h>
 
 #include <cstring>
+#include <exception>
 #include <string>
 #include <system_error>
 #include <iterator>
@@ -23,7 +24,7 @@ using Microsoft::WRL::RuntimeClassFlags;
 namespace {
 
 constexpr wchar_t kWebUiVirtualHost[] = L"appassets.anvilplayer.local";
-constexpr wchar_t kWebUiUrl[] = L"https://appassets.anvilplayer.local/index.html#/library";
+constexpr wchar_t kWebUiUrl[] = L"http://appassets.anvilplayer.local/index.html#/library";
 constexpr wchar_t kWebViewBrowserArguments[] =
     L"--allow-running-insecure-content "
     L"--disable-web-security "
@@ -146,8 +147,13 @@ struct WebUiHost::Impl {
     ComPtr<ICoreWebView2Environment> environment;
     ComPtr<ICoreWebView2Controller> controller;
     ComPtr<ICoreWebView2> webview;
+    HRESULT lastCreateResult = S_OK;
+    bool usedDefaultOptionsFallback = false;
+    bool allowInsecureCertificates = false;
 
     bool Create(HWND parentWindow, const std::filesystem::path& root, MessageHandler handler) {
+        lastCreateResult = S_OK;
+        usedDefaultOptionsFallback = false;
         parent = parentWindow;
         std::error_code error;
         webRoot = std::filesystem::absolute(root, error).lexically_normal();
@@ -161,6 +167,7 @@ struct WebUiHost::Impl {
         pendingBounds = client;
 
         if (!std::filesystem::exists(webRoot / L"index.html", error)) {
+            lastCreateResult = HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
             return false;
         }
 
@@ -173,72 +180,128 @@ struct WebUiHost::Impl {
             environmentOptions->put_AdditionalBrowserArguments(kWebViewBrowserArguments);
         }
 
-        const HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(
-            browserExecutableFolder.empty() ? nullptr : browserExecutableFolder.c_str(),
-            userData.c_str(),
-            environmentOptions.Get(),
-            Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
-                [this](HRESULT result, ICoreWebView2Environment* createdEnvironment) -> HRESULT {
-                    if (FAILED(result) || !createdEnvironment) {
-                        return S_OK;
-                    }
+        const auto createEnvironment = [this, &userData](ICoreWebView2EnvironmentOptions* options) -> HRESULT {
+            return CreateCoreWebView2EnvironmentWithOptions(
+                browserExecutableFolder.empty() ? nullptr : browserExecutableFolder.c_str(),
+                userData.c_str(),
+                options,
+                Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
+                    [this](HRESULT result, ICoreWebView2Environment* createdEnvironment) -> HRESULT {
+                        lastCreateResult = result;
+                        if (FAILED(result) || !createdEnvironment) {
+                            return S_OK;
+                        }
 
-                    environment = createdEnvironment;
-                    environment->CreateCoreWebView2Controller(
-                        parent,
-                        Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                            [this](HRESULT controllerResult, ICoreWebView2Controller* createdController) -> HRESULT {
-                                if (FAILED(controllerResult) || !createdController) {
-                                    return S_OK;
-                                }
-
-                                controller = createdController;
-                                controller->get_CoreWebView2(&webview);
-                                controller->put_Bounds(pendingBounds);
-                                controller->put_IsVisible(TRUE);
-
-                                if (webview) {
-                                    ComPtr<ICoreWebView2Settings> settings;
-                                    if (SUCCEEDED(webview->get_Settings(&settings)) && settings) {
-                                        settings->put_AreDefaultContextMenusEnabled(FALSE);
-                                        settings->put_AreDevToolsEnabled(TRUE);
-                                        settings->put_IsStatusBarEnabled(FALSE);
+                        environment = createdEnvironment;
+                        environment->CreateCoreWebView2Controller(
+                            parent,
+                            Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+                                [this](HRESULT controllerResult, ICoreWebView2Controller* createdController) -> HRESULT {
+                                    lastCreateResult = controllerResult;
+                                    if (FAILED(controllerResult) || !createdController) {
+                                        return S_OK;
                                     }
 
-                                    EventRegistrationToken token{};
-                                    webview->add_WebMessageReceived(
-                                        Callback<ICoreWebView2WebMessageReceivedEventHandler>(
-                                            [this](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
-                                                LPWSTR json = nullptr;
-                                                if (args && SUCCEEDED(args->get_WebMessageAsJson(&json)) && json) {
-                                                    if (messageHandler) {
-                                                        messageHandler(json);
+                                    controller = createdController;
+                                    controller->get_CoreWebView2(&webview);
+                                    controller->put_Bounds(pendingBounds);
+                                    controller->put_IsVisible(TRUE);
+
+                                    if (webview) {
+                                        ComPtr<ICoreWebView2Settings> settings;
+                                        if (SUCCEEDED(webview->get_Settings(&settings)) && settings) {
+                                            settings->put_AreDefaultContextMenusEnabled(FALSE);
+                                            settings->put_AreDevToolsEnabled(TRUE);
+                                            settings->put_IsStatusBarEnabled(FALSE);
+                                        }
+
+                                        EventRegistrationToken token{};
+                                        webview->add_WebMessageReceived(
+                                            Callback<ICoreWebView2WebMessageReceivedEventHandler>(
+                                                [this](ICoreWebView2*, ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
+                                                    LPWSTR json = nullptr;
+                                                    HRESULT result = S_OK;
+                                                    try {
+                                                        if (args && SUCCEEDED(args->get_WebMessageAsJson(&json)) && json) {
+                                                            if (messageHandler) {
+                                                                messageHandler(json);
+                                                            }
+                                                        }
+                                                    } catch (const std::exception& error) {
+                                                        std::wstring message = L"Anvil WebView message handler exception: ";
+                                                        message += std::wstring(error.what(), error.what() + std::strlen(error.what()));
+                                                        message += L"\n";
+                                                        OutputDebugStringW(message.c_str());
+                                                        result = E_FAIL;
+                                                    } catch (...) {
+                                                        OutputDebugStringW(L"Anvil WebView message handler unknown exception\n");
+                                                        result = E_FAIL;
                                                     }
-                                                }
-                                                CoTaskMemFree(json);
-                                                return S_OK;
-                                            })
-                                            .Get(),
-                                        &token);
+                                                    CoTaskMemFree(json);
+                                                    return result;
+                                                })
+                                                .Get(),
+                                            &token);
 
-                                    ComPtr<ICoreWebView2_3> webview3;
-                                    if (SUCCEEDED(webview.As(&webview3)) && webview3) {
-                                        webview3->SetVirtualHostNameToFolderMapping(
-                                            kWebUiVirtualHost,
-                                            webRoot.c_str(),
-                                            COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_DENY_CORS);
+                                        ComPtr<ICoreWebView2_14> webview14;
+                                        if (SUCCEEDED(webview.As(&webview14)) && webview14) {
+                                            EventRegistrationToken certificateToken{};
+                                            webview14->add_ServerCertificateErrorDetected(
+                                                Callback<ICoreWebView2ServerCertificateErrorDetectedEventHandler>(
+                                                    [this](ICoreWebView2*,
+                                                           ICoreWebView2ServerCertificateErrorDetectedEventArgs* args) -> HRESULT {
+                                                        if (allowInsecureCertificates && args) {
+                                                            args->put_Action(COREWEBVIEW2_SERVER_CERTIFICATE_ERROR_ACTION_ALWAYS_ALLOW);
+                                                        }
+                                                        return S_OK;
+                                                    })
+                                                    .Get(),
+                                                &certificateToken);
+                                        }
+
+                                        ComPtr<ICoreWebView2_3> webview3;
+                                        if (SUCCEEDED(webview.As(&webview3)) && webview3) {
+                                            webview3->SetVirtualHostNameToFolderMapping(
+                                                kWebUiVirtualHost,
+                                                webRoot.c_str(),
+                                                COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_DENY_CORS);
+                                        }
+                                        webview->Navigate(kWebUiUrl);
                                     }
-                                    webview->Navigate(kWebUiUrl);
-                                }
 
-                                return S_OK;
-                            })
-                            .Get());
-                    return S_OK;
-                })
-                .Get());
+                                    return S_OK;
+                                })
+                                .Get());
+                        return S_OK;
+                    })
+                    .Get());
+        };
 
+        HRESULT hr = createEnvironment(environmentOptions.Get());
+        if (FAILED(hr) && environmentOptions) {
+            hr = createEnvironment(nullptr);
+            usedDefaultOptionsFallback = SUCCEEDED(hr);
+        }
+
+        lastCreateResult = hr;
         return SUCCEEDED(hr);
+    }
+
+    void SetAllowInsecureCertificates(const bool allow) {
+        allowInsecureCertificates = allow;
+        if (allow || !webview) {
+            return;
+        }
+
+        ComPtr<ICoreWebView2_14> webview14;
+        if (SUCCEEDED(webview.As(&webview14)) && webview14) {
+            webview14->ClearServerCertificateErrorActions(
+                Callback<ICoreWebView2ClearServerCertificateErrorActionsCompletedHandler>(
+                    [](HRESULT) -> HRESULT {
+                        return S_OK;
+                    })
+                    .Get());
+        }
     }
 };
 
@@ -267,8 +330,20 @@ void WebUiHost::PostJson(const std::wstring& json) const {
     }
 }
 
+void WebUiHost::SetAllowInsecureCertificates(const bool allow) const {
+    impl_->SetAllowInsecureCertificates(allow);
+}
+
 bool WebUiHost::Ready() const {
     return impl_->webview != nullptr;
+}
+
+HRESULT WebUiHost::LastCreateResult() const {
+    return impl_->lastCreateResult;
+}
+
+bool WebUiHost::UsedDefaultOptionsFallback() const {
+    return impl_->usedDefaultOptionsFallback;
 }
 
 }  // namespace anvil::app

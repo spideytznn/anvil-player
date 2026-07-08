@@ -27,6 +27,8 @@ constexpr UINT kVideoFrameReadyMessage = WM_APP + 1;
 constexpr UINT kNativeVideoFrameReadyMessage = WM_APP + 2;
 constexpr UINT kPlaybackTimerTickMessage = WM_APP + 3;
 constexpr UINT kNativeColorSettingsRefreshMessage = WM_APP + 4;
+constexpr UINT kRuntimeStopCompleteMessage = WM_APP + 5;
+constexpr UINT kOpenPathMessage = WM_APP + 6;
 
 // DWM attribute constants for window chrome customization.
 constexpr DWORD kDwmUseImmersiveDarkMode = 20;

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cwctype>
 #include <cmath>
+#include <filesystem>
 #include <sstream>
 #include <utility>
 
@@ -29,6 +30,15 @@ std::chrono::milliseconds ScaleDuration(const std::chrono::milliseconds value, c
         static_cast<long long>(std::llround(static_cast<double>(value.count()) * rate))};
 }
 
+bool IsNetworkMediaPath(const std::filesystem::path& path) {
+    std::wstring value = path.wstring();
+    std::transform(value.begin(), value.end(), value.begin(), [](const wchar_t ch) {
+        return static_cast<wchar_t>(std::towlower(ch));
+    });
+    return value.rfind(L"http://", 0) == 0 ||
+           value.rfind(L"https://", 0) == 0;
+}
+
 }  // namespace
 
 PlayerController::PlayerController(std::shared_ptr<InMemoryLogSink> logSink)
@@ -38,7 +48,9 @@ PlayerController::PlayerController(std::shared_ptr<InMemoryLogSink> logSink)
 
 bool PlayerController::OpenMedia(const std::filesystem::path& path, const bool extractPreview) {
     std::scoped_lock lock(mutex_);
-    if (!std::filesystem::exists(path)) {
+    std::error_code existsError;
+    const bool networkMedia = IsNetworkMediaPath(path);
+    if (!networkMedia && !std::filesystem::exists(path, existsError)) {
         state_ = PlaybackState::Error;
         lastError_ = L"File does not exist";
         Log(LogLevel::Error, L"open", lastError_ + L": " + path.wstring());
@@ -224,6 +236,17 @@ void PlayerController::UpdateClock() {
         committedPosition_ = media_->duration;
         state_ = PlaybackState::Stopped;
         Log(LogLevel::Info, L"transport", L"completed");
+    }
+}
+
+void PlayerController::SyncClock(const std::chrono::milliseconds position) {
+    std::scoped_lock lock(mutex_);
+    if (!media_.has_value()) {
+        return;
+    }
+    CommitPositionLocked(position);
+    if (state_ == PlaybackState::Playing) {
+        playStartedAt_ = std::chrono::steady_clock::now();
     }
 }
 

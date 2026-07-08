@@ -1,4 +1,4 @@
-import type { LibrarySource, MediaItem } from './types'
+import type { LibraryHomeSection, LibrarySource, MediaItem } from './types'
 
 const CLIENT_NAME = 'Anvil Player'
 const CLIENT_VERSION = '0.1.0'
@@ -29,8 +29,15 @@ export interface EmbyLibrarySnapshot {
   session: EmbySession
   source: LibrarySource
   items: MediaItem[]
+  homeSections: LibraryHomeSection[]
   viewCount: number
   totalRecordCount: number
+}
+
+export interface EmbyPlaybackTarget {
+  itemId: string
+  title: string
+  url: string
 }
 
 interface EmbyPublicInfo {
@@ -53,8 +60,18 @@ interface EmbyItemsResponse {
   TotalRecordCount?: number
 }
 
+interface EmbyView {
+  Id: string
+  Name?: string
+  Type?: string
+  CollectionType?: string | null
+  ChildCount?: number
+  ImageTags?: Record<string, string>
+  BackdropImageTags?: string[]
+}
+
 interface EmbyViewsResponse {
-  Items?: Array<{ Id: string; Name: string; Type?: string }>
+  Items?: EmbyView[]
   TotalRecordCount?: number
 }
 
@@ -72,8 +89,13 @@ interface EmbyMediaStream {
 }
 
 interface EmbyMediaSource {
+  Id?: string
   Name?: string
   Container?: string
+  Path?: string
+  DirectStreamUrl?: string
+  TranscodingUrl?: string
+  Protocol?: string
   Height?: number
   MediaStreams?: EmbyMediaStream[]
 }
@@ -98,6 +120,14 @@ interface EmbyItem {
   BackdropImageTags?: string[]
   MediaSources?: EmbyMediaSource[]
   ChildCount?: number
+  ParentId?: string
+  IndexNumber?: number
+  ParentIndexNumber?: number
+  SeriesName?: string
+}
+
+interface EmbyPlaybackInfoResponse {
+  MediaSources?: EmbyMediaSource[]
 }
 
 function getDeviceId(): string {
@@ -251,7 +281,11 @@ function imageBackground(session: EmbySession, item: EmbyItem, type: 'Primary' |
   const tag = type === 'Primary'
     ? item.ImageTags?.Primary
     : item.BackdropImageTags?.[0]
-  if (!tag) return type === 'Primary' ? '#181815' : '#0d0d0c'
+  if (!tag) {
+    return type === 'Primary'
+      ? 'linear-gradient(145deg, rgba(82, 181, 75, 0.12), rgba(15, 18, 24, 0.96))'
+      : 'linear-gradient(135deg, rgba(37, 44, 56, 0.82), rgba(7, 10, 15, 0.96))'
+  }
 
   const path = type === 'Primary'
     ? `/Items/${item.Id}/Images/Primary`
@@ -264,13 +298,140 @@ function imageBackground(session: EmbySession, item: EmbyItem, type: 'Primary' |
   return `url("${imageUrl}") center / cover`
 }
 
+function viewImageBackground(session: EmbySession, view: EmbyView): string {
+  const imageType = view.BackdropImageTags?.[0] ? 'Backdrop' : 'Primary'
+  const tag = imageType === 'Backdrop' ? view.BackdropImageTags?.[0] : view.ImageTags?.Primary
+  if (!tag) return 'linear-gradient(135deg, rgba(82, 181, 75, 0.2), rgba(15, 18, 24, 0.94))'
+
+  const path = imageType === 'Backdrop'
+    ? `/Items/${view.Id}/Images/Backdrop/0`
+    : `/Items/${view.Id}/Images/Primary`
+  const imageUrl = apiUrl(session.apiBaseUrl, path, {
+    tag,
+    quality: 90,
+    maxWidth: 720
+  })
+  return `url("${imageUrl}") center / cover`
+}
+
+function viewSubtitle(view: EmbyView): string {
+  switch (view.CollectionType) {
+    case 'movies': return '电影库'
+    case 'tvshows': return '剧集库'
+    case 'music': return '音乐库'
+    default: return '媒体库'
+  }
+}
+
+function itemCardSubtitle(item: EmbyItem): string {
+  const pieces = [
+    item.ProductionYear ? String(item.ProductionYear) : '',
+    item.Type === 'Series' ? '剧集' : item.Type === 'Movie' ? '电影' : '媒体'
+  ].filter(Boolean)
+  return pieces.join(' · ')
+}
+
+interface EmbyViewLatest {
+  view: EmbyView
+  items: EmbyItem[]
+}
+
+interface EmbyViewItems {
+  view: EmbyView
+  items: EmbyItem[]
+  totalRecordCount: number
+}
+
+function latestItemTypesForView(view: EmbyView): string {
+  switch (view.CollectionType) {
+    case 'movies': return 'Movie'
+    case 'tvshows': return 'Series'
+    default: return 'Movie,Series'
+  }
+}
+
+function filterSupportedLatestItems(items: EmbyItem[], includeItemTypes: string): EmbyItem[] {
+  const allowedTypes = new Set(includeItemTypes.split(','))
+  return items.filter((item) => item.Type && allowedTypes.has(item.Type))
+}
+
+function buildHomeSections(
+  session: EmbySession,
+  sourceId: string,
+  views: EmbyView[],
+  latestByView: EmbyViewLatest[],
+  fallbackItems: EmbyItem[]
+): LibraryHomeSection[] {
+  const sections: LibraryHomeSection[] = []
+
+  if (views.length) {
+    sections.push({
+      id: `${sourceId}:views`,
+      sourceId,
+      title: '媒体库',
+      layout: 'landscape',
+      cards: views.map((view) => ({
+        id: `view:${view.Id}`,
+        sourceId,
+        title: view.Name ?? '媒体库',
+        subtitle: viewSubtitle(view),
+        image: viewImageBackground(session, view),
+        kind: 'view',
+        viewId: view.Id
+      }))
+    })
+  }
+
+  latestByView
+    .filter((row) => row.items.length > 0)
+    .forEach((row) => {
+      sections.push({
+        id: `${sourceId}:latest:${row.view.Id}`,
+        sourceId,
+        title: `最新 ${row.view.Name ?? '媒体'}`,
+        layout: 'poster',
+        cards: row.items.map((item) => ({
+          id: `latest:${row.view.Id}:${item.Id}`,
+          sourceId,
+          title: item.Name ?? '未命名',
+          subtitle: itemCardSubtitle(item),
+          image: imageBackground(session, item, 'Primary'),
+          kind: 'item',
+          itemId: item.Id,
+          mediaType: mediaKind(item.Type)
+        }))
+      })
+    })
+
+  if (sections.length === (views.length ? 1 : 0) && fallbackItems.length) {
+    sections.push({
+      id: `${sourceId}:latest`,
+      sourceId,
+      title: '最新媒体',
+      layout: 'poster',
+      cards: fallbackItems.map((item) => ({
+        id: `latest:${item.Id}`,
+        sourceId,
+        title: item.Name ?? '未命名',
+        subtitle: itemCardSubtitle(item),
+        image: imageBackground(session, item, 'Primary'),
+        kind: 'item',
+        itemId: item.Id,
+        mediaType: mediaKind(item.Type)
+      }))
+    })
+  }
+
+  return sections
+}
+
 function fallbackRuntime(item: EmbyItem): string {
   if (item.Type === 'Series') return item.ChildCount ? `${item.ChildCount} episodes` : 'Series'
   if (item.Type === 'Folder') return item.ChildCount ? `${item.ChildCount} items` : 'Folder'
   return ''
 }
 
-function mapItem(session: EmbySession, sourceId: string, item: EmbyItem): MediaItem {
+function mapItem(session: EmbySession, sourceId: string, item: EmbyItem, libraryViewId?: string): MediaItem {
   const type = mediaKind(item.Type)
   return {
     id: item.Id,
@@ -281,6 +442,7 @@ function mapItem(session: EmbySession, sourceId: string, item: EmbyItem): MediaI
     rating: item.CommunityRating ?? 0,
     runtime: ticksToRuntime(item.RunTimeTicks, fallbackRuntime(item)),
     sourceId,
+    libraryViewId,
     genres: item.Genres?.length ? item.Genres : ['未分类'],
     country: item.ProductionLocations?.[0] ?? '',
     quality: qualityLabel(item),
@@ -292,6 +454,322 @@ function mapItem(session: EmbySession, sourceId: string, item: EmbyItem): MediaI
     backdrop: imageBackground(session, item, 'Backdrop'),
     tagline: item.Taglines?.[0] ?? '',
     overview: item.Overview ?? ''
+  }
+}
+
+function authHeadersForSession(session: EmbySession): Record<string, string> {
+  return {
+    'X-Emby-Authorization': authorizationHeader(session.userId),
+    'X-Emby-Token': session.accessToken
+  }
+}
+
+function normalizePlayableHttpUrl(value: string): string {
+  try {
+    return new URL(value).toString()
+  } catch {
+    return value
+  }
+}
+
+function absoluteApiUrl(session: EmbySession, value: string): string {
+  const url = /^https?:\/\//i.test(value)
+    ? new URL(value)
+    : new URL(value, `${session.apiBaseUrl.replace(/\/+$/, '')}/`)
+  if (!url.searchParams.has('api_key') && !url.searchParams.has('X-Emby-Token')) {
+    url.searchParams.set('api_key', session.accessToken)
+  }
+  return url.toString()
+}
+
+function streamExtension(source: EmbyMediaSource | undefined): string {
+  const container = source?.Container
+    ?.split(',')
+    .map((value) => value.trim())
+    .find(Boolean)
+  const clean = container?.replace(/[^a-z0-9]/gi, '').toLowerCase()
+  return clean ? `.${clean}` : ''
+}
+
+function playbackStreamUrl(session: EmbySession, itemId: string, source: EmbyMediaSource | undefined): string {
+  if (source?.Protocol === 'Http' && source.Path && /^https?:\/\//i.test(source.Path)) {
+    return normalizePlayableHttpUrl(source.Path)
+  }
+
+  if (source?.DirectStreamUrl) {
+    return absoluteApiUrl(session, source.DirectStreamUrl)
+  }
+
+  const mediaSourceId = source?.Id
+  return apiUrl(session.apiBaseUrl, `/Videos/${itemId}/stream${streamExtension(source)}`, {
+    Static: true,
+    api_key: session.accessToken,
+    MediaSourceId: mediaSourceId,
+    DeviceId: getDeviceId()
+  })
+}
+
+async function assertPlayableHttpUrl(url: string): Promise<void> {
+  if (!/^https?:\/\//i.test(url)) return
+
+  let response: Response
+  try {
+    response = await fetch(url, { method: 'HEAD', redirect: 'follow' })
+  } catch {
+    return
+  }
+
+  if (!response.ok) {
+    if (response.status === 405) return
+    throw new Error(`播放地址不可用 (${response.status})`)
+  }
+
+  const contentType = response.headers.get('content-type')?.toLowerCase() ?? ''
+  const looksLikeErrorBody = contentType.includes('application/json') ||
+    contentType.includes('text/html') ||
+    contentType.includes('text/plain')
+  if (!looksLikeErrorBody) return
+
+  let detail = ''
+  try {
+    const body = await fetch(url, {
+      method: 'GET',
+      redirect: 'follow',
+      headers: { Range: 'bytes=0-2047' }
+    })
+    const text = (await body.text()).trim()
+    if (text) {
+      try {
+        const parsed = JSON.parse(text) as { message?: unknown; error?: unknown }
+        detail = String(parsed.message ?? parsed.error ?? text)
+      } catch {
+        detail = text.slice(0, 160)
+      }
+    }
+  } catch {
+    detail = contentType
+  }
+
+  throw new Error(`播放地址返回的不是视频${detail ? `：${detail}` : ''}`)
+}
+
+async function fetchPlaybackMediaSource(session: EmbySession, itemId: string): Promise<EmbyMediaSource | undefined> {
+  const response = await fetchJson<EmbyPlaybackInfoResponse>(
+    apiUrl(session.apiBaseUrl, `/Items/${itemId}/PlaybackInfo`, { api_key: session.accessToken }),
+    { method: 'GET' },
+    '读取 Emby 播放信息'
+  )
+  return response.MediaSources?.[0]
+}
+
+function episodeOrderValue(item: EmbyItem): number {
+  const season = item.ParentIndexNumber ?? 0
+  const episode = item.IndexNumber ?? 0
+  return season * 10000 + episode
+}
+
+function choosePlayableEpisode(items: EmbyItem[]): EmbyItem | undefined {
+  const sorted = [...items].sort((left, right) => episodeOrderValue(left) - episodeOrderValue(right))
+  return sorted.find((item) => progressRatio(item) > 0 && progressRatio(item) < 1)
+    ?? sorted.find((item) => !item.UserData?.Played)
+    ?? sorted[0]
+}
+
+export async function resolveEmbyPlaybackTarget(
+  session: EmbySession,
+  item: MediaItem
+): Promise<EmbyPlaybackTarget> {
+  const fields = [
+    'MediaSources',
+    'UserData',
+    'RunTimeTicks',
+    'IndexNumber',
+    'ParentIndexNumber',
+    'SeriesName'
+  ].join(',')
+
+  if (item.type === 'movie') {
+    const detail = await fetchJson<EmbyItem>(
+      apiUrl(session.apiBaseUrl, `/Users/${session.userId}/Items/${item.id}`, {
+        Fields: fields,
+        api_key: session.accessToken
+      }),
+      { method: 'GET' },
+      '读取 Emby 播放信息'
+    )
+    const source = await fetchPlaybackMediaSource(session, detail.Id)
+    const url = playbackStreamUrl(session, detail.Id, source ?? detail.MediaSources?.[0])
+    return {
+      itemId: detail.Id,
+      title: detail.Name ?? item.title,
+      url
+    }
+  }
+
+  if (item.type === 'series') {
+    const episodes = await fetchJson<EmbyItemsResponse>(
+      apiUrl(session.apiBaseUrl, `/Shows/${item.id}/Episodes`, {
+        UserId: session.userId,
+        Fields: fields,
+        SortBy: 'ParentIndexNumber,IndexNumber',
+        SortOrder: 'Ascending',
+        api_key: session.accessToken
+      }),
+      { method: 'GET' },
+      '读取 Emby 剧集'
+    )
+    const episode = choosePlayableEpisode(episodes.Items ?? [])
+    if (!episode) {
+      throw new Error('这个剧集没有可播放的分集')
+    }
+    const titleParts = [
+      episode.SeriesName ?? item.title,
+      episode.ParentIndexNumber && episode.IndexNumber
+        ? `S${episode.ParentIndexNumber}:E${episode.IndexNumber}`
+        : '',
+      episode.Name ?? ''
+    ].filter(Boolean)
+    const source = await fetchPlaybackMediaSource(session, episode.Id)
+    const url = playbackStreamUrl(session, episode.Id, source ?? episode.MediaSources?.[0])
+    return {
+      itemId: episode.Id,
+      title: titleParts.join(' - '),
+      url
+    }
+  }
+
+  throw new Error('这个条目暂时不能直接播放')
+}
+
+async function loadLibraryForSession(
+  session: EmbySession,
+  displayName: string | undefined,
+  limit: number
+): Promise<EmbyLibrarySnapshot> {
+  const apiBaseUrl = session.apiBaseUrl
+  const authHeaders = authHeadersForSession(session)
+  const fields = [
+    'PrimaryImageAspectRatio',
+    'Overview',
+    'Genres',
+    'ProductionYear',
+    'RunTimeTicks',
+    'DateCreated',
+    'UserData',
+    'CommunityRating',
+    'OfficialRating',
+    'MediaSources',
+    'OriginalTitle',
+    'Taglines',
+    'ProductionLocations',
+    'BackdropImageTags'
+  ].join(',')
+
+  const [views, items] = await Promise.all([
+    fetchJson<EmbyViewsResponse>(
+      apiUrl(apiBaseUrl, `/Users/${session.userId}/Views`),
+      { method: 'GET', headers: authHeaders },
+      '读取媒体库'
+    ),
+    fetchJson<EmbyItemsResponse>(
+      apiUrl(apiBaseUrl, `/Users/${session.userId}/Items`, {
+        Recursive: true,
+        IncludeItemTypes: 'Movie,Series',
+        Fields: fields,
+        SortBy: 'DateCreated',
+        SortOrder: 'Descending',
+        Limit: limit
+      }),
+      { method: 'GET', headers: authHeaders },
+      '读取媒体条目'
+    )
+  ])
+
+  const sourceId = sourceIdForSession(session)
+  const viewRows = views.Items ?? []
+  const mediaItems = items.Items ?? []
+  const itemsByView = await Promise.all(viewRows.map(async (view): Promise<EmbyViewItems> => {
+    const includeItemTypes = latestItemTypesForView(view)
+    try {
+      const response = await fetchJson<EmbyItemsResponse>(
+        apiUrl(apiBaseUrl, `/Users/${session.userId}/Items`, {
+          ParentId: view.Id,
+          Recursive: true,
+          IncludeItemTypes: includeItemTypes,
+          Fields: fields,
+          SortBy: 'DateCreated',
+          SortOrder: 'Descending',
+          Limit: limit
+        }),
+        { method: 'GET', headers: authHeaders },
+        '读取媒体库条目'
+      )
+      return {
+        view,
+        items: response.Items ?? [],
+        totalRecordCount: response.TotalRecordCount ?? response.Items?.length ?? 0
+      }
+    } catch {
+      return { view, items: [], totalRecordCount: 0 }
+    }
+  }))
+  const latestByView = await Promise.all(viewRows.map(async (view, index): Promise<EmbyViewLatest> => {
+    const includeItemTypes = latestItemTypesForView(view)
+    try {
+      const latest = await fetchJson<EmbyItem[]>(
+        apiUrl(apiBaseUrl, `/Users/${session.userId}/Items/Latest`, {
+          ParentId: view.Id,
+          Limit: 16,
+          Fields: fields,
+          IncludeItemTypes: includeItemTypes,
+          GroupItems: false
+        }),
+        { method: 'GET', headers: authHeaders },
+        '读取最新媒体'
+      )
+      const supportedLatest = filterSupportedLatestItems(latest, includeItemTypes)
+      if (supportedLatest.length) return { view, items: supportedLatest }
+    } catch {
+      // Some Emby libraries do not expose Series rows through Items/Latest.
+    }
+
+    return { view, items: itemsByView[index]?.items.slice(0, 16) ?? [] }
+  }))
+  const itemRows = new Map<string, { item: EmbyItem; libraryViewId?: string }>()
+  itemsByView.forEach((row) => {
+    row.items.forEach((item) => {
+      if (!itemRows.has(item.Id)) itemRows.set(item.Id, { item, libraryViewId: row.view.Id })
+    })
+  })
+  mediaItems.forEach((item) => {
+    if (!itemRows.has(item.Id)) itemRows.set(item.Id, { item })
+  })
+  const mappedItems = [...itemRows.values()].map((row) => mapItem(session, sourceId, row.item, row.libraryViewId))
+  const homeSections = buildHomeSections(
+    session,
+    sourceId,
+    viewRows,
+    latestByView,
+    mediaItems.slice(0, Math.min(36, mediaItems.length))
+  )
+  const viewItemCount = itemsByView.reduce((sum, row) => sum + row.totalRecordCount, 0)
+  const totalRecordCount = items.TotalRecordCount ?? (viewItemCount > 0 ? viewItemCount : mediaItems.length)
+  const source: LibrarySource = {
+    id: sourceId,
+    name: displayName?.trim() || session.serverName,
+    kind: 'Emby',
+    status: 'online',
+    itemCount: totalRecordCount,
+    location: apiBaseUrl
+  }
+
+  return {
+    session,
+    source,
+    items: mappedItems,
+    homeSections,
+    viewCount: views.TotalRecordCount ?? views.Items?.length ?? 0,
+    totalRecordCount
   }
 }
 
@@ -320,63 +798,13 @@ export async function loadEmbyLibrary(input: EmbyConnectionInput, limit = DEFAUL
     accessToken: auth.AccessToken
   }
 
-  const authHeaders = {
-    'X-Emby-Authorization': authorizationHeader(session.userId),
-    'X-Emby-Token': session.accessToken
-  }
-  const fields = [
-    'PrimaryImageAspectRatio',
-    'Overview',
-    'Genres',
-    'ProductionYear',
-    'RunTimeTicks',
-    'DateCreated',
-    'UserData',
-    'CommunityRating',
-    'OfficialRating',
-    'MediaSources',
-    'OriginalTitle',
-    'Taglines',
-    'ProductionLocations',
-    'BackdropImageTags'
-  ].join(',')
+  return await loadLibraryForSession(session, input.displayName, limit)
+}
 
-  const [views, items] = await Promise.all([
-    fetchJson<EmbyViewsResponse>(
-      apiUrl(apiBaseUrl, `/Users/${session.userId}/Views`),
-      { method: 'GET', headers: authHeaders },
-      '读取媒体库'
-    ),
-    fetchJson<EmbyItemsResponse>(
-      apiUrl(apiBaseUrl, `/Users/${session.userId}/Items`, {
-        Recursive: true,
-        IncludeItemTypes: 'Movie,Series,Folder',
-        Fields: fields,
-        SortBy: 'DateCreated',
-        SortOrder: 'Descending',
-        Limit: limit
-      }),
-      { method: 'GET', headers: authHeaders },
-      '读取媒体条目'
-    )
-  ])
-
-  const sourceId = sourceIdForSession(session)
-  const totalRecordCount = items.TotalRecordCount ?? items.Items?.length ?? 0
-  const source: LibrarySource = {
-    id: sourceId,
-    name: input.displayName?.trim() || session.serverName,
-    kind: 'Emby',
-    status: 'online',
-    itemCount: totalRecordCount,
-    location: apiBaseUrl
-  }
-
-  return {
-    session,
-    source,
-    items: (items.Items ?? []).map((item) => mapItem(session, sourceId, item)),
-    viewCount: views.TotalRecordCount ?? views.Items?.length ?? 0,
-    totalRecordCount
-  }
+export async function refreshEmbyLibrary(
+  session: EmbySession,
+  displayName?: string,
+  limit = DEFAULT_LIMIT
+): Promise<EmbyLibrarySnapshot> {
+  return await loadLibraryForSession(session, displayName, limit)
 }

@@ -1,7 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent, type ReactNode, type Ref } from 'react'
 import {
   Captions,
-  ChevronDown,
   ChevronLeft,
   ChevronRight,
   Folder,
@@ -9,7 +8,6 @@ import {
   History,
   Info,
   Library,
-  Languages,
   Maximize2,
   Minimize2,
   Monitor,
@@ -25,6 +23,7 @@ import {
   Volume2
 } from 'lucide-react'
 import { applyAppearanceSettings } from './appearance'
+import { applyDocumentLanguage, getInitialLanguage, saveUiLanguage, type UiLanguage } from './uiSettings'
 import {
   EMPTY_STATE,
   postNativeCommand,
@@ -35,8 +34,6 @@ import {
   type PlayerState,
   type TrackOption
 } from './nativeBridge'
-
-const LANGUAGE_STORAGE_KEY = 'anvil-player.uiLanguage'
 
 const en = {
   appTitle: 'Anvil Player',
@@ -125,7 +122,9 @@ const en = {
   chineseTrack: 'Chinese',
   englishTrack: 'English',
   japaneseTrack: 'Japanese',
-  koreanTrack: 'Korean'
+  koreanTrack: 'Korean',
+  buffering: 'Buffering',
+  waitingForNetwork: 'Waiting for network'
 } as const
 
 const zh: Record<keyof typeof en, string> = {
@@ -215,24 +214,15 @@ const zh: Record<keyof typeof en, string> = {
   chineseTrack: '中文',
   englishTrack: '英语',
   japaneseTrack: '日语',
-  koreanTrack: '韩语'
+  koreanTrack: '韩语',
+  buffering: '缓冲中',
+  waitingForNetwork: '等待网络'
 }
 
 const copy = { en, zh }
 
-type UiLanguage = keyof typeof copy
 type Copy = Record<keyof typeof en, string>
 type SubtitlePanel = 'subtitles' | 'audio' | 'danmaku'
-
-function getInitialLanguage(): UiLanguage {
-  try {
-    const saved = window.localStorage.getItem(LANGUAGE_STORAGE_KEY)
-    if (saved === 'en' || saved === 'zh') return saved
-  } catch {
-    // Ignore storage failures inside constrained WebView profiles.
-  }
-  return navigator.language.toLowerCase().startsWith('zh') ? 'zh' : 'en'
-}
 
 function displayTrackLabel(label: string, t: Copy): string {
   switch (label) {
@@ -264,8 +254,6 @@ const DEFAULT_SUBTITLE_ANCHOR: RectSnapshot = {
   width: 30,
   height: 30
 }
-
-const DISCLOSURE_CLOSE_ELEVATION_MS = 560
 
 function rectSnapshotFromElement(element: HTMLElement | null): RectSnapshot {
   if (!element) return DEFAULT_SUBTITLE_ANCHOR
@@ -854,6 +842,15 @@ function VideoStage({ state, t }: { state: PlayerState; t: Copy }): JSX.Element 
   return (
     <main className="video-shell">
       <div className="video-stage">
+        {state.hasMedia && state.buffering && (
+          <div className="buffering-overlay" aria-live="polite">
+            <span className="buffering-spinner" aria-hidden="true" />
+            <span className="buffering-copy">
+              <strong>{t.buffering}</strong>
+              <small>{state.networkKbps > 0 ? `${state.networkKbps} KB/s` : t.waitingForNetwork}</small>
+            </span>
+          </div>
+        )}
         {!state.hasMedia && (
           <div className="empty-stage">
             <div className="empty-play">
@@ -905,124 +902,11 @@ function MediaList({ items, t }: { items: MediaListItem[]; t: Copy }): JSX.Eleme
   )
 }
 
-function LanguageSwitcher({
-  language,
-  onLanguageChange,
-  t
-}: {
-  language: UiLanguage
-  onLanguageChange: (language: UiLanguage) => void
-  t: Copy
-}): JSX.Element {
-  const [open, setOpen] = useState(false)
-  const [elevated, setElevated] = useState(false)
-  const elevationTimerRef = useRef<number | null>(null)
-  const options = [
-    { value: 'zh' as UiLanguage, label: t.chinese },
-    { value: 'en' as UiLanguage, label: t.english }
-  ]
-  const currentLabel = options.find((option) => option.value === language)?.label ?? language
-
-  useEffect(() => {
-    if (elevationTimerRef.current !== null) {
-      window.clearTimeout(elevationTimerRef.current)
-      elevationTimerRef.current = null
-    }
-
-    if (open) {
-      setElevated(true)
-      return undefined
-    }
-
-    elevationTimerRef.current = window.setTimeout(() => {
-      elevationTimerRef.current = null
-      setElevated(false)
-    }, DISCLOSURE_CLOSE_ELEVATION_MS)
-
-    return () => {
-      if (elevationTimerRef.current !== null) {
-        window.clearTimeout(elevationTimerRef.current)
-        elevationTimerRef.current = null
-      }
-    }
-  }, [open])
-
-  return (
-    <div className="control-group language-control">
-      <div className="control-title with-action">
-        <span className="control-title-label">
-          <Languages size={14} />
-          <span>{t.interfaceLanguage}</span>
-        </span>
-      </div>
-      <div className={`language-disclosure ${elevated ? 'is-elevated' : ''}`}>
-        <div
-          className={`language-disclosure-panel ${open ? 'is-open' : ''}`}
-          onClick={(event) => event.stopPropagation()}
-          onPointerDown={(event) => event.stopPropagation()}
-        >
-          <button
-            type="button"
-            className="language-trigger"
-            aria-expanded={open}
-            aria-label={t.interfaceLanguage}
-            onClick={() => setOpen((value) => !value)}
-          >
-            <span className="language-trigger-copy">
-              <strong>{currentLabel}</strong>
-            </span>
-            <ChevronDown size={14} className={`language-chevron ${open ? 'is-open' : ''}`} />
-          </button>
-          <div className={`language-options ${open ? 'is-open' : ''}`}>
-            <div className="language-options-body">
-              {options.map((option, index) => {
-                const active = option.value === language
-                return (
-                  <button
-                    key={option.value}
-                    type="button"
-                    className={`language-option ${active ? 'is-selected' : ''}`}
-                    style={{
-                      transitionDelay: open ? `${index * 42}ms` : '0ms'
-                    }}
-                    onClick={() => {
-                      onLanguageChange(option.value)
-                      setOpen(false)
-                    }}
-                  >
-                    <span className="language-option-dot" />
-                    <span>{option.label}</span>
-                  </button>
-                )
-              })}
-            </div>
-          </div>
-        </div>
-
-        {open && <div className="language-outside" onClick={() => setOpen(false)} />}
-
-        <div className="language-placeholder" aria-hidden="true">
-          <div className="language-trigger">
-            <span className="language-trigger-copy">
-              <strong>{currentLabel}</strong>
-            </span>
-            <ChevronDown size={14} />
-          </div>
-        </div>
-      </div>
-    </div>
-  )
-}
-
 function InspectorContent({
   state,
-  language,
-  onLanguageChange,
   t
 }: {
   state: PlayerState
-  language: UiLanguage
-  onLanguageChange: (language: UiLanguage) => void
   t: Copy
 }): JSX.Element {
   if (state.inspectorTab === 'settings') {
@@ -1032,7 +916,6 @@ function InspectorContent({
           <SlidersHorizontal size={15} />
           <span>{t.settings}</span>
         </div>
-        <LanguageSwitcher language={language} onLanguageChange={onLanguageChange} t={t} />
         <HdrCurveEditor state={state} t={t} />
         <InfoRow label={t.backend} value={state.backendLabel} emptyLabel={t.none} />
         <InfoRow label={t.volume} value={`${Math.round(state.volume * 100)}%`} emptyLabel={t.none} />
@@ -1113,13 +996,9 @@ function InspectorContent({
 
 function Inspector({
   state,
-  language,
-  onLanguageChange,
   t
 }: {
   state: PlayerState
-  language: UiLanguage
-  onLanguageChange: (language: UiLanguage) => void
   t: Copy
 }): JSX.Element {
   const tabs = inspectorTabs(t)
@@ -1154,7 +1033,7 @@ function Inspector({
         </div>
       )}
 
-      <InspectorContent state={state} language={language} onLanguageChange={onLanguageChange} t={t} />
+      <InspectorContent state={state} t={t} />
     </aside>
   )
 }
@@ -1641,12 +1520,8 @@ export default function App(): JSX.Element {
   }, [state.fullscreen, state.fullscreenTransportVisible])
 
   useEffect(() => {
-    document.documentElement.lang = language === 'zh' ? 'zh-CN' : 'en'
-    try {
-      window.localStorage.setItem(LANGUAGE_STORAGE_KEY, language)
-    } catch {
-      // Ignore storage failures inside constrained WebView profiles.
-    }
+    applyDocumentLanguage(language)
+    saveUiLanguage(language)
   }, [language])
 
   useEffect(() => {
@@ -1694,7 +1569,7 @@ export default function App(): JSX.Element {
       <TopBar state={state} t={t} />
       <section className="content-grid">
         <VideoStage state={state} t={t} />
-        <Inspector state={state} language={language} onLanguageChange={setLanguage} t={t} />
+        <Inspector state={state} t={t} />
       </section>
       {subtitlePopoverMounted && <SubtitlePopover state={state} t={t} open={subtitlePopoverOpen} anchor={subtitleAnchor} />}
       {subtitleAnchorReady && (!state.fullscreen || subtitleVisualActive) && (

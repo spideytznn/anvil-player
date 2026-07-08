@@ -18,11 +18,13 @@
 #include <windows.h>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace anvil::app {
@@ -64,6 +66,7 @@ private:
     LRESULT HandleHdrToneCurveWindowMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
 
     static std::filesystem::path DefaultLogPath();
+    static std::filesystem::path RecentMediaPath();
     void LogApp(anvil::playback::LogLevel level, const std::wstring& message) const;
     void LogRuntime(anvil::playback::LogLevel level, const std::wstring& category, const std::wstring& message) const;
     void MaybeLogNativeSchedulerStats(const NativeVideoQueueStats& stats);
@@ -238,6 +241,10 @@ private:
 
     // main_window.cpp runtime + transport
     void StopRuntime(bool clearVideoFrame = true);
+    void StopRuntimeAsync(bool clearVideoFrame = true);
+    void StopRuntimeBackends();
+    void FinishRuntimeStopVisuals(bool clearVideoFrame, bool clearDecoderFrames);
+    void WaitForAsyncRuntimeStop();
     void StartRuntime(const anvil::playback::PlaybackSessionSnapshot& snapshot,
                       bool restart,
                       bool waitForPreroll = true);
@@ -252,6 +259,8 @@ private:
     void RefreshPausedNativeFrame(const anvil::playback::PlaybackSessionSnapshot& snapshot,
                                   bool forceDecoderRestart = false);
     void OpenPath(const std::filesystem::path& path, bool autoplay = true);
+    void LoadRecentMedia();
+    void SaveRecentMedia() const;
     void StartPlayback();
     void PausePlayback();
     void TogglePlayback();
@@ -344,11 +353,15 @@ private:
     bool videoHostReady_ = false;
     bool webUiRequested_ = true;
     bool webUiActive_ = false;
+    bool webUiPlayerRouteActive_ = false;
     mutable std::chrono::steady_clock::time_point lastWebUiStatePostedAt_{};
     bool layoutDirty_ = true;
     bool nativeFrameHoldVisible_ = false;
     bool pendingPausedFrameRefresh_ = false;
     bool heldNativeFrameNeedsPresent_ = false;
+    std::thread runtimeStopThread_;
+    std::atomic_bool runtimeStopAsyncInProgress_{false};
+    std::atomic_bool runtimeStopAsyncClearFrame_{true};
     UINT_PTR nativeColorSettingsRefreshSerial_ = 0;
     bool nativeColorSettingsRefreshRequiresDecoderRefresh_ = false;
     std::optional<NativeVideoFrame> heldNativeFrame_;

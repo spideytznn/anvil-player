@@ -405,7 +405,7 @@ void MainWindow::UpdateLayout() {
 
         UpdateSubtitleMenuLayout();
         if (!SidebarAnimationActive()) {
-            playbackPlayer_.SetBounds(PlaybackSurfaceBounds());
+            playbackPlayer_.SetBounds(webUiActive_ && !webUiPlayerRouteActive_ ? RECT{} : PlaybackSurfaceBounds());
         }
         UpdateVideoHost();
         UpdateTransportOverlay();
@@ -721,7 +721,9 @@ void MainWindow::UpdateLayout() {
 
     if (!SidebarAnimationActive() || webUiActive_) {
         RECT playerBounds = PlaybackSurfaceBounds();
-        if (webUiActive_ && !fullscreen_ && RectWidth(videoSurface_) > 0 && RectHeight(videoSurface_) > 0) {
+        if (webUiActive_ && !webUiPlayerRouteActive_) {
+            playerBounds = RECT{};
+        } else if (webUiActive_ && !fullscreen_ && RectWidth(videoSurface_) > 0 && RectHeight(videoSurface_) > 0) {
             playerBounds = DeflateRectCopy(videoSurface_, Scale(5), Scale(5));
         }
         playbackPlayer_.SetBounds(playerBounds);
@@ -734,6 +736,16 @@ void MainWindow::UpdateLayout() {
 
 void MainWindow::UpdateVideoHost() {
     if (!videoHostReady_ || !videoHost_) {
+        return;
+    }
+    if (webUiActive_ && !webUiPlayerRouteActive_) {
+        if (IsWindowVisible(videoHost_)) {
+            ShowWindow(videoHost_, SW_HIDE);
+        }
+        const RECT empty{};
+        if (!RectEquals(lastVideoHostBounds_, empty)) {
+            lastVideoHostBounds_ = empty;
+        }
         return;
     }
     if (SidebarAnimationActive() && !webUiActive_) {
@@ -753,8 +765,27 @@ void MainWindow::UpdateVideoHost() {
                                  nativeFrameHoldVisible_ &&
                                  heldNativeFrame_.has_value();
     const bool nativeVideoVisible = nativeActive || nativePausedFrame || nativeHeldFrame;
+    const bool webUiBufferingOverlayVisible = webUiActive_ &&
+                                              webUiPlayerRouteActive_ &&
+                                              nativeActive &&
+                                              snapshot.media.has_value() &&
+                                              snapshot.media->hasVideo &&
+                                              nativeVideoDecoder_->Stats().buffering;
     const int w = RectWidth(bounds);
     const int h = RectHeight(bounds);
+    if (nativeVideoVisible && webUiBufferingOverlayVisible && w > 0 && h > 0) {
+        if (bounds.left != lastVideoHostBounds_.left ||
+            bounds.top != lastVideoHostBounds_.top ||
+            w != RectWidth(lastVideoHostBounds_) ||
+            h != RectHeight(lastVideoHostBounds_)) {
+            SetWindowPos(videoHost_, HWND_TOP, bounds.left, bounds.top, w, h, SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOREDRAW);
+            lastVideoHostBounds_ = bounds;
+        }
+        if (IsWindowVisible(videoHost_)) {
+            ShowWindow(videoHost_, SW_HIDE);
+        }
+        return;
+    }
     if (nativeVideoVisible && w > 0 && h > 0) {
         const bool wasVisible = IsWindowVisible(videoHost_) != FALSE;
         const bool boundsChanged = bounds.left != lastVideoHostBounds_.left ||

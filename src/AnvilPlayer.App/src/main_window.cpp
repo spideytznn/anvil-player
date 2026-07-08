@@ -1,7 +1,9 @@
 #include "AnvilPlayer/App/main_window.h"
+#include "AnvilPlayer/App/string_util.h"
 
 #include <commdlg.h>
 #include <dwmapi.h>
+#include <shlobj.h>
 #include <shellapi.h>
 #include <windowsx.h>
 
@@ -9,6 +11,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cwctype>
+#include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <string>
@@ -38,6 +41,53 @@ constexpr auto kVolumeHoverAnimationDuration = std::chrono::milliseconds{180};
 constexpr auto kWebUiProgressUpdateInterval = std::chrono::milliseconds{100};
 constexpr auto kFullscreenTransportHideDelay = std::chrono::seconds{5};
 constexpr int kFullscreenTransportActivationHeight = 110;
+constexpr std::size_t kMaxRecentMedia = 12;
+
+bool HasBuiltWebUiRoot(const std::filesystem::path& root) {
+    if (root.empty()) {
+        return false;
+    }
+
+    std::error_code error;
+    return std::filesystem::exists(root / L"index.html", error) &&
+           std::filesystem::exists(root / L"assets", error);
+}
+
+std::filesystem::path FindBuiltWebUiRootNear(std::filesystem::path base) {
+    if (base.empty()) {
+        return {};
+    }
+
+    std::error_code error;
+    base = std::filesystem::absolute(base, error).lexically_normal();
+    if (error) {
+        return {};
+    }
+
+    for (auto current = base; !current.empty();) {
+        const std::filesystem::path candidates[] = {
+            current / L"webui",
+            current / L"webui" / L"dist",
+            current / L"src" / L"AnvilPlayer.App" / L"webui" / L"dist",
+            current / L"AnvilPlayer.App" / L"webui" / L"dist",
+            current / L"dist",
+        };
+
+        for (const auto& candidate : candidates) {
+            if (HasBuiltWebUiRoot(candidate)) {
+                return candidate;
+            }
+        }
+
+        const auto parent = current.parent_path();
+        if (parent == current) {
+            break;
+        }
+        current = parent;
+    }
+
+    return {};
+}
 
 enum class MotionCurve {
     Fluid,
@@ -237,11 +287,25 @@ bool WantsCmv4Approx(const anvil::playback::VideoSettings& settings) {
     return settings.dolbyVisionCmv4Approx || ExperimentalDoviTrimEnabled();
 }
 
+std::filesystem::path AppDataStorageFolder() {
+    wchar_t localAppData[MAX_PATH]{};
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, localAppData))) {
+        return std::filesystem::path(localAppData) / L"AnvilPlayer";
+    }
+    return std::filesystem::temp_directory_path() / L"anvil-player";
+}
+
 std::wstring LowerCopy(std::wstring value) {
     std::transform(value.begin(), value.end(), value.begin(), [](const wchar_t ch) {
         return static_cast<wchar_t>(std::towlower(ch));
     });
     return value;
+}
+
+bool IsNetworkMediaPath(const std::filesystem::path& path) {
+    const std::wstring value = LowerCopy(path.wstring());
+    return value.rfind(L"http://", 0) == 0 ||
+           value.rfind(L"https://", 0) == 0;
 }
 
 std::filesystem::path NormalizeListPath(const std::filesystem::path& path) {
@@ -790,6 +854,7 @@ bool MainWindow::Create(HINSTANCE instance) {
         return false;
     }
 
+    LoadRecentMedia();
     TryCreateWebUi();
     return true;
 }
@@ -804,19 +869,21 @@ std::filesystem::path MainWindow::WebUiRoot() const {
     constexpr DWORD modulePathCount = static_cast<DWORD>(sizeof(modulePath) / sizeof(modulePath[0]));
     const DWORD length = GetModuleFileNameW(instance_, modulePath, modulePathCount);
     if (length > 0 && length < modulePathCount) {
-        const auto outputRoot = std::filesystem::path(modulePath).parent_path() / L"webui";
-        std::error_code error;
-        if (std::filesystem::exists(outputRoot / L"index.html", error)) {
-            return outputRoot;
+        const auto root = FindBuiltWebUiRootNear(std::filesystem::path(modulePath).parent_path());
+        if (!root.empty()) {
+            return root;
         }
     }
 
     std::error_code error;
-    const auto sourceRoot = std::filesystem::current_path(error) / L"src" / L"AnvilPlayer.App" / L"webui" / L"dist";
-    if (!error && std::filesystem::exists(sourceRoot / L"index.html", error)) {
-        return sourceRoot;
+    const auto currentRoot = FindBuiltWebUiRootNear(std::filesystem::current_path(error));
+    if (!error && !currentRoot.empty()) {
+        return currentRoot;
     }
 
+    if (length > 0 && length < modulePathCount) {
+        return std::filesystem::path(modulePath).parent_path() / L"webui";
+    }
     return std::filesystem::current_path(error) / L"webui";
 }
 
@@ -831,13 +898,15 @@ bool MainWindow::TryCreateWebUi() {
         HandleWebUiMessage(message);
     });
     if (!started) {
-        LogApp(LogLevel::Warning, L"web ui unavailable root=" + root.wstring());
+        LogApp(LogLevel::Warning, L"web ui unavailable root=" + root.wstring() + L" hr=0x" + HexHr(host->LastCreateResult()));
         return false;
     }
 
     webUiHost_ = std::move(host);
     webUiActive_ = true;
-    LogApp(LogLevel::Info, L"web ui enabled root=" + root.wstring());
+    LogApp(LogLevel::Info,
+           L"web ui enabled root=" + root.wstring() +
+               (webUiHost_->UsedDefaultOptionsFallback() ? L" options=default_after_retry" : L" options=custom"));
     return true;
 }
 
@@ -851,15 +920,23 @@ std::wstring MainWindow::BuildWebUiStateJson() const {
     }
 
     const std::wstring mediaName = snapshot.media.has_value() ? snapshot.media->displayName : L"No media loaded";
-    const long long positionMs = std::max<long long>(0, snapshot.position.count());
+    long long positionMs = std::max<long long>(0, snapshot.position.count());
     const long long durationMs = snapshot.media.has_value() ? std::max<long long>(0, snapshot.media->duration.count()) : 0;
     long long bufferedEndMs = positionMs;
+    bool buffering = false;
+    uint64_t networkBytesPerSecond = 0;
     if (backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
         nativeVideoDecoder_ &&
         snapshot.media.has_value() &&
         snapshot.media->duration.count() > 0) {
         const auto stats = nativeVideoDecoder_->Stats();
-        if ((stats.queueDepth > 0 || stats.packetQueueDepth > 0) && stats.bufferedEnd > snapshot.position) {
+        buffering = stats.buffering;
+        networkBytesPerSecond = stats.networkBytesPerSecond;
+        if (buffering) {
+            positionMs = std::clamp<long long>(stats.clockPosition.count(), 0, durationMs);
+            bufferedEndMs = positionMs;
+        }
+        if ((stats.queueDepth > 0 || stats.packetQueueDepth > 0) && stats.bufferedEnd.count() > positionMs) {
             bufferedEndMs = std::clamp<long long>(stats.bufferedEnd.count(), positionMs, durationMs);
         }
     }
@@ -900,6 +977,8 @@ std::wstring MainWindow::BuildWebUiStateJson() const {
     json << L"\"positionMs\":" << positionMs << L",";
     json << L"\"durationMs\":" << durationMs << L",";
     json << L"\"bufferedEndMs\":" << bufferedEndMs << L",";
+    json << L"\"buffering\":" << (buffering ? L"true" : L"false") << L",";
+    json << L"\"networkKbps\":" << (networkBytesPerSecond / 1024) << L",";
     json << L"\"volume\":" << std::fixed << std::setprecision(3) << std::clamp(snapshot.volume, 0.0, 1.0) << L",";
     json << L"\"runtimeLabel\":\"" << JsonEscape(RuntimeShortLabel()) << L"\",";
     json << L"\"backendLabel\":\"" << JsonEscape(RuntimeLabel()) << L"\",";
@@ -973,11 +1052,48 @@ void MainWindow::HandleWebUiMessage(const std::wstring_view message) {
         return;
     }
 
-    if (MessageContains(message, L"\"command\":\"open\"")) {
+    if (MessageContains(message, L"\"command\":\"setAllowInsecureCertificates\"")) {
+        const bool enabled = MessageContains(message, L"\"enabled\":true");
+        if (webUiHost_) {
+            webUiHost_->SetAllowInsecureCertificates(enabled);
+        }
+        LogApp(LogLevel::Info,
+               std::wstring(L"web ui insecure certificates ") + (enabled ? L"enabled" : L"disabled"));
+    } else if (MessageContains(message, L"\"command\":\"setWebUiRoute\"")) {
+        const bool playerRoute = MessageContains(message, L"\"route\":\"player\"");
+        if (webUiPlayerRouteActive_ != playerRoute) {
+            webUiPlayerRouteActive_ = playerRoute;
+            if (!playerRoute) {
+                HideSubtitleMenu();
+                webUiSubtitleGeometryValid_ = false;
+                webUiTransportGeometryValid_ = false;
+                webUiSubtitleAnchor_ = RECT{};
+                webUiSubtitlePopover_ = RECT{};
+                webUiTransportBounds_ = RECT{};
+                controller_.Stop();
+                SetPlaybackTimer(false);
+                StopRuntimeAsync(true);
+            }
+            LogApp(LogLevel::Debug,
+                   std::wstring(L"web ui route=") + (playerRoute ? L"player" : L"library"));
+            MarkLayoutDirty();
+            EnsureLayout();
+            UpdateVideoHost();
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        }
+    } else if (MessageContains(message, L"\"command\":\"open\"")) {
         OpenFileDialog();
+    } else if (MessageContains(message, L"\"command\":\"debugLog\"")) {
+        if (const auto text = ReadJsonString(message, L"message")) {
+            LogApp(LogLevel::Debug, L"web ui debug: " + *text);
+        }
     } else if (MessageContains(message, L"\"command\":\"openPath\"")) {
         if (const auto path = ReadJsonString(message, L"path")) {
-            OpenPath(*path, true);
+            auto* postedPath = new std::filesystem::path(*path);
+            if (!PostMessageW(hwnd_, kOpenPathMessage, 1, reinterpret_cast<LPARAM>(postedPath))) {
+                delete postedPath;
+                LogApp(LogLevel::Error, L"web ui openPath post failed path=" + *path);
+            }
         }
     } else if (MessageContains(message, L"\"command\":\"playPause\"")) {
         TogglePlayback();
@@ -1166,7 +1282,19 @@ LRESULT CALLBACK MainWindow::WindowProc(HWND hwnd, UINT message, WPARAM wParam, 
     }
 
     if (window) {
-        return window->HandleMessage(message, wParam, lParam);
+        try {
+            return window->HandleMessage(message, wParam, lParam);
+        } catch (const std::exception& error) {
+            window->LogApp(LogLevel::Error,
+                           L"window message exception message=0x" + std::to_wstring(message) +
+                               L" error=" + Utf8ToWide(error.what()));
+            return 0;
+        } catch (...) {
+            window->LogApp(LogLevel::Error,
+                           L"window message exception message=0x" + std::to_wstring(message) +
+                               L" error=unknown");
+            return 0;
+        }
     }
     return DefWindowProcW(hwnd, message, wParam, lParam);
 }
@@ -1353,6 +1481,9 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
         EnsureLayout();
         return 0;
     case kVideoFrameReadyMessage:
+        if (runtimeStopAsyncInProgress_.load()) {
+            return 0;
+        }
         videoDecoder_.AcknowledgeFrameNotification();
         if (backend_ == PlaybackBackend::RawFrameBridge) {
             controller_.UpdateClock();
@@ -1362,6 +1493,9 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
         }
         return 0;
     case kNativeVideoFrameReadyMessage: {
+        if (runtimeStopAsyncInProgress_.load()) {
+            return 0;
+        }
         if (nativeVideoDecoder_) {
             nativeVideoDecoder_->AcknowledgeFrameNotification();
             if (SidebarAnimationActive() && !webUiActive_) {
@@ -1384,10 +1518,24 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
                     RenderHeldNativeFrame();
                     LogApp(LogLevel::Debug, L"paused native frame refresh completed");
                 }
+                if (webUiActive_ && webUiPlayerRouteActive_) {
+                    UpdateVideoHost();
+                }
             }
             if (snapshot.state == PlaybackState::Playing) {
                 RenderPlaybackTick(snapshot, false);
             }
+        }
+        return 0;
+    }
+    case kRuntimeStopCompleteMessage:
+        WaitForAsyncRuntimeStop();
+        PostWebUiState();
+        return 0;
+    case kOpenPathMessage: {
+        std::unique_ptr<std::filesystem::path> path(reinterpret_cast<std::filesystem::path*>(lParam));
+        if (path && !path->empty()) {
+            OpenPath(*path, wParam != 0);
         }
         return 0;
     }
@@ -1668,6 +1816,10 @@ std::filesystem::path MainWindow::DefaultLogPath() {
     return std::filesystem::temp_directory_path() / L"anvil-player" / L"anvil-player.log";
 }
 
+std::filesystem::path MainWindow::RecentMediaPath() {
+    return AppDataStorageFolder() / L"recent-media.txt";
+}
+
 void MainWindow::LogApp(const LogLevel level, const std::wstring& message) const {
     if (const auto sink = controller_.LogSink()) {
         sink->Write(level, L"app", message);
@@ -1705,6 +1857,8 @@ void MainWindow::MaybeLogNativeSchedulerStats(const NativeVideoQueueStats& stats
                     L" buffered_end=" + FormatTimecode(stats.bufferedEnd) +
                     L" buffered_ms=" + std::to_wstring(stats.bufferedDuration.count()) +
                     L" read_ahead_ms=" + std::to_wstring(stats.readAheadDuration.count()) +
+                    L" buffering=" + std::wstring(stats.buffering ? L"true" : L"false") +
+                    L" net_kbps=" + std::to_wstring(stats.networkBytesPerSecond / 1024) +
                     L" rendered=" + std::to_wstring(stats.rendered) +
                    L" hardware_frames=" + std::to_wstring(stats.hardwareFrames) +
                    L" zero_copy_frames=" + std::to_wstring(stats.zeroCopyFrames) +
@@ -2410,9 +2564,29 @@ void MainWindow::SetPlaybackTimer(const bool playing) {
 }
 
 void MainWindow::OnPlaybackTimerTick() {
-    controller_.UpdateClock();
+    bool nativeBuffering = false;
+    if (backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+        nativeVideoDecoder_) {
+        const auto current = controller_.Snapshot();
+        if (current.state == PlaybackState::Playing &&
+            current.media.has_value() &&
+            current.media->hasVideo) {
+            const auto stats = nativeVideoDecoder_->Stats();
+            nativeBuffering = stats.buffering;
+            if (nativeBuffering) {
+                controller_.SyncClock(stats.clockPosition);
+            }
+        }
+    }
+    if (!nativeBuffering) {
+        controller_.UpdateClock();
+    }
     const auto snapshot = controller_.Snapshot();
     if (snapshot.state != PlaybackState::Playing) {
+        if (runtimeStopAsyncInProgress_.load()) {
+            PostWebUiState(false);
+            return;
+        }
         SetTemporaryPlaybackRate(1.0);
         if (snapshot.state == PlaybackState::Paused &&
             backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
@@ -2432,6 +2606,17 @@ void MainWindow::OnPlaybackTimerTick() {
         InvalidateRect(hwnd_, nullptr, FALSE);
         PostWebUiState();
     } else {
+        if (backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+            nativeVideoDecoder_ &&
+            nativeVideoDecoder_->IsRunning() &&
+            snapshot.media.has_value() &&
+            snapshot.media->hasVideo) {
+            const auto stats = nativeVideoDecoder_->Stats();
+            MaybeLogNativeSchedulerStats(stats);
+            if (webUiActive_ && webUiPlayerRouteActive_) {
+                UpdateVideoHost();
+            }
+        }
         RenderPlaybackTick(snapshot);
         PostWebUiState(false);
     }
@@ -2817,15 +3002,47 @@ void MainWindow::OpenDanmakuFileDialog() {
 }
 
 void MainWindow::StopRuntime(const bool clearVideoFrame) {
+    WaitForAsyncRuntimeStop();
+    StopRuntimeBackends();
+    FinishRuntimeStopVisuals(clearVideoFrame, true);
+}
+
+void MainWindow::StopRuntimeAsync(const bool clearVideoFrame) {
+    if (runtimeStopAsyncInProgress_.load()) {
+        runtimeStopAsyncClearFrame_.store(runtimeStopAsyncClearFrame_.load() || clearVideoFrame);
+        FinishRuntimeStopVisuals(clearVideoFrame, false);
+        LogApp(LogLevel::Debug, L"runtime async stop already in progress");
+        return;
+    }
+
+    WaitForAsyncRuntimeStop();
+    runtimeStopAsyncClearFrame_.store(clearVideoFrame);
+    runtimeStopAsyncInProgress_.store(true);
+    FinishRuntimeStopVisuals(clearVideoFrame, false);
+    LogApp(LogLevel::Debug, L"runtime async stop begin");
+    runtimeStopThread_ = std::thread([this]() {
+        StopRuntimeBackends();
+        if (hwnd_) {
+            PostMessageW(hwnd_, kRuntimeStopCompleteMessage, 0, 0);
+        }
+    });
+}
+
+void MainWindow::StopRuntimeBackends() {
     playbackPlayer_.Stop();
     videoDecoder_.Stop();
     if (nativeVideoDecoder_) {
         nativeVideoDecoder_->Stop();
     }
     audioPlayer_.Stop();
+}
+
+void MainWindow::FinishRuntimeStopVisuals(const bool clearVideoFrame, const bool clearDecoderFrames) {
     if (clearVideoFrame) {
-        videoDecoder_.ClearFrame();
-        if (nativeVideoDecoder_) nativeVideoDecoder_->ClearFrame();
+        if (clearDecoderFrames) {
+            videoDecoder_.ClearFrame();
+            if (nativeVideoDecoder_) nativeVideoDecoder_->ClearFrame();
+        }
         heldNativeFrame_.reset();
         nativeFrameHoldVisible_ = false;
         pendingPausedFrameRefresh_ = false;
@@ -2840,6 +3057,17 @@ void MainWindow::StopRuntime(const bool clearVideoFrame) {
         if (videoHost_) {
             ShowWindow(videoHost_, SW_HIDE);
         }
+    }
+}
+
+void MainWindow::WaitForAsyncRuntimeStop() {
+    if (runtimeStopThread_.joinable()) {
+        LogApp(LogLevel::Debug, L"runtime async stop wait");
+        runtimeStopThread_.join();
+    }
+    if (runtimeStopAsyncInProgress_.exchange(false)) {
+        LogApp(LogLevel::Debug, L"runtime async stop complete");
+        FinishRuntimeStopVisuals(runtimeStopAsyncClearFrame_.load(), true);
     }
 }
 
@@ -2884,12 +3112,8 @@ void MainWindow::StartRuntime(const PlaybackSessionSnapshot& snapshot,
     }
 
     pendingPausedFrameRefresh_ = false;
+    WaitForAsyncRuntimeStop();
     StopRuntime(false);
-
-    if (backend_ == PlaybackBackend::NativeFfmpegD3D11) {
-        StartNativeRuntime(snapshot, restart, waitForPreroll);
-        return;
-    }
 
     if (backend_ == PlaybackBackend::EmbeddedFfplay) {
         const bool started = playbackPlayer_.Start(hwnd_,
@@ -2901,6 +3125,11 @@ void MainWindow::StartRuntime(const PlaybackSessionSnapshot& snapshot,
         LogApp(started ? (restart ? LogLevel::Debug : LogLevel::Info) : LogLevel::Error,
                std::wstring(L"external ffplay playback ") + (restart ? L"restart=" : L"start=") + (started ? L"true" : L"false"));
         LogApp(LogLevel::Debug, L"ffplay command=" + playbackPlayer_.LastCommandLine());
+        return;
+    }
+
+    if (backend_ == PlaybackBackend::NativeFfmpegD3D11) {
+        StartNativeRuntime(snapshot, restart, waitForPreroll);
         return;
     }
 
@@ -2997,10 +3226,43 @@ void MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
     bool audioStarted = true;
     bool preferDolbyVisionHdrOutput = false;
     bool enableDolbyVisionEnhancementDecode = false;
+    const auto runtimeSettings = controller_.Settings();
+    const bool useSharedNetworkDemuxer =
+        snapshot.media->hasVideo &&
+        snapshot.media->hasAudio &&
+        IsNetworkMediaPath(snapshot.media->path) &&
+        runtimeSettings.audio.selectedTrackIndex != anvil::playback::kAudioTrackOff;
+    NativeAudioPacketSink audioPacketSink;
+    if (useSharedNetworkDemuxer) {
+        audioPlayer_.SetPlaybackRate(snapshot.playbackRate);
+        audioPacketSink.selectedTrackIndex = runtimeSettings.audio.selectedTrackIndex;
+        audioPacketSink.start =
+            [this, path = snapshot.media->path, volume = snapshot.volume](
+                const AVCodecParameters* codecParameters,
+                const AVRational timeBase,
+                const std::chrono::milliseconds startPosition,
+                const int streamIndex) {
+                return audioPlayer_.StartPacketStream(path,
+                                                      codecParameters,
+                                                      timeBase,
+                                                      startPosition,
+                                                      volume,
+                                                      streamIndex);
+            };
+        audioPacketSink.pushPacket = [this](const AVPacket* packet) {
+            return audioPlayer_.QueuePacket(packet);
+        };
+        audioPacketSink.reset = [this](const std::chrono::milliseconds position) {
+            audioPlayer_.ResetPacketStream(position);
+        };
+        audioPacketSink.endOfStream = [this]() {
+            audioPlayer_.MarkPacketStreamEof();
+        };
+    }
     lastNativeStatsLog_ = {};
     if (snapshot.media->hasVideo) {
         if (d3dRenderer_) {
-            const auto settings = controller_.Settings();
+            const auto& settings = runtimeSettings;
             d3dRenderer_->ConfigureColorPipeline(settings.video, CachedCapabilities().display, snapshot.media->videoColor);
             d3dRenderer_->ConfigureSubtitleSettings(settings.subtitles);
             d3dRenderer_->ResetRenderStats();
@@ -3008,7 +3270,7 @@ void MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
         MarkLayoutDirty();
         EnsureLayout();
         EnsureVideoHost();
-        const auto settings = controller_.Settings();
+        const auto& settings = runtimeSettings;
         preferDolbyVisionHdrOutput = snapshot.media->dolbyVisionDetected;
         const bool preferHardwareDecode = snapshot.media->selectedDecodePath == L"ffmpeg_d3d11va";
         enableDolbyVisionEnhancementDecode =
@@ -3043,14 +3305,14 @@ void MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
                                                   settings.subtitles.externalSubtitlePath,
                                                   false,
                                                   preferDolbyVisionHdrOutput,
-                                                  enableDolbyVisionEnhancementDecode);
+                                                  enableDolbyVisionEnhancementDecode,
+                                                  std::move(audioPacketSink));
         if (videoStarted) {
             MarkLayoutDirty();
             EnsureLayout();
             UpdateVideoHost();
         }
     }
-    const auto runtimeSettings = controller_.Settings();
     const bool waitForEnhancedPreroll =
         waitForPreroll &&
         restart &&
@@ -3072,11 +3334,15 @@ void MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
     }
     if (snapshot.media->hasAudio &&
         runtimeSettings.audio.selectedTrackIndex != anvil::playback::kAudioTrackOff) {
-        audioPlayer_.SetPlaybackRate(snapshot.playbackRate);
-        audioStarted = audioPlayer_.Start(snapshot.media->path,
-                                          snapshot.position,
-                                          snapshot.volume,
-                                          runtimeSettings.audio.selectedTrackIndex);
+        if (useSharedNetworkDemuxer) {
+            audioStarted = videoStarted;
+        } else {
+            audioPlayer_.SetPlaybackRate(snapshot.playbackRate);
+            audioStarted = audioPlayer_.Start(snapshot.media->path,
+                                              snapshot.position,
+                                              snapshot.volume,
+                                              runtimeSettings.audio.selectedTrackIndex);
+        }
     }
 
     const LogLevel level = videoStarted && audioStarted ? (restart ? LogLevel::Debug : LogLevel::Info) : LogLevel::Error;
@@ -3084,7 +3350,8 @@ void MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
            std::wstring(L"native ffmpeg/d3d11 playback ") +
                (restart ? L"restart" : L"start") +
                L" video=" + (videoStarted ? L"true" : L"false") +
-               L" audio=" + (audioStarted ? L"true" : L"false"));
+               L" audio=" + (audioStarted ? L"true" : L"false") +
+               L" shared_demux=" + (useSharedNetworkDemuxer ? L"true" : L"false"));
     if (snapshot.media->hasVideo && videoStarted) {
         LogApp(LogLevel::Debug, L"native decode path=" + nativeVideoDecoder_->Path().wstring());
         if (snapshot.media->dolbyVisionDetected) {
@@ -3110,7 +3377,6 @@ bool MainWindow::SeekNativeRuntime(const PlaybackSessionSnapshot& snapshot) {
         (!snapshot.media->hasVideo && !snapshot.media->hasAudio)) {
         return false;
     }
-
     bool videoSeeked = true;
     if (snapshot.media->hasVideo) {
         videoSeeked = nativeVideoDecoder_ &&
@@ -3123,9 +3389,17 @@ bool MainWindow::SeekNativeRuntime(const PlaybackSessionSnapshot& snapshot) {
 
     bool audioSeeked = true;
     const auto runtimeSettings = controller_.Settings();
+    const bool useSharedNetworkDemuxer =
+        snapshot.media->hasVideo &&
+        snapshot.media->hasAudio &&
+        IsNetworkMediaPath(snapshot.media->path) &&
+        runtimeSettings.audio.selectedTrackIndex != anvil::playback::kAudioTrackOff;
     if (snapshot.media->hasAudio &&
         runtimeSettings.audio.selectedTrackIndex != anvil::playback::kAudioTrackOff) {
-        if (audioPlayer_.IsRunning()) {
+        if (useSharedNetworkDemuxer) {
+            audioPlayer_.ResetPacketStream(snapshot.position);
+            audioSeeked = true;
+        } else if (audioPlayer_.IsRunning()) {
             audioSeeked = audioPlayer_.Seek(snapshot.position);
         } else {
             audioPlayer_.SetPlaybackRate(snapshot.playbackRate);
@@ -3147,6 +3421,9 @@ bool MainWindow::SeekNativeRuntime(const PlaybackSessionSnapshot& snapshot) {
     lastNativeStatsLog_ = {};
     if (d3dRenderer_) {
         d3dRenderer_->ResetRenderStats();
+    }
+    if (webUiActive_ && webUiPlayerRouteActive_) {
+        UpdateVideoHost();
     }
     LogApp(LogLevel::Debug, L"native runtime seek position=" + FormatTimecode(snapshot.position));
     SetPlaybackTimer(true);
@@ -3394,8 +3671,66 @@ void MainWindow::OpenPath(const std::filesystem::path& path, const bool autoplay
     PostWebUiState();
 }
 
+void MainWindow::LoadRecentMedia() {
+    recentMedia_.clear();
+
+    std::ifstream input(RecentMediaPath(), std::ios::binary);
+    if (!input) {
+        return;
+    }
+
+    std::string line;
+    while (recentMedia_.size() < kMaxRecentMedia && std::getline(input, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        const auto decoded = Utf8ToWide(line.c_str());
+        if (decoded.empty()) {
+            continue;
+        }
+        const auto normalizedPath = NormalizeListPath(decoded);
+        std::error_code error;
+        if (normalizedPath.empty() ||
+            !std::filesystem::exists(normalizedPath, error) ||
+            !IsMediaFilePath(normalizedPath) ||
+            std::find(recentMedia_.begin(), recentMedia_.end(), normalizedPath) != recentMedia_.end()) {
+            continue;
+        }
+        recentMedia_.push_back(normalizedPath);
+    }
+
+    if (!recentMedia_.empty()) {
+        LogApp(LogLevel::Debug, L"recent media loaded count=" + std::to_wstring(recentMedia_.size()));
+    }
+}
+
+void MainWindow::SaveRecentMedia() const {
+    const auto path = RecentMediaPath();
+    std::error_code error;
+    std::filesystem::create_directories(path.parent_path(), error);
+    if (error) {
+        LogApp(LogLevel::Warning, L"recent media directory failed path=" + path.parent_path().wstring());
+        return;
+    }
+
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output) {
+        LogApp(LogLevel::Warning, L"recent media save failed path=" + path.wstring());
+        return;
+    }
+
+    for (const auto& item : recentMedia_) {
+        output << WideToUtf8(item.wstring()) << '\n';
+    }
+}
+
 void MainWindow::UpdateInspectorMediaLists(const std::filesystem::path& path) {
-    constexpr std::size_t kMaxRecentMedia = 12;
+    if (IsNetworkMediaPath(path)) {
+        currentFolderEntries_.clear();
+        PostWebUiState();
+        return;
+    }
+
     const auto normalizedPath = NormalizeListPath(path);
     if (normalizedPath.empty()) {
         return;
@@ -3406,6 +3741,7 @@ void MainWindow::UpdateInspectorMediaLists(const std::filesystem::path& path) {
     if (recentMedia_.size() > kMaxRecentMedia) {
         recentMedia_.resize(kMaxRecentMedia);
     }
+    SaveRecentMedia();
 
     currentFolderEntries_ = MediaFilesInFolder(normalizedPath);
     if (std::find(currentFolderEntries_.begin(), currentFolderEntries_.end(), normalizedPath) == currentFolderEntries_.end()) {
