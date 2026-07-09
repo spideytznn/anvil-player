@@ -247,6 +247,7 @@ private:
     void Execute(Command command);
     void OpenInspectorPathItem(int itemIndex);
     void OpenFileDialog();
+    void OpenLocalFolderDialog();
     void OpenSubtitleFileDialog();
     void OpenDanmakuFileDialog();
 

@@ -881,6 +881,17 @@ std::wstring FormatIoState(const AVFormatContext* formatCtx) {
     return state;
 }
 
+bool ClearNetworkIoState(AVFormatContext* formatCtx) {
+    if (!formatCtx || !formatCtx->pb) {
+        return false;
+    }
+    AVIOContext* io = formatCtx->pb;
+    const bool changed = io->eof_reached != 0 || io->error != 0;
+    io->eof_reached = 0;
+    io->error = 0;
+    return changed;
+}
+
 bool LanguageMatches(const std::wstring& desired, const std::wstring& actual) {
     if (IsAutoLanguage(desired)) {
         return true;
@@ -1380,6 +1391,7 @@ struct CachedVideoPacket {
     std::chrono::milliseconds pts{0};
     std::chrono::milliseconds end{0};
     std::size_t bytes = 0;
+    uint64_t timelineSerial = 0;
 
     CachedVideoPacket() = default;
     CachedVideoPacket(const CachedVideoPacket&) = delete;
@@ -1389,7 +1401,8 @@ struct CachedVideoPacket {
         : packet(std::exchange(other.packet, nullptr)),
           pts(other.pts),
           end(other.end),
-          bytes(std::exchange(other.bytes, 0)) {}
+          bytes(std::exchange(other.bytes, 0)),
+          timelineSerial(std::exchange(other.timelineSerial, 0)) {}
 
     CachedVideoPacket& operator=(CachedVideoPacket&& other) noexcept {
         if (this != &other) {
@@ -1398,6 +1411,7 @@ struct CachedVideoPacket {
             pts = other.pts;
             end = other.end;
             bytes = std::exchange(other.bytes, 0);
+            timelineSerial = std::exchange(other.timelineSerial, 0);
         }
         return *this;
     }
@@ -1416,7 +1430,8 @@ struct CachedVideoPacket {
     static std::optional<CachedVideoPacket> MoveFrom(AVPacket* source,
                                                      const AVRational timeBase,
                                                      const std::chrono::milliseconds fallbackStart,
-                                                     const std::chrono::milliseconds fallbackDuration) {
+                                                     const std::chrono::milliseconds fallbackDuration,
+                                                     const uint64_t timelineSerial) {
         if (!source) {
             return std::nullopt;
         }
@@ -1438,6 +1453,7 @@ struct CachedVideoPacket {
         }
         cached.pts = start;
         cached.end = std::max(start + duration, start + std::chrono::milliseconds{1});
+        cached.timelineSerial = timelineSerial;
         av_packet_move_ref(owned, source);
         cached.packet = owned;
         return cached;
@@ -1598,6 +1614,7 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
     dolbyVisionCpuReferenceLogged_ = false;
     dolbyVisionMultiPartitionFallbackLogged_ = false;
     dolbyVisionEnhancementStartupFallbackLogged_ = false;
+    dolbyVisionEnhancementBaseOnlyDropLogged_ = false;
     dolbyVisionEnhancementStartupMisses_ = 0;
     dolbyVisionEnhancementLastDynamicMetadataFingerprint_ = 0;
     dolbyVisionEnhancementFramesDecoded_ = 0;
@@ -1631,12 +1648,12 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
     pendingSeekMs_.store(-1);
     pendingSeekInterruptsEnabled_.store(false);
     ioInterruptAfterSteadyMs_.store(0);
+    activeTimelineSerial_.store(1);
     interruptReturnCount_.store(0);
     playbackPaused_.store(false);
     pausedPositionMs_.store(startPosition.count());
     seekFastResumeFramesRemaining_.store(0);
     seekFastResumeLogged_.store(false);
-    seekClockHoldFramesRemaining_.store(0);
     seekPrerollPending_.store(false);
     seekRecoveryTargetMs_.store(startPosition.count() > 0 ? startPosition.count() : -1);
     seekRecoveryDropLogged_.store(false);
@@ -1647,6 +1664,7 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
         latestFrame_.bgra.reset();
         latestFrame_.yuv = {};
         latestFrame_.serial = 0;
+        latestFrame_.timelineSerial = 0;
         latestFrame_.width = latestFrame_.height = latestFrame_.stride = 0;
         latestFrame_.d3dTexture.Reset();
         latestFrame_.hardwareFrameRef.reset();
@@ -1662,7 +1680,7 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
         frameQueue_.clear();
         stats_ = {};
         stats_.decoder = preferHardwareDecode_ ? L"ffmpeg_d3d11va_pending" : L"ffmpeg_software";
-        seekPrerollStartedAt_ = {};
+        ResetSeekRecoveryLocked();
     }
     running_.store(true);
     decodeThread_ = std::thread([this]() { DecodeLoop(); });
@@ -1674,6 +1692,7 @@ void FfmpegVideoDecoder::Stop() {
     pendingSeekMs_.store(-1);
     pendingSeekInterruptsEnabled_.store(false);
     ioInterruptAfterSteadyMs_.store(0);
+    activeTimelineSerial_.store(0);
     playbackPaused_.store(false);
     notificationWindow_.store(nullptr);
     notificationMessage_.store(0);
@@ -1681,7 +1700,6 @@ void FfmpegVideoDecoder::Stop() {
     frameMessagePending_.store(false);
     seekFastResumeFramesRemaining_.store(0);
     seekFastResumeLogged_.store(false);
-    seekClockHoldFramesRemaining_.store(0);
     seekPrerollPending_.store(false);
     seekRecoveryTargetMs_.store(-1);
     seekRecoveryDropLogged_.store(false);
@@ -1689,6 +1707,10 @@ void FfmpegVideoDecoder::Stop() {
         decodeThread_.join();
     }
     running_.store(false);
+    {
+        std::scoped_lock lock(mutex_);
+        ResetSeekRecoveryLocked();
+    }
     clockCallback_ = {};
     sharedD3DDevice_.Reset();
     subtitleAssRenderer_.reset();
@@ -1710,12 +1732,10 @@ bool FfmpegVideoDecoder::Seek(const std::chrono::milliseconds position) {
     seekPrerollPending_.store(prerollAfterSeek);
     if (prerollAfterSeek) {
         seekFastResumeFramesRemaining_.store(kSeekFastResumeFrameCount);
-        seekClockHoldFramesRemaining_.store(kSeekClockHoldFrameCount);
         seekFastResumeLogged_.store(false);
     }
     {
         std::scoped_lock lock(mutex_);
-        const bool networkMedia = IsNetworkMediaPath(path_);
         latestFrame_ = {};
         frameQueue_.clear();
         schedulePrimed_ = false;
@@ -1730,10 +1750,8 @@ bool FfmpegVideoDecoder::Seek(const std::chrono::milliseconds position) {
         stats_.fallbackReason = fallbackReason;
         stats_.usingHardwareDecode = usingHardware;
         stats_.networkBytesPerSecond = networkBytesPerSecond;
-        stats_.buffering = networkMedia || prerollAfterSeek;
         stats_.clockPosition = clamped;
-        seekPrerollStartedAt_ = prerollAfterSeek ? std::chrono::steady_clock::now()
-                                                 : std::chrono::steady_clock::time_point{};
+        BeginSeekRecoveryLocked(clamped, prerollAfterSeek, CurrentTimelineSerial());
         UpdateBufferedStatsLocked();
     }
     return true;
@@ -1774,17 +1792,21 @@ bool FfmpegVideoDecoder::LatestFrame(NativeVideoFrame& frame) const {
     if (!latestFrame_.HasContent()) {
         return false;
     }
+    const uint64_t activeSerial = CurrentTimelineSerial();
+    if (latestFrame_.timelineSerial != 0 && latestFrame_.timelineSerial != activeSerial) {
+        return false;
+    }
     frame = latestFrame_;
     return true;
 }
 
 void FfmpegVideoDecoder::ClearFrame() {
     std::scoped_lock lock(mutex_);
-    seekPrerollPending_.store(false);
-    seekPrerollStartedAt_ = {};
+    ResetSeekRecoveryLocked();
     latestFrame_.bgra.reset();
     latestFrame_.yuv = {};
     latestFrame_.serial = 0;
+    latestFrame_.timelineSerial = 0;
     latestFrame_.width = latestFrame_.height = latestFrame_.stride = 0;
     latestFrame_.d3dTexture.Reset();
     latestFrame_.hardwareFrameRef.reset();
@@ -1808,6 +1830,168 @@ void FfmpegVideoDecoder::ClearFrame() {
 
 void FfmpegVideoDecoder::AcknowledgeFrameNotification() {
     frameMessagePending_.store(false);
+}
+
+uint64_t FfmpegVideoDecoder::CurrentTimelineSerial() const {
+    return activeTimelineSerial_.load(std::memory_order_acquire);
+}
+
+uint64_t FfmpegVideoDecoder::AdvanceTimelineSerial() {
+    return activeTimelineSerial_.fetch_add(1, std::memory_order_acq_rel) + 1;
+}
+
+void FfmpegVideoDecoder::BeginSeekRecoveryLocked(const std::chrono::milliseconds target,
+                                                 const bool prerollAfterSeek,
+                                                 const uint64_t timelineSerial) {
+    seekRecovery_ = {};
+    seekPrerollPending_.store(prerollAfterSeek);
+    stats_.seekRecoveryActive = prerollAfterSeek;
+    stats_.seekRecoveryAudioHandoffReady = !prerollAfterSeek;
+    stats_.timelineSerial = timelineSerial;
+    stats_.buffering = prerollAfterSeek;
+    if (!prerollAfterSeek) {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    seekRecovery_.phase = SeekRecoveryPhase::Preroll;
+    seekRecovery_.timelineSerial = timelineSerial;
+    seekRecovery_.target = target;
+    seekRecovery_.startedAt = now;
+    seekRecovery_.clockAnchorPts = target;
+    seekRecovery_.clockAnchorTime = now;
+}
+
+void FfmpegVideoDecoder::ResetSeekRecoveryLocked() {
+    seekRecovery_ = {};
+    seekPrerollPending_.store(false);
+    stats_.seekRecoveryActive = false;
+    stats_.seekRecoveryAudioHandoffReady = true;
+    stats_.timelineSerial = CurrentTimelineSerial();
+    stats_.buffering = false;
+}
+
+void FfmpegVideoDecoder::DropStaleFramesLocked() {
+    const uint64_t activeSerial = CurrentTimelineSerial();
+    if (latestFrame_.HasContent() &&
+        latestFrame_.timelineSerial != 0 &&
+        latestFrame_.timelineSerial != activeSerial) {
+        latestFrame_ = {};
+        ++stats_.droppedStale;
+    }
+
+    for (auto it = frameQueue_.begin(); it != frameQueue_.end();) {
+        if (it->timelineSerial != 0 && it->timelineSerial != activeSerial) {
+            it = frameQueue_.erase(it);
+            ++stats_.droppedStale;
+        } else {
+            ++it;
+        }
+    }
+    stats_.timelineSerial = activeSerial;
+}
+
+void FfmpegVideoDecoder::StartSeekRecoveryVisualWarmupLocked(const std::chrono::steady_clock::time_point now) {
+    DropStaleFramesLocked();
+    if (frameQueue_.empty()) {
+        ResetSeekRecoveryLocked();
+        return;
+    }
+
+    seekRecovery_.timelineSerial = CurrentTimelineSerial();
+    seekRecovery_.phase = SeekRecoveryPhase::VisualWarmup;
+    seekRecovery_.visualStartedAt = now;
+    seekRecovery_.clockAnchorTime = now;
+    seekRecovery_.clockAnchorPts = frameQueue_.front().pts;
+    seekRecovery_.firstPublishedPts.reset();
+    seekRecovery_.publishedFrames = 0;
+    stats_.seekRecoveryActive = true;
+    stats_.seekRecoveryAudioHandoffReady = false;
+    stats_.buffering = false;
+    fallbackClockAnchor_.reset();
+    fallbackClockBasePts_ = frameQueue_.front().pts;
+}
+
+FfmpegVideoDecoder::SchedulerClock FfmpegVideoDecoder::SeekRecoverySchedulerClockLocked(
+    const std::chrono::milliseconds firstQueuedPts) {
+    if (seekRecovery_.phase != SeekRecoveryPhase::VisualWarmup) {
+        return CurrentSchedulerClockLocked(firstQueuedPts);
+    }
+    if (seekRecovery_.timelineSerial != CurrentTimelineSerial()) {
+        return CurrentSchedulerClockLocked(firstQueuedPts);
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (seekRecovery_.clockAnchorTime.time_since_epoch().count() <= 0) {
+        seekRecovery_.clockAnchorTime = now;
+        seekRecovery_.clockAnchorPts = firstQueuedPts;
+    }
+
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - seekRecovery_.clockAnchorTime);
+    auto position = seekRecovery_.clockAnchorPts + std::max(elapsed, std::chrono::milliseconds{0});
+    if (position < firstQueuedPts) {
+        position = firstQueuedPts;
+    }
+    return {position, false};
+}
+
+void FfmpegVideoDecoder::UpdateSeekRecoveryAfterPublishLocked(
+    const std::chrono::milliseconds publishedPts,
+    const std::chrono::steady_clock::time_point now) {
+    if (seekRecovery_.phase != SeekRecoveryPhase::VisualWarmup) {
+        return;
+    }
+    if (seekRecovery_.timelineSerial != CurrentTimelineSerial()) {
+        ResetSeekRecoveryLocked();
+        return;
+    }
+
+    if (!seekRecovery_.firstPublishedPts.has_value()) {
+        seekRecovery_.firstPublishedPts = publishedPts;
+    }
+    ++seekRecovery_.publishedFrames;
+
+    const auto publishedSpan = publishedPts - *seekRecovery_.firstPublishedPts;
+    const auto elapsed = seekRecovery_.visualStartedAt.time_since_epoch().count() > 0
+                             ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   now - seekRecovery_.visualStartedAt)
+                             : std::chrono::milliseconds{0};
+    const bool hasPublishedContinuity =
+        seekRecovery_.publishedFrames >= kSeekRecoveryWarmupFrameCount ||
+        publishedSpan >= kSeekRecoveryWarmupMinSpan;
+    std::size_t minQueuedLead = kSeekRecoveryHandoffMinQueuedFrames;
+    if (!frameQueue_.empty()) {
+        const auto capacity = MaxQueueDepthForFrame(frameQueue_.front());
+        minQueuedLead = std::min(minQueuedLead, capacity > 1 ? capacity - 1 : capacity);
+    }
+    const bool hasQueuedLead = !frameQueue_.empty() && frameQueue_.size() >= minQueuedLead;
+    const bool hasReadAheadLead = stats_.readAheadDuration >= kSeekRecoveryHandoffMinReadAhead;
+    const bool warmupTimedOut =
+        elapsed >= kSeekRecoveryWarmupMaxWait &&
+        hasPublishedContinuity;
+    if (!hasPublishedContinuity) {
+        return;
+    }
+    if (!hasQueuedLead && !hasReadAheadLead && !warmupTimedOut) {
+        return;
+    }
+
+    LogThread(LogLevel::Debug,
+              L"decoder",
+              L"seek_recovery_audio_handoff frames=" +
+                  std::to_wstring(seekRecovery_.publishedFrames) +
+                  L" span_ms=" + std::to_wstring(std::max(publishedSpan, std::chrono::milliseconds{0}).count()) +
+                  L" elapsed_ms=" + std::to_wstring(std::max(elapsed, std::chrono::milliseconds{0}).count()) +
+                  L" queue_depth=" + std::to_wstring(frameQueue_.size()) +
+                  L" read_ahead_ms=" + std::to_wstring(stats_.readAheadDuration.count()) +
+                  (warmupTimedOut ? L" timeout=true" : L""));
+
+    seekRecovery_ = {};
+    stats_.seekRecoveryActive = false;
+    stats_.seekRecoveryAudioHandoffReady = true;
+    fallbackClockAnchor_ = now;
+    fallbackClockBasePts_ = publishedPts;
 }
 
 NativeVideoQueueStats FfmpegVideoDecoder::Stats() const {
@@ -1849,10 +2033,8 @@ bool FfmpegVideoDecoder::WaitForEnhancementPreroll(const std::chrono::millisecon
         }
     } waitScope{enhancementPrerollWaitActive_};
 
-    const auto waitStarted = std::chrono::steady_clock::now();
-    const auto fallbackDeadline = waitStarted + std::min(timeout, std::chrono::milliseconds{1200});
     const auto deadline = std::chrono::steady_clock::now() + timeout;
-    bool fallbackLogged = false;
+    bool baseOnlyDropLogged = false;
     while (!stopping_.load() && running_.load() && std::chrono::steady_clock::now() < deadline) {
         if (HasPendingSeek()) {
             std::this_thread::sleep_for(std::chrono::milliseconds{1});
@@ -1899,38 +2081,19 @@ bool FfmpegVideoDecoder::WaitForEnhancementPreroll(const std::chrono::millisecon
                 ready = true;
             } else if (!frameQueue_.empty()) {
                 const auto base = std::find_if(frameQueue_.begin(), frameQueue_.end(), closeToTarget);
-                const bool allowBaseFallback = publishReadyFrame &&
-                                               base != frameQueue_.end() &&
-                                               std::chrono::steady_clock::now() >= fallbackDeadline;
-                if (allowBaseFallback) {
+                if (base != frameQueue_.end()) {
                     const std::size_t framesToDrop =
-                        static_cast<std::size_t>(std::distance(frameQueue_.begin(), base));
+                        static_cast<std::size_t>(std::distance(frameQueue_.begin(), base)) + 1;
                     for (std::size_t index = 0; index < framesToDrop; ++index) {
                         frameQueue_.pop_front();
                         ++stats_.droppedLate;
                     }
-                    NativeVideoFrame frameToPublish = std::move(frameQueue_.front());
-                    frameQueue_.pop_front();
-                    const auto publishedPts = frameToPublish.pts;
-                    latestFrame_ = std::move(frameToPublish);
-                    ++stats_.rendered;
-                    stats_.buffering = false;
-                    schedulePrimed_ = true;
-                    notify = true;
-                    ready = true;
-                    if (!fallbackLogged) {
-                        fallbackLogged = true;
-                        LogThread(LogLevel::Warning,
+                    if (!baseOnlyDropLogged) {
+                        baseOnlyDropLogged = true;
+                        LogThread(LogLevel::Debug,
                                   L"decoder",
-                                  L"dolby_vision_el_overlay enhancement_preroll_timeout fallback=base_layer"
-                                      L" pts_ms=" + std::to_wstring(publishedPts.count()));
-                    }
-                } else if (base != frameQueue_.end()) {
-                    const std::size_t framesToDrop =
-                        static_cast<std::size_t>(std::distance(frameQueue_.begin(), base));
-                    for (std::size_t index = 0; index < framesToDrop; ++index) {
-                        frameQueue_.pop_front();
-                        ++stats_.droppedLate;
+                                  L"dolby_vision_el_overlay enhancement_preroll_drop_base_only"
+                                      L" dropped=" + std::to_wstring(framesToDrop));
                     }
                 } else {
                     const std::size_t dropped = frameQueue_.size();
@@ -2286,6 +2449,7 @@ void FfmpegVideoDecoder::DecodeLoop() {
                     break;
                 }
             } else if (networkSource) {
+                ClearNetworkIoState(formatCtx);
                 LogThread(LogLevel::Debug,
                           L"decoder",
                           L"initial_seek target=" + anvil::playback::FormatTimecode(startPosition_) +
@@ -2312,7 +2476,9 @@ void FfmpegVideoDecoder::DecodeLoop() {
         bool inputEof = false;
         bool readFrameWaitLogged = false;
         bool firstReadFrameLogged = false;
-        bool networkEofResetAttempted = false;
+        bool networkEofClearAttempted = false;
+        bool networkEofSeekResetAttempted = false;
+        bool networkInterruptedIoResetAttempted = false;
         int nonVideoPacketLogCount = 0;
         int videoPacketCacheLogCount = 0;
         int readFrameErrorLogCount = 0;
@@ -2400,9 +2566,46 @@ void FfmpegVideoDecoder::DecodeLoop() {
             return frameQueue_.size() + 1 >= capacity;
         };
 
+        auto absEnhancementDelta = [](const std::chrono::milliseconds lhs, const std::chrono::milliseconds rhs) {
+            return lhs >= rhs ? lhs - rhs : rhs - lhs;
+        };
+
+        auto enhancementReadyForNextVideoPacket = [&]() {
+            if (!enhancementOverlayReadAheadActive() || packetQueue.empty()) {
+                return true;
+            }
+            if (dolbyVisionEnhancementFrames_.empty()) {
+                return inputEof;
+            }
+
+            const auto targetPts = packetQueue.front().pts;
+            auto bestDelta = absEnhancementDelta(dolbyVisionEnhancementFrames_.front().pts, targetPts);
+            for (std::size_t index = 1; index < dolbyVisionEnhancementFrames_.size(); ++index) {
+                bestDelta = std::min(bestDelta,
+                                     absEnhancementDelta(dolbyVisionEnhancementFrames_[index].pts, targetPts));
+            }
+            if (bestDelta <= kDolbyVisionEnhancementMatchDelta) {
+                return true;
+            }
+
+            const auto firstPts = dolbyVisionEnhancementFrames_.front().pts;
+            const auto lastPts = dolbyVisionEnhancementFrames_.back().pts;
+            if (targetPts + kDolbyVisionEnhancementMatchDelta < firstPts) {
+                return true;
+            }
+            if (lastPts + kDolbyVisionEnhancementMatchDelta < targetPts) {
+                return inputEof || packetQueueAtTarget();
+            }
+            return true;
+        };
+
         auto cacheVideoPacket = [&](AVPacket* source) {
             const auto fallbackStart = packetQueue.empty() ? packetTimelineEnd : packetQueue.back().end;
-            auto cached = CachedVideoPacket::MoveFrom(source, streamTimeBase, fallbackStart, fallbackPacketDuration);
+            auto cached = CachedVideoPacket::MoveFrom(source,
+                                                      streamTimeBase,
+                                                      fallbackStart,
+                                                      fallbackPacketDuration,
+                                                      CurrentTimelineSerial());
             if (!cached.has_value()) {
                 av_packet_unref(source);
                 return false;
@@ -2433,11 +2636,10 @@ void FfmpegVideoDecoder::DecodeLoop() {
                 if (readResult < 0) {
                     if (readResult == AVERROR_EOF &&
                         networkSource &&
-                        !networkEofResetAttempted &&
                         !HasPendingSeek()) {
-                        networkEofResetAttempted = true;
-                        if (formatCtx->pb && formatCtx->pb->error == 0) {
-                            formatCtx->pb->eof_reached = 0;
+                        if (!networkEofClearAttempted && formatCtx->pb) {
+                            networkEofClearAttempted = true;
+                            ClearNetworkIoState(formatCtx);
                             LogThread(LogLevel::Warning,
                                       L"decoder",
                                       L"read_frame eof_reset method=clear_eof " + FormatIoState(formatCtx));
@@ -2448,9 +2650,9 @@ void FfmpegVideoDecoder::DecodeLoop() {
                         networkSource &&
                         videoPacketsRead == 0 &&
                         !firstReadFrameLogged &&
-                        !networkEofResetAttempted &&
+                        !networkEofSeekResetAttempted &&
                         !HasPendingSeek()) {
-                        networkEofResetAttempted = true;
+                        networkEofSeekResetAttempted = true;
                         const int64_t seekTarget = static_cast<int64_t>(startPosition_.count()) *
                                                    AV_TIME_BASE / 1000;
                         const auto resetSeekStart = std::chrono::steady_clock::now();
@@ -2461,6 +2663,7 @@ void FfmpegVideoDecoder::DecodeLoop() {
                             std::chrono::steady_clock::now() - resetSeekStart).count();
                         if (seekError >= 0) {
                             avformat_flush(formatCtx);
+                            ClearNetworkIoState(formatCtx);
                             LogThread(LogLevel::Warning,
                                       L"decoder",
                                       L"read_frame eof_reset method=seek target=" +
@@ -2478,6 +2681,21 @@ void FfmpegVideoDecoder::DecodeLoop() {
                                            ? L" interrupted=true"
                                            : L"") +
                                       L" " + FormatIoState(formatCtx));
+                    }
+                    if (readResult == AVERROR_EXIT &&
+                        networkSource &&
+                        !networkInterruptedIoResetAttempted &&
+                        !stopping_.load() &&
+                        !HasPendingSeek() &&
+                        ioInterruptAfterSteadyMs_.load() == 0) {
+                        networkInterruptedIoResetAttempted = true;
+                        if (ClearNetworkIoState(formatCtx)) {
+                            LogThread(LogLevel::Warning,
+                                      L"decoder",
+                                      L"read_frame interrupt_reset method=clear_io_state " +
+                                          FormatIoState(formatCtx));
+                            continue;
+                        }
                     }
                     if (readFrameErrorLogCount < 3) {
                         ++readFrameErrorLogCount;
@@ -2576,6 +2794,18 @@ void FfmpegVideoDecoder::DecodeLoop() {
             }
         };
 
+        auto readAheadForEnhancementMatch = [&]() {
+            if (!enhancementOverlayReadAheadActive() ||
+                packetQueue.empty() ||
+                enhancementReadyForNextVideoPacket() ||
+                inputEof ||
+                packetQueueAtTarget()) {
+                return false;
+            }
+            readAheadPackets(kDolbyVisionEnhancementPlayingPacketReadAheadBatch);
+            return true;
+        };
+
         auto decodeNextCachedPacket = [&]() {
             if (packetQueue.empty()) {
                 return true;
@@ -2589,6 +2819,14 @@ void FfmpegVideoDecoder::DecodeLoop() {
             }
             packetQueue.pop_front();
             updatePacketStats();
+            if (cached.timelineSerial != CurrentTimelineSerial()) {
+                {
+                    std::scoped_lock lock(mutex_);
+                    ++stats_.droppedStale;
+                    UpdateBufferedStatsLocked();
+                }
+                return true;
+            }
 
             if (!firstPacketSeen) {
                 LogThread(LogLevel::Debug,
@@ -2596,6 +2834,7 @@ void FfmpegVideoDecoder::DecodeLoop() {
                           L"first_video_packet pts_ms=" + std::to_wstring(cached.pts.count()) +
                               L" end_ms=" + std::to_wstring(cached.end.count()) +
                               L" bytes=" + std::to_wstring(cached.bytes) +
+                              L" timeline_serial=" + std::to_wstring(cached.timelineSerial) +
                               L" key=" + ((cached.packet && (cached.packet->flags & AV_PKT_FLAG_KEY) != 0) ? L"true" : L"false"));
             }
             firstPacketSeen = true;
@@ -2679,12 +2918,31 @@ void FfmpegVideoDecoder::DecodeLoop() {
             const bool hasPreroll = hasDecodedPreroll();
             const bool elOverlay = enhancementOverlayReadAheadActive();
             const bool enhancementPrerollWaitActive = enhancementPrerollWaitActive_.load();
+            const bool seekPrerollWaiting = seekPrerollPending_.load();
             if (paused && hasPreroll && !enhancementPrerollWaitActive) {
                 std::this_thread::sleep_for(std::chrono::milliseconds{1});
                 continue;
             }
 
             const bool decodedNearCapacity = !paused && hasPreroll && decodedQueueNearCapacity();
+            if (HasPendingSeek()) {
+                continue;
+            }
+
+            if (!packetQueue.empty() && !decodedNearCapacity) {
+                if (readAheadForEnhancementMatch()) {
+                    continue;
+                }
+                if (!decodeNextCachedPacket()) {
+                    break;
+                }
+                continue;
+            }
+
+            if (decodedNearCapacity && !seekPrerollWaiting) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{1});
+                continue;
+            }
 
             if (paused) {
                 readAheadPackets(elOverlay ? kDolbyVisionEnhancementPausedPacketReadAheadBatch
@@ -2703,12 +2961,10 @@ void FfmpegVideoDecoder::DecodeLoop() {
                 continue;
             }
 
-            if (decodedNearCapacity) {
-                std::this_thread::sleep_for(std::chrono::milliseconds{1});
-                continue;
-            }
-
-            if (!packetQueue.empty()) {
+            if (!packetQueue.empty() && !decodedNearCapacity) {
+                if (readAheadForEnhancementMatch()) {
+                    continue;
+                }
                 if (!decodeNextCachedPacket()) {
                     break;
                 }
@@ -3912,6 +4168,7 @@ bool FfmpegVideoDecoder::TryPublishDoviLibplaceboFrame(AVFrame* frame,
         queued.dynamicMetadataDetails = DoviFrameSummary(inputDovi.get());
         queued.pts = pts;
         queued.serial = ++serial;
+        queued.timelineSerial = CurrentTimelineSerial();
         RefreshFrameSubtitles(queued);
 
         if (!dolbyVisionLibplaceboFrameLogged_) {
@@ -3941,7 +4198,6 @@ void FfmpegVideoDecoder::AttachDolbyVisionEnhancementFrame(NativeVideoFrame& fra
         return;
     }
 
-    constexpr std::chrono::milliseconds kMaxEnhancementDelta{80};
     auto absDelta = [](const std::chrono::milliseconds lhs, const std::chrono::milliseconds rhs) {
         return lhs >= rhs ? lhs - rhs : rhs - lhs;
     };
@@ -3956,9 +4212,9 @@ void FfmpegVideoDecoder::AttachDolbyVisionEnhancementFrame(NativeVideoFrame& fra
         }
     }
 
-    if (bestDelta > kMaxEnhancementDelta) {
+    if (bestDelta > kDolbyVisionEnhancementMatchDelta) {
         while (!dolbyVisionEnhancementFrames_.empty() &&
-               dolbyVisionEnhancementFrames_.front().pts + kMaxEnhancementDelta < pts) {
+               dolbyVisionEnhancementFrames_.front().pts + kDolbyVisionEnhancementMatchDelta < pts) {
             dolbyVisionEnhancementFrames_.pop_front();
         }
         if (!dolbyVisionEnhancementNoMatchLogged_) {
@@ -4078,11 +4334,13 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
     if (ShouldDropSeekPreroll(pts)) {
         return true;
     }
+    const uint64_t frameTimelineSerial = CurrentTimelineSerial();
 
     AVFrame* conversionFrame = frame;
     if (frame && frame->format == hardwarePixelFormat_ && hardwarePixelFormat_ != AV_PIX_FMT_NONE) {
         NativeVideoFrame textureFrame;
         if (TryBuildD3DTextureFrame(frame, pts, serial, textureFrame)) {
+            textureFrame.timelineSerial = frameTimelineSerial;
             if (!firstHardwareFrameLogged_) {
                 firstHardwareFrameLogged_ = true;
                 LogThread(LogLevel::Info,
@@ -4189,36 +4447,33 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
             queued.yuv = std::move(packedYuv);
             AttachDolbyVisionEnhancementFrame(queued, pts);
             if (enhancementOverlayPath && !queued.HasEnhancementYuv()) {
-                constexpr int kMaxStartupEnhancementMisses = 4;
                 bool hasRenderedFrame = false;
                 {
                     std::scoped_lock lock(mutex_);
                     hasRenderedFrame = stats_.rendered > 0 || latestFrame_.HasContent();
                 }
-                if (!hasRenderedFrame && dolbyVisionEnhancementStartupMisses_ < kMaxStartupEnhancementMisses) {
-                    ++dolbyVisionEnhancementStartupMisses_;
-                    if (dolbyVisionEnhancementStartupMisses_ == 1) {
-                        LogThread(LogLevel::Debug,
-                                  L"decoder",
-                                  L"dolby_vision_el_overlay startup_wait_for_match bl_pts_ms=" +
-                                      std::to_wstring(pts.count()));
-                    }
-                    return true;
-                }
-                if (!hasRenderedFrame && !dolbyVisionEnhancementStartupFallbackLogged_) {
-                    dolbyVisionEnhancementStartupFallbackLogged_ = true;
-                    LogThread(LogLevel::Warning,
+                ++dolbyVisionEnhancementStartupMisses_;
+                if (!hasRenderedFrame && dolbyVisionEnhancementStartupMisses_ == 1) {
+                    LogThread(LogLevel::Debug,
                               L"decoder",
-                              L"dolby_vision_el_overlay startup_match_timeout fallback=base_layer"
-                                  L" bl_pts_ms=" + std::to_wstring(pts.count()) +
-                                  L" skipped_frames=" + std::to_wstring(dolbyVisionEnhancementStartupMisses_));
+                              L"dolby_vision_el_overlay startup_wait_for_match bl_pts_ms=" +
+                                  std::to_wstring(pts.count()));
+                } else if (hasRenderedFrame && !dolbyVisionEnhancementBaseOnlyDropLogged_) {
+                    dolbyVisionEnhancementBaseOnlyDropLogged_ = true;
+                    LogThread(LogLevel::Debug,
+                              L"decoder",
+                              L"dolby_vision_el_overlay drop_base_only bl_pts_ms=" +
+                                  std::to_wstring(pts.count()));
                 }
+                return true;
             } else if (enhancementOverlayPath) {
                 dolbyVisionEnhancementStartupMisses_ = 0;
                 dolbyVisionEnhancementStartupFallbackLogged_ = false;
+                dolbyVisionEnhancementBaseOnlyDropLogged_ = false;
             }
             queued.pts = pts;
             queued.serial = ++serial;
+            queued.timelineSerial = frameTimelineSerial;
             RefreshFrameSubtitles(queued);
             const bool logFirstDoviQueue = !dolbyVisionFirstQueueLogged_;
             if (logFirstDoviQueue) {
@@ -4288,6 +4543,7 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
     }
     queued.pts = pts;
     queued.serial = ++serial;
+    queued.timelineSerial = frameTimelineSerial;
     RefreshFrameSubtitles(queued);
     if (oneShotFrame_) {
         return PublishImmediateFrame(std::move(queued));
@@ -4357,6 +4613,7 @@ bool FfmpegVideoDecoder::TryBuildD3DTextureFrame(AVFrame* frame, std::chrono::mi
     });
     out.pts = pts;
     out.serial = ++serial;
+    out.timelineSerial = CurrentTimelineSerial();
     RefreshFrameSubtitles(out);
 
     {
@@ -4378,6 +4635,7 @@ bool FfmpegVideoDecoder::PublishImmediateFrame(NativeVideoFrame&& frame) {
         stats_.usingAudioClock = false;
         stats_.driftMs = 0;
         stats_.buffering = false;
+        stats_.timelineSerial = frame.timelineSerial != 0 ? frame.timelineSerial : CurrentTimelineSerial();
         ++stats_.rendered;
         latestFrame_ = frame;
     }
@@ -4440,19 +4698,20 @@ bool FfmpegVideoDecoder::ApplyPendingSeek(AVFormatContext* formatCtx,
         std::chrono::steady_clock::now() - seekStart).count();
     const bool seekInterrupted = seekError == AVERROR_EXIT ||
                                  (seekError < 0 && seekElapsedMs >= kRuntimeSeekIoTimeout.count());
+    const uint64_t seekTimelineSerial = seekError >= 0 ? AdvanceTimelineSerial() : CurrentTimelineSerial();
     LogThread(seekError < 0 ? LogLevel::Warning : LogLevel::Info,
               L"decoder",
               L"runtime_seek target=" + anvil::playback::FormatTimecode(*target) +
                   L" method=" + seekMethod +
                   L" seek_ms=" + std::to_wstring(seekElapsedMs) +
+                  (seekError >= 0 ? L" timeline_serial=" + std::to_wstring(seekTimelineSerial) : L"") +
                   (seekInterrupted ? L" interrupted=true" : L""));
     if (seekError < 0) {
         LogThread(LogLevel::Warning, L"decoder", L"runtime_seek failed reason=" + FfmpegErrorString(seekError));
-        seekPrerollPending_.store(false);
         {
             std::scoped_lock lock(mutex_);
+            ResetSeekRecoveryLocked();
             stats_.buffering = false;
-            seekPrerollStartedAt_ = {};
         }
         if (stopping_.load()) {
             return false;
@@ -4467,6 +4726,12 @@ bool FfmpegVideoDecoder::ApplyPendingSeek(AVFormatContext* formatCtx,
     }
 
     avformat_flush(formatCtx);
+    const bool clearedIoState = ClearNetworkIoState(formatCtx);
+    if (clearedIoState) {
+        LogThread(LogLevel::Debug,
+                  L"decoder",
+                  L"runtime_seek cleared_io_state " + FormatIoState(formatCtx));
+    }
     avcodec_flush_buffers(codecCtx);
     if (subtitleCodecCtx) {
         avcodec_flush_buffers(subtitleCodecCtx);
@@ -4486,6 +4751,7 @@ bool FfmpegVideoDecoder::ApplyPendingSeek(AVFormatContext* formatCtx,
     dolbyVisionCpuReferenceLogged_ = false;
     dolbyVisionMultiPartitionFallbackLogged_ = false;
     dolbyVisionEnhancementStartupFallbackLogged_ = false;
+    dolbyVisionEnhancementBaseOnlyDropLogged_ = false;
     dolbyVisionEnhancementStartupMisses_ = 0;
     dolbyVisionEnhancementLastDynamicMetadataFingerprint_ = 0;
     dolbyVisionEnhancementFramesDecoded_ = 0;
@@ -4521,10 +4787,8 @@ bool FfmpegVideoDecoder::ApplyPendingSeek(AVFormatContext* formatCtx,
         stats_.clockPosition = *target;
         stats_.driftMs = 0;
         stats_.rendered = 0;
-        stats_.buffering = prerollAfterSeek;
-        seekPrerollStartedAt_ = prerollAfterSeek ? std::chrono::steady_clock::now()
-                                                 : std::chrono::steady_clock::time_point{};
-        seekPrerollPending_.store(prerollAfterSeek);
+        stats_.droppedStale = 0;
+        BeginSeekRecoveryLocked(*target, prerollAfterSeek, seekTimelineSerial);
         UpdateBufferedStatsLocked();
     }
     seekRecoveryTargetMs_.store(target->count());
@@ -5273,6 +5537,7 @@ bool FfmpegVideoDecoder::HasQueueCapacityLocked(const NativeVideoFrame& frame) c
 }
 
 void FfmpegVideoDecoder::UpdateBufferedStatsLocked() {
+    stats_.timelineSerial = CurrentTimelineSerial();
     stats_.queueDepth = frameQueue_.size();
     const auto decodedStart = latestFrame_.HasContent()
                                   ? latestFrame_.pts
@@ -5336,17 +5601,19 @@ bool FfmpegVideoDecoder::SeekPrerollReadyLocked() const {
     const bool videoReady = softwareFrame
                                 ? queuedFramesReady
                                 : (queuedFramesReady || decodedSpan >= minDecodedSpan);
+    const bool decodedQueueFull = frameQueue_.size() >= effectiveMaxQueueDepth;
     const bool readAheadReady =
         stats_.readAheadDuration >= minReadAhead ||
+        (softwareFrame && decodedQueueFull) ||
         (!softwareFrame && stats_.packetQueueDepth >= kSeekPrerollMinPacketDepth);
     if (videoReady && readAheadReady) {
         return true;
     }
 
-    if (seekPrerollStartedAt_.time_since_epoch().count() <= 0) {
+    if (seekRecovery_.startedAt.time_since_epoch().count() <= 0) {
         return false;
     }
-    if (std::chrono::steady_clock::now() - seekPrerollStartedAt_ < timeout) {
+    if (std::chrono::steady_clock::now() - seekRecovery_.startedAt < timeout) {
         return false;
     }
     if (enhancementOverlayFrame) {
@@ -5355,7 +5622,7 @@ bool FfmpegVideoDecoder::SeekPrerollReadyLocked() const {
     if (softwareFrame) {
         return videoReady && stats_.readAheadDuration >= kSeekPrerollSoftwareTimeoutMinReadAhead;
     }
-    return true;
+    return videoReady && stats_.readAheadDuration >= kSeekPrerollTimeoutMinReadAhead;
 }
 
 bool FfmpegVideoDecoder::EnqueueFrame(NativeVideoFrame&& frame) {
@@ -5363,10 +5630,18 @@ bool FfmpegVideoDecoder::EnqueueFrame(NativeVideoFrame&& frame) {
         if (HasPendingSeek()) {
             return true;
         }
+        const uint64_t activeSerial = CurrentTimelineSerial();
+        if (frame.timelineSerial != 0 && frame.timelineSerial != activeSerial) {
+            std::scoped_lock lock(mutex_);
+            ++stats_.droppedStale;
+            UpdateBufferedStatsLocked();
+            return true;
+        }
         ScheduleDueFrames();
         bool queued = false;
         {
             std::scoped_lock lock(mutex_);
+            DropStaleFramesLocked();
             if (HasQueueCapacityLocked(frame)) {
                 frameQueue_.push_back(std::move(frame));
                 stats_.buffering = seekPrerollPending_.load();
@@ -5406,12 +5681,14 @@ void FfmpegVideoDecoder::ScheduleDueFrames() {
     bool seekPrerollReleased = false;
     std::size_t publishedQueueDepth = 0;
     std::size_t seekPrerollQueueDepth = 0;
+    std::size_t seekPrerollPacketDepth = 0;
     int seekPrerollReadAheadMs = 0;
     int seekPrerollWaitMs = 0;
     std::chrono::milliseconds publishedClockPosition{0};
 
     {
         std::scoped_lock lock(mutex_);
+        DropStaleFramesLocked();
         if (frameQueue_.empty()) {
             UpdateBufferedStatsLocked();
             return;
@@ -5423,26 +5700,29 @@ void FfmpegVideoDecoder::ScheduleDueFrames() {
                 stats_.buffering = true;
                 return;
             }
+            const auto now = std::chrono::steady_clock::now();
             seekPrerollPending_.store(false);
             seekPrerollReleased = true;
             seekPrerollQueueDepth = frameQueue_.size();
+            seekPrerollPacketDepth = stats_.packetQueueDepth;
             seekPrerollReadAheadMs = static_cast<int>(stats_.readAheadDuration.count());
-            if (seekPrerollStartedAt_.time_since_epoch().count() > 0) {
+            if (seekRecovery_.startedAt.time_since_epoch().count() > 0) {
                 seekPrerollWaitMs = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - seekPrerollStartedAt_).count());
+                    now - seekRecovery_.startedAt).count());
             }
-            seekPrerollStartedAt_ = {};
-            stats_.buffering = false;
+            StartSeekRecoveryVisualWarmupLocked(now);
             schedulePrimed_ = false;
         }
 
-        const bool seekClockHold = seekClockHoldFramesRemaining_.load() > 0;
-        auto clock = seekClockHold
-                         ? SchedulerClock{frameQueue_.front().pts, false}
+        const bool seekRecoveryVisualWarmup = seekRecovery_.phase == SeekRecoveryPhase::VisualWarmup;
+        auto clock = seekRecoveryVisualWarmup
+                         ? SeekRecoverySchedulerClockLocked(frameQueue_.front().pts)
                          : CurrentSchedulerClockLocked(frameQueue_.front().pts);
-        if (seekClockHold || (!schedulePrimed_ && stats_.rendered == 0)) {
+        if (!seekRecoveryVisualWarmup && !schedulePrimed_ && stats_.rendered == 0) {
             clock.position = frameQueue_.front().pts;
             clock.usingAudioClock = false;
+            schedulePrimed_ = true;
+        } else if (seekRecoveryVisualWarmup) {
             schedulePrimed_ = true;
         }
         stats_.clockPosition = clock.position;
@@ -5467,7 +5747,9 @@ void FfmpegVideoDecoder::ScheduleDueFrames() {
             const NativeVideoFrame& front = frameQueue_.front();
             const auto earlyBy = front.pts - clock.position;
             const auto lateBy = clock.position - front.pts;
-            if (lateBy > kFrameLateDropThreshold && (stats_.rendered > 0 || frameQueue_.size() > 1)) {
+            if (!seekRecoveryVisualWarmup &&
+                lateBy > kFrameLateDropThreshold &&
+                frameQueue_.size() > 1) {
                 frameQueue_.pop_front();
                 UpdateBufferedStatsLocked();
                 ++stats_.droppedLate;
@@ -5502,13 +5784,11 @@ void FfmpegVideoDecoder::ScheduleDueFrames() {
             RefreshFrameSubtitles(frameToPublish);
             stats_.driftMs = static_cast<int>((frameToPublish.pts - clock.position).count());
             ++stats_.rendered;
-            if (seekClockHoldFramesRemaining_.load() > 0) {
-                seekClockHoldFramesRemaining_.fetch_sub(1);
-            }
             firstPublishedFrame = stats_.rendered == 1;
             publishedClockPosition = clock.position;
             latestFrame_ = frameToPublish;
             UpdateBufferedStatsLocked();
+            UpdateSeekRecoveryAfterPublishLocked(frameToPublish.pts, std::chrono::steady_clock::now());
             publishedQueueDepth = stats_.queueDepth;
         }
     }
@@ -5518,6 +5798,7 @@ void FfmpegVideoDecoder::ScheduleDueFrames() {
             LogThread(LogLevel::Debug,
                       L"decoder",
                       L"seek_preroll_ready frames=" + std::to_wstring(seekPrerollQueueDepth) +
+                          L" packets=" + std::to_wstring(seekPrerollPacketDepth) +
                           L" read_ahead_ms=" + std::to_wstring(seekPrerollReadAheadMs) +
                           L" wait_ms=" + std::to_wstring(seekPrerollWaitMs));
         }

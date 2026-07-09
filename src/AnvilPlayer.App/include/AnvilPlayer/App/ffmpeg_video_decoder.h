@@ -111,6 +111,7 @@ struct NativeVideoFrame {
     std::shared_ptr<AVFrame> hardwareFrameRef;
     std::chrono::milliseconds pts{0};
     uint64_t serial = 0;
+    uint64_t timelineSerial = 0;
 
     bool HasPixels() const {
         return bgra && !bgra->empty() && width > 0 && height > 0 && stride > 0;
@@ -144,6 +145,7 @@ struct NativeVideoQueueStats {
     std::chrono::milliseconds readAheadDuration{0};
     uint64_t rendered = 0;
     uint64_t droppedLate = 0;
+    uint64_t droppedStale = 0;
     uint64_t droppedSuperseded = 0;
     uint64_t droppedQueueFull = 0;
     uint64_t hardwareFrames = 0;
@@ -154,6 +156,9 @@ struct NativeVideoQueueStats {
     int frameCadenceMs = 0;
     int earlyToleranceMs = 0;
     bool buffering = false;
+    bool seekRecoveryActive = false;
+    bool seekRecoveryAudioHandoffReady = true;
+    uint64_t timelineSerial = 0;
     uint64_t networkBytesPerSecond = 0;
     bool usingAudioClock = false;
     bool usingHardwareDecode = false;
@@ -265,25 +270,49 @@ private:
     static constexpr std::chrono::milliseconds kDolbyVisionEnhancementPacketReadAheadTarget{1500};
     static constexpr std::size_t kMaxDolbyVisionEnhancementQueuedFrames = 160;
     static constexpr std::size_t kMaxDolbyVisionEnhancementQueuedBytes = 768ull * 1024ull * 1024ull;
+    static constexpr std::chrono::milliseconds kDolbyVisionEnhancementMatchDelta{80};
     static constexpr std::chrono::milliseconds kMinFrameEarlyTolerance{2};
     static constexpr std::chrono::milliseconds kMaxFrameEarlyTolerance{6};
     static constexpr std::chrono::milliseconds kFrameLateDropThreshold{120};
     static constexpr std::chrono::milliseconds kMaxMeasuredFrameCadence{250};
     static constexpr int kSeekStartupPacketReadAheadBatch = 1;
     static constexpr int kSeekFastResumeFrameCount = 4;
-    static constexpr int kSeekClockHoldFrameCount = 0;
+    static constexpr int kSeekRecoveryWarmupFrameCount = 3;
     static constexpr std::size_t kSeekPrerollMinQueuedFrames = 4;
     static constexpr std::size_t kSeekPrerollSoftwareMinQueuedFrames = 9;
     static constexpr std::size_t kSeekPrerollMinPacketDepth = 24;
     static constexpr std::chrono::milliseconds kSeekPrerollMinReadAhead{1200};
     static constexpr std::chrono::milliseconds kSeekPrerollSoftwareMinReadAhead{15000};
     static constexpr std::chrono::milliseconds kSeekPrerollTimeout{1800};
+    static constexpr std::chrono::milliseconds kSeekPrerollTimeoutMinReadAhead{900};
     static constexpr std::chrono::milliseconds kSeekPrerollSoftwareTimeout{10000};
     static constexpr std::chrono::milliseconds kSeekPrerollSoftwareTimeoutMinReadAhead{6000};
     static constexpr std::size_t kSeekPrerollEnhancementMinQueuedFrames = 2;
     static constexpr std::chrono::milliseconds kSeekPrerollEnhancementMinReadAhead{900};
     static constexpr std::chrono::milliseconds kSeekPrerollEnhancementTimeoutMinReadAhead{500};
+    static constexpr std::size_t kSeekRecoveryHandoffMinQueuedFrames = 3;
+    static constexpr std::chrono::milliseconds kSeekRecoveryHandoffMinReadAhead{900};
+    static constexpr std::chrono::milliseconds kSeekRecoveryWarmupMinSpan{80};
+    static constexpr std::chrono::milliseconds kSeekRecoveryWarmupMaxWait{650};
     static constexpr std::chrono::milliseconds kRuntimeSeekIoTimeout{4500};
+
+    enum class SeekRecoveryPhase {
+        None,
+        Preroll,
+        VisualWarmup,
+    };
+
+    struct SeekRecoveryState {
+        SeekRecoveryPhase phase = SeekRecoveryPhase::None;
+        uint64_t timelineSerial = 0;
+        std::chrono::milliseconds target{0};
+        std::chrono::milliseconds clockAnchorPts{0};
+        std::chrono::steady_clock::time_point startedAt{};
+        std::chrono::steady_clock::time_point visualStartedAt{};
+        std::chrono::steady_clock::time_point clockAnchorTime{};
+        std::optional<std::chrono::milliseconds> firstPublishedPts;
+        int publishedFrames = 0;
+    };
 
     struct NativeSubtitleCue {
         std::chrono::milliseconds start{0};
@@ -414,6 +443,15 @@ private:
     void SetDecodeBackend(const std::wstring& decoder, bool usingHardware, const std::wstring& fallbackReason);
     void LogThread(anvil::playback::LogLevel level, const std::wstring& category, const std::wstring& message) const;
     void LogThreadError(const std::wstring& message) const;
+    uint64_t CurrentTimelineSerial() const;
+    uint64_t AdvanceTimelineSerial();
+    void BeginSeekRecoveryLocked(std::chrono::milliseconds target, bool prerollAfterSeek, uint64_t timelineSerial);
+    void ResetSeekRecoveryLocked();
+    void DropStaleFramesLocked();
+    void StartSeekRecoveryVisualWarmupLocked(std::chrono::steady_clock::time_point now);
+    SchedulerClock SeekRecoverySchedulerClockLocked(std::chrono::milliseconds firstQueuedPts);
+    void UpdateSeekRecoveryAfterPublishLocked(std::chrono::milliseconds publishedPts,
+                                              std::chrono::steady_clock::time_point now);
 
     std::filesystem::path path_;
     std::chrono::milliseconds startPosition_{0};
@@ -463,6 +501,7 @@ private:
     bool dolbyVisionCpuReferenceLogged_ = false;
     bool dolbyVisionMultiPartitionFallbackLogged_ = false;
     bool dolbyVisionEnhancementStartupFallbackLogged_ = false;
+    bool dolbyVisionEnhancementBaseOnlyDropLogged_ = false;
     int dolbyVisionEnhancementStartupMisses_ = 0;
     uint64_t dolbyVisionEnhancementLastDynamicMetadataFingerprint_ = 0;
     uint64_t dolbyVisionEnhancementFramesDecoded_ = 0;
@@ -496,7 +535,7 @@ private:
     std::deque<NativeSubtitleCue> externalSubtitleCues_;
     std::optional<std::chrono::steady_clock::time_point> fallbackClockAnchor_;
     std::chrono::milliseconds fallbackClockBasePts_{0};
-    std::chrono::steady_clock::time_point seekPrerollStartedAt_{};
+    SeekRecoveryState seekRecovery_;
     mutable std::mutex mutex_;
     NativeVideoFrame latestFrame_;
     std::deque<NativeVideoFrame> frameQueue_;
@@ -511,12 +550,12 @@ private:
     std::atomic<int64_t> pendingSeekMs_{-1};
     std::atomic_bool pendingSeekInterruptsEnabled_{false};
     std::atomic<int64_t> ioInterruptAfterSteadyMs_{0};
+    std::atomic<uint64_t> activeTimelineSerial_{1};
     mutable std::atomic<int> interruptReturnCount_{0};
     std::atomic_bool playbackPaused_{false};
     std::atomic_bool enhancementPrerollWaitActive_{false};
     std::atomic<int> seekFastResumeFramesRemaining_{0};
     std::atomic_bool seekFastResumeLogged_{false};
-    std::atomic<int> seekClockHoldFramesRemaining_{0};
     std::atomic_bool seekPrerollPending_{false};
     std::atomic<int64_t> seekRecoveryTargetMs_{-1};
     std::atomic_bool seekRecoveryDropLogged_{false};

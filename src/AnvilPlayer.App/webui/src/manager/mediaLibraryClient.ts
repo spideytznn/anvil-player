@@ -1,4 +1,4 @@
-import type { LibraryHomeSection, LibraryQuery, LibrarySource, LibraryView, MediaFilterKey, MediaItem, NavKey, SortKey, SortOrder, SourceDraft } from './types'
+import type { EpisodeItem, LibraryHomeSection, LibraryQuery, LibrarySource, LibraryView, MediaFilterKey, MediaItem, NavKey, SeasonItem, SortKey, SortOrder, SourceDraft } from './types'
 
 const LIBRARY_CACHE_KEY = 'anvil-player.library.cache.v1'
 
@@ -9,6 +9,8 @@ export interface MediaLibraryClient {
   listHomeSections: (sourceId?: string) => Promise<LibraryHomeSection[]>
   getContinueWatching: () => Promise<MediaItem[]>
   saveSourceDraft: (draft: SourceDraft) => Promise<LibrarySource>
+  updateItem: (item: MediaItem) => Promise<void>
+  removeSource: (sourceId: string) => Promise<void>
   upsertSourceItems: (source: LibrarySource, sourceItems: MediaItem[], sourceHomeSections?: LibraryHomeSection[]) => Promise<void>
 }
 
@@ -127,7 +129,7 @@ function loadCache(): LibraryCache {
   }
 }
 
-function compactItemForCache(item: MediaItem): MediaItem {
+function compactNestedItemForCache(item: MediaItem): MediaItem {
   const {
     cast,
     episodes,
@@ -141,9 +143,34 @@ function compactItemForCache(item: MediaItem): MediaItem {
   return {
     ...cacheItem,
     genres: item.genres.slice(0, 8),
-    tagline: '',
-    overview: ''
+    tagline: item.tagline.slice(0, 240),
+    overview: item.overview.slice(0, 2400)
   }
+}
+
+function compactEpisodeForCache(episode: EpisodeItem): EpisodeItem {
+  return {
+    ...episode,
+    item: episode.item ? compactNestedItemForCache(episode.item) : undefined
+  }
+}
+
+function compactSeasonForCache(season: SeasonItem): SeasonItem {
+  return {
+    ...season,
+    episodes: season.episodes.map(compactEpisodeForCache)
+  }
+}
+
+function compactItemForCache(item: MediaItem): MediaItem {
+  const compactItem = compactNestedItemForCache(item)
+  if (item.episodes?.length) {
+    compactItem.episodes = item.episodes.map(compactEpisodeForCache)
+  }
+  if (item.seasons?.length) {
+    compactItem.seasons = item.seasons.map(compactSeasonForCache)
+  }
+  return compactItem
 }
 
 function minimalItemForCache(item: MediaItem): MediaItem {
@@ -154,8 +181,8 @@ function minimalItemForCache(item: MediaItem): MediaItem {
     genres: item.genres.slice(0, 3),
     videoSpec: '',
     audioSpec: '',
-    tagline: '',
-    overview: '',
+    tagline: item.tagline.slice(0, 120),
+    overview: item.overview.slice(0, 480),
     path: undefined
   }
 }
@@ -249,6 +276,18 @@ export function createEmptyLibraryClient(): MediaLibraryClient {
       }
       saveCache(sources, items, homeSections)
       return source
+    },
+
+    async updateItem(item) {
+      items = items.map((candidate) => candidate.id === item.id ? item : candidate)
+      saveCache(sources, items, homeSections)
+    },
+
+    async removeSource(sourceId) {
+      sources = sources.filter((source) => source.id !== sourceId)
+      items = items.filter((item) => item.sourceId !== sourceId)
+      homeSections = homeSections.filter((section) => section.sourceId !== sourceId)
+      saveCache(sources, items, homeSections)
     },
 
     async upsertSourceItems(source, sourceItems, sourceHomeSections = []) {

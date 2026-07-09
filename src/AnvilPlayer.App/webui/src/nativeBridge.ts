@@ -56,6 +56,103 @@ export interface MediaListItem {
   path: string
 }
 
+export interface LocalFolderPickItem {
+  name: string
+  path: string
+  playbackPath?: string
+  modifiedAt?: number
+  sizeBytes?: number
+}
+
+export interface LocalFolderPickResult {
+  type: 'localFolderPicked'
+  folder: {
+    name: string
+    path: string
+  }
+  items: LocalFolderPickItem[]
+  truncated?: boolean
+  scanPending?: boolean
+}
+
+export interface LocalFolderPickCancelled {
+  type: 'localFolderPickCancelled'
+}
+
+export interface LocalFolderPickFailed {
+  type: 'localFolderPickFailed'
+  message: string
+}
+
+export interface LocalFolderScanCompleted {
+  type: 'localFolderScanCompleted'
+  folder: {
+    name: string
+    path: string
+  }
+  items: LocalFolderPickItem[]
+  truncated?: boolean
+}
+
+export interface LocalFolderScanFailed {
+  type: 'localFolderScanFailed'
+  folder: {
+    name: string
+    path: string
+  }
+  message: string
+}
+
+export interface SmbDirectoryEntry {
+  name: string
+  path: string
+}
+
+export interface SmbDirectoryListed {
+  type: 'smbDirectoryListed'
+  requestId: string
+  path: string
+  directories: SmbDirectoryEntry[]
+}
+
+export interface SmbDirectoryFailed {
+  type: 'smbDirectoryFailed'
+  requestId: string
+  path: string
+  message: string
+}
+
+export interface WebDavDirectoryEntry {
+  name: string
+  path: string
+}
+
+export interface WebDavDirectoryListed {
+  type: 'webDavDirectoryListed'
+  requestId: string
+  path: string
+  directories: WebDavDirectoryEntry[]
+}
+
+export interface WebDavDirectoryFailed {
+  type: 'webDavDirectoryFailed'
+  requestId: string
+  path: string
+  message: string
+}
+
+export type NativeMessage =
+  | { type?: 'state'; state?: PlayerState }
+  | LocalFolderPickResult
+  | LocalFolderPickCancelled
+  | LocalFolderPickFailed
+  | LocalFolderScanCompleted
+  | LocalFolderScanFailed
+  | SmbDirectoryListed
+  | SmbDirectoryFailed
+  | WebDavDirectoryListed
+  | WebDavDirectoryFailed
+
 export interface TrackOption {
   index: number
   label: string
@@ -71,6 +168,12 @@ export interface HdrToneCurvePoint {
 export type NativeCommand =
   | { type: 'command'; command: 'open' }
   | { type: 'command'; command: 'openPath'; path: string }
+  | { type: 'command'; command: 'pickLocalFolder' }
+  | { type: 'command'; command: 'scanLocalFolder'; path: string; username?: string; password?: string }
+  | { type: 'command'; command: 'listSmbDirectory'; requestId: string; host: string; path?: string; username?: string; password?: string }
+  | { type: 'command'; command: 'connectSmbShare'; path: string; username?: string; password?: string }
+  | { type: 'command'; command: 'listWebDavDirectory'; requestId: string; url: string; username?: string; password?: string }
+  | { type: 'command'; command: 'scanWebDavFolder'; url: string; name?: string; username?: string; password?: string }
   | { type: 'command'; command: 'debugLog'; message: string }
   | { type: 'command'; command: 'setWebUiRoute'; route: 'player' | 'library' }
   | { type: 'command'; command: 'setAllowInsecureCertificates'; enabled: boolean }
@@ -215,9 +318,18 @@ export function postNativeCommand(command: NativeCommand): void {
   window.dispatchEvent(new CustomEvent('anvil-debug-command', { detail: command }))
 }
 
+export function subscribeNativeMessages(onMessage: (message: NativeMessage) => void): () => void {
+  const handler = (event: MessageEvent): void => {
+    onMessage(event.data as NativeMessage)
+  }
+
+  window.chrome?.webview?.addEventListener('message', handler)
+  return () => window.chrome?.webview?.removeEventListener('message', handler)
+}
+
 export function subscribeNativeState(onState: (state: PlayerState) => void): () => void {
   const handler = (event: MessageEvent): void => {
-    const payload = event.data as { type?: string; state?: PlayerState }
+    const payload = event.data as NativeMessage
     if (payload?.type === 'state' && payload.state) {
       onState({ ...EMPTY_STATE, ...payload.state })
     }

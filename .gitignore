@@ -29,3 +29,8 @@ src/AnvilPlayer.App/webui/dist/
 third_party/webview2/*.nupkg
 third_party/webview2/Microsoft.Web.WebView2.*/
 third_party/webview2-runtime/
+
+# Installer/package build artifacts
+dist/*.exe
+dist/*.zip
+dist/installer/*.zip

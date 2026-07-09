@@ -98,3 +98,18 @@ export function saveSavedEmbyConnection(connection: SavedEmbyConnection): void {
     // Connection restore is a convenience; a full storage quota should not block playback.
   }
 }
+
+export function removeSavedEmbyConnection(sourceId: string): void {
+  try {
+    const next = loadSavedEmbyConnections().filter((candidate) => candidate.sourceId !== sourceId)
+    if (next.length) {
+      window.localStorage.setItem(EMBY_CONNECTIONS_STORAGE_KEY, JSON.stringify(next))
+      window.localStorage.setItem(EMBY_CONNECTION_STORAGE_KEY, JSON.stringify(next[0]))
+    } else {
+      window.localStorage.removeItem(EMBY_CONNECTIONS_STORAGE_KEY)
+      window.localStorage.removeItem(EMBY_CONNECTION_STORAGE_KEY)
+    }
+  } catch {
+    // Connection restore is a convenience; deletion should not block the UI.
+  }
+}

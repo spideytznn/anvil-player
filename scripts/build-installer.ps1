@@ -130,6 +130,7 @@ Copy-Item -Path (Join-Path $root 'third_party\ffmpeg\bin\*.dll') -Destination $a
 Copy-Item -LiteralPath (Join-Path $root 'third_party\ffmpeg\bin\ffmpeg.exe') -Destination $appStage -Force
 Copy-Item -LiteralPath (Join-Path $root 'third_party\ffmpeg\bin\ffprobe.exe') -Destination $appStage -Force
 Copy-Item -LiteralPath (Join-Path $root 'third_party\ffmpeg\bin\ffplay.exe') -Destination $appStage -Force
+Copy-Item -Path (Join-Path $root 'third_party\libass\bin\*.dll') -Destination $appStage -Force
 
 Copy-Item -LiteralPath $webViewExtract -Destination (Join-Path $appStage 'WebView2Runtime') -Recurse -Force
 
@@ -144,6 +145,10 @@ Microsoft Edge WebView2
 - Fixed Version Runtime $webViewVersion x64 is bundled in WebView2Runtime.
 - Microsoft WebView2 SDK files are under third_party/webview2.
 - License and notices: see third_party/webview2/LICENSE.txt and NOTICE.txt.
+
+libass
+- Runtime DLLs and dependencies are bundled from third_party/libass.
+- License files are available under third_party/libass/licenses in this repository.
 "@
 Set-Content -LiteralPath (Join-Path $appStage 'THIRD-PARTY-NOTICES.txt') -Value $notice -Encoding UTF8
 Copy-Item -LiteralPath (Join-Path $root 'third_party\ffmpeg\LICENSE.txt') -Destination (Join-Path $appStage 'FFMPEG-LICENSE.txt') -Force

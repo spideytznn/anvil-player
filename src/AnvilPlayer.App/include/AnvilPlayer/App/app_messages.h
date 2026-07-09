@@ -34,6 +34,7 @@ constexpr UINT kNativeColorSettingsRefreshMessage = WM_APP + 4;
 constexpr UINT kRuntimeStopCompleteMessage = WM_APP + 5;
 constexpr UINT kOpenPathMessage = WM_APP + 6;
 constexpr UINT kNativeVideoDecodeFailedMessage = WM_APP + 7;
+constexpr UINT kLocalFolderScanResultMessage = WM_APP + 8;
 
 // DWM attribute constants for window chrome customization.
 constexpr DWORD kDwmUseImmersiveDarkMode = 20;

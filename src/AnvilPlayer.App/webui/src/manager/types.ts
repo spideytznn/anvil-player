@@ -2,7 +2,7 @@ export type LibraryView = 'home' | 'movies' | 'series' | 'folders'
 export type SortKey = 'recent' | 'title' | 'rating' | 'year'
 export type SortOrder = 'ascending' | 'descending'
 export type MediaFilterKey = 'all' | 'unwatched' | 'watched' | 'favorites' | 'inProgress'
-export type SourceKind = 'Emby' | 'Local' | 'WebDAV'
+export type SourceKind = 'Emby' | 'Local' | 'SMB' | 'WebDAV'
 export type SourceStatus = 'online' | 'draft'
 
 export type NavKey =
@@ -26,6 +26,8 @@ export interface LibrarySource {
   status: SourceStatus
   itemCount: number
   location: string
+  rootLocation?: string
+  folders?: string[]
 }
 
 export interface EpisodeItem {
@@ -95,6 +97,14 @@ export interface MediaItem {
   studios?: string[]
   tags?: string[]
   path?: string
+  playbackPath?: string
+  externalIds?: {
+    tmdb?: string
+    imdb?: string
+    tvdb?: string
+  }
+  metadataProvider?: string
+  metadataMatchedAt?: number
 }
 
 export interface LibraryHomeCard {
