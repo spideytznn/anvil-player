@@ -76,6 +76,7 @@ if exist "$(SolutionDir)third_party\webview2-runtime\Microsoft.WebView2.FixedVer
     <ClCompile Include="src\ui_draw.cpp" />
     <ClCompile Include="src\wasapi_audio_player.cpp" />
     <ClCompile Include="src\web_ui_host.cpp" />
+    <ClCompile Include="src\web_ui_json.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\AnvilPlayer\App\app_messages.h" />
@@ -95,6 +96,7 @@ if exist "$(SolutionDir)third_party\webview2-runtime\Microsoft.WebView2.FixedVer
     <ClInclude Include="include\AnvilPlayer\App\ui_types.h" />
     <ClInclude Include="include\AnvilPlayer\App\wasapi_audio_player.h" />
     <ClInclude Include="include\AnvilPlayer\App\web_ui_host.h" />
+    <ClInclude Include="include\AnvilPlayer\App\web_ui_json.h" />
     <ClInclude Include="src\resource.h" />
   </ItemGroup>
   <ItemGroup>
