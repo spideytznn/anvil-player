@@ -1,3 +1,4 @@
+import { pathBaseName, safeDecodeURIComponent } from './pathUtils'
 import type { MediaItem, PersonCredit } from './types'
 
 const TMDB_SETTINGS_KEY = 'anvil-player.tmdb.settings.v1'
@@ -88,7 +89,7 @@ interface TmdbTvDetails {
   external_ids?: { imdb_id?: string; tvdb_id?: number }
 }
 
-export const DEFAULT_TMDB_SETTINGS: TmdbSettings = {
+const DEFAULT_TMDB_SETTINGS: TmdbSettings = {
   networkMode: 'official',
   authMode: 'apiKey',
   credential: '',
@@ -185,13 +186,24 @@ function itemYear(item: MediaItem): number | undefined {
 }
 
 function cleanSearchTitle(value: string): string {
-  return value
-    .replace(/\bS\d{1,2}E\d{1,3}\b/gi, ' ')
+  return safeDecodeURIComponent(value)
+    .replace(/%[0-9a-f]{2}/gi, ' ')
+    .replace(/\.[^.\\/]+$/g, ' ')
+    .replace(/\bS\d{1,2}[\s._-]*E\d{1,3}\b/gi, ' ')
+    .replace(/\b\d{1,2}x\d{1,3}\b/gi, ' ')
+    .replace(/\bseason\s*\d{1,2}\b/gi, ' ')
+    .replace(/\bs\d{1,2}\b/gi, ' ')
+    .replace(/第\s*\d{1,2}\s*[季部].*?第\s*\d{1,3}\s*[集话話]/g, ' ')
+    .replace(/第\s*\d{1,3}\s*[集话話]/g, ' ')
     .replace(/\b(?:19|20)\d{2}\b/g, ' ')
-    .replace(/\b(2160p|1080p|720p|480p|4k|uhd|bluray|web-dl|webrip|hdr|dv|x265|x264)\b/gi, ' ')
+    .replace(/\b(2160p|1080p|720p|480p|4k|uhd|bluray|blu-ray|web(?:\s|-)?dl|webrip|hdr|dv|x265|x264|h\.?265|h\.?264|hevc|avc|10bit|remux|proper|repack|hdsweb|ddp?5\.1|aac|dts|atmos)\b/gi, ' ')
     .replace(/[._-]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
+}
+
+function isWeakSearchTitle(value: string): boolean {
+  return !value || /^(?:season|series|episode|ep|s)\s*\d*$/i.test(value.trim())
 }
 
 function releaseYear(result: TmdbSearchResult): number {
@@ -221,8 +233,8 @@ async function searchBestCandidate(settings: TmdbSettings, item: MediaItem): Pro
   const queries = Array.from(new Set([
     cleanSearchTitle(item.title),
     cleanSearchTitle(item.originalTitle),
-    cleanSearchTitle(item.path?.split(/[\\/]/g).pop() ?? '')
-  ].filter(Boolean)))
+    cleanSearchTitle(pathBaseName(item.path ?? ''))
+  ].filter((query) => !isWeakSearchTitle(query))))
 
   for (const query of queries) {
     const response = await tmdbFetch<TmdbSearchResponse>(settings, mediaPath, {

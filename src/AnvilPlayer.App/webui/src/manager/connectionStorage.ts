@@ -1,3 +1,4 @@
+import { isObject, stringValue } from './storageCodec'
 import type { EmbySession } from './embyClient'
 
 const EMBY_CONNECTION_STORAGE_KEY = 'anvil-player.library.emby.connection.v1'
@@ -11,14 +12,6 @@ export interface SavedEmbyConnection {
   ignoreCertificateErrors: boolean
   session?: EmbySession
   savedAt: number
-}
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === 'object'
-}
-
-function stringValue(value: unknown): string {
-  return typeof value === 'string' ? value : ''
 }
 
 function loadSession(value: unknown): EmbySession | undefined {
@@ -36,10 +29,6 @@ function loadSession(value: unknown): EmbySession | undefined {
     return undefined
   }
   return session
-}
-
-export function loadSavedEmbyConnection(): SavedEmbyConnection | undefined {
-  return loadSavedEmbyConnections()[0]
 }
 
 export function loadSavedEmbyConnections(): SavedEmbyConnection[] {

@@ -1,3 +1,5 @@
+import { createCredentialStore } from './credentialStore'
+
 export interface SmbCredentials {
   sourceId: string
   host: string
@@ -5,32 +7,15 @@ export interface SmbCredentials {
   password: string
 }
 
-const SMB_CREDENTIALS_KEY = 'anvil-player.smb.credentials.v1'
+const smbCredentialStore = createCredentialStore<SmbCredentials>('anvil-player.smb.credentials.v1')
 
-function loadCredentialRows(): SmbCredentials[] {
-  try {
-    const raw = window.localStorage.getItem(SMB_CREDENTIALS_KEY)
-    if (!raw) return []
-    const parsed: unknown = JSON.parse(raw)
-    return Array.isArray(parsed) ? parsed as SmbCredentials[] : []
-  } catch {
-    return []
-  }
+export const loadSmbCredentials = (sourceId: string): SmbCredentials | undefined =>
+  smbCredentialStore.load(sourceId)
+
+export const saveSmbCredentials = (credentials: SmbCredentials): void => {
+  smbCredentialStore.save(credentials)
 }
 
-function saveCredentialRows(rows: SmbCredentials[]): void {
-  window.localStorage.setItem(SMB_CREDENTIALS_KEY, JSON.stringify(rows))
-}
-
-export function loadSmbCredentials(sourceId: string): SmbCredentials | undefined {
-  return loadCredentialRows().find((row) => row.sourceId === sourceId)
-}
-
-export function saveSmbCredentials(credentials: SmbCredentials): void {
-  const rows = loadCredentialRows()
-  saveCredentialRows([credentials, ...rows.filter((row) => row.sourceId !== credentials.sourceId)])
-}
-
-export function removeSmbCredentials(sourceId: string): void {
-  saveCredentialRows(loadCredentialRows().filter((row) => row.sourceId !== sourceId))
+export const removeSmbCredentials = (sourceId: string): void => {
+  smbCredentialStore.remove(sourceId)
 }

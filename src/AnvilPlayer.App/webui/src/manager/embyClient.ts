@@ -1,3 +1,4 @@
+import { numberValue, objectValue, stringValue } from './storageCodec'
 import type {
   EpisodeItem,
   LibraryHomeSection,
@@ -939,18 +940,6 @@ function authHeadersForSession(session: EmbySession): Record<string, string> {
 
 function millisToTicks(positionMs: number): number {
   return Math.max(0, Math.round(positionMs * TICKS_PER_MILLISECOND))
-}
-
-function stringValue(value: unknown): string {
-  return typeof value === 'string' ? value : ''
-}
-
-function numberValue(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
-}
-
-function objectValue(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === 'object' ? value as Record<string, unknown> : undefined
 }
 
 function loadReportTarget(value: unknown): EmbyPlaybackTarget | undefined {

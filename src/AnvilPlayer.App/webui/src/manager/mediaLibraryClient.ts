@@ -1,3 +1,4 @@
+import { isObject } from './storageCodec'
 import type { EpisodeItem, LibraryHomeSection, LibraryQuery, LibrarySource, LibraryView, MediaFilterKey, MediaItem, NavKey, SeasonItem, SortKey, SortOrder, SourceDraft } from './types'
 
 const LIBRARY_CACHE_KEY = 'anvil-player.library.cache.v1'
@@ -108,10 +109,6 @@ interface LibraryCache {
   homeSections: LibraryHomeSection[]
 }
 
-function isObject(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === 'object'
-}
-
 function loadCache(): LibraryCache {
   try {
     const raw = window.localStorage.getItem(LIBRARY_CACHE_KEY)
@@ -134,10 +131,12 @@ function compactNestedItemForCache(item: MediaItem): MediaItem {
     cast,
     episodes,
     seasons,
+    versions,
     similarItems,
     streamSpecs,
     studios,
     tags,
+    playbackPath,
     ...cacheItem
   } = item
   return {
@@ -170,21 +169,128 @@ function compactItemForCache(item: MediaItem): MediaItem {
   if (item.seasons?.length) {
     compactItem.seasons = item.seasons.map(compactSeasonForCache)
   }
+  if (item.versions?.length) {
+    compactItem.versions = item.versions.map(compactNestedItemForCache)
+  }
   return compactItem
 }
 
 function minimalItemForCache(item: MediaItem): MediaItem {
+  const minimalItem = minimalNestedItemForCache(item)
+  if (item.episodes?.length) {
+    minimalItem.episodes = item.episodes.map(minimalEpisodeForCache)
+  }
+  if (item.seasons?.length) {
+    minimalItem.seasons = item.seasons.map(minimalSeasonForCache)
+  }
+  if (item.versions?.length) {
+    minimalItem.versions = item.versions.map(minimalNestedItemForCache)
+  }
+  return minimalItem
+}
+
+function minimalNestedItemForCache(item: MediaItem): MediaItem {
+  const compactItem = compactNestedItemForCache(item)
   return {
-    ...compactItemForCache(item),
+    ...compactItem,
     originalTitle: '',
     country: '',
     genres: item.genres.slice(0, 3),
     videoSpec: '',
     audioSpec: '',
     tagline: item.tagline.slice(0, 120),
-    overview: item.overview.slice(0, 480),
-    path: undefined
+    overview: item.overview.slice(0, 480)
   }
+}
+
+function minimalEpisodeForCache(episode: EpisodeItem): EpisodeItem {
+  return {
+    ...episode,
+    item: episode.item ? minimalNestedItemForCache(episode.item) : undefined
+  }
+}
+
+function minimalSeasonForCache(season: SeasonItem): SeasonItem {
+  return {
+    ...season,
+    episodes: season.episodes.map(minimalEpisodeForCache)
+  }
+}
+
+function tinyNestedItemForCache(item: MediaItem): MediaItem {
+  return {
+    id: item.id,
+    title: item.title,
+    originalTitle: item.originalTitle,
+    type: item.type,
+    year: item.year,
+    rating: item.rating,
+    runtime: item.runtime,
+    sourceId: item.sourceId,
+    libraryViewId: item.libraryViewId,
+    genres: item.genres.slice(0, 2),
+    country: item.country.slice(0, 80),
+    quality: item.quality,
+    videoSpec: '',
+    audioSpec: '',
+    progress: item.progress,
+    continueWatching: item.continueWatching,
+    watched: item.watched,
+    favorite: item.favorite,
+    addedDaysAgo: item.addedDaysAgo,
+    poster: item.poster,
+    backdrop: '',
+    tagline: '',
+    overview: '',
+    path: item.path,
+    externalIds: item.externalIds,
+    metadataProvider: item.metadataProvider,
+    metadataMatchedAt: item.metadataMatchedAt
+  }
+}
+
+function tinyEpisodeForCache(episode: EpisodeItem): EpisodeItem {
+  return {
+    id: episode.id,
+    title: episode.title,
+    index: episode.index,
+    duration: episode.duration,
+    poster: episode.poster,
+    item: episode.item ? tinyNestedItemForCache(episode.item) : undefined
+  }
+}
+
+function tinySeasonForCache(season: SeasonItem): SeasonItem {
+  return {
+    id: season.id,
+    title: season.title,
+    index: season.index,
+    episodeCount: season.episodeCount,
+    poster: season.poster,
+    episodes: season.episodes.map(tinyEpisodeForCache)
+  }
+}
+
+function tinyItemForCache(item: MediaItem): MediaItem {
+  const tinyItem = tinyNestedItemForCache(item)
+  if (item.episodes?.length) {
+    tinyItem.episodes = item.episodes.map(tinyEpisodeForCache)
+  }
+  if (item.seasons?.length) {
+    tinyItem.seasons = item.seasons.map(tinySeasonForCache)
+  }
+  if (item.versions?.length) {
+    tinyItem.versions = item.versions.map(tinyNestedItemForCache)
+  }
+  return tinyItem
+}
+
+function flatTinyItemForCache(item: MediaItem): MediaItem {
+  const tinyItem = tinyNestedItemForCache(item)
+  if (item.versions?.length) {
+    tinyItem.versions = item.versions.map(tinyNestedItemForCache)
+  }
+  return tinyItem
 }
 
 function saveCache(sources: LibrarySource[], items: MediaItem[], homeSections: LibraryHomeSection[]): void {
@@ -200,6 +306,18 @@ function saveCache(sources: LibrarySource[], items: MediaItem[], homeSections: L
       sources,
       items: items.map(minimalItemForCache),
       homeSections
+    },
+    {
+      version: 1,
+      sources,
+      items: items.map(tinyItemForCache),
+      homeSections
+    },
+    {
+      version: 1,
+      sources,
+      items: items.map(flatTinyItemForCache),
+      homeSections: []
     }
   ]
 
