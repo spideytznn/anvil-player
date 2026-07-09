@@ -167,7 +167,7 @@ export interface HdrToneCurvePoint {
 
 export type NativeCommand =
   | { type: 'command'; command: 'open' }
-  | { type: 'command'; command: 'openPath'; path: string }
+  | { type: 'command'; command: 'openPath'; path: string; startPositionRatio?: number }
   | { type: 'command'; command: 'pickLocalFolder' }
   | { type: 'command'; command: 'scanLocalFolder'; path: string; username?: string; password?: string }
   | { type: 'command'; command: 'listSmbDirectory'; requestId: string; host: string; path?: string; username?: string; password?: string }

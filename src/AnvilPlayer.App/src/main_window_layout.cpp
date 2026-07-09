@@ -1090,6 +1090,7 @@ void MainWindow::UpdateBufferingOverlay(const NativeVideoQueueStats* statsOverri
             }
         }
         lastBufferingOverlayBounds_ = RECT{};
+        lastBufferingOverlayScreenBounds_ = RECT{};
     };
 
     const auto snapshot = controller_.Snapshot();
@@ -1167,7 +1168,12 @@ void MainWindow::UpdateBufferingOverlay(const NativeVideoQueueStats* statsOverri
 
     RECT windowBounds = overlayBounds;
     MapWindowPoints(hwnd_, nullptr, reinterpret_cast<POINT*>(&windowBounds), 2);
-    if (moved || !wasVisible) {
+    const bool screenMoved = windowBounds.left != lastBufferingOverlayScreenBounds_.left ||
+                             windowBounds.top != lastBufferingOverlayScreenBounds_.top ||
+                             w != RectWidth(lastBufferingOverlayScreenBounds_) ||
+                             h != RectHeight(lastBufferingOverlayScreenBounds_);
+    const bool positionChanged = moved || screenMoved || !wasVisible;
+    if (positionChanged) {
         const int hudLeft = windowBounds.left + (w - hudWidth) / 2;
         const int hudTop = windowBounds.top + (h - hudHeight) / 2;
         SetWindowPos(bufferingOverlay_,
@@ -1227,6 +1233,9 @@ void MainWindow::UpdateBufferingOverlay(const NativeVideoQueueStats* statsOverri
             }
         }
         lastBufferingOverlayBounds_ = overlayBounds;
+    }
+    if (positionChanged) {
+        lastBufferingOverlayScreenBounds_ = windowBounds;
     }
 
     RenderBufferingHudOverlay(bufferingOverlayStats_);

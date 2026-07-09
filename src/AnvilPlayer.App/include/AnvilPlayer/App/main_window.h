@@ -390,6 +390,7 @@ private:
     bool deferredRuntimeWaitForPreroll_ = false;
     bool deferredPausedFrameRefresh_ = false;
     bool deferredPausedFrameRefreshForceRestart_ = false;
+    double pendingStartPositionRatio_ = 0.0;  // 0..1, seek here after next openPath playback start
     UINT_PTR nativeColorSettingsRefreshSerial_ = 0;
     bool nativeColorSettingsRefreshRequiresDecoderRefresh_ = false;
     std::optional<NativeVideoFrame> heldNativeFrame_;
@@ -397,6 +398,7 @@ private:
     RECT lastFullscreenOverlayBounds_{};
     RECT lastTransportOverlayBounds_{};
     RECT lastBufferingOverlayBounds_{};
+    RECT lastBufferingOverlayScreenBounds_{};
     RECT lastSubtitleMenuOverlayBounds_{};
     bool trackingMouseLeave_ = false;
     bool hdrToneCurveWindowTrackingMouseLeave_ = false;

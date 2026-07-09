@@ -91,6 +91,7 @@ export interface MediaItem {
   overview: string
   episodes?: EpisodeItem[]
   seasons?: SeasonItem[]
+  versions?: MediaItem[]
   cast?: PersonCredit[]
   similarItems?: MediaItem[]
   streamSpecs?: MediaStreamSpec[]

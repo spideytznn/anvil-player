@@ -2918,7 +2918,8 @@ export default function LibraryApp(): JSX.Element {
         postNativeCommand({
           type: 'command',
           command: 'openPath',
-          path: playablePath
+          path: playablePath,
+          startPositionRatio: item.progress > 0 && item.progress < 1 ? item.progress : undefined
         })
         debugLibraryPlayback(`play local openPath posted id=${localPlayableItem.id} path=${localPlayableItem.path ?? ''}`)
       }, 0)
@@ -2949,7 +2950,8 @@ export default function LibraryApp(): JSX.Element {
         postNativeCommand({
           type: 'command',
           command: 'openPath',
-          path: target.url
+          path: target.url,
+          startPositionRatio: item.progress > 0 && item.progress < 1 ? item.progress : undefined
         })
         debugLibraryPlayback(`play openPath posted targetId=${target.itemId}`)
       }, 0)

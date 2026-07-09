@@ -2115,6 +2115,7 @@ void MainWindow::HandleWebUiMessage(const std::wstring_view message) {
         }
     } else if (MessageContains(message, L"\"command\":\"openPath\"")) {
         if (const auto path = ReadJsonString(message, L"path")) {
+            pendingStartPositionRatio_ = ReadJsonNumber(message, L"startPositionRatio").value_or(0.0);
             auto* postedPath = new std::filesystem::path(*path);
             if (!PostMessageW(hwnd_, kOpenPathMessage, 1, reinterpret_cast<LPARAM>(postedPath))) {
                 delete postedPath;
@@ -2736,6 +2737,10 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
             webUiHost_->Resize(client);
         }
         InvalidateRect(hwnd_, nullptr, FALSE);
+        return 0;
+    case WM_MOVE:
+        UpdateBufferingOverlay();
+        UpdateFullscreenOverlay();
         return 0;
     case WM_MOUSEMOVE:
         OnMouseMove(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
@@ -5294,6 +5299,16 @@ void MainWindow::OpenPath(const std::filesystem::path& path, const bool autoplay
     }
     if (opened && autoplay) {
         StartPlayback();
+        const double startRatio = std::exchange(pendingStartPositionRatio_, 0.0);
+        if (startRatio > 0.001) {
+            const auto snapshot = controller_.Snapshot();
+            if (snapshot.media.has_value() && snapshot.media->duration.count() > 0) {
+                SeekToPosition(std::chrono::milliseconds{
+                    static_cast<long long>(static_cast<double>(snapshot.media->duration.count()) *
+                                           std::clamp(startRatio, 0.0, 0.99))});
+                LogApp(LogLevel::Info, L"resume from ratio=" + std::to_wstring(startRatio));
+            }
+        }
         return;
     }
     InvalidateRect(hwnd_, nullptr, FALSE);
