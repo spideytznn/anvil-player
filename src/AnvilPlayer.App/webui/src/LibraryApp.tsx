@@ -47,10 +47,7 @@ import {
 } from './manager/embyClient'
 import { buildLocalFolderLibrary, buildLocalFolderSource } from './manager/localFolderLibrary'
 import {
-  loadTmdbSettings,
-  saveTmdbSettings,
   scrapeTmdbItem,
-  testTmdbConnection,
   tmdbApiBaseUrl,
   type TmdbAuthMode,
   type TmdbNetworkMode,
@@ -111,6 +108,7 @@ import {
   metadataFormFromItem,
   type MetadataEditForm
 } from './library/merge'
+import { useTmdbSettings } from './library/useTmdbSettings'
 
 interface NavItem {
   key: NavKey
@@ -1578,9 +1576,7 @@ export default function LibraryApp(): JSX.Element {
   )
   const client = useMemo(() => createEmptyLibraryClient(), [])
   const [language, setLanguage] = useState<UiLanguage>(() => getInitialLanguage())
-  const [tmdbSettings, setTmdbSettings] = useState<TmdbSettings>(() => loadTmdbSettings())
-  const [tmdbStatus, setTmdbStatus] = useState('')
-  const [isTestingTmdb, setIsTestingTmdb] = useState(false)
+  const { settings: tmdbSettings, status: tmdbStatus, isTesting: isTestingTmdb, updateSettings: updateTmdbSettings, testConnection: testTmdbSettingsConnection } = useTmdbSettings()
   const [sources, setSources] = useState<LibrarySource[]>([])
   const [allItems, setAllItems] = useState<MediaItem[]>([])
   const [visibleItems, setVisibleItems] = useState<MediaItem[]>([])
@@ -1741,10 +1737,6 @@ export default function LibraryApp(): JSX.Element {
     applyDocumentLanguage(language)
     saveUiLanguage(language)
   }, [language])
-
-  useEffect(() => {
-    saveTmdbSettings(tmdbSettings)
-  }, [tmdbSettings])
 
   useEffect(() => {
     activeNavRef.current = activeNav
@@ -2578,24 +2570,6 @@ export default function LibraryApp(): JSX.Element {
       libraryViewId: ''
     })
     activateFileSystemSource(source, visibleRows)
-  }
-
-  function updateTmdbSettings(settings: TmdbSettings): void {
-    setTmdbSettings(settings)
-    setTmdbStatus('')
-  }
-
-  async function testTmdbSettingsConnection(): Promise<void> {
-    setIsTestingTmdb(true)
-    setTmdbStatus('正在测试 TMDB 连接...')
-    try {
-      const message = await testTmdbConnection(tmdbSettings)
-      setTmdbStatus(message)
-    } catch (error) {
-      setTmdbStatus(error instanceof Error ? `TMDB 连接失败：${error.message}` : 'TMDB 连接失败')
-    } finally {
-      setIsTestingTmdb(false)
-    }
   }
 
   async function applyUpdatedMediaItem(updatedItem: MediaItem): Promise<void> {
