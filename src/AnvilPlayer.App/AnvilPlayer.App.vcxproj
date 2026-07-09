@@ -92,6 +92,7 @@ if exist "$(SolutionDir)third_party\webview2-runtime\Microsoft.WebView2.FixedVer
     <ClInclude Include="include\AnvilPlayer\App\main_window.h" />
     <ClInclude Include="include\AnvilPlayer\App\rect_util.h" />
     <ClInclude Include="include\AnvilPlayer\App\string_util.h" />
+    <ClInclude Include="include\AnvilPlayer\App\ui_animation_math.h" />
     <ClInclude Include="include\AnvilPlayer\App\ui_draw.h" />
     <ClInclude Include="include\AnvilPlayer\App\ui_types.h" />
     <ClInclude Include="include\AnvilPlayer\App\wasapi_audio_player.h" />

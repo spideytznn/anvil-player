@@ -7,6 +7,7 @@
 #include "AnvilPlayer/App/ffmpeg_video_decoder.h"
 #include "AnvilPlayer/App/icon_painter.h"
 #include "AnvilPlayer/App/log_sink_ptr.h"
+#include "AnvilPlayer/App/ui_animation_math.h"
 #include "AnvilPlayer/App/ui_draw.h"
 #include "AnvilPlayer/App/ui_types.h"
 #include "AnvilPlayer/App/wasapi_audio_player.h"
@@ -28,13 +29,6 @@
 #include <vector>
 
 namespace anvil::app {
-
-struct UiMotionValue {
-    double amount = 0.0;
-    double startAmount = 0.0;
-    double target = 0.0;
-    std::chrono::steady_clock::time_point startedAt{};
-};
 
 // The native Win32 main window. Owns the PlayerController, the three playback
 // backends (native FFmpeg/D3D11, embedded ffplay, raw-frame bridge), the
