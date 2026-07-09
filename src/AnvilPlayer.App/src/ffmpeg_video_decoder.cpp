@@ -1,5 +1,6 @@
 #include "AnvilPlayer/App/ffmpeg_video_decoder.h"
 
+#include "AnvilPlayer/App/color_math.h"
 #include "AnvilPlayer/App/libass_subtitle_renderer.h"
 #include "AnvilPlayer/App/string_util.h"
 
@@ -84,25 +85,6 @@ double RationalToDouble(const AVRational value) {
     }
     const double result = av_q2d(value);
     return std::isfinite(result) ? result : 0.0;
-}
-
-float Pq12CodeToNits(const uint16_t code) {
-    if (code == 0) {
-        return 0.0f;
-    }
-
-    constexpr double m1 = 2610.0 / 16384.0;
-    constexpr double m2 = 2523.0 / 32.0;
-    constexpr double c1 = 3424.0 / 4096.0;
-    constexpr double c2 = 2413.0 / 128.0;
-    constexpr double c3 = 2392.0 / 128.0;
-
-    const double v = std::clamp(static_cast<double>(code) / 4095.0, 0.0, 1.0);
-    const double p = std::pow(v, 1.0 / m2);
-    const double numerator = std::max(p - c1, 0.0);
-    const double denominator = std::max(c2 - c3 * p, 0.000001);
-    const double nits = 10000.0 * std::pow(numerator / denominator, 1.0 / m1);
-    return std::isfinite(nits) ? static_cast<float>(nits) : 0.0f;
 }
 
 uint64_t HashBytes(uint64_t hash, const void* data, const std::size_t size) {

@@ -1,5 +1,8 @@
 #include "AnvilPlayer/App/main_window.h"
 
+#include "AnvilPlayer/App/hdr_tone_curve_math.h"
+#include "AnvilPlayer/App/rect_util.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -45,15 +48,6 @@ double ScrollbarOpacity(const std::chrono::steady_clock::time_point lastActiveAt
                              age - kScrollbarVisibleDuration).count()) /
                      static_cast<double>(kScrollbarFadeDuration.count());
     return 1.0 - std::clamp(t, 0.0, 1.0);
-}
-
-bool RectsIntersect(const RECT& a, const RECT& b) {
-    RECT intersection{};
-    return RectWidth(a) > 0 &&
-           RectHeight(a) > 0 &&
-           RectWidth(b) > 0 &&
-           RectHeight(b) > 0 &&
-           IntersectRect(&intersection, &a, &b) != FALSE;
 }
 
 COLORREF FadeForOpacity(const COLORREF color, const double opacity) {
@@ -294,28 +288,6 @@ std::wstring VideoSelectionText(const int selectedTrackIndex) {
         return L"DV EL";
     }
     return L"Stream " + std::to_wstring(selectedTrackIndex);
-}
-
-constexpr double kHdrToneCurveMaxNits = 4000.0;
-constexpr double kHdrToneCurveFocusNits = 1000.0;
-constexpr double kHdrToneCurveFocusUnit = 0.72;
-
-double ToneCurveNitsToUnit(const double nits) {
-    const double clamped = std::clamp(nits, 0.0, kHdrToneCurveMaxNits);
-    if (clamped <= kHdrToneCurveFocusNits) {
-        return (clamped / kHdrToneCurveFocusNits) * kHdrToneCurveFocusUnit;
-    }
-    return kHdrToneCurveFocusUnit +
-           ((clamped - kHdrToneCurveFocusNits) / (kHdrToneCurveMaxNits - kHdrToneCurveFocusNits)) *
-               (1.0 - kHdrToneCurveFocusUnit);
-}
-
-int ToneCurveX(const RECT& plot, const double nits) {
-    return plot.left + static_cast<int>(std::round(ToneCurveNitsToUnit(nits) * RectWidth(plot)));
-}
-
-int ToneCurveY(const RECT& plot, const double nits) {
-    return plot.bottom - static_cast<int>(std::round(ToneCurveNitsToUnit(nits) * RectHeight(plot)));
 }
 
 std::wstring NitsLabel(const double nits) {

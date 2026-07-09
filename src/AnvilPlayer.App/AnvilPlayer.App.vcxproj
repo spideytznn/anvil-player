@@ -79,14 +79,17 @@ if exist "$(SolutionDir)third_party\webview2-runtime\Microsoft.WebView2.FixedVer
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\AnvilPlayer\App\app_messages.h" />
+    <ClInclude Include="include\AnvilPlayer\App\color_math.h" />
     <ClInclude Include="include\AnvilPlayer\App\d3d11_video_renderer.h" />
     <ClInclude Include="include\AnvilPlayer\App\embedded_ffplay.h" />
     <ClInclude Include="include\AnvilPlayer\App\external_video_decoder.h" />
     <ClInclude Include="include\AnvilPlayer\App\ffmpeg_video_decoder.h" />
+    <ClInclude Include="include\AnvilPlayer\App\hdr_tone_curve_math.h" />
     <ClInclude Include="include\AnvilPlayer\App\icon_painter.h" />
     <ClInclude Include="include\AnvilPlayer\App\libass_subtitle_renderer.h" />
     <ClInclude Include="include\AnvilPlayer\App\log_sink_ptr.h" />
     <ClInclude Include="include\AnvilPlayer\App\main_window.h" />
+    <ClInclude Include="include\AnvilPlayer\App\rect_util.h" />
     <ClInclude Include="include\AnvilPlayer\App\string_util.h" />
     <ClInclude Include="include\AnvilPlayer\App\ui_draw.h" />
     <ClInclude Include="include\AnvilPlayer\App\ui_types.h" />

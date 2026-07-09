@@ -1,4 +1,5 @@
 #include "AnvilPlayer/App/main_window.h"
+#include "AnvilPlayer/App/rect_util.h"
 #include "AnvilPlayer/App/string_util.h"
 
 #include <commdlg.h>
@@ -248,32 +249,6 @@ bool UpdateMotionValue(UiMotionValue& value,
         value.amount = value.target;
     }
     return std::abs(value.amount - previous) > 0.0001;
-}
-
-bool HasArea(const RECT& rect) {
-    return RectWidth(rect) > 0 && RectHeight(rect) > 0;
-}
-
-bool SameRect(const RECT& a, const RECT& b) {
-    return a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom;
-}
-
-bool RectsIntersect(const RECT& a, const RECT& b) {
-    RECT intersection{};
-    return HasArea(a) && HasArea(b) && IntersectRect(&intersection, &a, &b) != FALSE;
-}
-
-RECT InflateRectCopy(RECT rect, const int dx, const int dy) {
-    InflateRect(&rect, dx, dy);
-    return rect;
-}
-
-void InvalidateIfVisible(HWND hwnd, RECT rect, const int padding) {
-    if (!hwnd || !HasArea(rect)) {
-        return;
-    }
-    rect = InflateRectCopy(rect, padding, padding);
-    InvalidateRect(hwnd, &rect, FALSE);
 }
 
 RECT SidebarEdgeRect(const RECT& before, const RECT& after) {
@@ -948,7 +923,7 @@ std::wstring WebDavOrigin(const std::wstring& url) {
     return origin.str();
 }
 
-std::wstring NormalizeWebDavUrlText(std::wstring url) {
+std::wstring NormalizeWebDavUrlText(std::wstring url, const bool ensureTrailingSlash = true) {
     url = TrimWhitespace(std::move(url));
     const auto hash = url.find(L'#');
     if (hash != std::wstring::npos) {
@@ -980,6 +955,25 @@ std::wstring NormalizeWebDavUrlText(std::wstring url) {
             normalizedPath.pop_back();
         }
 
+        std::wstring encodedPath = L"/";
+        std::size_t segmentStart = normalizedPath.front() == L'/' ? 1 : 0;
+        while (segmentStart < normalizedPath.size()) {
+            const auto segmentEnd = normalizedPath.find(L'/', segmentStart);
+            const auto segment = normalizedPath.substr(
+                segmentStart,
+                segmentEnd == std::wstring::npos ? std::wstring::npos : segmentEnd - segmentStart);
+            if (!segment.empty()) {
+                if (encodedPath.size() > 1 && encodedPath.back() != L'/') {
+                    encodedPath.push_back(L'/');
+                }
+                encodedPath += UrlEncodePathSegmentPreservingEscapes(segment);
+            }
+            if (segmentEnd == std::wstring::npos) {
+                break;
+            }
+            segmentStart = segmentEnd + 1;
+        }
+
         std::wostringstream rebuilt;
         rebuilt << parts->scheme << L"://" << parts->host;
         const bool defaultPort = (parts->secure && parts->port == INTERNET_DEFAULT_HTTPS_PORT) ||
@@ -987,10 +981,10 @@ std::wstring NormalizeWebDavUrlText(std::wstring url) {
         if (!defaultPort) {
             rebuilt << L":" << parts->port;
         }
-        rebuilt << normalizedPath;
+        rebuilt << encodedPath;
         url = rebuilt.str();
     }
-    if (!url.empty() && url.back() != L'/') {
+    if (ensureTrailingSlash && !url.empty() && url.back() != L'/') {
         url.push_back(L'/');
     }
     return url;
@@ -998,37 +992,25 @@ std::wstring NormalizeWebDavUrlText(std::wstring url) {
 
 std::wstring AbsoluteWebDavHref(const std::wstring& baseUrl, std::wstring href) {
     href = XmlDecode(std::move(href));
+    for (std::size_t index = 0; (index = href.find(L'#', index)) != std::wstring::npos; index += 3) {
+        href.replace(index, 1, L"%23");
+    }
     if (StartsWithInsensitive(href, L"http://") || StartsWithInsensitive(href, L"https://")) {
-        return href;
+        return NormalizeWebDavUrlText(href, false);
     }
     const auto origin = WebDavOrigin(baseUrl);
     if (href.rfind(L"/", 0) == 0) {
-        return origin + href;
+        return NormalizeWebDavUrlText(origin + href, false);
     }
-    return NormalizeWebDavUrlText(baseUrl) + href;
-}
-
-std::wstring WebDavHrefLastSegment(std::wstring href) {
-    href = XmlDecode(std::move(href));
-    const auto query = href.find_first_of(L"?#");
-    if (query != std::wstring::npos) {
-        href.erase(query);
-    }
-    while (!href.empty() && (href.back() == L'/' || href.back() == L'\\')) {
-        href.pop_back();
-    }
-    const auto slash = href.find_last_of(L"/\\");
-    const auto segment = slash == std::wstring::npos ? href : href.substr(slash + 1);
-    return segment;
+    return NormalizeWebDavUrlText(NormalizeWebDavUrlText(baseUrl) + href, false);
 }
 
 std::wstring WebDavChildUrlFromHref(const std::wstring& baseUrl, const std::wstring& href, const bool isDirectory) {
-    const auto segment = WebDavHrefLastSegment(href);
-    if (segment.empty()) {
+    std::wstring childUrl = AbsoluteWebDavHref(baseUrl, href);
+    if (childUrl.empty()) {
         return {};
     }
-    std::wstring childUrl = NormalizeWebDavUrlText(baseUrl) + UrlEncodePathSegmentPreservingEscapes(segment);
-    if (isDirectory) {
+    if (isDirectory && childUrl.back() != L'/') {
         childUrl.push_back(L'/');
     }
     return childUrl;
@@ -1416,6 +1398,20 @@ std::wstring JsonEscape(const std::wstring& value) {
 
 bool MessageContains(const std::wstring_view message, const wchar_t* needle) {
     return message.find(needle) != std::wstring_view::npos;
+}
+
+std::size_t CountOccurrences(const std::wstring_view text, const std::wstring_view needle) {
+    if (needle.empty()) {
+        return 0;
+    }
+
+    std::size_t count = 0;
+    std::size_t position = 0;
+    while ((position = text.find(needle, position)) != std::wstring_view::npos) {
+        ++count;
+        position += needle.size();
+    }
+    return count;
 }
 
 std::optional<double> ReadJsonNumber(const std::wstring_view message, const wchar_t* field) {
@@ -2387,16 +2383,20 @@ void MainWindow::HandleWebUiMessage(const std::wstring_view message) {
             }
         }
     } else if (MessageContains(message, L"\"command\":\"listWebDavDirectory\"")) {
+        const auto url = ReadJsonString(message, L"url").value_or(L"");
+        LogApp(LogLevel::Debug, L"webdav list request url=" + NormalizeWebDavUrlText(url));
         StartWebDavDirectoryListAsync(
             hwnd_,
             ReadJsonString(message, L"requestId").value_or(L""),
-            ReadJsonString(message, L"url").value_or(L""),
+            url,
             ReadJsonString(message, L"username").value_or(L""),
             ReadJsonString(message, L"password").value_or(L""));
     } else if (MessageContains(message, L"\"command\":\"scanWebDavFolder\"")) {
+        const auto url = ReadJsonString(message, L"url").value_or(L"");
+        LogApp(LogLevel::Debug, L"webdav scan start url=" + NormalizeWebDavUrlText(url));
         StartWebDavScanAsync(
             hwnd_,
-            ReadJsonString(message, L"url").value_or(L""),
+            url,
             ReadJsonString(message, L"username").value_or(L""),
             ReadJsonString(message, L"password").value_or(L""));
     } else if (MessageContains(message, L"\"command\":\"debugLog\"")) {
@@ -2960,6 +2960,36 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
     }
     case kLocalFolderScanResultMessage: {
         std::unique_ptr<std::wstring> json(reinterpret_cast<std::wstring*>(lParam));
+        if (json) {
+            const auto type = ReadJsonString(*json, L"type").value_or(L"");
+            const auto path = ReadJsonString(*json, L"path").value_or(L"");
+            const bool isWebDav = StartsWithInsensitive(path, L"http://") || StartsWithInsensitive(path, L"https://");
+            const auto prefix = isWebDav ? L"webdav" : L"folder";
+            if (type == L"localFolderScanCompleted") {
+                const std::size_t pathCount = CountOccurrences(*json, L"\"path\":\"");
+                const std::size_t itemCount = pathCount > 0 ? pathCount - 1 : 0;
+                LogApp(
+                    LogLevel::Debug,
+                    std::wstring(prefix) + L" scan completed path=" + path +
+                        L" items=" + std::to_wstring(itemCount));
+            } else if (type == L"localFolderScanFailed") {
+                LogApp(
+                    LogLevel::Warning,
+                    std::wstring(prefix) + L" scan failed path=" + path +
+                        L" error=" + ReadJsonString(*json, L"message").value_or(L""));
+            } else if (type == L"webDavDirectoryListed") {
+                const std::size_t directoryCount = CountOccurrences(*json, L"\"path\":\"");
+                LogApp(
+                    LogLevel::Debug,
+                    L"webdav list completed path=" + path +
+                        L" directories=" + std::to_wstring(directoryCount > 0 ? directoryCount - 1 : 0));
+            } else if (type == L"webDavDirectoryFailed") {
+                LogApp(
+                    LogLevel::Warning,
+                    L"webdav list failed path=" + path +
+                        L" error=" + ReadJsonString(*json, L"message").value_or(L""));
+            }
+        }
         if (json && webUiActive_ && webUiHost_ && webUiHost_->Ready()) {
             webUiHost_->PostJson(*json);
         }

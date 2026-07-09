@@ -1,5 +1,6 @@
 #include "AnvilPlayer/App/d3d11_video_renderer.h"
 
+#include "AnvilPlayer/App/color_math.h"
 #include "AnvilPlayer/App/string_util.h"
 #include "AnvilPlayer/App/ui_draw.h"
 
@@ -257,20 +258,6 @@ float HdrToneCurveOutputPeakNits(const anvil::playback::VideoSettings& settings)
         return static_cast<float>(std::max(100, settings.peakBrightnessNits));
     }
     return std::max(100.0f, ClampHdrToneCurveNits(settings.hdrToneCurve.back().outputNits));
-}
-
-float Pq12CodeToNits(const uint16_t code) {
-    constexpr double m1 = 2610.0 / 16384.0;
-    constexpr double m2 = 2523.0 / 32.0;
-    constexpr double c1 = 3424.0 / 4096.0;
-    constexpr double c2 = 2413.0 / 128.0;
-    constexpr double c3 = 2392.0 / 128.0;
-    const double normalized = std::clamp(static_cast<double>(code) / 4095.0, 0.0, 1.0);
-    const double p = std::pow(normalized, 1.0 / m2);
-    const double numerator = std::max(p - c1, 0.0);
-    const double denominator = std::max(c2 - c3 * p, 1.0e-9);
-    const double nits = 10000.0 * std::pow(numerator / denominator, 1.0 / m1);
-    return std::isfinite(nits) ? static_cast<float>(nits) : 0.0f;
 }
 
 struct DoviTrimSelection {

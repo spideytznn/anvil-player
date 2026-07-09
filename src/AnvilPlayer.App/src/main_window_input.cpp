@@ -1,5 +1,7 @@
 #include "AnvilPlayer/App/main_window.h"
 
+#include "AnvilPlayer/App/hdr_tone_curve_math.h"
+
 #include <windowsx.h>
 
 #include <algorithm>
@@ -16,51 +18,6 @@ namespace anvil::app {
 using anvil::playback::PlaybackState;
 
 namespace {
-
-constexpr double kHdrToneCurveMaxNits = 4000.0;
-constexpr double kHdrToneCurveFocusNits = 1000.0;
-constexpr double kHdrToneCurveFocusUnit = 0.72;
-
-double ToneCurveNitsToUnit(const double nits) {
-    const double clamped = std::clamp(nits, 0.0, kHdrToneCurveMaxNits);
-    if (clamped <= kHdrToneCurveFocusNits) {
-        return (clamped / kHdrToneCurveFocusNits) * kHdrToneCurveFocusUnit;
-    }
-    return kHdrToneCurveFocusUnit +
-           ((clamped - kHdrToneCurveFocusNits) / (kHdrToneCurveMaxNits - kHdrToneCurveFocusNits)) *
-               (1.0 - kHdrToneCurveFocusUnit);
-}
-
-double UnitToToneCurveNits(const double unit) {
-    const double clamped = std::clamp(unit, 0.0, 1.0);
-    if (clamped <= kHdrToneCurveFocusUnit) {
-        return (clamped / kHdrToneCurveFocusUnit) * kHdrToneCurveFocusNits;
-    }
-    return kHdrToneCurveFocusNits +
-           ((clamped - kHdrToneCurveFocusUnit) / (1.0 - kHdrToneCurveFocusUnit)) *
-               (kHdrToneCurveMaxNits - kHdrToneCurveFocusNits);
-}
-
-int ToneCurveX(const RECT& plot, const double nits) {
-    return plot.left + static_cast<int>(std::round(ToneCurveNitsToUnit(nits) * RectWidth(plot)));
-}
-
-int ToneCurveY(const RECT& plot, const double nits) {
-    return plot.bottom - static_cast<int>(std::round(ToneCurveNitsToUnit(nits) * RectHeight(plot)));
-}
-
-double RoundToneCurveNits(const double nits) {
-    const double clamped = std::clamp(nits, 0.0, kHdrToneCurveMaxNits);
-    return std::round(clamped);
-}
-
-double ToneCurveYToNits(const RECT& plot, const int y) {
-    if (RectHeight(plot) <= 0) {
-        return 0.0;
-    }
-    const double unitY = 1.0 - static_cast<double>(y - plot.top) / static_cast<double>(RectHeight(plot));
-    return UnitToToneCurveNits(unitY);
-}
 
 void NormalizeHdrToneCurveForEditing(std::array<anvil::playback::HdrToneCurvePoint,
                                                 anvil::playback::kHdrToneCurvePointCount>& curve) {
