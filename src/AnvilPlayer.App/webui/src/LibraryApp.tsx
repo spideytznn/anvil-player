@@ -57,6 +57,7 @@ import {
   type TmdbSettings
 } from './manager/tmdbClient'
 import {
+  credentialedWebDavUrl,
   loadWebDavCredentials,
   removeWebDavCredentials,
   saveWebDavCredentials
@@ -71,6 +72,45 @@ import {
   type UiLanguage
 } from './uiSettings'
 import './library.css'
+import {
+  buildServerAddress,
+  directoryDisplayName,
+  fileServiceNameFromLocation,
+  locationKey,
+  mediaItemBelongsToScanRoot,
+  normalizeSmbHost,
+  normalizeSmbPath,
+  normalizeWebDavSourceUrl,
+  parseServerAddress,
+  scanLocationsForSource,
+  scanProgressSummary,
+  smbParentPath,
+  sourceScanKind,
+  tryNormalizeWebDavSourceUrl,
+  uniqueLocationRows,
+  webDavBaseUrlForSource,
+  webDavParentUrl,
+  webDavSelectedPathsForSource,
+  type ServerAddressParts,
+  type ServerProtocol,
+  type SourceScanProgress
+} from './library/paths'
+import {
+  buildManualMetadataItem,
+  clearLocalMetadata,
+  duplicateMetadataKey,
+  hasImageBackground,
+  imageBackgroundUrl,
+  itemHasPlaybackPath,
+  itemMergeRank,
+  localFileName,
+  localVersionLabel,
+  mediaPathKey,
+  mergeDuplicateMetadataItems,
+  mergeLocalScannedItem,
+  metadataFormFromItem,
+  type MetadataEditForm
+} from './library/merge'
 
 interface NavItem {
   key: NavKey
@@ -79,62 +119,10 @@ interface NavItem {
 }
 
 type SourceSetupMode = 'hidden' | 'select' | 'emby' | 'localFolder' | 'smb' | 'webdav' | 'settings'
-type ServerProtocol = 'http' | 'https'
-
-interface MetadataEditForm {
-  title: string
-  originalTitle: string
-  type: MediaItem['type']
-  year: string
-  rating: string
-  runtime: string
-  genres: string
-  country: string
-  quality: string
-  poster: string
-  backdrop: string
-  tagline: string
-  overview: string
-  tmdbId: string
-  imdbId: string
-  tvdbId: string
-}
 
 interface FileServiceDirectory {
   name: string
   path: string
-}
-
-interface ServerAddressParts {
-  protocol: ServerProtocol
-  host: string
-  port: string
-  path: string
-}
-
-function parseServerAddress(value: string, fallbackProtocol: ServerProtocol): ServerAddressParts | undefined {
-  const trimmed = value.trim()
-  if (!trimmed) return undefined
-
-  try {
-    const url = new URL(/^https?:\/\//i.test(trimmed) ? trimmed : `${fallbackProtocol}://${trimmed}`)
-    const protocol = url.protocol.toLowerCase() === 'https:' ? 'https' : 'http'
-    return {
-      protocol,
-      host: url.hostname,
-      port: url.port,
-      path: url.pathname === '/' ? '' : url.pathname.replace(/^\/+|\/+$/g, '')
-    }
-  } catch {
-    return undefined
-  }
-}
-
-function buildServerAddress(protocol: ServerProtocol, host: string, port: string, path: string): string {
-  const cleanHost = host.trim()
-  const cleanPort = port.trim()
-  const cleanPath = path.trim().replace(/^\/+|\/+$/g, '')
-  return `${protocol}://${cleanHost}${cleanPort ? `:${cleanPort}` : ''}${cleanPath ? `/${cleanPath}` : ''}`
 }
 
 const primaryNav: NavItem[] = [
@@ -227,307 +215,6 @@ function errorText(error: unknown): string {
 function posterMark(item: MediaItem): string {
   if (item.type === 'folder') return '合集'
   return item.title.slice(0, 2)
-}
-
-function localFileName(path: string | undefined, fallback: string): string {
-  if (!path) return fallback
-  return path.split(/[\\/]/g).pop()?.replace(/\.[^.\\/]+$/g, '') || fallback
-}
-
-function clearLocalMetadata(item: MediaItem): MediaItem {
-  const title = localFileName(item.path, item.originalTitle || item.title)
-  return {
-    ...item,
-    title,
-    originalTitle: title,
-    year: 0,
-    rating: 0,
-    runtime: '未知',
-    genres: ['未分类'],
-    country: '本地',
-    quality: item.quality || '本地文件',
-    poster: '',
-    backdrop: '',
-    tagline: '等待刮削',
-    overview: item.path ? `本地媒体文件：${item.path}` : '',
-    cast: undefined,
-    similarItems: undefined,
-    studios: undefined,
-    tags: undefined,
-    externalIds: undefined,
-    metadataProvider: undefined,
-    metadataMatchedAt: undefined
-  }
-}
-
-function imageBackgroundUrl(background: string): string | undefined {
-  const match = background.trim().match(/^url\((["']?)(.*?)\1\)/)
-  return match?.[2]
-}
-
-function metadataFormFromItem(item: MediaItem): MetadataEditForm {
-  return {
-    title: item.title,
-    originalTitle: item.originalTitle,
-    type: item.type,
-    year: item.year ? String(item.year) : '',
-    rating: item.rating ? String(item.rating) : '',
-    runtime: item.runtime === '未知' ? '' : item.runtime,
-    genres: item.genres.join(', '),
-    country: item.country === '本地' ? '' : item.country,
-    quality: item.quality,
-    poster: imageBackgroundUrl(item.poster) ?? item.poster,
-    backdrop: imageBackgroundUrl(item.backdrop) ?? item.backdrop,
-    tagline: item.tagline === '等待刮削' ? '' : item.tagline,
-    overview: item.overview,
-    tmdbId: item.externalIds?.tmdb ?? '',
-    imdbId: item.externalIds?.imdb ?? '',
-    tvdbId: item.externalIds?.tvdb ?? ''
-  }
-}
-
-function splitMetadataList(value: string): string[] {
-  return value
-    .split(/[,，/、]+/g)
-    .map((entry) => entry.trim())
-    .filter(Boolean)
-}
-
-function normalizeArtworkValue(value: string): string {
-  const trimmed = value.trim()
-  if (!trimmed) return ''
-  if (/^url\(/i.test(trimmed)) return trimmed
-  return `url("${trimmed.replace(/"/g, '%22')}")`
-}
-
-function normalizeSmbPath(value: string): string {
-  const trimmed = value.trim()
-  if (!trimmed) return ''
-  if (/^smb:\/\//i.test(trimmed)) {
-    const url = new URL(trimmed.replace(/^smb:/i, 'file:'))
-    return `\\\\${url.hostname}${decodeURIComponent(url.pathname).replace(/\//g, '\\')}`
-  }
-  const slashNormalized = trimmed.replace(/\//g, '\\')
-  if (slashNormalized.startsWith('\\\\')) return slashNormalized
-  return `\\\\${slashNormalized.replace(/^\\+/g, '')}`
-}
-
-function normalizeSmbHost(value: string): string {
-  const normalized = normalizeSmbPath(value)
-  return normalized.split(/[\\/]/g).filter(Boolean)[0] ?? ''
-}
-
-function smbParentPath(path: string): string {
-  const parts = normalizeSmbPath(path).split(/[\\/]/g).filter(Boolean)
-  if (parts.length <= 1) return ''
-  return `\\\\${parts.slice(0, -1).join('\\')}`
-}
-
-function webDavParentUrl(value: string): string {
-  const url = new URL(normalizeWebDavSourceUrl(value))
-  const parts = url.pathname.split('/').filter(Boolean)
-  if (!parts.length) return ''
-  parts.pop()
-  url.pathname = parts.length ? `/${parts.map((part) => encodeURIComponent(decodeURIComponent(part))).join('/')}/` : '/'
-  return normalizeWebDavSourceUrl(url.toString())
-}
-
-function directoryDisplayName(path: string, fallback: string): string {
-  return fileServiceNameFromLocation(path, fallback)
-}
-
-function locationKey(value: string): string {
-  return value.trim().replace(/[\\/]+$/g, '').toLowerCase()
-}
-
-function fileServiceNameFromLocation(location: string, fallback: string): string {
-  const trimmed = location.trim().replace(/[\\/]+$/g, '')
-  if (!trimmed) return fallback
-  try {
-    const url = new URL(trimmed)
-    const parts = url.pathname.split('/').filter(Boolean)
-    return decodeURIComponent(parts.at(-1) || url.hostname || fallback)
-  } catch {
-    return trimmed.split(/[\\/]/g).filter(Boolean).pop() || fallback
-  }
-}
-
-function normalizeWebDavSourceUrl(value: string): string {
-  const url = new URL(value.trim())
-  url.username = ''
-  url.password = ''
-  url.hash = ''
-  url.search = ''
-  const parts = url.pathname
-    .split('/')
-    .filter(Boolean)
-    .map((part) => decodeURIComponent(part))
-  url.pathname = parts.length ? `/${parts.join('/')}/` : '/'
-  return url.toString().replace(/\/+$/, '/')
-}
-
-function tryNormalizeWebDavSourceUrl(value: string): string {
-  try {
-    return normalizeWebDavSourceUrl(value)
-  } catch {
-    return value.trim()
-  }
-}
-
-function uniqueLocationRows(rows: string[]): string[] {
-  const result: string[] = []
-  rows.forEach((row) => {
-    const trimmed = row.trim()
-    if (!trimmed) return
-    if (!result.some((candidate) => locationKey(candidate) === locationKey(trimmed))) {
-      result.push(trimmed)
-    }
-  })
-  return result
-}
-
-function webDavBaseUrlForSource(source?: LibrarySource): string {
-  if (!source) return ''
-  const credentials = loadWebDavCredentials(source.id)
-  return tryNormalizeWebDavSourceUrl(credentials?.baseUrl || source.rootLocation || source.location)
-}
-
-function webDavSelectedPathsForSource(source?: LibrarySource): string[] {
-  if (!source) return []
-  const credentials = loadWebDavCredentials(source.id)
-  const rows = credentials?.selectedPaths?.length
-    ? credentials.selectedPaths
-    : source.folders?.length
-      ? source.folders
-      : source.location
-        ? [source.location]
-        : []
-  return uniqueLocationRows(rows.map(tryNormalizeWebDavSourceUrl))
-}
-
-function scanLocationsForSource(source: LibrarySource): string[] {
-  if (source.kind === 'WebDAV') {
-    return uniqueLocationRows([
-      source.location,
-      ...(source.folders ?? []),
-      ...(loadWebDavCredentials(source.id)?.selectedPaths ?? [])
-    ])
-  }
-  return uniqueLocationRows([source.location])
-}
-
-function normalizedPrefixLocation(value: string): string {
-  const trimmed = value.trim()
-  if (!trimmed) return ''
-  try {
-    const url = new URL(trimmed)
-    if (url.protocol === 'http:' || url.protocol === 'https:') {
-      return normalizeWebDavSourceUrl(trimmed).toLowerCase()
-    }
-  } catch {
-    // Fall through to path-style normalization.
-  }
-  return trimmed.replace(/[\\/]+$/g, '').toLowerCase()
-}
-
-function mediaItemBelongsToScanRoot(item: MediaItem, rootPath: string): boolean {
-  const root = normalizedPrefixLocation(rootPath)
-  if (!root) return false
-  return [item.path, item.playbackPath].some((candidate) => {
-    if (!candidate) return false
-    const value = normalizedPrefixLocation(candidate)
-    return value === root ||
-      value.startsWith(root.endsWith('/') || root.endsWith('\\') ? root : `${root}/`) ||
-      value.startsWith(root.endsWith('/') || root.endsWith('\\') ? root : `${root}\\`)
-  })
-}
-
-function parseMetadataYear(value: string): number {
-  const year = Number(value.trim())
-  return Number.isFinite(year) && year > 0 ? Math.round(year) : 0
-}
-
-function parseMetadataRating(value: string): number {
-  const rating = Number(value.trim())
-  if (!Number.isFinite(rating)) return 0
-  return Math.max(0, Math.min(10, Math.round(rating * 10) / 10))
-}
-
-function buildManualMetadataItem(item: MediaItem, form: MetadataEditForm): MediaItem {
-  const genres = splitMetadataList(form.genres)
-  const externalIds = {
-    tmdb: form.tmdbId.trim() || undefined,
-    imdb: form.imdbId.trim() || undefined,
-    tvdb: form.tvdbId.trim() || undefined
-  }
-  const hasExternalIds = Boolean(externalIds.tmdb || externalIds.imdb || externalIds.tvdb)
-
-  return {
-    ...item,
-    title: form.title.trim() || item.title,
-    originalTitle: form.originalTitle.trim() || form.title.trim() || item.originalTitle,
-    type: form.type,
-    year: parseMetadataYear(form.year),
-    rating: parseMetadataRating(form.rating),
-    runtime: form.runtime.trim() || '未知',
-    genres: genres.length ? genres : ['未分类'],
-    country: form.country.trim() || '本地',
-    quality: form.quality.trim() || '本地文件',
-    poster: normalizeArtworkValue(form.poster),
-    backdrop: normalizeArtworkValue(form.backdrop),
-    tagline: form.tagline.trim() || '手动编辑',
-    overview: form.overview.trim(),
-    externalIds: hasExternalIds ? externalIds : undefined,
-    metadataProvider: 'manual',
-    metadataMatchedAt: Date.now()
-  }
-}
-
-function mergeLocalScannedItem(existingItem: MediaItem | undefined, scannedItem: MediaItem): MediaItem {
-  if (!existingItem) return scannedItem
-
-  const preservedState: Pick<MediaItem, 'progress' | 'continueWatching' | 'watched' | 'favorite'> = {
-    progress: existingItem.progress,
-    continueWatching: existingItem.continueWatching,
-    watched: existingItem.watched,
-    favorite: existingItem.favorite
-  }
-
-  if (!existingItem.metadataProvider) {
-    return {
-      ...scannedItem,
-      ...preservedState
-    }
-  }
-
-  return {
-    ...scannedItem,
-    ...preservedState,
-    title: existingItem.title,
-    originalTitle: existingItem.originalTitle,
-    type: existingItem.type,
-    year: existingItem.year,
-    rating: existingItem.rating,
-    runtime: existingItem.runtime,
-    genres: existingItem.genres,
-    country: existingItem.country,
-    quality: existingItem.quality,
-    poster: existingItem.poster,
-    backdrop: existingItem.backdrop,
-    tagline: existingItem.tagline,
-    overview: existingItem.overview,
-    cast: existingItem.cast,
-    similarItems: existingItem.similarItems,
-    studios: existingItem.studios,
-    tags: existingItem.tags,
-    externalIds: existingItem.externalIds,
-    metadataProvider: existingItem.metadataProvider,
-    metadataMatchedAt: existingItem.metadataMatchedAt
-  }
-}
-
-function hasImageBackground(background: string): boolean {
-  return Boolean(imageBackgroundUrl(background))
 }
 
 function MediaArtwork(props: {
@@ -1061,6 +748,7 @@ function DetailPanel(props: {
   const seasonOptions = seasons.map((season) => ({ key: season.id, label: season.index }))
   const activeSeasonSelectId = activeSeason?.id ?? seasonOptions[0]?.key ?? ''
   const episodeRows = activeSeason?.episodes ?? props.item.episodes ?? []
+  const versionRows = props.item.versions ?? []
   const streamDetailValue = (type: 'video' | 'audio', label: string): string => {
     const stream = props.item.streamSpecs?.find((row) => row.type === type)
     return stream?.details.find((detail) => detail.label === label)?.value ?? ''
@@ -1230,6 +918,33 @@ function DetailPanel(props: {
             <strong>{props.item.watched ? '已看完' : props.item.progress > 0 ? '观看中' : '未观看'}</strong>
           </div>
         </div>
+
+        {versionRows.length ? (
+          <section className="library-episode-section">
+            <div className="library-section-heading">
+              <span>其他版本</span>
+              <span className="library-section-count">共 {versionRows.length + 1} 个</span>
+            </div>
+            <HorizontalScroller className="library-episode-row">
+              {versionRows.map((version, index) => (
+                <button
+                  className="library-episode-card"
+                  type="button"
+                  disabled={props.isResolvingPlayback || !itemHasPlaybackPath(version)}
+                  key={version.id}
+                  onClick={() => props.onPlayIntent(version)}
+                >
+                  <MediaArtwork background={version.poster || props.item.poster} className="library-episode-thumb">
+                    <Play size={18} />
+                  </MediaArtwork>
+                  <span>{version.quality || `版本 ${index + 2}`}</span>
+                  <strong>{localVersionLabel(version, index + 1)}</strong>
+                  <small>{version.runtime || version.year || props.source.name}</small>
+                </button>
+              ))}
+            </HorizontalScroller>
+          </section>
+        ) : null}
 
         {seasons.length || props.item.episodes?.length ? (
           <section className="library-episode-section">
@@ -1925,6 +1640,7 @@ export default function LibraryApp(): JSX.Element {
   const [connectTone, setConnectTone] = useState<'idle' | 'success' | 'error'>('idle')
   const [connectMessage, setConnectMessage] = useState('')
   const [editingSourceId, setEditingSourceId] = useState('')
+  const [scanProgressBySourceId, setScanProgressBySourceId] = useState<Map<string, SourceScanProgress>>(() => new Map())
   const ignoredLocalFolderScanSourceIdsRef = useRef<Set<string>>(new Set())
   const fileSystemSourceByLocationRef = useRef<Map<string, LibrarySource>>(new Map())
   const homeSectionRefreshSourceIdsRef = useRef<Set<string>>(new Set())
@@ -1933,6 +1649,89 @@ export default function LibraryApp(): JSX.Element {
   const webDavBrowseRequestIdRef = useRef('')
   const localScanUpdateChainRef = useRef<Promise<void>>(Promise.resolve())
   const pendingFolderScanCountsRef = useRef<Map<string, number>>(new Map())
+
+  function beginSourceScan(source: LibrarySource, totalFolders: number, foundItems = 0, lastPath = source.location): void {
+    setScanProgressBySourceId((current) => {
+      const next = new Map(current)
+      next.set(source.id, {
+        sourceId: source.id,
+        sourceName: source.name,
+        kind: sourceScanKind(source),
+        totalFolders: Math.max(1, totalFolders),
+        completedFolders: 0,
+        foundItems,
+        failedFolders: 0,
+        active: true,
+        truncated: false,
+        lastPath
+      })
+      return next
+    })
+  }
+
+  function completeSourceScanFolder(source: LibrarySource, foundItems: number, stillActive: boolean, path: string, truncated?: boolean): void {
+    setScanProgressBySourceId((current) => {
+      const existing = current.get(source.id)
+      const totalFolders = Math.max(1, existing?.totalFolders ?? pendingFolderScanCountsRef.current.get(source.id) ?? 1)
+      const next = new Map(current)
+      next.set(source.id, {
+        sourceId: source.id,
+        sourceName: source.name,
+        kind: sourceScanKind(source),
+        totalFolders,
+        completedFolders: Math.min(totalFolders, (existing?.completedFolders ?? 0) + 1),
+        foundItems,
+        failedFolders: existing?.failedFolders ?? 0,
+        active: stillActive,
+        truncated: Boolean(existing?.truncated || truncated),
+        lastPath: path || existing?.lastPath || source.location
+      })
+      return next
+    })
+  }
+
+  function failSourceScanFolder(source: LibrarySource, stillActive: boolean, path: string): void {
+    setScanProgressBySourceId((current) => {
+      const existing = current.get(source.id)
+      const totalFolders = Math.max(1, existing?.totalFolders ?? pendingFolderScanCountsRef.current.get(source.id) ?? 1)
+      const next = new Map(current)
+      next.set(source.id, {
+        sourceId: source.id,
+        sourceName: source.name,
+        kind: sourceScanKind(source),
+        totalFolders,
+        completedFolders: Math.min(totalFolders, (existing?.completedFolders ?? 0) + 1),
+        foundItems: existing?.foundItems ?? source.itemCount,
+        failedFolders: (existing?.failedFolders ?? 0) + 1,
+        active: stillActive,
+        truncated: existing?.truncated ?? false,
+        lastPath: path || existing?.lastPath || source.location
+      })
+      return next
+    })
+  }
+
+  async function mergeCachedDuplicateMetadata(
+    sourceRows: LibrarySource[],
+    allRows: MediaItem[]
+  ): Promise<{ sourceRows: LibrarySource[]; allRows: MediaItem[]; mergedCount: number }> {
+    let mergedCount = 0
+    for (const source of sourceRows) {
+      if (source.kind === 'Emby') continue
+      const sourceItems = allRows.filter((item) => item.sourceId === source.id)
+      const mergeResult = mergeDuplicateMetadataItems(sourceItems)
+      if (!mergeResult.mergedCount) continue
+      mergedCount += mergeResult.mergedCount
+      await client.upsertSourceItems({ ...source, itemCount: mergeResult.items.length }, mergeResult.items)
+      debugLibraryPlayback(`tmdb cached duplicates merged source=${source.id} merged=${mergeResult.mergedCount}`)
+    }
+    if (!mergedCount) return { sourceRows, allRows, mergedCount }
+    const [nextSourceRows, nextAllRows] = await Promise.all([
+      client.listSources(),
+      client.listAllItems()
+    ])
+    return { sourceRows: nextSourceRows, allRows: nextAllRows, mergedCount }
+  }
 
   useEffect(() => {
     applyAppearanceSettings()
@@ -1966,14 +1765,25 @@ export default function LibraryApp(): JSX.Element {
     let cancelled = false
 
     async function loadInitialLibrary(): Promise<void> {
-      const [sourceRows, allRows, visibleRows, continueRows, homeRows] = await Promise.all([
+      const [rawSourceRows, rawAllRows] = await Promise.all([
         client.listSources(),
-        client.listAllItems(),
+        client.listAllItems()
+      ])
+      const {
+        sourceRows,
+        allRows,
+        mergedCount
+      } = await mergeCachedDuplicateMetadata(rawSourceRows, rawAllRows)
+      const [visibleRows, continueRows, homeRows] = await Promise.all([
         client.listItems({ navKey: initialActiveNav, view: 'home', search: '', sortKey: 'recent' }),
         client.getContinueWatching(),
         client.listHomeSections()
       ])
       if (cancelled) return
+      if (mergedCount > 0) {
+        setConnectTone('success')
+        setConnectMessage(`已合并 ${mergedCount} 个重复媒体。`)
+      }
       setSources(sourceRows)
       setAllItems(allRows)
       setContinueItems(continueRows)
@@ -2057,6 +1867,7 @@ export default function LibraryApp(): JSX.Element {
       } else {
         pendingFolderScanCountsRef.current.delete(snapshot.source.id)
       }
+      completeSourceScanFolder(snapshot.source, mergedItems.length, stillScanningSource, result.folder.path, result.truncated)
       setScanningLocalFolderSourceIds((current) => {
         const next = new Set(current)
         if (!stillScanningSource) {
@@ -2113,6 +1924,7 @@ export default function LibraryApp(): JSX.Element {
         ignoredLocalFolderScanSourceIdsRef.current.delete(source.id)
         setScanningLocalFolderSourceIds((current) => new Set(current).add(source.id))
         const sourceItems = (await client.listAllItems()).filter((item) => item.sourceId === source.id)
+        beginSourceScan(source, 1, sourceItems.length)
         await client.upsertSourceItems({ ...source, itemCount: sourceItems.length }, sourceItems)
 
         const sourceNav = `source:${source.id}` as NavKey
@@ -2178,6 +1990,7 @@ export default function LibraryApp(): JSX.Element {
       } else {
         pendingFolderScanCountsRef.current.delete(source.id)
       }
+      failSourceScanFolder(source, stillScanningSource, result.folder.path)
       setScanningLocalFolderSourceIds((current) => {
         const next = new Set(current)
         if (!stillScanningSource) {
@@ -2387,6 +2200,7 @@ export default function LibraryApp(): JSX.Element {
     ? allItems.filter((item) => item.sourceId === editingSource.id)
     : []
   const editingFileServiceScanning = Boolean(editingSource && editingSource.kind !== 'Emby' && scanningLocalFolderSourceIds.has(editingSource.id))
+  const editingFileServiceScanProgress = editingSource ? scanProgressBySourceId.get(editingSource.id) : undefined
   const editingFileSystemSource = sourceSetupMode === 'localFolder' && editingSource?.kind !== 'Emby'
     ? editingSource
     : undefined
@@ -2397,6 +2211,7 @@ export default function LibraryApp(): JSX.Element {
   const isSourceSetup = sourceSetupMode !== 'hidden'
   const isActiveEmby = activeSource?.kind === 'Emby'
   const isActiveFileSystemScanning = Boolean(activeSource && activeSource.kind !== 'Emby' && scanningLocalFolderSourceIds.has(activeSource.id))
+  const activeSourceScanProgress = activeSource ? scanProgressBySourceId.get(activeSource.id) : undefined
   const selectedItem = isSourceSetup
     ? undefined
     : visibleItems.find((item) => item.id === selectedId)
@@ -2788,7 +2603,12 @@ export default function LibraryApp(): JSX.Element {
     const nextAllItems = allItems.some((item) => item.id === updatedItem.id)
       ? allItems.map((item) => item.id === updatedItem.id ? updatedItem : item)
       : [...allItems, updatedItem]
-    const sourceItems = nextAllItems.filter((item) => item.sourceId === updatedItem.sourceId)
+    const rawSourceItems = nextAllItems.filter((item) => item.sourceId === updatedItem.sourceId)
+    const {
+      items: sourceItems,
+      representativeIdByMergedId
+    } = mergeDuplicateMetadataItems(rawSourceItems)
+    const selectedUpdatedId = representativeIdByMergedId.get(updatedItem.id) ?? updatedItem.id
     await client.upsertSourceItems({ ...source, itemCount: sourceItems.length }, sourceItems)
 
     const activeSourceId = activeNav.startsWith('source:') ? activeNav.slice('source:'.length) : ''
@@ -2814,10 +2634,13 @@ export default function LibraryApp(): JSX.Element {
     setContinueItems(continueRows)
     setVisibleItems(visibleRows)
     setHomeSections(homeRows)
-    setSelectedId(updatedItem.id)
+    setSelectedId(selectedUpdatedId)
     setDetailItemsById((current) => {
       const next = new Map(current)
-      next.set(updatedItem.id, updatedItem)
+      representativeIdByMergedId.forEach((representativeId, mergedId) => {
+        if (representativeId !== mergedId) next.delete(mergedId)
+      })
+      sourceItems.forEach((item) => next.set(item.id, item))
       return next
     })
   }
@@ -2927,6 +2750,11 @@ export default function LibraryApp(): JSX.Element {
       next.delete(sourceId)
       return next
     })
+    setScanProgressBySourceId((current) => {
+      const next = new Map(current)
+      next.delete(sourceId)
+      return next
+    })
     if (source.kind === 'Emby') {
       removeSavedEmbyConnection(sourceId)
       setEmbySessionsBySourceId((current) => {
@@ -3023,7 +2851,12 @@ export default function LibraryApp(): JSX.Element {
       }
 
       const nextAllItems = allItems.map((item) => updatedItems.get(item.id) ?? item)
-      const nextSourceItems = nextAllItems.filter((item) => item.sourceId === sourceId)
+      const rawNextSourceItems = nextAllItems.filter((item) => item.sourceId === sourceId)
+      const {
+        items: nextSourceItems,
+        mergedCount,
+        representativeIdByMergedId
+      } = mergeDuplicateMetadataItems(rawNextSourceItems)
       await client.upsertSourceItems({ ...source, itemCount: nextSourceItems.length }, nextSourceItems)
 
       const activeSourceId = activeNav.startsWith('source:') ? activeNav.slice('source:'.length) : ''
@@ -3049,16 +2882,20 @@ export default function LibraryApp(): JSX.Element {
       setContinueItems(continueRows)
       setVisibleItems(visibleRows)
       setHomeSections(homeRows)
+      setSelectedId((current) => representativeIdByMergedId.get(current) ?? current)
       setDetailItemsById((current) => {
         const next = new Map(current)
-        updatedItems.forEach((item) => next.set(item.id, item))
+        representativeIdByMergedId.forEach((representativeId, mergedId) => {
+          if (representativeId !== mergedId) next.delete(mergedId)
+        })
+        nextSourceItems.forEach((item) => next.set(item.id, item))
         return next
       })
 
       const successCount = updatedItems.size
       setConnectTone(successCount > 0 ? 'success' : 'error')
-      setConnectMessage(`刮削完成：成功 ${successCount} 个，失败 ${failedCount} 个。`)
-      debugLibraryPlayback(`tmdb source scrape done source=${sourceId} ok=${successCount} failed=${failedCount}`)
+      setConnectMessage(`刮削完成：成功 ${successCount} 个，失败 ${failedCount} 个，合并 ${mergedCount} 个重复项。`)
+      debugLibraryPlayback(`tmdb source scrape done source=${sourceId} ok=${successCount} failed=${failedCount} merged=${mergedCount}`)
     } catch (error) {
       const message = error instanceof Error ? error.message : '文件系统源刮削失败'
       setConnectTone('error')
@@ -3078,7 +2915,13 @@ export default function LibraryApp(): JSX.Element {
         : item.seasons?.flatMap((season) => season.episodes).find((episode) => episode.item?.path)?.item
           ?? item.episodes?.find((episode) => episode.item?.path)?.item
           ?? item
-      const playablePath = localPlayableItem.playbackPath || localPlayableItem.path
+      let playablePath = localPlayableItem.playbackPath || localPlayableItem.path
+      if (source.kind === 'WebDAV' && localPlayableItem.path) {
+        const credentials = loadWebDavCredentials(source.id)
+        playablePath = credentials
+          ? credentialedWebDavUrl(localPlayableItem.path, credentials.username, credentials.password)
+          : playablePath
+      }
       if (!playablePath) {
         setPlayIntent('本地媒体缺少文件路径。')
         debugLibraryPlayback(`play local blocked missing path id=${item.id}`)
@@ -3324,6 +3167,7 @@ export default function LibraryApp(): JSX.Element {
 
     ignoredLocalFolderScanSourceIdsRef.current.delete(source.id)
     setScanningLocalFolderSourceIds((current) => new Set(current).add(source.id))
+    beginSourceScan(source, 1, source.itemCount)
     setConnectTone('idle')
     setConnectMessage(`正在后台重新扫描 ${source.name}...`)
     const credentials = source.kind === 'SMB' ? loadSmbCredentials(source.id) : undefined
@@ -3373,6 +3217,7 @@ export default function LibraryApp(): JSX.Element {
         saveSmbCredentials({ sourceId: source.id, host, username: smbUsername, password: smbPassword })
         fileSystemSourceByLocationRef.current.set(locationKey(source.location), source)
         ignoredLocalFolderScanSourceIdsRef.current.delete(source.id)
+        beginSourceScan(source, 1, sourceItems.length)
       }
 
       setScanningLocalFolderSourceIds((current) => {
@@ -3450,6 +3295,8 @@ export default function LibraryApp(): JSX.Element {
       })
       ignoredLocalFolderScanSourceIdsRef.current.delete(source.id)
       pendingFolderScanCountsRef.current.set(source.id, normalizedSelectedPaths.length)
+      beginSourceScan(source, normalizedSelectedPaths.length, sourceItems.length, normalizedSelectedPaths[0] ?? source.location)
+      debugLibraryPlayback(`webdav scan queued source=${source.id} folders=${normalizedSelectedPaths.length}`)
 
       setScanningLocalFolderSourceIds((current) => {
         const next = new Set(current)
@@ -3464,6 +3311,7 @@ export default function LibraryApp(): JSX.Element {
       await activatePendingFileServiceSource(source)
 
       normalizedSelectedPaths.forEach((path) => {
+        debugLibraryPlayback(`webdav scan request source=${source.id} url=${path}`)
         postNativeCommand({
           type: 'command',
           command: 'scanWebDavFolder',
@@ -3789,11 +3637,15 @@ export default function LibraryApp(): JSX.Element {
   function renderSourceRows(sourceRows: LibrarySource[]): JSX.Element[] {
     return sourceRows.map((source) => {
       const key = `source:${source.id}` as NavKey
-      const scanning = source.kind !== 'Emby' && scanningLocalFolderSourceIds.has(source.id)
+      const scanProgress = source.kind !== 'Emby' ? scanProgressBySourceId.get(source.id) : undefined
+      const scanning = Boolean(scanProgress?.active || (source.kind !== 'Emby' && scanningLocalFolderSourceIds.has(source.id)))
+      const sourceLabel = scanProgress
+        ? `${source.name} · ${scanProgress.active ? '扫描中' : '已扫描'} · ${scanProgress.foundItems}`
+        : source.name
       return (
         <div className="library-source-nav-row" key={source.id}>
           <SidebarButton
-            item={{ key, label: scanning ? `${source.name} · 扫描中` : source.name, icon: sourceIcon(source.kind) }}
+            item={{ key, label: scanning || scanProgress ? sourceLabel : source.name, icon: sourceIcon(source.kind) }}
             activeNav={activeNav}
             suppressActive={isSourceSetup && editingSourceId !== source.id}
             onSelect={selectNavigation}
@@ -3930,6 +3782,18 @@ export default function LibraryApp(): JSX.Element {
             </>
           ) : null}
         </section>
+
+        {!isSourceSetup && activeSourceScanProgress ? (
+          <section className={`library-scan-status ${activeSourceScanProgress.active ? 'is-active' : ''}`}>
+            <span className="library-scan-status-icon">
+              {sourceIcon(activeSourceScanProgress.kind, 18)}
+            </span>
+            <div>
+              <strong>{activeSourceScanProgress.active ? '正在扫描媒体源' : '媒体源扫描完成'}</strong>
+              <p>{scanProgressSummary(activeSourceScanProgress, activeSource?.itemCount ?? 0)}</p>
+            </div>
+          </section>
+        ) : null}
 
         {sourceSetupMode === 'settings' ? (
           <LibrarySettingsPage
@@ -4160,9 +4024,9 @@ export default function LibraryApp(): JSX.Element {
                   <span>{isConnecting ? '保存中' : editingSource?.kind === 'SMB' ? '保存并扫描所选' : '添加所选文件夹'}</span>
                 </button>
               </div>
-              {connectMessage ? (
+              {connectMessage || editingFileServiceScanProgress ? (
                 <div className={`library-source-status ${connectTone === 'success' ? 'is-success' : ''} ${connectTone === 'error' ? 'is-error' : ''}`}>
-                  {connectMessage}
+                  {connectMessage || scanProgressSummary(editingFileServiceScanProgress, editingFileServiceItems.length)}
                 </div>
               ) : null}
             </section>
@@ -4276,9 +4140,9 @@ export default function LibraryApp(): JSX.Element {
                   <span>{isConnecting ? '扫描中' : editingSource?.kind === 'WebDAV' ? '保存并扫描所选' : '添加所选文件夹'}</span>
                 </button>
               </div>
-              {connectMessage ? (
+              {connectMessage || editingFileServiceScanProgress ? (
                 <div className={`library-source-status ${connectTone === 'success' ? 'is-success' : ''} ${connectTone === 'error' ? 'is-error' : ''}`}>
-                  {connectMessage}
+                  {connectMessage || scanProgressSummary(editingFileServiceScanProgress, editingFileServiceItems.length)}
                 </div>
               ) : null}
             </section>
@@ -4305,7 +4169,7 @@ export default function LibraryApp(): JSX.Element {
                   <strong>{editingFileSystemSource ? editingFileSystemSource.name : '选择一个包含媒体文件的文件夹'}</strong>
                   <p>
                     {editingFileSystemSource
-                      ? `位置：${editingFileSystemSource.location || '未配置'} · ${editingFileSystemScanning ? '正在后台扫描' : `${editingFileSystemItems.length} 个媒体文件`}`
+                      ? `位置：${editingFileSystemSource.location || '未配置'} · ${scanProgressSummary(editingFileServiceScanProgress, editingFileSystemItems.length)}`
                       : '将递归扫描常见视频格式，并作为本地文件系统源加入媒体库。'}
                   </p>
                 </div>
@@ -4443,7 +4307,9 @@ export default function LibraryApp(): JSX.Element {
                 <EmptyState
                   icon={<Film size={24} />}
                   title="暂无媒体"
-                  caption={isActiveFileSystemScanning ? '正在后台扫描媒体文件，扫描完成后会自动出现。' : '当前没有来自真实媒体源的条目'}
+                  caption={activeSourceScanProgress
+                    ? scanProgressSummary(activeSourceScanProgress, activeSource?.itemCount ?? 0)
+                    : isActiveFileSystemScanning ? '正在后台扫描媒体文件，扫描完成后会自动出现。' : '当前没有来自真实媒体源的条目'}
                 />
               )}
             </section>
