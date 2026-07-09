@@ -4106,7 +4106,7 @@ bool FfmpegVideoDecoder::TryPublishDoviLibplaceboFrame(AVFrame* frame,
     }
 
     bool produced = false;
-    while (!stopping_.load()) {
+    while (!stopping_.load() && !HasPendingSeek()) {
         AVFrame* filtered = av_frame_alloc();
         if (!filtered) {
             LogThread(LogLevel::Warning, L"decoder", L"dolby_vision_libplacebo disabled=filtered_frame_alloc_failed");
@@ -5647,7 +5647,11 @@ bool FfmpegVideoDecoder::SeekPrerollReadyLocked() const {
         return videoReady && stats_.readAheadDuration >= kSeekPrerollEnhancementTimeoutMinReadAhead;
     }
     if (softwareFrame) {
-        return videoReady && stats_.readAheadDuration >= kSeekPrerollSoftwareTimeoutMinReadAhead;
+        // After the (long) software-frame timeout, release as soon as we have
+        // enough decoded frames. Requiring a large read-ahead here deadlocks
+        // network sources whose read-ahead stalls while the decode loop is
+        // blocked on a full frame queue.
+        return videoReady;
     }
     return videoReady && stats_.readAheadDuration >= kSeekPrerollTimeoutMinReadAhead;
 }

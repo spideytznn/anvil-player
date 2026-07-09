@@ -283,11 +283,14 @@ private:
     static constexpr std::size_t kSeekPrerollMinPacketDepth = 24;
     static constexpr std::chrono::milliseconds kSeekPrerollMinReadAhead{1200};
     static constexpr std::chrono::milliseconds kSeekPrerollSoftwareMinReadAhead{15000};
-    static constexpr std::chrono::milliseconds kSeekPrerollSoftwareQueueFullMinReadAhead{1500};
+    // When the software-frame queue is full the decoder is producing faster
+    // than the scheduler drains; requiring a large read-ahead here deadlocks
+    // network sources (read-ahead stalls at ~80ms because the decode loop is
+    // blocked on enqueue). A near-zero floor lets a full queue release preroll.
+    static constexpr std::chrono::milliseconds kSeekPrerollSoftwareQueueFullMinReadAhead{0};
     static constexpr std::chrono::milliseconds kSeekPrerollTimeout{1800};
     static constexpr std::chrono::milliseconds kSeekPrerollTimeoutMinReadAhead{900};
     static constexpr std::chrono::milliseconds kSeekPrerollSoftwareTimeout{10000};
-    static constexpr std::chrono::milliseconds kSeekPrerollSoftwareTimeoutMinReadAhead{6000};
     static constexpr std::size_t kSeekPrerollEnhancementMinQueuedFrames = 2;
     static constexpr std::chrono::milliseconds kSeekPrerollEnhancementMinReadAhead{900};
     static constexpr std::chrono::milliseconds kSeekPrerollEnhancementTimeoutMinReadAhead{500};
