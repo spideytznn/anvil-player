@@ -283,6 +283,7 @@ private:
     static constexpr std::size_t kSeekPrerollMinPacketDepth = 24;
     static constexpr std::chrono::milliseconds kSeekPrerollMinReadAhead{1200};
     static constexpr std::chrono::milliseconds kSeekPrerollSoftwareMinReadAhead{15000};
+    static constexpr std::chrono::milliseconds kSeekPrerollSoftwareQueueFullMinReadAhead{1500};
     static constexpr std::chrono::milliseconds kSeekPrerollTimeout{1800};
     static constexpr std::chrono::milliseconds kSeekPrerollTimeoutMinReadAhead{900};
     static constexpr std::chrono::milliseconds kSeekPrerollSoftwareTimeout{10000};
@@ -294,7 +295,12 @@ private:
     static constexpr std::chrono::milliseconds kSeekRecoveryHandoffMinReadAhead{900};
     static constexpr std::chrono::milliseconds kSeekRecoveryWarmupMinSpan{80};
     static constexpr std::chrono::milliseconds kSeekRecoveryWarmupMaxWait{650};
+    static constexpr int kSeekRecoverySoftwareWarmupFrameCount = 5;
+    static constexpr std::chrono::milliseconds kSeekRecoverySoftwareHandoffMinReadAhead{1500};
+    static constexpr std::chrono::milliseconds kSeekRecoverySoftwareWarmupMinSpan{160};
+    static constexpr std::chrono::milliseconds kSeekRecoverySoftwareWarmupMaxWait{900};
     static constexpr std::chrono::milliseconds kRuntimeSeekIoTimeout{4500};
+    static constexpr std::chrono::milliseconds kRuntimeNetworkSeekIoTimeout{15000};
 
     enum class SeekRecoveryPhase {
         None,

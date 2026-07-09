@@ -76,6 +76,7 @@ private:
     bool CheckNativeBufferingWatchdog(const anvil::playback::PlaybackSessionSnapshot& snapshot,
                                       const NativeVideoQueueStats& stats);
     void FailPlaybackRuntime(const std::wstring& message);
+    bool TryRecoverNativeSeekFailure(const NativeDecodeFailure& failure, const std::wstring& message);
     void StartUiAnimationTimer() const;
     bool SidebarAnimationActive() const;
     void UpdateUiAnimations();

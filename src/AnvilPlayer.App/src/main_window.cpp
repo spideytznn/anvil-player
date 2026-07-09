@@ -2939,6 +2939,10 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
             return 0;
         }
 
+        if (failure && TryRecoverNativeSeekFailure(*failure, message)) {
+            return 0;
+        }
+
         LogApp(LogLevel::Error, L"native decode failed message=" + message);
         FailPlaybackRuntime(message);
         return 0;
@@ -3457,6 +3461,31 @@ void MainWindow::FailPlaybackRuntime(const std::wstring& message) {
     InvalidateFullscreenOverlay();
     InvalidateRect(hwnd_, nullptr, FALSE);
     PostWebUiState();
+}
+
+bool MainWindow::TryRecoverNativeSeekFailure(const NativeDecodeFailure& failure, const std::wstring& message) {
+    if (message.rfind(L"Runtime seek failed at ", 0) != 0) {
+        return false;
+    }
+
+    const auto snapshot = controller_.Snapshot();
+    if (backend_ != PlaybackBackend::NativeFfmpegD3D11 ||
+        snapshot.state != PlaybackState::Playing ||
+        !snapshot.media.has_value() ||
+        snapshot.media->path != failure.path ||
+        !IsNetworkMediaPath(snapshot.media->path)) {
+        return false;
+    }
+
+    LogApp(LogLevel::Warning,
+           L"recovering native runtime after network seek failure position=" +
+               FormatTimecode(snapshot.position) +
+               L" message=" + message);
+    nativeSeekPrerollHoldingAudio_ = false;
+    ResetNativeBufferingWatchdog();
+    RequestRuntimeStart(true, false);
+    SetPlaybackTimer(true);
+    return true;
 }
 
 void MainWindow::StartUiAnimationTimer() const {

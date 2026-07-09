@@ -1957,20 +1957,39 @@ void FfmpegVideoDecoder::UpdateSeekRecoveryAfterPublishLocked(
                              ? std::chrono::duration_cast<std::chrono::milliseconds>(
                                    now - seekRecovery_.visualStartedAt)
                              : std::chrono::milliseconds{0};
+    const bool softwareFrame =
+        latestFrame_.HasYuv() ||
+        latestFrame_.HasPixels() ||
+        (!frameQueue_.empty() && (frameQueue_.front().HasYuv() || frameQueue_.front().HasPixels()));
+    const int warmupFrameCount = softwareFrame
+                                     ? kSeekRecoverySoftwareWarmupFrameCount
+                                     : kSeekRecoveryWarmupFrameCount;
+    const auto warmupMinSpan = softwareFrame
+                                   ? kSeekRecoverySoftwareWarmupMinSpan
+                                   : kSeekRecoveryWarmupMinSpan;
+    const auto handoffMinReadAhead = softwareFrame
+                                         ? kSeekRecoverySoftwareHandoffMinReadAhead
+                                         : kSeekRecoveryHandoffMinReadAhead;
+    const auto warmupMaxWait = softwareFrame
+                                   ? kSeekRecoverySoftwareWarmupMaxWait
+                                   : kSeekRecoveryWarmupMaxWait;
     const bool hasPublishedContinuity =
-        seekRecovery_.publishedFrames >= kSeekRecoveryWarmupFrameCount ||
-        publishedSpan >= kSeekRecoveryWarmupMinSpan;
+        seekRecovery_.publishedFrames >= warmupFrameCount ||
+        publishedSpan >= warmupMinSpan;
     std::size_t minQueuedLead = kSeekRecoveryHandoffMinQueuedFrames;
     if (!frameQueue_.empty()) {
         const auto capacity = MaxQueueDepthForFrame(frameQueue_.front());
         minQueuedLead = std::min(minQueuedLead, capacity > 1 ? capacity - 1 : capacity);
     }
     const bool hasQueuedLead = !frameQueue_.empty() && frameQueue_.size() >= minQueuedLead;
-    const bool hasReadAheadLead = stats_.readAheadDuration >= kSeekRecoveryHandoffMinReadAhead;
+    const bool hasReadAheadLead = stats_.readAheadDuration >= handoffMinReadAhead;
     const bool warmupTimedOut =
-        elapsed >= kSeekRecoveryWarmupMaxWait &&
+        elapsed >= warmupMaxWait &&
         hasPublishedContinuity;
     if (!hasPublishedContinuity) {
+        return;
+    }
+    if (softwareFrame && !hasReadAheadLead && !warmupTimedOut) {
         return;
     }
     if (!hasQueuedLead && !hasReadAheadLead && !warmupTimedOut) {
@@ -1985,6 +2004,7 @@ void FfmpegVideoDecoder::UpdateSeekRecoveryAfterPublishLocked(
                   L" elapsed_ms=" + std::to_wstring(std::max(elapsed, std::chrono::milliseconds{0}).count()) +
                   L" queue_depth=" + std::to_wstring(frameQueue_.size()) +
                   L" read_ahead_ms=" + std::to_wstring(stats_.readAheadDuration.count()) +
+                  (softwareFrame ? L" software=true" : L"") +
                   (warmupTimedOut ? L" timeout=true" : L""));
 
     seekRecovery_ = {};
@@ -2425,8 +2445,9 @@ void FfmpegVideoDecoder::DecodeLoop() {
         if (startPosition_.count() > 0 && !skipNetworkNearStartSeek) {
             const int64_t seekTarget = static_cast<int64_t>(startPosition_.count()) *
                                        AV_TIME_BASE / 1000;
+            const auto seekIoTimeout = networkSource ? kRuntimeNetworkSeekIoTimeout : kRuntimeSeekIoTimeout;
             const auto initialSeekStart = std::chrono::steady_clock::now();
-            ioInterruptAfterSteadyMs_.store(SteadyClockMs() + kRuntimeSeekIoTimeout.count());
+            ioInterruptAfterSteadyMs_.store(SteadyClockMs() + seekIoTimeout.count());
             const int seekResult = av_seek_frame(formatCtx, -1, seekTarget, AVSEEK_FLAG_BACKWARD);
             ioInterruptAfterSteadyMs_.store(0);
             const auto initialSeekElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -2438,7 +2459,7 @@ void FfmpegVideoDecoder::DecodeLoop() {
                               L" target=" + anvil::playback::FormatTimecode(startPosition_) +
                               L" seek_ms=" + std::to_wstring(initialSeekElapsedMs) +
                               (seekResult == AVERROR_EXIT ||
-                                       initialSeekElapsedMs >= kRuntimeSeekIoTimeout.count()
+                                       initialSeekElapsedMs >= seekIoTimeout.count()
                                    ? L" interrupted=true"
                                    : L"") +
                               L" " + FormatIoState(formatCtx));
@@ -2482,6 +2503,7 @@ void FfmpegVideoDecoder::DecodeLoop() {
         int nonVideoPacketLogCount = 0;
         int videoPacketCacheLogCount = 0;
         int readFrameErrorLogCount = 0;
+        bool sharedDemuxCapacityReadAheadLogged = false;
         uint64_t networkBytesWindow = 0;
         auto networkBytesWindowStartedAt = std::chrono::steady_clock::now();
         const auto fallbackPacketDuration = EstimatedVideoPacketDuration(formatCtx->streams[videoStreamIndex]);
@@ -2655,8 +2677,9 @@ void FfmpegVideoDecoder::DecodeLoop() {
                         networkEofSeekResetAttempted = true;
                         const int64_t seekTarget = static_cast<int64_t>(startPosition_.count()) *
                                                    AV_TIME_BASE / 1000;
+                        const auto seekIoTimeout = networkSource ? kRuntimeNetworkSeekIoTimeout : kRuntimeSeekIoTimeout;
                         const auto resetSeekStart = std::chrono::steady_clock::now();
-                        ioInterruptAfterSteadyMs_.store(SteadyClockMs() + kRuntimeSeekIoTimeout.count());
+                        ioInterruptAfterSteadyMs_.store(SteadyClockMs() + seekIoTimeout.count());
                         const int seekError = av_seek_frame(formatCtx, -1, seekTarget, AVSEEK_FLAG_BACKWARD);
                         ioInterruptAfterSteadyMs_.store(0);
                         const auto resetSeekElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -2677,7 +2700,7 @@ void FfmpegVideoDecoder::DecodeLoop() {
                                       L" target=" + anvil::playback::FormatTimecode(startPosition_) +
                                       L" seek_ms=" + std::to_wstring(resetSeekElapsedMs) +
                                       (seekError == AVERROR_EXIT ||
-                                               resetSeekElapsedMs >= kRuntimeSeekIoTimeout.count()
+                                               resetSeekElapsedMs >= seekIoTimeout.count()
                                            ? L" interrupted=true"
                                            : L"") +
                                       L" " + FormatIoState(formatCtx));
@@ -2940,6 +2963,16 @@ void FfmpegVideoDecoder::DecodeLoop() {
             }
 
             if (decodedNearCapacity && !seekPrerollWaiting) {
+                if (audioPacketSinkActive && shouldReadPlayingPackets()) {
+                    if (!sharedDemuxCapacityReadAheadLogged) {
+                        sharedDemuxCapacityReadAheadLogged = true;
+                        LogThread(LogLevel::Debug,
+                                  L"decoder",
+                                  L"shared_demux read_ahead while video_queue_full");
+                    }
+                    readAheadPackets(elOverlay ? kDolbyVisionEnhancementPlayingPacketReadAheadBatch
+                                               : kPlayingPacketReadAheadBatch);
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds{1});
                 continue;
             }
@@ -4674,36 +4707,44 @@ bool FfmpegVideoDecoder::ApplyPendingSeek(AVFormatContext* formatCtx,
     if (playbackPaused_.load()) {
         pausedPositionMs_.store(target->count());
     }
+    const bool networkSource = IsNetworkMediaPath(path_);
+    const auto seekIoTimeout = networkSource ? kRuntimeNetworkSeekIoTimeout : kRuntimeSeekIoTimeout;
     const auto seekStart = std::chrono::steady_clock::now();
-    const int64_t seekInterruptDeadlineMs = SteadyClockMs() + kRuntimeSeekIoTimeout.count();
     const int64_t globalSeekTarget = static_cast<int64_t>(target->count()) * AV_TIME_BASE / 1000;
     std::wstring seekMethod = L"global";
     int seekError = AVERROR(EINVAL);
-    ioInterruptAfterSteadyMs_.store(seekInterruptDeadlineMs);
+    const auto armSeekInterrupt = [&]() {
+        ioInterruptAfterSteadyMs_.store(SteadyClockMs() + seekIoTimeout.count());
+    };
     if (videoStreamIndex >= 0 && videoTimeBase.num > 0 && videoTimeBase.den > 0) {
         const int64_t videoSeekTarget = av_rescale_q(target->count(), AVRational{1, 1000}, videoTimeBase);
+        armSeekInterrupt();
         seekError = av_seek_frame(formatCtx, videoStreamIndex, videoSeekTarget, AVSEEK_FLAG_BACKWARD);
         seekMethod = L"video_stream";
     }
     if (seekError < 0) {
         seekMethod = L"global";
+        armSeekInterrupt();
         seekError = av_seek_frame(formatCtx, -1, globalSeekTarget, AVSEEK_FLAG_BACKWARD);
     }
     if (seekError < 0) {
         seekMethod = L"global_file";
+        armSeekInterrupt();
         seekError = avformat_seek_file(formatCtx, -1, INT64_MIN, globalSeekTarget, INT64_MAX, 0);
     }
     ioInterruptAfterSteadyMs_.store(0);
     const auto seekElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - seekStart).count();
     const bool seekInterrupted = seekError == AVERROR_EXIT ||
-                                 (seekError < 0 && seekElapsedMs >= kRuntimeSeekIoTimeout.count());
+                                 (seekError < 0 && seekElapsedMs >= seekIoTimeout.count());
     const uint64_t seekTimelineSerial = seekError >= 0 ? AdvanceTimelineSerial() : CurrentTimelineSerial();
     LogThread(seekError < 0 ? LogLevel::Warning : LogLevel::Info,
               L"decoder",
               L"runtime_seek target=" + anvil::playback::FormatTimecode(*target) +
                   L" method=" + seekMethod +
                   L" seek_ms=" + std::to_wstring(seekElapsedMs) +
+                  L" timeout_ms=" + std::to_wstring(seekIoTimeout.count()) +
+                  L" source=" + std::wstring(networkSource ? L"network" : L"local") +
                   (seekError >= 0 ? L" timeline_serial=" + std::to_wstring(seekTimelineSerial) : L"") +
                   (seekInterrupted ? L" interrupted=true" : L""));
     if (seekError < 0) {
@@ -5602,9 +5643,13 @@ bool FfmpegVideoDecoder::SeekPrerollReadyLocked() const {
                                 ? queuedFramesReady
                                 : (queuedFramesReady || decodedSpan >= minDecodedSpan);
     const bool decodedQueueFull = frameQueue_.size() >= effectiveMaxQueueDepth;
+    const bool softwareQueueFullWithLead =
+        softwareFrame &&
+        decodedQueueFull &&
+        stats_.readAheadDuration >= kSeekPrerollSoftwareQueueFullMinReadAhead;
     const bool readAheadReady =
         stats_.readAheadDuration >= minReadAhead ||
-        (softwareFrame && decodedQueueFull) ||
+        softwareQueueFullWithLead ||
         (!softwareFrame && stats_.packetQueueDepth >= kSeekPrerollMinPacketDepth);
     if (videoReady && readAheadReady) {
         return true;
