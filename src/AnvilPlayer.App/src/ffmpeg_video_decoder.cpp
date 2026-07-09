@@ -1,6 +1,7 @@
 #include "AnvilPlayer/App/ffmpeg_video_decoder.h"
 
 #include "AnvilPlayer/App/color_math.h"
+#include "AnvilPlayer/App/color_metadata_util.h"
 #include "AnvilPlayer/App/libass_subtitle_renderer.h"
 #include "AnvilPlayer/App/string_util.h"
 #include "AnvilPlayer/App/subtitle_util.h"
@@ -78,14 +79,6 @@ int64_t SteadyClockMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
-}
-
-double RationalToDouble(const AVRational value) {
-    if (value.num <= 0 || value.den <= 0) {
-        return 0.0;
-    }
-    const double result = av_q2d(value);
-    return std::isfinite(result) ? result : 0.0;
 }
 
 uint64_t HashBytes(uint64_t hash, const void* data, const std::size_t size) {
@@ -716,98 +709,6 @@ bool BuildDolbyVisionCpuReferenceSample(const NativeVideoFrame& frame, DoviCpuRe
     return stats.sampleCount > 0;
 }
 
-VideoColorPrimaries MapColorPrimaries(const AVColorPrimaries value) {
-    switch (value) {
-    case AVCOL_PRI_BT709:
-        return VideoColorPrimaries::Bt709;
-    case AVCOL_PRI_BT2020:
-        return VideoColorPrimaries::Bt2020;
-    case AVCOL_PRI_SMPTE432:
-        return VideoColorPrimaries::DisplayP3;
-    default:
-        return VideoColorPrimaries::Unknown;
-    }
-}
-
-VideoTransferCharacteristic MapTransfer(const AVColorTransferCharacteristic value) {
-    switch (value) {
-    case AVCOL_TRC_BT709:
-    case AVCOL_TRC_GAMMA22:
-    case AVCOL_TRC_GAMMA28:
-    case AVCOL_TRC_SMPTE170M:
-    case AVCOL_TRC_BT2020_10:
-    case AVCOL_TRC_BT2020_12:
-        return VideoTransferCharacteristic::Bt709;
-    case AVCOL_TRC_IEC61966_2_1:
-        return VideoTransferCharacteristic::Srgb;
-    case AVCOL_TRC_SMPTE2084:
-        return VideoTransferCharacteristic::Pq;
-    case AVCOL_TRC_ARIB_STD_B67:
-        return VideoTransferCharacteristic::Hlg;
-    default:
-        return VideoTransferCharacteristic::Unknown;
-    }
-}
-
-VideoMatrixCoefficients MapMatrix(const AVColorSpace value) {
-    switch (value) {
-    case AVCOL_SPC_RGB:
-        return VideoMatrixCoefficients::Rgb;
-    case AVCOL_SPC_BT709:
-        return VideoMatrixCoefficients::Bt709;
-    case AVCOL_SPC_BT470BG:
-    case AVCOL_SPC_SMPTE170M:
-        return VideoMatrixCoefficients::Bt601;
-    case AVCOL_SPC_BT2020_NCL:
-        return VideoMatrixCoefficients::Bt2020Ncl;
-    case AVCOL_SPC_BT2020_CL:
-        return VideoMatrixCoefficients::Bt2020Cl;
-    default:
-        return VideoMatrixCoefficients::Unknown;
-    }
-}
-
-VideoColorRange MapColorRange(const AVColorRange value) {
-    switch (value) {
-    case AVCOL_RANGE_MPEG:
-        return VideoColorRange::Limited;
-    case AVCOL_RANGE_JPEG:
-        return VideoColorRange::Full;
-    default:
-        return VideoColorRange::Unknown;
-    }
-}
-
-anvil::playback::ChromaticityPoint MakePoint(const AVRational x, const AVRational y) {
-    return anvil::playback::ChromaticityPoint{RationalToDouble(x), RationalToDouble(y)};
-}
-
-void ApplyMasteringDisplay(VideoColorMetadata& metadata, const AVMasteringDisplayMetadata* source) {
-    if (!source) {
-        return;
-    }
-    if (source->has_primaries) {
-        metadata.masteringDisplay.hasPrimaries = true;
-        metadata.masteringDisplay.red = MakePoint(source->display_primaries[0][0], source->display_primaries[0][1]);
-        metadata.masteringDisplay.green = MakePoint(source->display_primaries[1][0], source->display_primaries[1][1]);
-        metadata.masteringDisplay.blue = MakePoint(source->display_primaries[2][0], source->display_primaries[2][1]);
-        metadata.masteringDisplay.whitePoint = MakePoint(source->white_point[0], source->white_point[1]);
-    }
-    if (source->has_luminance) {
-        metadata.masteringDisplay.hasLuminance = true;
-        metadata.masteringDisplay.minLuminanceNits = RationalToDouble(source->min_luminance);
-        metadata.masteringDisplay.maxLuminanceNits = RationalToDouble(source->max_luminance);
-    }
-}
-
-void ApplyContentLight(VideoColorMetadata& metadata, const AVContentLightMetadata* source) {
-    if (!source) {
-        return;
-    }
-    metadata.contentLight.hasValues = true;
-    metadata.contentLight.maxContentLightLevelNits = static_cast<int>(source->MaxCLL);
-    metadata.contentLight.maxFrameAverageLightLevelNits = static_cast<int>(source->MaxFALL);
-}
 
 std::wstring ToLowerWide(std::wstring value) {
     std::transform(value.begin(), value.end(), value.begin(), [](const wchar_t ch) {
@@ -4718,81 +4619,19 @@ AVPixelFormat FfmpegVideoDecoder::HardwareFrameSoftwareFormat(const AVFrame* fra
 }
 
 VideoColorMetadata FfmpegVideoDecoder::BuildColorMetadata(const AVCodecParameters* parameters) {
-    VideoColorMetadata metadata;
-    if (!parameters) {
-        return metadata;
-    }
-
-    metadata.primaries = MapColorPrimaries(parameters->color_primaries);
-    metadata.transfer = MapTransfer(parameters->color_trc);
-    metadata.matrix = MapMatrix(parameters->color_space);
-    metadata.range = MapColorRange(parameters->color_range);
-
-    for (int index = 0; index < parameters->nb_coded_side_data; ++index) {
-        const AVPacketSideData& sideData = parameters->coded_side_data[index];
-        if (sideData.type == AV_PKT_DATA_MASTERING_DISPLAY_METADATA &&
-            sideData.size >= static_cast<int>(sizeof(AVMasteringDisplayMetadata))) {
-            ApplyMasteringDisplay(metadata, reinterpret_cast<const AVMasteringDisplayMetadata*>(sideData.data));
-        } else if (sideData.type == AV_PKT_DATA_CONTENT_LIGHT_LEVEL &&
-                   sideData.size >= static_cast<int>(sizeof(AVContentLightMetadata))) {
-            ApplyContentLight(metadata, reinterpret_cast<const AVContentLightMetadata*>(sideData.data));
-        }
-    }
-    return metadata;
+    return anvil::app::BuildColorMetadata(parameters);
 }
 
 VideoColorMetadata FfmpegVideoDecoder::MergeFrameColorMetadata(const AVFrame* frame, const VideoColorMetadata& defaults) {
-    VideoColorMetadata metadata = defaults;
-    if (!frame) {
-        return metadata;
-    }
-
-    const auto primaries = MapColorPrimaries(frame->color_primaries);
-    const auto transfer = MapTransfer(frame->color_trc);
-    const auto matrix = MapMatrix(frame->colorspace);
-    const auto range = MapColorRange(frame->color_range);
-    if (primaries != VideoColorPrimaries::Unknown) {
-        metadata.primaries = primaries;
-    }
-    if (transfer != VideoTransferCharacteristic::Unknown) {
-        metadata.transfer = transfer;
-    }
-    if (matrix != VideoMatrixCoefficients::Unknown) {
-        metadata.matrix = matrix;
-    }
-    if (range != VideoColorRange::Unknown) {
-        metadata.range = range;
-    }
-
-    const AVFrameSideData* mastering = av_frame_get_side_data(frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
-    if (mastering && mastering->size >= sizeof(AVMasteringDisplayMetadata)) {
-        ApplyMasteringDisplay(metadata, reinterpret_cast<const AVMasteringDisplayMetadata*>(mastering->data));
-    }
-
-    const AVFrameSideData* light = av_frame_get_side_data(frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
-    if (light && light->size >= sizeof(AVContentLightMetadata)) {
-        ApplyContentLight(metadata, reinterpret_cast<const AVContentLightMetadata*>(light->data));
-    }
-
-    return metadata;
+    return anvil::app::MergeFrameColorMetadata(frame, defaults);
 }
 
 VideoColorMetadata FfmpegVideoDecoder::SdrBt709ColorMetadata() {
-    VideoColorMetadata metadata;
-    metadata.primaries = VideoColorPrimaries::Bt709;
-    metadata.transfer = VideoTransferCharacteristic::Bt709;
-    metadata.matrix = VideoMatrixCoefficients::Rgb;
-    metadata.range = VideoColorRange::Full;
-    return metadata;
+    return anvil::app::SdrBt709ColorMetadata();
 }
 
 VideoColorMetadata FfmpegVideoDecoder::HdrBt2020PqColorMetadata() {
-    VideoColorMetadata metadata;
-    metadata.primaries = VideoColorPrimaries::Bt2020;
-    metadata.transfer = VideoTransferCharacteristic::Pq;
-    metadata.matrix = VideoMatrixCoefficients::Rgb;
-    metadata.range = VideoColorRange::Full;
-    return metadata;
+    return anvil::app::HdrBt2020PqColorMetadata();
 }
 
 std::shared_ptr<const DolbyVisionFrameMetadata> FfmpegVideoDecoder::ExtractDolbyVisionMetadata(const AVFrame* frame) {

@@ -73,6 +73,7 @@ if exist "$(SolutionDir)third_party\webview2-runtime\Microsoft.WebView2.FixedVer
     <ClCompile Include="src\main_window_layout.cpp" />
     <ClCompile Include="src\main_window_paint.cpp" />
     <ClCompile Include="src\string_util.cpp" />
+    <ClCompile Include="src\color_metadata_util.cpp" />
     <ClCompile Include="src\subtitle_util.cpp" />
     <ClCompile Include="src\ui_draw.cpp" />
     <ClCompile Include="src\wasapi_audio_player.cpp" />
@@ -82,6 +83,7 @@ if exist "$(SolutionDir)third_party\webview2-runtime\Microsoft.WebView2.FixedVer
   <ItemGroup>
     <ClInclude Include="include\AnvilPlayer\App\app_messages.h" />
     <ClInclude Include="include\AnvilPlayer\App\color_math.h" />
+    <ClInclude Include="include\AnvilPlayer\App\color_metadata_util.h" />
     <ClInclude Include="include\AnvilPlayer\App\d3d11_video_renderer.h" />
     <ClInclude Include="include\AnvilPlayer\App\embedded_ffplay.h" />
     <ClInclude Include="include\AnvilPlayer\App\external_video_decoder.h" />
