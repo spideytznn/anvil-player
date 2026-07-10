@@ -7,7 +7,6 @@ import {
   FolderOpen,
   History,
   Info,
-  Library,
   Maximize2,
   Minimize2,
   Monitor,
@@ -28,6 +27,7 @@ import {
   clearPendingEmbyPlaybackReport,
   EMBY_PLAYBACK_REPORT_PENDING_EVENT,
   loadPendingEmbyPlaybackReport,
+  receiveEmbyPlaybackReportFromNative,
   reportEmbyPlaybackProgress,
   reportEmbyPlaybackStarted,
   reportEmbyPlaybackStopped,
@@ -37,6 +37,7 @@ import { applyDocumentLanguage, getInitialLanguage, saveUiLanguage, type UiLangu
 import {
   EMPTY_STATE,
   postNativeCommand,
+  subscribeNativeMessages,
   subscribeNativeState,
   type HdrToneCurvePoint,
   type MediaListItem,
@@ -110,14 +111,12 @@ const en = {
   playbackFailedHint: 'The player could not open this stream. The source may have rejected the request or the URL may have expired.',
   errorDetails: 'Details',
   retry: 'Retry',
-  backToLibrary: 'Back to library',
   hdrCurve: 'HDR Curve',
   reset: 'Reset',
   zoom: 'Zoom',
   peak: 'Peak',
   nits: 'nits',
   language: 'Language',
-  mediaLibrary: 'Media library',
   interfaceLanguage: 'Interface language',
   english: 'English',
   chinese: 'Chinese',
@@ -207,14 +206,12 @@ const zh: Record<keyof typeof en, string> = {
   playbackFailedHint: '播放器无法打开这个视频流，可能是片源拒绝访问或播放地址已经失效。',
   errorDetails: '详情',
   retry: '重试',
-  backToLibrary: '返回媒体库',
   hdrCurve: 'HDR 曲线',
   reset: '重置',
   zoom: '放大',
   peak: '峰值',
   nits: '尼特',
   language: '语言',
-  mediaLibrary: '媒体库',
   interfaceLanguage: '界面语言',
   english: 'English',
   chinese: '中文',
@@ -404,7 +401,25 @@ function useEmbyPlaybackReporting(state: PlayerState): void {
   useEffect(() => {
     activeRef.current = null
     return () => {
-      stopActiveEmbyPlaybackReport(activeRef.current, activeRef.current?.lastPositionMs ?? 0, false, true)
+      const active = activeRef.current
+      if (!active?.started || active.stopped) return
+
+      // The player WebView can be recreated while native playback keeps
+      // running (for example after changing the certificate policy). Treating
+      // a React/WebView teardown as the end of playback clears the persisted
+      // report and leaves the continuing native session without heartbeats.
+      // Keep the report pending so the replacement WebView can resume it, and
+      // only flush the latest known position here. Real playback termination
+      // is handled by the Stopped/Empty/Error state path below.
+      void reportEmbyPlaybackProgress(
+        active.report,
+        active.lastPositionMs,
+        active.lastPlaybackState === 'Paused',
+        'TimeUpdate',
+        true
+      ).catch(() => {
+        // Best effort during WebView teardown.
+      })
     }
   }, [])
 
@@ -1043,9 +1058,6 @@ function TopBar({ state, t }: { state: PlayerState; t: Copy }): JSX.Element {
       <IconButton label={t.openMediaLabel} onClick={() => postNativeCommand({ type: 'command', command: 'open' })}>
         <FolderOpen size={17} />
       </IconButton>
-      <IconButton label={t.mediaLibrary} onClick={() => { window.location.hash = '#/library' }}>
-        <Library size={17} />
-      </IconButton>
       <IconButton
         label={t.settings}
         active={state.inspectorTab === 'settings'}
@@ -1080,10 +1092,6 @@ function VideoStage({ state, t }: { state: PlayerState; t: Copy }): JSX.Element 
                 <button className="line-button text-button" type="button" onClick={() => postNativeCommand({ type: 'command', command: 'playPause' })}>
                   <RotateCcw size={15} />
                   <span>{t.retry}</span>
-                </button>
-                <button className="line-button text-button" type="button" onClick={() => { window.location.hash = '#/library' }}>
-                  <Library size={15} />
-                  <span>{t.backToLibrary}</span>
                 </button>
               </div>
             </div>
@@ -1778,6 +1786,17 @@ export default function App(): JSX.Element {
   useEffect(() => {
     applyAppearanceSettings()
     return subscribeNativeState(setState)
+  }, [])
+
+  useEffect(() => {
+    // The library window relays pending Emby playback reports through native
+    // because the player window has its own WebView2 storage. Inject the
+    // received report here so useEmbyPlaybackReporting picks it up.
+    return subscribeNativeMessages((message) => {
+      if (message && message.type === 'deliverEmbyPlaybackReport') {
+        receiveEmbyPlaybackReportFromNative(message.report)
+      }
+    })
   }, [])
 
   useEffect(() => {

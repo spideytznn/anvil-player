@@ -197,6 +197,10 @@ export function savePendingEmbyPlaybackReport(
   try {
     window.localStorage.setItem(PLAYBACK_REPORT_STORAGE_KEY, JSON.stringify(report))
     notifyPendingEmbyPlaybackReport(report.id)
+    // The player window is a separate WebView2 environment with its own
+    // storage, so the pending report stored above is invisible to it. Relay
+    // the full report through native so the player window can inject it.
+    deliverEmbyPlaybackReportToNative(report)
     return report
   } catch {
     return undefined
@@ -249,6 +253,43 @@ export function clearPendingEmbyPlaybackReport(reportId?: string): void {
   }
 }
 
+// Relay the pending report to native so the host can forward it to the player
+// window (which lives in a separate WebView2 environment with its own storage).
+function deliverEmbyPlaybackReportToNative(report: EmbyPlaybackReportRecord): void {
+  try {
+    window.chrome?.webview?.postMessage({
+      type: 'command',
+      command: 'deliverEmbyPlaybackReport',
+      report
+    })
+  } catch {
+    // Non-fatal: the player just won't receive the cross-window relay.
+  }
+}
+
+// Player-window side: injects a report received from native (relayed from the
+// library window) into this environment's storage and fires the pending event
+// so useEmbyPlaybackReporting picks it up.
+export function receiveEmbyPlaybackReportFromNative(report: unknown): void {
+  try {
+    const row = objectValue(report)
+    if (!row) return
+    const session = loadReportSession(row.session)
+    const target = loadReportTarget(row.target)
+    if (!session || !target) return
+    const record: EmbyPlaybackReportRecord = {
+      id: stringValue(row.id) || `emby-playback-${numberValue(row.createdAt) ?? Date.now()}`,
+      createdAt: numberValue(row.createdAt) ?? Date.now(),
+      session,
+      target
+    }
+    window.localStorage.setItem(PLAYBACK_REPORT_STORAGE_KEY, JSON.stringify(record))
+    notifyPendingEmbyPlaybackReport(record.id)
+  } catch {
+    // Malformed relay payload; ignore.
+  }
+}
+
 export async function reportEmbyPlaybackStarted(
   report: EmbyPlaybackReportRecord,
   positionMs: number
@@ -265,13 +306,15 @@ export async function reportEmbyPlaybackProgress(
   report: EmbyPlaybackReportRecord,
   positionMs: number,
   paused: boolean,
-  eventName = 'TimeUpdate'
+  eventName = 'TimeUpdate',
+  keepalive = false
 ): Promise<void> {
   await postPlaybackReport(
     report,
     '/Sessions/Playing/Progress',
     playbackReportBody(report, millisToTicks(positionMs), { paused, eventName }),
-    'Report Emby playback progress'
+    'Report Emby playback progress',
+    keepalive
   )
 }
 

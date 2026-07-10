@@ -24,7 +24,7 @@ using Microsoft::WRL::RuntimeClassFlags;
 namespace {
 
 constexpr wchar_t kWebUiVirtualHost[] = L"appassets.anvilplayer.local";
-constexpr wchar_t kWebUiUrl[] = L"http://appassets.anvilplayer.local/index.html#/library";
+constexpr wchar_t kWebUiBaseUrl[] = L"http://appassets.anvilplayer.local/index.html";
 constexpr wchar_t kWebViewBrowserArguments[] =
     L"--allow-running-insecure-content "
     L"--disable-web-security "
@@ -97,12 +97,18 @@ private:
     BOOL allowSingleSignOnUsingOSPrimaryAccount_ = FALSE;
 };
 
-std::filesystem::path WebViewUserDataFolder() {
+std::filesystem::path WebViewUserDataFolder(std::wstring_view profileName) {
     wchar_t localAppData[MAX_PATH]{};
+    // An empty profile name maps to the legacy base folder (AnvilPlayer/WebView2)
+    // so existing user data (Emby connections, TMDB settings, view state) is
+    // preserved when the library window reuses it. Named profiles get a sibling
+    // subfolder so two hosts in one process never share a folder.
     if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, localAppData))) {
-        return std::filesystem::path(localAppData) / L"AnvilPlayer" / L"WebView2";
+        auto base = std::filesystem::path(localAppData) / L"AnvilPlayer" / L"WebView2";
+        return profileName.empty() ? base : base / profileName;
     }
-    return std::filesystem::temp_directory_path() / L"AnvilPlayer-WebView2";
+    auto fallback = std::filesystem::temp_directory_path() / L"AnvilPlayer-WebView2";
+    return profileName.empty() ? fallback : fallback / profileName;
 }
 
 std::filesystem::path ModuleDirectory() {
@@ -142,6 +148,8 @@ struct WebUiHost::Impl {
     HWND parent = nullptr;
     RECT pendingBounds{};
     std::filesystem::path webRoot;
+    std::wstring initialUrl;
+    std::wstring profileName;
     MessageHandler messageHandler;
     std::filesystem::path browserExecutableFolder;
     ComPtr<ICoreWebView2Environment> environment;
@@ -151,7 +159,11 @@ struct WebUiHost::Impl {
     bool usedDefaultOptionsFallback = false;
     bool allowInsecureCertificates = false;
 
-    bool Create(HWND parentWindow, const std::filesystem::path& root, MessageHandler handler) {
+    bool Create(HWND parentWindow,
+                const std::filesystem::path& root,
+                std::wstring_view url,
+                std::wstring_view profile,
+                MessageHandler handler) {
         lastCreateResult = S_OK;
         usedDefaultOptionsFallback = false;
         parent = parentWindow;
@@ -160,6 +172,8 @@ struct WebUiHost::Impl {
         if (error) {
             webRoot = root;
         }
+        initialUrl = std::wstring{url.empty() ? std::wstring_view{kWebUiBaseUrl} : url};
+        profileName = profile;
         messageHandler = std::move(handler);
 
         RECT client{};
@@ -171,7 +185,7 @@ struct WebUiHost::Impl {
             return false;
         }
 
-        const std::filesystem::path userData = WebViewUserDataFolder();
+        const std::filesystem::path userData = WebViewUserDataFolder(profileName);
         std::filesystem::create_directories(userData, error);
         browserExecutableFolder = LocalWebViewRuntimeFolder();
 
@@ -266,7 +280,7 @@ struct WebUiHost::Impl {
                                                 webRoot.c_str(),
                                                 COREWEBVIEW2_HOST_RESOURCE_ACCESS_KIND_DENY_CORS);
                                         }
-                                        webview->Navigate(kWebUiUrl);
+                                        webview->Navigate(initialUrl.c_str());
                                     }
 
                                     return S_OK;
@@ -313,8 +327,12 @@ WebUiHost::~WebUiHost() {
     delete impl_;
 }
 
-bool WebUiHost::Create(HWND parent, const std::filesystem::path& webRoot, MessageHandler handler) {
-    return impl_->Create(parent, webRoot, std::move(handler));
+bool WebUiHost::Create(HWND parent,
+                       const std::filesystem::path& webRoot,
+                       std::wstring_view initialUrl,
+                       std::wstring_view profileName,
+                       MessageHandler handler) {
+    return impl_->Create(parent, webRoot, initialUrl, profileName, std::move(handler));
 }
 
 void WebUiHost::Resize(const RECT bounds) const {

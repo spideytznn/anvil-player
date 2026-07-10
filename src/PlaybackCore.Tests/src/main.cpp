@@ -1,7 +1,9 @@
 #include "AnvilPlayer/Playback/PlayerController.h"
 #include "AnvilPlayer/Playback/PlaybackPlan.h"
+#include "AnvilPlayer/App/video_texture_sampling_math.h"
 
 #include <cassert>
+#include <cmath>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -15,6 +17,42 @@ using anvil::playback::InMemoryLogSink;
 using anvil::playback::LogLevel;
 
 namespace {
+
+void AssertNear(const float actual, const float expected) {
+    assert(std::abs(actual - expected) < 0.000001f);
+}
+
+void TestVideoTextureSamplingRegion() {
+    const auto padded = anvil::app::BuildVideoTextureSamplingRegion(3832, 1592, 3840, 1664);
+    assert(padded.valid);
+    assert(padded.visibleWidth == 3832);
+    assert(padded.visibleHeight == 1592);
+    AssertNear(padded.uvRect.left, 0.0f);
+    AssertNear(padded.uvRect.top, 0.0f);
+    AssertNear(padded.uvRect.right, 3832.0f / 3840.0f);
+    AssertNear(padded.uvRect.bottom, 1592.0f / 1664.0f);
+
+    const auto exact = anvil::app::BuildVideoTextureSamplingRegion(3840, 2160, 3840, 2160);
+    assert(exact.valid);
+    AssertNear(exact.uvRect.left, 0.0f);
+    AssertNear(exact.uvRect.top, 0.0f);
+    AssertNear(exact.uvRect.right, 1.0f);
+    AssertNear(exact.uvRect.bottom, 1.0f);
+
+    const auto cropped = anvil::app::BuildVideoTextureSamplingRegion(
+        3824, 2148, 3840, 2176, 8, 4);
+    assert(cropped.valid);
+    assert(cropped.visibleWidth == 3816);
+    assert(cropped.visibleHeight == 2144);
+    AssertNear(cropped.uvRect.left, 8.0f / 3840.0f);
+    AssertNear(cropped.uvRect.top, 4.0f / 2176.0f);
+    AssertNear(cropped.uvRect.right, 3824.0f / 3840.0f);
+    AssertNear(cropped.uvRect.bottom, 2148.0f / 2176.0f);
+
+    assert(!anvil::app::BuildVideoTextureSamplingRegion(3840, 2160, 3839, 2160).valid);
+    assert(!anvil::app::BuildVideoTextureSamplingRegion(0, 2160, 3840, 2160).valid);
+    assert(!anvil::app::BuildVideoTextureSamplingRegion(3840, 2160, 3840, 2160, -1, 0).valid);
+}
 
 std::filesystem::path MakeTempMediaFile() {
     static int counter = 0;
@@ -233,6 +271,7 @@ void TestDolbyVisionPlaybackPlanUsesSoftwareReshape() {
 }  // namespace
 
 int main() {
+    TestVideoTextureSamplingRegion();
     TestOpenAndTransport();
     TestSeekAndVolumeClamp();
     TestMissingFileLogsError();

@@ -5,7 +5,8 @@
 namespace anvil::app {
 
 // Window class names.
-constexpr wchar_t kWindowClassName[] = L"AnvilPlayerWindow";
+constexpr wchar_t kWindowClassName[] = L"AnvilPlayerWindow";          // player window
+constexpr wchar_t kLibraryWindowClassName[] = L"AnvilLibraryWindow";  // library window
 constexpr wchar_t kVideoHostClassName[] = L"AnvilVideoHostWindow";
 constexpr wchar_t kFullscreenOverlayClassName[] = L"AnvilFullscreenOverlayWindow";
 constexpr wchar_t kTransportOverlayClassName[] = L"AnvilTransportOverlayWindow";

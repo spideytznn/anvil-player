@@ -62,9 +62,11 @@ struct VideoColorConstants {
     float doviTrimReserved1 = 0.0f;
     float doviActiveArea[4] = {0.0f, 0.0f, 1.0f, 1.0f};  // x0,y0,x1,y1 in source UV.
     float hdrToneCurve[anvil::playback::kHdrToneCurvePointCount][4] = {};
+    float sourceUvRect[4] = {0.0f, 0.0f, 1.0f, 1.0f};
 };
 
 static_assert(sizeof(VideoColorConstants) % 16 == 0);
+static_assert(offsetof(VideoColorConstants, sourceUvRect) % 16 == 0);
 
 constexpr DWORD kFrameLatencyWaitTimeoutMs = 8;
 constexpr UINT kVideoPresentSyncInterval = 1;
@@ -1069,6 +1071,7 @@ bool D3D11VideoRenderer::CreatePipeline() {
         "  float doviTrimReserved1;\n"
         "  float4 doviActiveArea;\n"
         "  float4 hdrToneCurve[9];\n"
+        "  float4 sourceUvRect;\n"
         "};\n"
         "bool outside_dovi_active_area(float2 uv) {\n"
         "  return uv.x < doviActiveArea.x || uv.y < doviActiveArea.y || uv.x >= doviActiveArea.z || uv.y >= doviActiveArea.w;\n"
@@ -1236,8 +1239,10 @@ bool D3D11VideoRenderer::CreatePipeline() {
         "  return apply_sdr_contrast_recovery(encode_sdr_g22(compress_gamut_preserve_luma(linear709)));\n"
         "}\n"
         "float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_Target {\n"
-        "  if (outside_dovi_active_area(uv)) return float4(0.0, 0.0, 0.0, 1.0);\n"
-        "  float4 c = tex.Sample(samp, uv);\n"
+        "  float2 displayUv = saturate(uv);\n"
+        "  if (outside_dovi_active_area(displayUv)) return float4(0.0, 0.0, 0.0, 1.0);\n"
+        "  float2 sampleUv = lerp(sourceUvRect.xy, sourceUvRect.zw, displayUv);\n"
+        "  float4 c = tex.Sample(samp, sampleUv);\n"
         "  if (outputMode == 1) return float4(apply_hdr_tone_curve_pq(c.rgb), c.a);\n"
         "  if (transferType == 2 && primariesType == 2) return float4(bt2020_pq_to_sdr(c.rgb), c.a);\n"
         "  return float4(apply_dovi_trim_sdr_g22(c.rgb), c.a);\n"
@@ -1275,6 +1280,7 @@ bool D3D11VideoRenderer::CreatePipeline() {
         "  float doviTrimReserved1;\n"
         "  float4 doviActiveArea;\n"
         "  float4 hdrToneCurve[9];\n"
+        "  float4 sourceUvRect;\n"
         "};\n"
         "bool outside_dovi_active_area(float2 uv) {\n"
         "  return uv.x < doviActiveArea.x || uv.y < doviActiveArea.y || uv.x >= doviActiveArea.z || uv.y >= doviActiveArea.w;\n"
@@ -1770,11 +1776,13 @@ bool D3D11VideoRenderer::CreatePipeline() {
         "  return dovi_lms_to_bt2020(lms) * 10000.0;\n"
         "}\n"
         "float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_Target {\n"
-        "  if (outside_dovi_active_area(uv)) return float4(0.0, 0.0, 0.0, 1.0);\n"
-        "  float y = texY.Sample(samp, uv);\n"
-        "  float2 cbcr = texUV.Sample(samp, uv);\n"
+        "  float2 displayUv = saturate(uv);\n"
+        "  if (outside_dovi_active_area(displayUv)) return float4(0.0, 0.0, 0.0, 1.0);\n"
+        "  float2 sampleUv = lerp(sourceUvRect.xy, sourceUvRect.zw, displayUv);\n"
+        "  float y = texY.Sample(samp, sampleUv);\n"
+        "  float2 cbcr = texUV.Sample(samp, sampleUv);\n"
         "  if (doviEnabled == 2) {\n"
-        "    float3 hdrYcc = dovi_compose_p7_fel(y, cbcr, uv);\n"
+        "    float3 hdrYcc = dovi_compose_p7_fel(y, cbcr, displayUv);\n"
         "    float3 rgb = ycbcr_to_rgb(hdrYcc.x, hdrYcc.yz);\n"
         "    if (outputMode == 1) {\n"
         "      if (transferType == 2 && primariesType == 2) return float4(apply_hdr_tone_curve_pq(rgb), 1.0);\n"
@@ -1795,7 +1803,7 @@ bool D3D11VideoRenderer::CreatePipeline() {
         "    }\n"
         "    return float4(bt2020_nits_to_sdr(bt2020Nits), 1.0);\n"
         "  }\n"
-        "  apply_fel_overlay(y, cbcr, uv);\n"
+        "  apply_fel_overlay(y, cbcr, displayUv);\n"
         "  float3 rgb = ycbcr_to_rgb(y, cbcr);\n"
         "  if (outputMode == 1) {\n"
         "    if (transferType == 2 && primariesType == 2) return float4(apply_hdr_tone_curve_pq(rgb), 1.0);\n"
@@ -1942,6 +1950,10 @@ bool D3D11VideoRenderer::UpdateColorPipeline(const NativeVideoFrame& frame) {
     }
 
     VideoColorConstants constants;
+    constants.sourceUvRect[0] = frame.sourceUvRect.left;
+    constants.sourceUvRect[1] = frame.sourceUvRect.top;
+    constants.sourceUvRect[2] = frame.sourceUvRect.right;
+    constants.sourceUvRect[3] = frame.sourceUvRect.bottom;
     constants.matrixType = MatrixType(color);
     constants.rangeType = color.range == VideoColorRange::Full ? 1 : 0;
     constants.transferType = TransferType(color.transfer);

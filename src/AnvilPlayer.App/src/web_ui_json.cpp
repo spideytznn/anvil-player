@@ -169,4 +169,53 @@ std::optional<std::wstring> ReadJsonString(std::wstring_view message, const wcha
     return std::nullopt;
 }
 
+std::optional<std::wstring> ReadJsonObject(std::wstring_view message, const wchar_t* field) {
+    const std::wstring key = L"\"" + std::wstring(field) + L"\":";
+    const std::size_t start = message.find(key);
+    if (start == std::wstring_view::npos) {
+        return std::nullopt;
+    }
+
+    std::size_t index = start + key.size();
+    while (index < message.size() && std::iswspace(message[index])) {
+        ++index;
+    }
+    if (index >= message.size() || (message[index] != L'{' && message[index] != L'[')) {
+        return std::nullopt;
+    }
+
+    const wchar_t open = message[index];
+    const wchar_t close = open == L'{' ? L'}' : L']';
+    int depth = 0;
+    bool inString = false;
+    bool escape = false;
+    const std::size_t valueStart = index;
+    for (; index < message.size(); ++index) {
+        const wchar_t ch = message[index];
+        if (escape) {
+            escape = false;
+            continue;
+        }
+        if (inString) {
+            if (ch == L'\\') {
+                escape = true;
+            } else if (ch == L'"') {
+                inString = false;
+            }
+            continue;
+        }
+        if (ch == L'"') {
+            inString = true;
+        } else if (ch == open) {
+            ++depth;
+        } else if (ch == close) {
+            --depth;
+            if (depth == 0) {
+                return std::wstring(message.substr(valueStart, index + 1 - valueStart));
+            }
+        }
+    }
+    return std::nullopt;
+}
+
 }  // namespace anvil::app

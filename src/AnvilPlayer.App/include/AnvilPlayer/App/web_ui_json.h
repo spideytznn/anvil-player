@@ -31,4 +31,10 @@ std::optional<double> ReadJsonNumber(std::wstring_view message, const wchar_t* f
 // malformed.
 std::optional<std::wstring> ReadJsonString(std::wstring_view message, const wchar_t* field);
 
+// Extracts a balanced JSON object/array value for "field":{...} or "field":[...].
+// Tracks brace/bracket depth and respects quoted strings so nested objects and
+// strings containing delimiters do not confuse the scan. Returns nullopt when
+// the field is absent or its value is not an object/array.
+std::optional<std::wstring> ReadJsonObject(std::wstring_view message, const wchar_t* field);
+
 }  // namespace anvil::app

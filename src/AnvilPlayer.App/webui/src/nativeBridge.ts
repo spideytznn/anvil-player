@@ -152,6 +152,7 @@ export type NativeMessage =
   | SmbDirectoryFailed
   | WebDavDirectoryListed
   | WebDavDirectoryFailed
+  | { type: 'deliverEmbyPlaybackReport'; report: unknown }
 
 export interface TrackOption {
   index: number
@@ -176,6 +177,9 @@ export type NativeCommand =
   | { type: 'command'; command: 'scanWebDavFolder'; url: string; name?: string; username?: string; password?: string }
   | { type: 'command'; command: 'debugLog'; message: string }
   | { type: 'command'; command: 'setWebUiRoute'; route: 'player' | 'library' }
+  | { type: 'command'; command: 'requestPlayback'; path: string; startPositionRatio?: number }
+  | { type: 'command'; command: 'focusPlayer' }
+  | { type: 'command'; command: 'deliverEmbyPlaybackReport'; report: unknown }
   | { type: 'command'; command: 'setAllowInsecureCertificates'; enabled: boolean }
   | { type: 'command'; command: 'playPause' }
   | { type: 'command'; command: 'stop' }

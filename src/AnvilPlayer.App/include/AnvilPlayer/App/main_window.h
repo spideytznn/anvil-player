@@ -22,6 +22,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -39,14 +40,28 @@ namespace anvil::app {
 // (Paint + all Draw* methods).
 class MainWindow {
 public:
+    // Called from WM_DESTROY. When set, the Application decides whether to quit
+    // the process (e.g. closing the player window alone should NOT quit).
+    using QuitHandler = std::function<void()>;
+
     void ConfigureLogging(anvil::playback::LogLevel minimumLevel);
     void SetBackend(PlaybackBackend backend);
-    void SetInitialVideoTrackSelection(int selectedTrackIndex);
+    void SetInitialVideoTrackSelection(int selectedVideoTrackIndex);
     void SetWebUiEnabled(bool enabled);
+    void SetQuitHandler(QuitHandler handler);
 
     bool Create(HINSTANCE instance);
     void Show(int commandShow) const;
     void OpenInitialPath(const std::filesystem::path& path, bool autoplay);
+    // Sets the 0..1 resume ratio consumed by the next OpenInitialPath/OpenPath.
+    void SetPendingStartPositionRatio(double ratio) { pendingStartPositionRatio_ = ratio; }
+    HWND Handle() const { return hwnd_; }
+    bool IsVisible() const;
+    // Posts a relayed Emby playback report JSON object into the player WebView
+    // so useEmbyPlaybackReporting can inject it (the player has separate
+    // storage from the library window). Returns true when the WebView was
+    // ready and the message was actually posted.
+    bool DeliverEmbyPlaybackReport(const std::wstring& reportJson) const;
 
 private:
     static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
@@ -350,6 +365,7 @@ private:
     HWND hwnd_ = nullptr;
     HINSTANCE instance_ = nullptr;
     UINT dpi_ = 96;
+    QuitHandler quitHandler_;
     Palette palette_;
     anvil::playback::PlayerController controller_;
     anvil::playback::CapabilityReport cachedCapabilities_;
@@ -371,7 +387,10 @@ private:
     bool videoHostReady_ = false;
     bool webUiRequested_ = true;
     bool webUiActive_ = false;
-    bool webUiPlayerRouteActive_ = false;
+    // MainWindow is always the player window, so the player route is always
+    // active. Retained as a constant-true flag because layout/paint/runtime
+    // code still branches on it; the legacy setWebUiRoute switching is gone.
+    bool webUiPlayerRouteActive_ = true;
     mutable std::chrono::steady_clock::time_point lastWebUiStatePostedAt_{};
     bool layoutDirty_ = true;
     bool nativeFrameHoldVisible_ = false;

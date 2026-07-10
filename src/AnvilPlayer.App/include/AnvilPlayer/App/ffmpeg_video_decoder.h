@@ -1,6 +1,7 @@
 #pragma once
 
 #include "AnvilPlayer/App/log_sink_ptr.h"
+#include "AnvilPlayer/App/video_texture_sampling_math.h"
 #include "AnvilPlayer/Playback/DolbyVisionMetadata.h"
 #include "AnvilPlayer/Playback/Settings.h"
 #include "AnvilPlayer/Playback/Types.h"
@@ -93,6 +94,9 @@ struct NativeVideoFrame {
     Microsoft::WRL::ComPtr<ID3D11Texture2D> d3dTexture;
     UINT d3dArraySlice = 0;
     DXGI_FORMAT d3dFormat = DXGI_FORMAT_UNKNOWN;
+    int d3dTextureWidth = 0;
+    int d3dTextureHeight = 0;
+    VideoTextureUvRect sourceUvRect;
     AVPixelFormat softwareFormat = AV_PIX_FMT_NONE;
     anvil::playback::VideoColorMetadata color;
     // Per-frame Dolby Vision metadata (reshaping curves + color matrices).

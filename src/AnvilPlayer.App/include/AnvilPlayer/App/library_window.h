@@ -1,0 +1,75 @@
+#pragma once
+
+#include "AnvilPlayer/App/web_ui_host.h"
+
+#include <shellapi.h>
+#include <windows.h>
+
+#include <filesystem>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string>
+
+namespace anvil::app {
+
+// A lightweight top-level window that hosts the WebView2 media-library UI
+// (the #/library route). It owns its own WebUiHost and handles only the
+// library-source commands (open file, pick/scan local folder, SMB/WebDAV
+// listing, insecure-certificate toggle, debug logging). Playback is delegated
+// to the player window via the PlaybackRequest callback.
+//
+// Lifecycle note: closing this window is treated as "close the application".
+// The message loop should continue running as long as either the library or
+// the player window is alive.
+class LibraryWindow {
+public:
+    using PlaybackRequest = std::function<void(const std::filesystem::path& path, double startPositionRatio)>;
+    using QuitHandler = std::function<void()>;
+
+    LibraryWindow();
+    ~LibraryWindow();
+
+    LibraryWindow(const LibraryWindow&) = delete;
+    LibraryWindow& operator=(const LibraryWindow&) = delete;
+
+    void SetPlaybackRequest(PlaybackRequest callback);
+    void SetAllowInsecureCertificatesRequest(std::function<void(bool)> callback);
+    void SetFocusPlayerRequest(std::function<void()> callback);
+    // Relays a serialized Emby playback report (from the library WebView) to
+    // the player window so it can report progress despite separate storage.
+    void SetEmbyPlaybackReportRelay(std::function<void(const std::wstring&)> callback);
+    void SetQuitHandler(QuitHandler handler);
+    // Fired from the library window's WM_TIMER (used for the Emby report retry).
+    void SetTimerHandler(std::function<void()> callback);
+
+    bool Create(HINSTANCE instance);
+    void Show(int commandShow) const;
+    HWND Handle() const { return hwnd_; }
+
+private:
+    static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
+    LRESULT HandleMessage(UINT message, WPARAM wParam, LPARAM lParam);
+
+    bool TryCreateWebUi();
+    std::filesystem::path WebUiRoot() const;
+    void HandleWebUiMessage(std::wstring_view message);
+    void PostScanResult(const std::wstring& json);
+    void OpenLocalFolderDialog();
+    void OpenMediaFileDialog();
+    void ApplyWindowChrome() const;
+
+    HWND hwnd_ = nullptr;
+    HINSTANCE instance_ = nullptr;
+    UINT dpi_ = 96;
+    std::unique_ptr<WebUiHost> webUiHost_;
+    bool webUiActive_ = false;
+    PlaybackRequest playbackRequest_;
+    std::function<void(bool)> allowInsecureCertificatesRequest_;
+    std::function<void()> focusPlayerRequest_;
+    std::function<void(const std::wstring&)> embyPlaybackReportRelay_;
+    QuitHandler quitHandler_;
+    std::function<void()> timerHandler_;
+};
+
+}  // namespace anvil::app

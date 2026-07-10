@@ -3837,7 +3837,13 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
                           L"decoder",
                           L"hardware_frame path=zero_copy pts_ms=" + std::to_wstring(pts.count()) +
                               L" size=" + std::to_wstring(textureFrame.width) + L"x" +
-                              std::to_wstring(textureFrame.height) +
+                              std::to_wstring(textureFrame.height) + L" texture=" +
+                              std::to_wstring(textureFrame.d3dTextureWidth) + L"x" +
+                              std::to_wstring(textureFrame.d3dTextureHeight) + L" uv_rect=" +
+                              std::to_wstring(textureFrame.sourceUvRect.left) + L"," +
+                              std::to_wstring(textureFrame.sourceUvRect.top) + L"," +
+                              std::to_wstring(textureFrame.sourceUvRect.right) + L"," +
+                              std::to_wstring(textureFrame.sourceUvRect.bottom) +
                               L" dxgi=" + DxgiFormatName(textureFrame.d3dFormat));
             }
             if (oneShotFrame_) {
@@ -4063,6 +4069,33 @@ bool FfmpegVideoDecoder::TryBuildD3DTextureFrame(AVFrame* frame, std::chrono::mi
         return false;
     }
 
+    const auto cropToInt = [](const std::size_t value) {
+        return value <= static_cast<std::size_t>(std::numeric_limits<int>::max())
+                   ? static_cast<int>(value)
+                   : -1;
+    };
+    const bool textureDimensionsFit =
+        desc.Width <= static_cast<UINT>(std::numeric_limits<int>::max()) &&
+        desc.Height <= static_cast<UINT>(std::numeric_limits<int>::max());
+    const int textureWidth = textureDimensionsFit ? static_cast<int>(desc.Width) : 0;
+    const int textureHeight = textureDimensionsFit ? static_cast<int>(desc.Height) : 0;
+    const auto samplingRegion = BuildVideoTextureSamplingRegion(
+        frame->width,
+        frame->height,
+        textureWidth,
+        textureHeight,
+        cropToInt(frame->crop_left),
+        cropToInt(frame->crop_top),
+        cropToInt(frame->crop_right),
+        cropToInt(frame->crop_bottom));
+    if (!samplingRegion.valid) {
+        LogZeroCopyFallbackOnce(
+            L"invalid_visible_texture_region frame=" + std::to_wstring(frame->width) + L"x" +
+            std::to_wstring(frame->height) + L" texture=" + std::to_wstring(desc.Width) + L"x" +
+            std::to_wstring(desc.Height));
+        return false;
+    }
+
     Microsoft::WRL::ComPtr<ID3D11Device> textureDevice;
     texture->GetDevice(&textureDevice);
     if (!textureDevice || textureDevice.Get() != sharedD3DDevice_.Get()) {
@@ -4081,12 +4114,15 @@ bool FfmpegVideoDecoder::TryBuildD3DTextureFrame(AVFrame* frame, std::chrono::mi
         return false;
     }
 
-    out.width = frame->width;
-    out.height = frame->height;
+    out.width = samplingRegion.visibleWidth;
+    out.height = samplingRegion.visibleHeight;
     out.stride = 0;
     out.d3dTexture = texture;
     out.d3dArraySlice = static_cast<UINT>(reinterpret_cast<intptr_t>(frame->data[1]));
     out.d3dFormat = desc.Format;
+    out.d3dTextureWidth = textureWidth;
+    out.d3dTextureHeight = textureHeight;
+    out.sourceUvRect = samplingRegion.uvRect;
     out.softwareFormat = HardwareFrameSoftwareFormat(frame);
     out.color = MergeFrameColorMetadata(frame, streamColorMetadata_);
     if (dolbyVisionStream_) {
@@ -5038,13 +5074,18 @@ bool FfmpegVideoDecoder::SeekPrerollReadyLocked() const {
                                 ? queuedFramesReady
                                 : (queuedFramesReady || decodedSpan >= minDecodedSpan);
     const bool decodedQueueFull = frameQueue_.size() >= effectiveMaxQueueDepth;
+    const bool decodedQueueAtCapacity = frameQueue_.size() >= maxQueueDepth;
     const bool softwareQueueFullWithLead =
         softwareFrame &&
         decodedQueueFull &&
         stats_.readAheadDuration >= kSeekPrerollSoftwareQueueFullMinReadAhead;
+    const bool hardwareQueueFull =
+        !softwareFrame &&
+        decodedQueueAtCapacity;
     const bool readAheadReady =
         stats_.readAheadDuration >= minReadAhead ||
         softwareQueueFullWithLead ||
+        hardwareQueueFull ||
         (!softwareFrame && stats_.packetQueueDepth >= kSeekPrerollMinPacketDepth);
     if (videoReady && readAheadReady) {
         return true;

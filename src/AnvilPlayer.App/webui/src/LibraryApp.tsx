@@ -1583,6 +1583,7 @@ export default function LibraryApp(): JSX.Element {
   const [detailItemsById, setDetailItemsById] = useState<Map<string, MediaItem>>(() => new Map())
   const [loadedDetailIds, setLoadedDetailIds] = useState<Set<string>>(() => new Set())
   const [continueItems, setContinueItems] = useState<MediaItem[]>([])
+  const [embyRefreshPulse, setEmbyRefreshPulse] = useState(0)
   const [homeSections, setHomeSections] = useState<LibraryHomeSection[]>([])
   const [activeNav, setActiveNav] = useState<NavKey>(initialActiveNav)
   const [activeView, setActiveView] = useState<LibraryView>('home')
@@ -2042,6 +2043,20 @@ export default function LibraryApp(): JSX.Element {
   }, [activeLibraryViewId, activeNav, activeView, client, debouncedQuery, mediaFilter, selectedId, sortKey, sortOrder, sources])
 
   useEffect(() => {
+    const requestRefresh = (): void => {
+      if (document.visibilityState === 'visible') {
+        setEmbyRefreshPulse((value) => value + 1)
+      }
+    }
+    window.addEventListener('focus', requestRefresh)
+    document.addEventListener('visibilitychange', requestRefresh)
+    return () => {
+      window.removeEventListener('focus', requestRefresh)
+      document.removeEventListener('visibilitychange', requestRefresh)
+    }
+  }, [])
+
+  useEffect(() => {
     const connections = savedConnections.filter((connection) => connection.session)
     if (!connections.length) return undefined
     let cancelled = false
@@ -2100,7 +2115,7 @@ export default function LibraryApp(): JSX.Element {
     return () => {
       cancelled = true
     }
-  }, [client, savedConnections])
+  }, [client, savedConnections, embyRefreshPulse])
 
   useEffect(() => {
     const timer = window.setTimeout(() => setDebouncedQuery(query), 220)
@@ -2901,9 +2916,9 @@ export default function LibraryApp(): JSX.Element {
         debugLibraryPlayback(`play local blocked missing path id=${item.id}`)
         return
       }
-      postNativeCommand({ type: 'command', command: 'setWebUiRoute', route: 'player' })
-      postNativeCommand({ type: 'command', command: 'inspectorMedia' })
-      window.location.hash = '#/player'
+      // The library lives in its own window now; ask the host to open the
+      // standalone player window (or switch its current media). The library
+      // window stays on the library route.
       window.setTimeout(() => {
         if (source.kind === 'SMB') {
           const credentials = loadSmbCredentials(source.id)
@@ -2917,11 +2932,11 @@ export default function LibraryApp(): JSX.Element {
         }
         postNativeCommand({
           type: 'command',
-          command: 'openPath',
+          command: 'requestPlayback',
           path: playablePath,
           startPositionRatio: item.progress > 0 && item.progress < 1 ? item.progress : undefined
         })
-        debugLibraryPlayback(`play local openPath posted id=${localPlayableItem.id} path=${localPlayableItem.path ?? ''}`)
+        debugLibraryPlayback(`play local requestPlayback posted id=${localPlayableItem.id} path=${localPlayableItem.path ?? ''}`)
       }, 0)
       setPlayIntent(`Opening ${localPlayableItem.title}`)
       return
@@ -2940,20 +2955,20 @@ export default function LibraryApp(): JSX.Element {
     try {
       const target = await resolveEmbyPlaybackTarget(embySession, item)
       debugLibraryPlayback(`play resolve ok sourceId=${item.id} targetId=${target.itemId} url=${redactPlaybackUrl(target.url)}`)
+      // savePendingEmbyPlaybackReport stores the report in this window's
+      // storage AND relays it through native to the player window (which has
+      // its own WebView2 storage) so progress reporting works across windows.
       const report = savePendingEmbyPlaybackReport(embySession, target)
       debugLibraryPlayback(`play emby report pending targetId=${target.itemId} reportId=${report?.id ?? 'none'}`)
-      postNativeCommand({ type: 'command', command: 'setWebUiRoute', route: 'player' })
-      postNativeCommand({ type: 'command', command: 'inspectorMedia' })
-      window.location.hash = '#/player'
       window.setTimeout(() => {
         notifyPendingEmbyPlaybackReport(report?.id)
         postNativeCommand({
           type: 'command',
-          command: 'openPath',
+          command: 'requestPlayback',
           path: target.url,
           startPositionRatio: item.progress > 0 && item.progress < 1 ? item.progress : undefined
         })
-        debugLibraryPlayback(`play openPath posted targetId=${target.itemId}`)
+        debugLibraryPlayback(`play requestPlayback posted targetId=${target.itemId}`)
       }, 0)
       setPlayIntent(`Opening ${target.title}`)
     } catch (error) {
@@ -3713,7 +3728,7 @@ export default function LibraryApp(): JSX.Element {
             <Settings2 size={15} />
             <span>{settingsLabels.settings}</span>
           </button>
-          <button className="library-back-button" type="button" onClick={() => { window.location.hash = '#/player' }}>
+          <button className="library-back-button" type="button" onClick={() => { postNativeCommand({ type: 'command', command: 'focusPlayer' }) }}>
           <Play size={15} />
           <span>播放器模块</span>
           </button>
