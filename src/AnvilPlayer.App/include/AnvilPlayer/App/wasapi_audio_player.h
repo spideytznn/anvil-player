@@ -31,6 +31,15 @@ extern "C" {
 
 namespace anvil::app {
 
+enum class WasapiRuntimeState {
+    Stopped,
+    Starting,
+    Ready,
+    Failed,
+    Stopping,
+    Ended,
+};
+
 // WASAPI shared-mode PCM audio player with in-process FFmpeg audio decode and
 // swresample. Owns its own playback clock; PlaybackClock() is the master clock
 // consumed by the native video scheduler for A/V sync.
@@ -53,12 +62,19 @@ public:
                            AVRational timeBase,
                            std::chrono::milliseconds startPosition,
                            double volume,
-                           int streamIndex);
+                           int streamIndex,
+                           uint64_t startGeneration);
 
     bool QueuePacket(const AVPacket* packet);
     void ResetPacketStream(std::chrono::milliseconds position);
     void MarkPacketStreamEof();
 
+    // Non-blocking first phase of shutdown. Wakes packet waiters, interrupts
+    // FFmpeg I/O, and cancels synchronous I/O owned by the playback thread.
+    void RequestStop();
+
+    // Completes shutdown and releases worker-owned resources. Call this from a
+    // non-window thread after RequestStop when blocking is unacceptable.
     void Stop();
     void Pause(std::chrono::milliseconds position);
     bool Resume(std::chrono::milliseconds position);
@@ -70,6 +86,15 @@ public:
 
     bool IsRunning() const {
         return running_.load();
+    }
+    bool IsStopping() const {
+        return stopping_.load();
+    }
+    bool HasStartFailed() const;
+    uint64_t ArmPendingStart(std::chrono::milliseconds position);
+    void FailPendingStart(uint64_t startGeneration, std::wstring status);
+    bool IsStarting() const {
+        return runtimeState_.load() == WasapiRuntimeState::Starting;
     }
 
     std::wstring LastStatus() const;
@@ -89,6 +114,17 @@ private:
             return SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE;
         }
         HRESULT hr = E_FAIL;
+    };
+
+    struct CoCallCancellationScope {
+        CoCallCancellationScope()
+            : enabled(SUCCEEDED(CoEnableCallCancellation(nullptr))) {}
+        ~CoCallCancellationScope() {
+            if (enabled) {
+                CoDisableCallCancellation(nullptr);
+            }
+        }
+        bool enabled = false;
     };
 
     struct CoTaskMemDeleter {
@@ -114,7 +150,7 @@ private:
         double playbackRate = 1.0;
     };
 
-    void PlaybackLoop();
+    void PlaybackLoop(uint64_t workerGeneration);
     std::optional<std::chrono::milliseconds> TakePendingSeek();
     bool HasPendingSeek() const;
     bool HandlePause(IAudioClient* audioClient,
@@ -202,7 +238,8 @@ private:
 
     static int InterruptCallback(void* opaque);
 
-    void SignalStart(bool success);
+    bool PrepareWorkerForStart();
+    void SignalStart(bool success, uint64_t workerGeneration);
 
     void LogError(const std::wstring& message) const;
     void LogInfo(const std::wstring& message) const;
@@ -218,12 +255,16 @@ private:
     std::atomic<double> playbackRate_{1.0};
     std::atomic_bool stopping_{false};
     std::atomic_bool running_{false};
+    std::atomic<WasapiRuntimeState> runtimeState_{WasapiRuntimeState::Stopped};
     std::atomic_bool paused_{false};
     std::atomic_bool packetInputMode_{false};
     std::atomic_bool packetStreamEof_{false};
     std::atomic<int64_t> pausePositionMs_{0};
     std::atomic<int64_t> pendingSeekMs_{-1};
     std::atomic<int64_t> ioInterruptAfterSteadyMs_{0};
+    std::atomic<DWORD> playbackThreadId_{0};
+    std::atomic_bool workerFinished_{true};
+    std::atomic<uint64_t> startGeneration_{0};
     std::mutex packetMutex_;
     std::condition_variable packetCv_;
     std::deque<AVPacket*> packetQueue_;
@@ -244,6 +285,7 @@ private:
     UINT32 clockPaddingFrames_ = 0;
     UINT32 clockSampleRate_ = 0;
     std::chrono::steady_clock::time_point clockUpdatedAt_{};
+    mutable std::mutex workerMutex_;
     std::thread playbackThread_;
 };
 

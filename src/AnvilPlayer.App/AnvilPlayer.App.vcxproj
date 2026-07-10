@@ -76,6 +76,7 @@ if exist "$(SolutionDir)third_party\webview2-runtime\Microsoft.WebView2.FixedVer
     <ClCompile Include="src\main_window_input.cpp" />
     <ClCompile Include="src\main_window_layout.cpp" />
     <ClCompile Include="src\main_window_paint.cpp" />
+    <ClCompile Include="src\playback_supervisor.cpp" />
     <ClCompile Include="src\single_instance.cpp" />
     <ClCompile Include="src\string_util.cpp" />
     <ClCompile Include="src\color_metadata_util.cpp" />
@@ -103,6 +104,7 @@ if exist "$(SolutionDir)third_party\webview2-runtime\Microsoft.WebView2.FixedVer
     <ClInclude Include="include\AnvilPlayer\App\libass_subtitle_renderer.h" />
     <ClInclude Include="include\AnvilPlayer\App\log_sink_ptr.h" />
     <ClInclude Include="include\AnvilPlayer\App\main_window.h" />
+    <ClInclude Include="include\AnvilPlayer\App\playback_supervisor.h" />
     <ClInclude Include="include\AnvilPlayer\App\rect_util.h" />
     <ClInclude Include="include\AnvilPlayer\App\single_instance.h" />
     <ClInclude Include="include\AnvilPlayer\App\string_util.h" />

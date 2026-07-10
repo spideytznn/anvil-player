@@ -4,6 +4,7 @@
 
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <string>
 #include <string_view>
 
@@ -28,6 +29,9 @@ public:
                 std::wstring_view initialUrl,
                 std::wstring_view profileName,
                 MessageHandler handler);
+    // Invalidates pending asynchronous creation and releases the active WebView.
+    // Safe to call repeatedly; the destructor calls it automatically.
+    void Shutdown() noexcept;
     void Resize(RECT bounds) const;
     void PostJson(const std::wstring& json) const;
     void SetAllowInsecureCertificates(bool allow) const;
@@ -37,7 +41,7 @@ public:
 
 private:
     struct Impl;
-    Impl* impl_ = nullptr;
+    std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace anvil::app

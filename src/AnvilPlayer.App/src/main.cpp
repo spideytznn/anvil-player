@@ -53,21 +53,24 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int commandShow) {
         appArguments.webUiEnabled = false;
     }
 
-    anvil::app::Application app;
-    if (!app.Initialize(instance, commandShow, appArguments)) {
-        MessageBoxW(nullptr, L"Unable to create Anvil Player library window.", L"Anvil Player", MB_ICONERROR | MB_OK);
-        if (comInitialized) {
-            CoUninitialize();
+    int exitCode = 1;
+    {
+        // Keep every Application-owned WebView/COM object inside this scope.
+        // Its destructor must run before the apartment is uninitialized.
+        anvil::app::Application app;
+        if (!app.Initialize(instance, commandShow, appArguments)) {
+            MessageBoxW(nullptr,
+                        L"Unable to create Anvil Player library window.",
+                        L"Anvil Player",
+                        MB_ICONERROR | MB_OK);
+        } else {
+            // A media path on the command line (first launch) opens the player.
+            if (!appArguments.mediaPath.empty()) {
+                app.OpenInPlayer(appArguments.mediaPath, 0.0);
+            }
+            exitCode = app.Run();
         }
-        return 1;
     }
-
-    // A media path on the command line (first launch) opens the player.
-    if (!appArguments.mediaPath.empty()) {
-        app.OpenInPlayer(appArguments.mediaPath, 0.0);
-    }
-
-    const int exitCode = app.Run();
     if (comInitialized) {
         CoUninitialize();
     }

@@ -5,9 +5,12 @@
 #include "AnvilPlayer/App/main_window.h"
 
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace anvil::app {
+
+struct PlayerReaperState;
 
 // Process-level coordinator that owns the media-library window and the player
 // window, and routes playback requests between them. There is exactly one
@@ -52,16 +55,31 @@ private:
     void OnLibraryClosed();
     void OnPlayerClosed();
     void TryDeliverPendingEmbyReport();
+    void OnApplicationTimer();
+    void ProcessDeferredWindowLifetime();
+    void StartPlayerReaper(MainWindow* retiredPlayer) noexcept;
+    void ArmPlayerReaperPollIfNeeded() const noexcept;
+    bool PlayerReaperPreventsCreation() const noexcept;
+    void ReplayPendingPlayerRequest();
 
     HINSTANCE instance_ = nullptr;
     AppArguments arguments_{};
     std::unique_ptr<LibraryWindow> library_;
     std::unique_ptr<MainWindow> player_;
+    std::shared_ptr<PlayerReaperState> playerReaperState_;
     // Emby report relay: buffered when it arrives before the player WebView is
     // ready, then redelivered on a timer until consumed once.
     std::wstring pendingEmbyReport_;
     bool embyReportDelivered_ = false;
     int embyReportRetries_ = 0;
+    bool playerResetPending_ = false;
+    bool libraryResetPending_ = false;
+    bool shutdownRequested_ = false;
+    bool quitPosted_ = false;
+    std::optional<std::filesystem::path> pendingPlayerOpenPath_;
+    double pendingPlayerOpenRatio_ = 0.0;
+    bool pendingPlayerFocus_ = false;
+    bool playerReaperUnavailable_ = false;
 };
 
 }  // namespace anvil::app

@@ -1600,7 +1600,10 @@ void MainWindow::ApplyAudioSelection(const int selectedTrackIndex) {
                updated.media.has_value() &&
                updated.media->hasAudio &&
                backend_ == PlaybackBackend::NativeFfmpegD3D11) {
-        audioPlayer_.Stop();
+        // Retire the complete shared-demux session. A later Resume is queued by
+        // the existing runtime-stop state machine, so it cannot race a stale
+        // WASAPI worker or silently switch to a second network demuxer.
+        StopRuntimeAsync(false);
     }
     MarkLayoutDirty();
     EnsureLayout();

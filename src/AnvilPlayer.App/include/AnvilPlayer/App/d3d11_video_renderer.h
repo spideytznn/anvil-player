@@ -15,14 +15,33 @@
 
 #include <wrl/client.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace anvil::app {
+
+struct D3D11QueuedVideoFrame;
+
+// Initialization and rendering are owned by the render worker. Failed is a
+// terminal state for the current renderer instance (the worker has exited and
+// all GPU resources have been released). Stopping means RequestStop has been
+// observed but a driver call may still be returning on the worker.
+enum class D3D11RendererState : uint32_t {
+    Stopped = 0,
+    Initializing,
+    Ready,
+    Failed,
+    Stopping,
+};
 
 struct D3D11RenderStats {
     uint64_t frames = 0;
@@ -63,7 +82,32 @@ public:
     D3D11VideoRenderer(const D3D11VideoRenderer&) = delete;
     D3D11VideoRenderer& operator=(const D3D11VideoRenderer&) = delete;
 
+    // Starts GPU initialization and returns as soon as the render worker has
+    // been launched. A true result means "accepted", not "ready". The optional
+    // completion message is posted for both Ready and Failed transitions with
+    // the 64-bit lifetime cookie in wParam and D3D11RendererState in lParam.
+    // The application is x64, so WPARAM carries the cookie without truncation.
+    bool BeginInitialize(HWND host,
+                         HWND completionWindow,
+                         UINT completionMessage,
+                         uint64_t completionCookie);
+
+    // Compatibility entry point for callers that do not need a completion
+    // message. This is equally non-blocking; poll State()/IsReady() before
+    // requesting Device().
     bool Initialize(HWND host);
+
+    D3D11RendererState State() const noexcept;
+    bool IsReady() const noexcept;
+    bool InitializationFailed() const noexcept;
+
+    // Begins renderer shutdown without waiting for GPU work. The completion
+    // message is posted only after all render-thread-owned resources are
+    // released. Passing a null window or zero message requests no callback.
+    void RequestStop(HWND completionWindow,
+                     UINT completionMessage,
+                     uint64_t completionCookie = 0);
+    bool IsStopped() const noexcept;
 
     void ConfigureColorPipeline(const anvil::playback::VideoSettings& settings,
                                 const anvil::playback::DisplayCapabilities& display,
@@ -78,13 +122,43 @@ public:
 
     void Render(const NativeVideoFrame& frame);
 
+    // Transfers a frame to the bounded, process-lifetime retirement worker.
+    // Returns true only after ownership has been transferred. On false the
+    // source is completely unchanged; the caller must keep it alive and retry
+    // later (or arrange destruction on a non-window thread).
+    bool RetireFrame(NativeVideoFrame&& frame) noexcept;
+
     void Clear();
 
-    ID3D11Device* Device() const {
-        return device_.Get();
-    }
+    // Borrowed pointer published only after the complete pipeline is ready.
+    // RequestStop withdraws the publication before releasing GPU resources.
+    ID3D11Device* Device() const noexcept;
 
 private:
+    struct PendingColorPipeline {
+        anvil::playback::VideoSettings settings;
+        anvil::playback::DisplayCapabilities display;
+        anvil::playback::VideoColorMetadata mediaColor;
+    };
+
+    void RenderThreadMain();
+    void StopRenderThread();
+    bool InitializeGpuOnRenderThread(UINT width, UINT height);
+    bool IsStopRequested() const;
+    void PostInitializationCompletion(D3D11RendererState state,
+                                      HWND window,
+                                      UINT message,
+                                      uint64_t cookie) const noexcept;
+    bool HasPendingWorkLocked() const;
+    void ApplyColorPipelineConfiguration(const PendingColorPipeline& configuration);
+    void ApplySubtitleConfiguration(const anvil::playback::SubtitleSettings& settings);
+    void ResizeOnRenderThread(UINT width, UINT height);
+    void SetDiagnosticsEnabledOnRenderThread(bool enabled);
+    void ResetRenderStatsOnRenderThread();
+    void PublishRenderStats();
+    void RenderOnRenderThread(const NativeVideoFrame& frame);
+    void ClearOnRenderThread();
+
     void EnableMultithreadProtection();
     bool CreateRenderTarget();
     bool CreatePipeline();
@@ -132,8 +206,50 @@ private:
     SubtitleTextureCacheEntry* EnsureSubtitleBitmapTexture(const NativeSubtitleBitmap& bitmap);
     void PruneSubtitleTextureCache();
 
-    HWND host_ = nullptr;
+    std::atomic<HWND> host_{nullptr};
     LogSinkPtr logSink_;
+
+    // The public methods only update this bounded mailbox. There is never more
+    // than one retained frame, resize, or instance of any coalesced command.
+    // All D3D creation, immediate-context, swap-chain, Present and destruction
+    // work is performed by renderThread_. Public methods only update this
+    // mailbox, including while initialization is still in progress.
+    mutable std::mutex commandMutex_;
+    std::condition_variable commandCv_;
+    std::thread renderThread_;
+    bool stopRequested_ = true;
+    bool acceptingCommands_ = false;
+    std::atomic<bool> stopped_{true};
+    std::atomic<D3D11RendererState> state_{D3D11RendererState::Stopped};
+    std::atomic<ID3D11Device*> publishedDevice_{nullptr};
+    UINT initialWidth_ = 1;
+    UINT initialHeight_ = 1;
+    HWND initializationCompletionWindow_ = nullptr;
+    UINT initializationCompletionMessage_ = 0;
+    uint64_t initializationCompletionCookie_ = 0;
+    HWND stopCompletionWindow_ = nullptr;
+    UINT stopCompletionMessage_ = 0;
+    uint64_t stopCompletionCookie_ = 0;
+    // Frame envelopes are allocated through a process-lifetime bounded pool
+    // and retired by its independent worker. Keeping only a raw pointer here
+    // is intentional: replacing the latest-frame mailbox must never release
+    // decoder, AVFrame, or D3D references on the window thread.
+    D3D11QueuedVideoFrame* pendingFrame_ = nullptr;
+    bool pendingResize_ = false;
+    UINT pendingResizeWidth_ = 1;
+    UINT pendingResizeHeight_ = 1;
+    std::optional<PendingColorPipeline> pendingColorPipeline_;
+    std::optional<anvil::playback::SubtitleSettings> pendingSubtitleSettings_;
+    std::optional<bool> pendingDiagnosticsEnabled_;
+    bool pendingResetStats_ = false;
+    bool pendingClear_ = false;
+
+    // Published statistics have a lock independent from the GPU worker. The
+    // render thread only holds it while adding an already-computed snapshot,
+    // never across a wait, Present, ResizeBuffers, or immediate-context call.
+    std::mutex publishedStatsMutex_;
+    D3D11RenderStats publishedRenderStats_;
+
     Microsoft::WRL::ComPtr<IDXGIFactory2> factory_;
     Microsoft::WRL::ComPtr<IDXGIAdapter> adapter_;
     Microsoft::WRL::ComPtr<ID3D11Device> device_;

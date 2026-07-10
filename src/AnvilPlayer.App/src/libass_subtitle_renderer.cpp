@@ -365,7 +365,8 @@ struct LibassSubtitleRenderer::Impl {
         if (coalesceImages) {
             const int stride = unionWidth * 4;
             auto pixels = std::make_shared<std::vector<uint8_t>>(
-                static_cast<std::size_t>(stride) * static_cast<std::size_t>(unionHeight), 0);
+                static_cast<std::size_t>(stride) * static_cast<std::size_t>(unionHeight),
+                uint8_t{0});
 
             for (ASS_Image* current : images) {
                 const uint8_t red = static_cast<uint8_t>((current->color >> 24) & 0xff);

@@ -46,6 +46,10 @@ struct CapabilityReport {
 
 class CapabilityDetector {
 public:
+    // Returns the latest process-wide capability snapshot without waiting for
+    // D3D11 device creation or Media Foundation enumeration. The first call
+    // starts one process-lifetime background probe and returns a conservative
+    // "pending" report; later calls reuse the immutable published result.
     static CapabilityReport CollectBasic();
 };
 

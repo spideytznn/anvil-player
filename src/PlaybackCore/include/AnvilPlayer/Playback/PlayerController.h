@@ -2,6 +2,9 @@
 
 #include "AnvilPlayer/Playback/CapabilityReport.h"
 #include "AnvilPlayer/Playback/Log.h"
+#include "AnvilPlayer/Playback/MediaPreview.h"
+#include "AnvilPlayer/Playback/MediaProbe.h"
+#include "AnvilPlayer/Playback/PlaybackPlan.h"
 #include "AnvilPlayer/Playback/Settings.h"
 #include "AnvilPlayer/Playback/Types.h"
 
@@ -13,11 +16,31 @@
 
 namespace anvil::playback {
 
+struct PreparedMediaOpen {
+    std::filesystem::path path;
+    bool succeeded = false;
+    bool extractPreview = false;
+    std::wstring error;
+    MediaProbeResult probe;
+    MediaPreviewResult preview;
+    CapabilityReport capabilities;
+    PlaybackPlan plan;
+};
+
 class PlayerController {
 public:
     explicit PlayerController(std::shared_ptr<InMemoryLogSink> logSink = std::make_shared<InMemoryLogSink>());
 
     bool OpenMedia(const std::filesystem::path& path, bool extractPreview = true);
+    // Potentially blocking work. This deliberately never owns controller
+    // mutex_, so Snapshot/transport calls stay responsive while probing.
+    PreparedMediaOpen PrepareMedia(const std::filesystem::path& path,
+                                   bool extractPreview = true,
+                                   const MediaProbeOptions& options = {}) const;
+    // Short state commit. Callers may discard stale PreparedMediaOpen values
+    // using their operation generation before invoking this method.
+    bool CommitMedia(PreparedMediaOpen prepared);
+    void BeginOpen();
     void Close();
     void Play();
     void Pause();

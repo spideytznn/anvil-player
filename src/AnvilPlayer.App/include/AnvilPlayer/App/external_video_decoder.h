@@ -4,10 +4,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -41,8 +43,15 @@ public:
     bool Start(const std::filesystem::path& mediaPath,
                std::chrono::milliseconds startPosition,
                HWND notificationWindow,
-               UINT notificationMessage);
+               UINT notificationMessage,
+               uint64_t notificationCookie = 0);
 
+    // Non-blocking first phase of shutdown. Safe to call repeatedly; prevents
+    // further window notifications and cancels a pending pipe read.
+    void RequestStop();
+
+    // Completes shutdown and releases the worker/process resources. Call this
+    // from a non-window thread after RequestStop when blocking is unacceptable.
     void Stop();
 
     bool IsRunning() const {
@@ -51,28 +60,58 @@ public:
 
     bool LatestFrame(VideoFrame& frame) const;
 
+    // Executes a short read-only operation while the decoder retains frame
+    // ownership.  Window paint code uses this instead of copying a shared_ptr
+    // whose final large pixel-buffer release could otherwise occur in
+    // WM_PAINT after the reader publishes the next frame.
+    template <typename Visitor>
+    bool VisitLatestFrame(Visitor&& visitor) const {
+        std::unique_lock lock(frameMutex_, std::try_to_lock);
+        if (!lock.owns_lock() || !frame_.HasPixels()) {
+            return false;
+        }
+        visitor(static_cast<const VideoFrame&>(frame_));
+        return true;
+    }
+
     void ClearFrame();
 
     void AcknowledgeFrameNotification();
 
-    std::wstring LastCommandLine() const {
-        return lastCommandLine_;
-    }
+    std::wstring LastCommandLine() const;
 
 private:
-    void NotifyFrameReady();
-    void ReaderLoop();
+    struct StartRequest {
+        std::uint64_t generation = 0;
+        std::filesystem::path mediaPath;
+        std::chrono::milliseconds startPosition{0};
+        HWND notificationWindow = nullptr;
+        UINT notificationMessage = 0;
+        std::uint64_t notificationCookie = 0;
+    };
 
-    mutable std::mutex mutex_;
+    bool EnsureControlWorkerLocked();
+    std::uint64_t RequestStopLocked();
+    void ControlLoop();
+    void ReaderLoop(StartRequest request, HANDLE stdoutRead, std::atomic_bool& readerDone);
+    void NotifyFrameReady(const StartRequest& request);
+
+    mutable std::mutex controlMutex_;
+    std::condition_variable controlCv_;
+    std::optional<StartRequest> pendingStart_;
+    std::uint64_t desiredGeneration_ = 0;
+    std::uint64_t settledGeneration_ = 0;
+    bool desiredRunning_ = false;
+    bool exitRequested_ = false;
+    bool workerStarted_ = false;
+    std::thread controlThread_;
+
+    mutable std::mutex frameMutex_;
     VideoFrame frame_;
-    std::atomic_bool stopping_ = false;
     std::atomic_bool running_ = false;
-    std::atomic<HWND> notificationWindow_ = nullptr;
-    std::atomic_uint notificationMessage_ = 0;
     std::atomic_bool frameMessagePending_ = false;
-    PROCESS_INFORMATION process_{};
-    HANDLE stdoutRead_ = nullptr;
-    std::thread readerThread_;
+
+    mutable std::mutex commandLineMutex_;
     std::wstring lastCommandLine_;
 };
 

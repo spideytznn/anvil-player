@@ -6,6 +6,11 @@
 
 namespace anvil::app {
 
+void IconPainter::ClearCache() noexcept {
+    iconBitmaps_.clear();
+    iconAssetDirectory_.clear();
+}
+
 std::filesystem::path IconPainter::ModuleDirectory() const {
     wchar_t modulePath[MAX_PATH]{};
     const DWORD length = GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
@@ -102,9 +107,11 @@ bool IconPainter::DrawAsset(HDC hdc, const IconKind icon, RECT bounds) const {
 }
 
 bool IconPainter::Draw(HDC hdc, const IconKind icon, RECT bounds, const COLORREF color) const {
-    if (DrawAsset(hdc, icon, bounds)) {
-        return true;
-    }
+    // WM_PAINT must never discover paths, probe files, or synchronously decode
+    // PNG assets (the executable/current directory may itself be a stalled
+    // network location). The built-in vector set covers every IconKind and is
+    // deterministic at all DPI values; packaged PNGs are no longer consulted
+    // on the paint path.
     DrawVector(hdc, icon, bounds, color);
     return false;
 }

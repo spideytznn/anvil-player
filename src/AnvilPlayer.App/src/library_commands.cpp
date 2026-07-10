@@ -818,6 +818,9 @@ std::vector<WebDavEntry> ParseWebDavEntries(const std::wstring& baseUrl, const s
                     0,
                     sizeBytes,
                 });
+                if (entries.size() >= kMaxLocalFolderScanItems) {
+                    break;
+                }
             }
         }
         pos = close + tagName.size() + 3;
@@ -825,10 +828,102 @@ std::vector<WebDavEntry> ParseWebDavEntries(const std::wstring& baseUrl, const s
     return entries;
 }
 
+namespace {
+
+constexpr int kWebDavMaximumSegmentTimeoutMs = 3000;
+constexpr std::size_t kWebDavMaximumResponseBytes = 8 * 1024 * 1024;
+
+class WinHttpHandle final {
+public:
+    explicit WinHttpHandle(HINTERNET handle = nullptr) noexcept
+        : handle_(handle) {}
+
+    ~WinHttpHandle() {
+        if (handle_) {
+            WinHttpCloseHandle(handle_);
+        }
+    }
+
+    WinHttpHandle(const WinHttpHandle&) = delete;
+    WinHttpHandle& operator=(const WinHttpHandle&) = delete;
+
+    HINTERNET Get() const noexcept {
+        return handle_;
+    }
+
+    explicit operator bool() const noexcept {
+        return handle_ != nullptr;
+    }
+
+private:
+    HINTERNET handle_ = nullptr;
+};
+
+bool CheckWebDavRequestActive(const WebDavRequestOptions& options,
+                              std::wstring& errorMessage) {
+    if (options.StopRequested()) {
+        errorMessage = L"WebDAV 请求已取消。";
+        return false;
+    }
+    if (std::chrono::steady_clock::now() >= options.deadline) {
+        errorMessage = L"WebDAV 请求超时。";
+        return false;
+    }
+    return true;
+}
+
+int WebDavSegmentTimeoutMs(const WebDavRequestOptions& options) noexcept {
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        options.deadline - std::chrono::steady_clock::now()).count();
+    if (remaining <= 0) {
+        return 1;
+    }
+
+    // WinHttpSendRequest may resolve, connect and send within one synchronous
+    // call. Allocate at most one quarter of the remaining total budget to each
+    // sub-stage so that a single call cannot multiply the total deadline by
+    // assigning the whole remaining budget to every phase.
+    const auto fairShare = std::max<std::int64_t>(1, remaining / 4);
+    return static_cast<int>(std::min<std::int64_t>(fairShare, kWebDavMaximumSegmentTimeoutMs));
+}
+
+bool ApplyWebDavTimeouts(const HINTERNET handle,
+                         const WebDavRequestOptions& options,
+                         std::wstring& errorMessage) {
+    if (!CheckWebDavRequestActive(options, errorMessage)) {
+        return false;
+    }
+    const int timeoutMs = WebDavSegmentTimeoutMs(options);
+    if (!WinHttpSetTimeouts(handle, timeoutMs, timeoutMs, timeoutMs, timeoutMs)) {
+        errorMessage = L"WebDAV 超时设置失败：" + WindowsErrorMessage(GetLastError());
+        return false;
+    }
+    return true;
+}
+
+std::wstring WebDavCallFailure(const std::wstring& prefix,
+                               const WebDavRequestOptions& options,
+                               const DWORD error) {
+    if (options.StopRequested()) {
+        return L"WebDAV 请求已取消。";
+    }
+    if (std::chrono::steady_clock::now() >= options.deadline ||
+        error == ERROR_WINHTTP_TIMEOUT) {
+        return L"WebDAV 请求超时。";
+    }
+    return prefix + WindowsErrorMessage(error);
+}
+
+}  // namespace
+
 std::vector<WebDavEntry> WebDavPropFind(const std::wstring& url,
                                         const std::wstring& username,
                                         const std::wstring& password,
-                                        std::wstring& errorMessage) {
+                                        std::wstring& errorMessage,
+                                        const WebDavRequestOptions& options) {
+    if (!CheckWebDavRequestActive(options, errorMessage)) {
+        return {};
+    }
     const auto normalizedUrl = NormalizeWebDavUrlText(url);
     const auto parts = CrackWebDavUrl(normalizedUrl);
     if (!parts) {
@@ -836,37 +931,40 @@ std::vector<WebDavEntry> WebDavPropFind(const std::wstring& url,
         return {};
     }
 
-    HINTERNET session = WinHttpOpen(
+    WinHttpHandle session(WinHttpOpen(
         L"AnvilPlayer/1.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,
-        0);
+        0));
     if (!session) {
         errorMessage = L"WebDAV 初始化失败：" + WindowsErrorMessage(GetLastError());
         return {};
     }
+    if (!ApplyWebDavTimeouts(session.Get(), options, errorMessage)) {
+        return {};
+    }
 
-    HINTERNET connection = WinHttpConnect(session, parts->host.c_str(), parts->port, 0);
+    WinHttpHandle connection(WinHttpConnect(session.Get(), parts->host.c_str(), parts->port, 0));
     if (!connection) {
-        errorMessage = L"WebDAV 连接失败：" + WindowsErrorMessage(GetLastError());
-        WinHttpCloseHandle(session);
+        errorMessage = WebDavCallFailure(L"WebDAV 连接失败：", options, GetLastError());
         return {};
     }
 
     const DWORD flags = parts->secure ? WINHTTP_FLAG_SECURE : 0;
-    HINTERNET request = WinHttpOpenRequest(
-        connection,
+    WinHttpHandle request(WinHttpOpenRequest(
+        connection.Get(),
         L"PROPFIND",
         parts->pathAndQuery.c_str(),
         nullptr,
         WINHTTP_NO_REFERER,
         WINHTTP_DEFAULT_ACCEPT_TYPES,
-        flags);
+        flags));
     if (!request) {
         errorMessage = L"WebDAV 请求创建失败：" + WindowsErrorMessage(GetLastError());
-        WinHttpCloseHandle(connection);
-        WinHttpCloseHandle(session);
+        return {};
+    }
+    if (!ApplyWebDavTimeouts(request.Get(), options, errorMessage)) {
         return {};
     }
 
@@ -876,25 +974,29 @@ std::vector<WebDavEntry> WebDavPropFind(const std::wstring& url,
     }
     const std::string body = "<?xml version=\"1.0\" encoding=\"utf-8\"?><propfind xmlns=\"DAV:\"><prop><resourcetype/><getcontentlength/><getlastmodified/></prop></propfind>";
     const BOOL sent = WinHttpSendRequest(
-        request,
+        request.Get(),
         headers.c_str(),
         static_cast<DWORD>(headers.size()),
         const_cast<char*>(body.data()),
         static_cast<DWORD>(body.size()),
         static_cast<DWORD>(body.size()),
         0);
-    if (!sent || !WinHttpReceiveResponse(request, nullptr)) {
-        errorMessage = L"WebDAV 请求失败：" + WindowsErrorMessage(GetLastError());
-        WinHttpCloseHandle(request);
-        WinHttpCloseHandle(connection);
-        WinHttpCloseHandle(session);
+    if (!sent) {
+        errorMessage = WebDavCallFailure(L"WebDAV 请求失败：", options, GetLastError());
+        return {};
+    }
+    if (!ApplyWebDavTimeouts(request.Get(), options, errorMessage)) {
+        return {};
+    }
+    if (!WinHttpReceiveResponse(request.Get(), nullptr)) {
+        errorMessage = WebDavCallFailure(L"WebDAV 请求失败：", options, GetLastError());
         return {};
     }
 
     DWORD statusCode = 0;
     DWORD statusSize = sizeof(statusCode);
     WinHttpQueryHeaders(
-        request,
+        request.Get(),
         WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
         WINHTTP_HEADER_NAME_BY_INDEX,
         &statusCode,
@@ -902,38 +1004,58 @@ std::vector<WebDavEntry> WebDavPropFind(const std::wstring& url,
         WINHTTP_NO_HEADER_INDEX);
     if (statusCode != 200 && statusCode != 207) {
         errorMessage = L"WebDAV 请求失败：HTTP " + std::to_wstring(statusCode) + L" · " + normalizedUrl;
-        WinHttpCloseHandle(request);
-        WinHttpCloseHandle(connection);
-        WinHttpCloseHandle(session);
         return {};
     }
 
     std::string response;
+    const std::size_t responseLimit = std::min(
+        options.maxResponseBytes,
+        kWebDavMaximumResponseBytes);
     for (;;) {
+        if (!ApplyWebDavTimeouts(request.Get(), options, errorMessage)) {
+            return {};
+        }
         DWORD available = 0;
-        if (!WinHttpQueryDataAvailable(request, &available) || available == 0) {
+        if (!WinHttpQueryDataAvailable(request.Get(), &available)) {
+            errorMessage = WebDavCallFailure(L"WebDAV 响应读取失败：", options, GetLastError());
+            return {};
+        }
+        if (available == 0) {
             break;
+        }
+        if (response.size() > responseLimit ||
+            static_cast<std::size_t>(available) > responseLimit - response.size()) {
+            errorMessage = L"WebDAV 响应超过 8 MiB 限制。";
+            return {};
         }
         std::string chunk(available, '\0');
         DWORD read = 0;
-        if (!WinHttpReadData(request, chunk.data(), available, &read) || read == 0) {
+        if (!ApplyWebDavTimeouts(request.Get(), options, errorMessage)) {
+            return {};
+        }
+        if (!WinHttpReadData(request.Get(), chunk.data(), available, &read)) {
+            errorMessage = WebDavCallFailure(L"WebDAV 响应读取失败：", options, GetLastError());
+            return {};
+        }
+        if (read == 0) {
             break;
         }
         chunk.resize(read);
         response += chunk;
     }
 
-    WinHttpCloseHandle(request);
-    WinHttpCloseHandle(connection);
-    WinHttpCloseHandle(session);
+    if (!CheckWebDavRequestActive(options, errorMessage)) {
+        return {};
+    }
     return ParseWebDavEntries(normalizedUrl, response);
 }
 
 std::vector<SmbDirectoryEntry> ListWebDavDirectories(const std::wstring& url,
                                                      const std::wstring& username,
                                                      const std::wstring& password,
-                                                     std::wstring& errorMessage) {
-    const auto entries = WebDavPropFind(url, username, password, errorMessage);
+                                                     std::wstring& errorMessage,
+                                                     const WebDavRequestOptions& options) {
+    const auto entries = WebDavPropFind(url, username, password, errorMessage, options);
     std::vector<SmbDirectoryEntry> directories;
     for (const auto& entry : entries) {
         if (!entry.isDirectory) {
@@ -955,7 +1077,8 @@ std::vector<LocalFolderScanItem> ScanWebDavMediaFiles(const std::wstring& rootUr
                                                       const std::wstring& username,
                                                       const std::wstring& password,
                                                       bool& truncated,
-                                                      std::wstring& errorMessage) {
+                                                      std::wstring& errorMessage,
+                                                      const WebDavRequestOptions& options) {
     truncated = false;
     std::vector<LocalFolderScanItem> items;
     std::deque<std::pair<std::wstring, int>> queue;
@@ -972,7 +1095,7 @@ std::vector<LocalFolderScanItem> ScanWebDavMediaFiles(const std::wstring& rootUr
         }
 
         std::wstring propFindError;
-        const auto entries = WebDavPropFind(currentUrl, username, password, propFindError);
+        const auto entries = WebDavPropFind(currentUrl, username, password, propFindError, options);
         if (!propFindError.empty()) {
             errorMessage = propFindError;
             return items;

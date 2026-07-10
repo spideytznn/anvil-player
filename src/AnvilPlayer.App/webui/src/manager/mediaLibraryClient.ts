@@ -2,6 +2,7 @@ import { isObject } from './storageCodec'
 import type { EpisodeItem, LibraryHomeSection, LibraryQuery, LibrarySource, LibraryView, MediaFilterKey, MediaItem, NavKey, SeasonItem, SortKey, SortOrder, SourceDraft } from './types'
 
 const LIBRARY_CACHE_KEY = 'anvil-player.library.cache.v1'
+const LIBRARY_CACHE_WRITE_DELAY_MS = 250
 
 export interface MediaLibraryClient {
   listSources: () => Promise<LibrarySource[]>
@@ -293,35 +294,28 @@ function flatTinyItemForCache(item: MediaItem): MediaItem {
   return tinyItem
 }
 
-function saveCache(sources: LibrarySource[], items: MediaItem[], homeSections: LibraryHomeSection[]): void {
-  const attempts: LibraryCache[] = [
-    {
-      version: 1,
-      sources,
-      items: items.map(compactItemForCache),
-      homeSections
-    },
-    {
-      version: 1,
-      sources,
-      items: items.map(minimalItemForCache),
-      homeSections
-    },
-    {
-      version: 1,
-      sources,
-      items: items.map(tinyItemForCache),
-      homeSections
-    },
-    {
-      version: 1,
-      sources,
-      items: items.map(flatTinyItemForCache),
-      homeSections: []
-    }
-  ]
+interface CacheWriteAttempt {
+  compactItem: (item: MediaItem) => MediaItem
+  includeHomeSections: boolean
+}
 
-  for (const payload of attempts) {
+const CACHE_WRITE_ATTEMPTS: CacheWriteAttempt[] = [
+  { compactItem: compactItemForCache, includeHomeSections: true },
+  { compactItem: minimalItemForCache, includeHomeSections: true },
+  { compactItem: tinyItemForCache, includeHomeSections: true },
+  { compactItem: flatTinyItemForCache, includeHomeSections: false }
+]
+
+function saveCache(cache: LibraryCache): void {
+  // Construct fallbacks only after the previous payload is rejected. Building
+  // all four variants up front briefly retained four deep item trees.
+  for (const attempt of CACHE_WRITE_ATTEMPTS) {
+    const payload: LibraryCache = {
+      version: 1,
+      sources: cache.sources,
+      items: cache.items.map(attempt.compactItem),
+      homeSections: attempt.includeHomeSections ? cache.homeSections : []
+    }
     try {
       window.localStorage.setItem(LIBRARY_CACHE_KEY, JSON.stringify(payload))
       return
@@ -331,11 +325,40 @@ function saveCache(sources: LibrarySource[], items: MediaItem[], homeSections: L
   }
 }
 
+function createCacheWriter(readCache: () => LibraryCache): () => void {
+  let dirty = false
+  let writeTimer: number | undefined
+
+  const flush = (): void => {
+    if (!dirty) return
+    dirty = false
+    writeTimer = undefined
+    saveCache(readCache())
+  }
+
+  const schedule = (): void => {
+    dirty = true
+    if (writeTimer !== undefined) return
+    writeTimer = window.setTimeout(flush, LIBRARY_CACHE_WRITE_DELAY_MS)
+  }
+
+  window.addEventListener('pagehide', () => {
+    if (writeTimer !== undefined) {
+      window.clearTimeout(writeTimer)
+      writeTimer = undefined
+    }
+    flush()
+  })
+
+  return schedule
+}
+
 export function createEmptyLibraryClient(): MediaLibraryClient {
   const cached = loadCache()
   let sources: LibrarySource[] = cached.sources
   let items: MediaItem[] = cached.items
   let homeSections: LibraryHomeSection[] = cached.homeSections
+  const scheduleCacheWrite = createCacheWriter(() => ({ version: 1, sources, items, homeSections }))
 
   return {
     async listSources() {
@@ -392,20 +415,20 @@ export function createEmptyLibraryClient(): MediaLibraryClient {
       } else {
         sources = [source, ...sources]
       }
-      saveCache(sources, items, homeSections)
+      scheduleCacheWrite()
       return source
     },
 
     async updateItem(item) {
       items = items.map((candidate) => candidate.id === item.id ? item : candidate)
-      saveCache(sources, items, homeSections)
+      scheduleCacheWrite()
     },
 
     async removeSource(sourceId) {
       sources = sources.filter((source) => source.id !== sourceId)
       items = items.filter((item) => item.sourceId !== sourceId)
       homeSections = homeSections.filter((section) => section.sourceId !== sourceId)
-      saveCache(sources, items, homeSections)
+      scheduleCacheWrite()
     },
 
     async upsertSourceItems(source, sourceItems, sourceHomeSections = []) {
@@ -418,7 +441,7 @@ export function createEmptyLibraryClient(): MediaLibraryClient {
         ...homeSections.filter((section) => section.sourceId !== source.id),
         ...sourceHomeSections
       ]
-      saveCache(sources, items, homeSections)
+      scheduleCacheWrite()
     }
   }
 }

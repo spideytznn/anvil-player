@@ -5,13 +5,17 @@
 #include <shellapi.h>
 #include <windows.h>
 
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace anvil::app {
+
+struct LibraryWindowAsyncState;
 
 // A lightweight top-level window that hosts the WebView2 media-library UI
 // (the #/library route). It owns its own WebUiHost and handles only the
@@ -55,6 +59,30 @@ private:
     std::filesystem::path WebUiRoot() const;
     void HandleWebUiMessage(std::wstring_view message);
     void PostScanResult(const std::wstring& json);
+    void StartLocalFolderScan(std::filesystem::path folder,
+                              std::wstring username,
+                              std::wstring password,
+                              bool postPickedResult);
+    void StartSmbDirectoryList(std::wstring requestId,
+                               std::wstring host,
+                               std::wstring path,
+                               std::wstring username,
+                               std::wstring password);
+    void StartSmbConnection(std::filesystem::path path,
+                            std::wstring username,
+                            std::wstring password);
+    void StartWebDavDirectoryList(std::wstring requestId,
+                                  std::wstring url,
+                                  std::wstring username,
+                                  std::wstring password);
+    void StartWebDavScan(std::wstring url,
+                         std::wstring username,
+                         std::wstring password);
+    void HandleAsyncIoResult(std::uintptr_t resultId);
+    void CancelAsyncIo() noexcept;
+    bool DeferPlaybackForPendingSmbConnection(const std::filesystem::path& path,
+                                              double startPositionRatio);
+    void CompleteDeferredSmbPlayback();
     void OpenLocalFolderDialog();
     void OpenMediaFileDialog();
     void ApplyWindowChrome() const;
@@ -63,6 +91,7 @@ private:
     HINSTANCE instance_ = nullptr;
     UINT dpi_ = 96;
     std::unique_ptr<WebUiHost> webUiHost_;
+    std::shared_ptr<LibraryWindowAsyncState> asyncIoState_;
     bool webUiActive_ = false;
     PlaybackRequest playbackRequest_;
     std::function<void(bool)> allowInsecureCertificatesRequest_;

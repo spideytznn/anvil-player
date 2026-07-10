@@ -11,9 +11,11 @@
 #include <windows.h>
 #include <winhttp.h>  // INTERNET_PORT, INTERNET_DEFAULT_HTTP_PORT
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <vector>
 
@@ -84,6 +86,18 @@ struct WebDavUrlParts {
     bool secure = false;
 };
 
+struct WebDavRequestOptions {
+    std::chrono::steady_clock::time_point deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    std::stop_token cancellationToken;
+    std::stop_token shutdownToken;
+    std::size_t maxResponseBytes = 8 * 1024 * 1024;
+
+    bool StopRequested() const noexcept {
+        return cancellationToken.stop_requested() || shutdownToken.stop_requested();
+    }
+};
+
 std::optional<WebDavUrlParts> CrackWebDavUrl(const std::wstring& url);
 std::wstring WebDavOrigin(const std::wstring& url);
 std::wstring NormalizeWebDavUrlText(std::wstring url, bool ensureTrailingSlash = true);
@@ -94,9 +108,9 @@ std::wstring WebDavNameFromUrl(std::wstring url, const std::wstring& fallback);
 std::wstring WebDavExtension(const std::wstring& url);
 std::wstring CredentialedWebDavUrl(const std::wstring& url, const std::wstring& username, const std::wstring& password);
 std::vector<WebDavEntry> ParseWebDavEntries(const std::wstring& baseUrl, const std::string& xmlUtf8);
-std::vector<WebDavEntry> WebDavPropFind(const std::wstring& url, const std::wstring& username, const std::wstring& password, std::wstring& errorMessage);
-std::vector<SmbDirectoryEntry> ListWebDavDirectories(const std::wstring& url, const std::wstring& username, const std::wstring& password, std::wstring& errorMessage);
-std::vector<LocalFolderScanItem> ScanWebDavMediaFiles(const std::wstring& rootUrl, const std::wstring& username, const std::wstring& password, bool& truncated, std::wstring& errorMessage);
+std::vector<WebDavEntry> WebDavPropFind(const std::wstring& url, const std::wstring& username, const std::wstring& password, std::wstring& errorMessage, const WebDavRequestOptions& options = {});
+std::vector<SmbDirectoryEntry> ListWebDavDirectories(const std::wstring& url, const std::wstring& username, const std::wstring& password, std::wstring& errorMessage, const WebDavRequestOptions& options = {});
+std::vector<LocalFolderScanItem> ScanWebDavMediaFiles(const std::wstring& rootUrl, const std::wstring& username, const std::wstring& password, bool& truncated, std::wstring& errorMessage, const WebDavRequestOptions& options = {});
 
 // --- JSON builders (library result messages) ---
 

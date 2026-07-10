@@ -15,6 +15,7 @@ extern "C" {
 
 #include <algorithm>
 #include <chrono>
+#include <cerrno>
 #include <cmath>
 #include <cwctype>
 #include <sstream>
@@ -24,6 +25,8 @@ extern "C" {
 
 namespace anvil::playback {
 namespace {
+
+constexpr std::size_t kMaxReportedStreams = 256;
 
 std::wstring Uppercase(std::wstring value) {
     std::transform(value.begin(), value.end(), value.begin(), [](const wchar_t ch) {
@@ -448,6 +451,41 @@ std::wstring JoinParts(const std::vector<std::wstring>& parts, const std::wstrin
     return details.empty() ? fallback : details;
 }
 
+struct ProbeInterruptState {
+    std::stop_token stopToken;
+    std::chrono::steady_clock::time_point deadline{};
+
+    bool StopRequested() const {
+        return stopToken.stop_requested();
+    }
+
+    bool DeadlineExpired() const {
+        return deadline.time_since_epoch().count() != 0 &&
+               std::chrono::steady_clock::now() >= deadline;
+    }
+
+    bool Interrupted() const {
+        return StopRequested() || DeadlineExpired();
+    }
+};
+
+int ProbeInterruptCallback(void* opaque) {
+    const auto* state = static_cast<const ProbeInterruptState*>(opaque);
+    return state && state->Interrupted() ? 1 : 0;
+}
+
+MediaProbeResult InterruptedProbeResult(const std::filesystem::path& path,
+                                        const ProbeInterruptState& interrupt) {
+    MediaProbeResult result;
+    result.probeTool = L"avformat";
+    result.descriptor.path = path;
+    result.descriptor.displayName = path.filename().wstring();
+    result.cancelled = interrupt.StopRequested();
+    result.timedOut = !result.cancelled && interrupt.DeadlineExpired();
+    result.diagnostic = result.cancelled ? L"media probe cancelled" : L"media probe deadline exceeded";
+    return result;
+}
+
 std::wstring BuildVideoDetails(const AVStream* stream, const AVCodecParameters* parameters) {
     std::vector<std::wstring> parts;
     if (parameters && parameters->width > 0 && parameters->height > 0) {
@@ -489,8 +527,18 @@ std::wstring BuildAudioDetails(const AVCodecParameters* parameters) {
     return JoinParts(parts, L"Audio stream");
 }
 
-MediaProbeResult ProbeWithAvformat(const std::filesystem::path& path) {
+MediaProbeResult ProbeWithAvformat(const std::filesystem::path& path,
+                                   const MediaProbeOptions& options) {
     av_log_set_level(AV_LOG_QUIET);
+
+    ProbeInterruptState interrupt;
+    interrupt.stopToken = options.stopToken;
+    if (options.timeout.count() > 0) {
+        interrupt.deadline = std::chrono::steady_clock::now() + options.timeout;
+    }
+    if (interrupt.Interrupted()) {
+        return InterruptedProbeResult(path, interrupt);
+    }
 
     MediaProbeResult result;
     result.probeTool = L"avformat";
@@ -500,16 +548,42 @@ MediaProbeResult ProbeWithAvformat(const std::filesystem::path& path) {
     result.descriptor.hdrFormat = L"SDR / unknown";
     result.descriptor.selectedDecodePath = L"Probe only";
 
-    AVFormatContext* formatContext = nullptr;
+    AVFormatContext* formatContext = avformat_alloc_context();
+    if (!formatContext) {
+        return MediaProbe::ExtensionFallback(path, L"avformat_alloc_context failed");
+    }
+    formatContext->interrupt_callback.callback = &ProbeInterruptCallback;
+    formatContext->interrupt_callback.opaque = &interrupt;
     const std::string pathUtf8 = WideToUtf8(path.wstring());
-    int error = avformat_open_input(&formatContext, pathUtf8.c_str(), nullptr, nullptr);
+    AVDictionary* inputOptions = nullptr;
+    if (options.timeout.count() > 0) {
+        const auto timeoutUs = std::chrono::duration_cast<std::chrono::microseconds>(options.timeout).count();
+        const std::string timeoutValue = std::to_string(std::max<int64_t>(1, timeoutUs));
+        av_dict_set(&inputOptions, "rw_timeout", timeoutValue.c_str(), 0);
+        av_dict_set(&inputOptions, "timeout", timeoutValue.c_str(), 0);
+    }
+    int error = avformat_open_input(&formatContext, pathUtf8.c_str(), nullptr, &inputOptions);
+    av_dict_free(&inputOptions);
     if (error < 0) {
+        if (interrupt.Interrupted()) {
+            avformat_close_input(&formatContext);
+            return InterruptedProbeResult(path, interrupt);
+        }
+        avformat_close_input(&formatContext);
+        if (error == AVERROR(ENOENT) || error == AVERROR(EACCES) || error == AVERROR(EISDIR)) {
+            result.failed = true;
+            result.diagnostic = L"avformat_open_input failed: " + FfmpegErrorString(error);
+            return result;
+        }
         return MediaProbe::ExtensionFallback(path, L"avformat_open_input failed: " + FfmpegErrorString(error));
     }
 
     error = avformat_find_stream_info(formatContext, nullptr);
     if (error < 0) {
         avformat_close_input(&formatContext);
+        if (interrupt.Interrupted()) {
+            return InterruptedProbeResult(path, interrupt);
+        }
         return MediaProbe::ExtensionFallback(path, L"avformat_find_stream_info failed: " + FfmpegErrorString(error));
     }
 
@@ -546,33 +620,39 @@ MediaProbeResult ProbeWithAvformat(const std::filesystem::path& path) {
                 result.descriptor.videoHeight = parameters->height;
                 result.descriptor.videoFrameRate = ProbeFrameRate(stream, parameters);
             }
-            result.descriptor.streams.push_back(MediaStreamSummary{
-                streamIndex,
-                L"Video",
-                codec,
-                language,
-                BuildVideoDetails(stream, parameters),
-            });
+            if (result.descriptor.streams.size() < kMaxReportedStreams) {
+                result.descriptor.streams.push_back(MediaStreamSummary{
+                    streamIndex,
+                    L"Video",
+                    codec,
+                    language,
+                    BuildVideoDetails(stream, parameters),
+                });
+            }
         } else if (parameters->codec_type == AVMEDIA_TYPE_AUDIO) {
             result.descriptor.hasAudio = true;
             if (result.descriptor.audioCodec.empty()) {
                 result.descriptor.audioCodec = codec;
             }
-            result.descriptor.streams.push_back(MediaStreamSummary{
-                streamIndex,
-                L"Audio",
-                codec,
-                language,
-                BuildAudioDetails(parameters),
-            });
+            if (result.descriptor.streams.size() < kMaxReportedStreams) {
+                result.descriptor.streams.push_back(MediaStreamSummary{
+                    streamIndex,
+                    L"Audio",
+                    codec,
+                    language,
+                    BuildAudioDetails(parameters),
+                });
+            }
         } else if (parameters->codec_type == AVMEDIA_TYPE_SUBTITLE) {
-            result.descriptor.streams.push_back(MediaStreamSummary{
-                streamIndex,
-                L"Subtitle",
-                codec,
-                language,
-                L"Subtitle stream",
-            });
+            if (result.descriptor.streams.size() < kMaxReportedStreams) {
+                result.descriptor.streams.push_back(MediaStreamSummary{
+                    streamIndex,
+                    L"Subtitle",
+                    codec,
+                    language,
+                    L"Subtitle stream",
+                });
+            }
         }
     }
 
@@ -593,8 +673,9 @@ MediaProbeResult ProbeWithAvformat(const std::filesystem::path& path) {
 
 }  // namespace
 
-MediaProbeResult MediaProbe::Probe(const std::filesystem::path& path) {
-    return ProbeWithAvformat(path);
+MediaProbeResult MediaProbe::Probe(const std::filesystem::path& path,
+                                   const MediaProbeOptions& options) {
+    return ProbeWithAvformat(path, options);
 }
 
 MediaProbeResult MediaProbe::ExtensionFallback(const std::filesystem::path& path, std::wstring diagnostic) {

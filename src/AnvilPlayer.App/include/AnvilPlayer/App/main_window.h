@@ -7,6 +7,7 @@
 #include "AnvilPlayer/App/ffmpeg_video_decoder.h"
 #include "AnvilPlayer/App/icon_painter.h"
 #include "AnvilPlayer/App/log_sink_ptr.h"
+#include "AnvilPlayer/App/playback_supervisor.h"
 #include "AnvilPlayer/App/ui_animation_math.h"
 #include "AnvilPlayer/App/ui_draw.h"
 #include "AnvilPlayer/App/ui_types.h"
@@ -21,9 +22,11 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <thread>
@@ -44,6 +47,8 @@ public:
     // the process (e.g. closing the player window alone should NOT quit).
     using QuitHandler = std::function<void()>;
 
+    ~MainWindow();
+
     void ConfigureLogging(anvil::playback::LogLevel minimumLevel);
     void SetBackend(PlaybackBackend backend);
     void SetInitialVideoTrackSelection(int selectedVideoTrackIndex);
@@ -57,6 +62,11 @@ public:
     void SetPendingStartPositionRatio(double ratio) { pendingStartPositionRatio_ = ratio; }
     HWND Handle() const { return hwnd_; }
     bool IsVisible() const;
+    bool IsClosing() const { return closePending_; }
+    // Must be called on the window thread after HWND destruction and before
+    // MainWindow is handed to a background destructor. It releases all
+    // apartment/GDI+-affine resources; backend waits remain for the reaper.
+    void ReleaseUiThreadResourcesForBackgroundDestruction() noexcept;
     // Posts a relayed Emby playback report JSON object into the player WebView
     // so useEmbyPlaybackReporting can inject it (the player has separate
     // storage from the library window). Returns true when the WebView was
@@ -72,7 +82,6 @@ private:
     static LRESULT CALLBACK BufferingHudOverlayProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK SubtitleMenuOverlayProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK HdrToneCurveWindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
-    static void CALLBACK PlaybackTimerQueueProc(PVOID context, BOOLEAN timerOrWaitFired);
     LRESULT HandleMessage(UINT message, WPARAM wParam, LPARAM lParam);
     LRESULT HandleHdrToneCurveWindowMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
 
@@ -133,7 +142,6 @@ private:
     void InvalidateHdrToneCurveEditor() const;
 
     const anvil::playback::CapabilityReport& CachedCapabilities();
-    void RefreshCapabilityCache();
     void RenderPlaybackTick(const anvil::playback::PlaybackSessionSnapshot& snapshot, bool forceRefresh = true);
     bool CurrentMediaHasHdrControls() const;
     bool CurrentMediaHasCmv4Control() const;
@@ -262,11 +270,15 @@ private:
     void OpenDanmakuFileDialog();
 
     // main_window.cpp runtime + transport
-    void StopRuntime(bool clearVideoFrame = true);
     void StopRuntimeAsync(bool clearVideoFrame = true);
     void StopRuntimeBackends();
-    void FinishRuntimeStopVisuals(bool clearVideoFrame, bool clearDecoderFrames);
-    void WaitForAsyncRuntimeStop();
+    void RetireAfterRuntimeStopSchedulingFailure();
+    void FinishRuntimeStopVisuals(bool clearVideoFrame);
+    void CompleteAsyncRuntimeStop();
+    void PollPlaybackSupervisorCompletion();
+    void CompleteRendererInitialization(D3D11RendererState state);
+    void BeginClose();
+    void TryFinishClose();
     bool RuntimeStopInProgress() const;
     bool RuntimeBackendsRunning() const;
     void ClearDeferredRuntimeStart();
@@ -285,12 +297,18 @@ private:
     void ResumeNativeSeekPrerollAudio(std::chrono::milliseconds position);
     bool PrepareNativeEnhancedPlaybackBeforePlay(const anvil::playback::PlaybackSessionSnapshot& snapshot);
     bool CaptureLatestNativeFrame();
+    bool ReplaceHeldNativeFrame(const NativeVideoFrame& frame);
+    void RetireHeldNativeFrame();
     void RenderHeldNativeFrame(bool logRepaint = true);
     void RefreshPausedNativeFrame(const anvil::playback::PlaybackSessionSnapshot& snapshot,
                                   bool forceDecoderRestart = false);
     void OpenPath(const std::filesystem::path& path, bool autoplay = true);
+    void CompleteOpenPath(PlaybackSupervisor::OpenCompletion completion);
     void LoadRecentMedia();
+    bool EnsureRecentMediaWorker() const;
     void SaveRecentMedia() const;
+    void StartInspectorFolderScan(const std::filesystem::path& mediaPath);
+    void InvalidateBackgroundListWorkers() noexcept;
     void StartPlayback();
     void PausePlayback();
     void TogglePlayback();
@@ -360,14 +378,42 @@ private:
         std::filesystem::path path;
     };
 
+    struct InspectorFolderScanState {
+        std::mutex mutex;
+        std::condition_variable wake;
+        std::optional<std::filesystem::path> pendingPath;
+        std::vector<std::filesystem::path> entries;
+        std::atomic<HWND> notificationWindow{nullptr};
+        std::atomic_bool stopping{false};
+        std::atomic_uint64_t requestedGeneration{0};
+        uint64_t completedGeneration = 0;
+    };
+
+    struct RecentMediaWriterState {
+        std::mutex mutex;
+        std::condition_variable wake;
+        std::optional<std::vector<std::filesystem::path>> pendingItems;
+        std::vector<std::filesystem::path> loadedItems;
+        std::filesystem::path outputPath;
+        LogSinkPtr logSink;
+        std::atomic<HWND> notificationWindow{nullptr};
+        std::atomic_bool stopping{false};
+        bool loadRequested = false;
+        uint64_t loadGeneration = 0;
+        uint64_t completedLoadGeneration = 0;
+        uint64_t pendingGeneration = 0;
+    };
+
     static constexpr std::size_t kCommandAnimationSlotCount = 32;
 
     HWND hwnd_ = nullptr;
+    uint64_t windowLifetimeCookie_ = 0;
     HINSTANCE instance_ = nullptr;
     UINT dpi_ = 96;
     QuitHandler quitHandler_;
     Palette palette_;
     anvil::playback::PlayerController controller_;
+    std::unique_ptr<PlaybackSupervisor> playbackSupervisor_;
     anvil::playback::CapabilityReport cachedCapabilities_;
     bool capabilitiesCached_ = false;
     EmbeddedFfplayPlayer playbackPlayer_;
@@ -385,8 +431,10 @@ private:
     HWND subtitleMenuOverlay_ = nullptr;
     HWND hdrToneCurveWindow_ = nullptr;
     bool videoHostReady_ = false;
+    bool videoHostInitializationFailureHandled_ = false;
     bool webUiRequested_ = true;
     bool webUiActive_ = false;
+    bool uiThreadResourcesReleased_ = false;
     // MainWindow is always the player window, so the player route is always
     // active. Retained as a constant-true flag because layout/paint/runtime
     // code still branches on it; the legacy setWebUiRoute switching is gone.
@@ -404,6 +452,17 @@ private:
     std::thread runtimeStopThread_;
     std::atomic_bool runtimeStopAsyncInProgress_{false};
     std::atomic_bool runtimeStopAsyncClearFrame_{true};
+    std::atomic_bool runtimeStopWorkerDone_{false};
+    bool runtimeStopRetryPending_ = false;
+    unsigned int runtimeStopWorkerStartFailureCount_ = 0;
+    // A backend can reach EOF and publish IsRunning()==false while its thread
+    // objects and last decoded frames still need to be retired.  Keep that
+    // cleanup obligation explicit so a subsequent start never performs the
+    // old session's joins or heavyweight frame releases on the window thread.
+    std::atomic_bool runtimeCleanupPending_{false};
+    bool closePending_ = false;
+    bool closeReady_ = false;
+    std::chrono::steady_clock::time_point closeStartedAt_{};
     bool deferredRuntimeStart_ = false;
     bool deferredRuntimeRestart_ = false;
     bool deferredRuntimeWaitForPreroll_ = false;
@@ -512,7 +571,6 @@ private:
     std::chrono::steady_clock::time_point settingsScrollLastActiveAt_{};
     std::chrono::steady_clock::time_point subtitleMenuScrollLastActiveAt_{};
     std::chrono::steady_clock::time_point lastPlaybackUiRefreshAt_{};
-    HANDLE playbackTimerQueueTimer_ = nullptr;
     POINT lastFullscreenCursorClient_{};
     bool hasLastFullscreenCursorClient_ = false;
     POINT videoPressStart_{};
@@ -540,6 +598,9 @@ private:
     SubtitleMenuPage subtitleMenuPage_ = SubtitleMenuPage::Subtitles;
     std::vector<std::filesystem::path> recentMedia_;
     std::vector<std::filesystem::path> currentFolderEntries_;
+    std::shared_ptr<InspectorFolderScanState> inspectorFolderScan_;
+    uint64_t inspectorFolderScanGeneration_ = 0;
+    mutable std::shared_ptr<RecentMediaWriterState> recentMediaWriter_;
     std::vector<InspectorPathItem> inspectorPathItems_;
     std::vector<UiButton> buttons_;
     mutable HBITMAP previewBitmap_ = nullptr;

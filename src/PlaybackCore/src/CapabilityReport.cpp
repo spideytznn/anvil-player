@@ -9,6 +9,11 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <memory>
+#include <new>
+#include <process.h>
 #include <string>
 #include <utility>
 
@@ -23,6 +28,18 @@ namespace anvil::playback {
 namespace {
 
 using Microsoft::WRL::ComPtr;
+
+CapabilityReport MakeConservativeReport() {
+    CapabilityReport report;
+    report.display.colorSpace = L"Probe pending";
+    report.gpu.adapterName = L"Probe pending";
+    report.gpu.d3dFeatureLevel = L"Pending";
+    report.gpu.hardwareDecodeProfiles = {L"Probe pending"};
+    report.audio.endpointName = L"Default Windows endpoint";
+    report.audio.encodedFormats = {L"AC-3", L"E-AC-3", L"TrueHD", L"DTS", L"DTS-HD"};
+    report.codecs.mediaFoundationTransforms = {L"Probe pending"};
+    return report;
+}
 
 std::wstring FeatureLevelToString(const D3D_FEATURE_LEVEL level) {
     switch (level) {
@@ -223,10 +240,56 @@ bool TryPopulateD3D11(CapabilityReport& report) {
     return true;
 }
 
+class MediaFoundationSession {
+public:
+    MediaFoundationSession()
+        : result_(MFStartup(MF_VERSION, MFSTARTUP_LITE)) {
+    }
+
+    ~MediaFoundationSession() {
+        if (SUCCEEDED(result_)) {
+            MFShutdown();
+        }
+    }
+
+    HRESULT Result() const {
+        return result_;
+    }
+
+private:
+    HRESULT result_ = E_FAIL;
+};
+
+struct MediaFoundationActivations {
+    ~MediaFoundationActivations() {
+        if (!values) {
+            return;
+        }
+        for (UINT32 index = 0; index < count; ++index) {
+            if (values[index]) {
+                values[index]->Release();
+            }
+        }
+        CoTaskMemFree(values);
+    }
+
+    IMFActivate** values = nullptr;
+    UINT32 count = 0;
+};
+
+struct CoTaskMemWideString {
+    ~CoTaskMemWideString() {
+        CoTaskMemFree(value);
+    }
+
+    wchar_t* value = nullptr;
+};
+
 void PopulateMediaFoundationTransforms(CodecCapabilities& codecs) {
     codecs.mediaFoundationTransforms.clear();
 
-    HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_LITE);
+    MediaFoundationSession mediaFoundation;
+    HRESULT hr = mediaFoundation.Result();
     if (FAILED(hr)) {
         codecs.mediaFoundationTransforms = {L"Media Foundation startup failed " + std::to_wstring(static_cast<unsigned long>(hr))};
         return;
@@ -236,36 +299,43 @@ void PopulateMediaFoundationTransforms(CodecCapabilities& codecs) {
     inputType.guidMajorType = MFMediaType_Video;
     inputType.guidSubtype = MFVideoFormat_HEVC;
 
-    IMFActivate** activates = nullptr;
-    UINT32 count = 0;
+    MediaFoundationActivations activations;
     const UINT32 flags =
         MFT_ENUM_FLAG_SYNCMFT |
         MFT_ENUM_FLAG_ASYNCMFT |
         MFT_ENUM_FLAG_HARDWARE |
         MFT_ENUM_FLAG_LOCALMFT |
         MFT_ENUM_FLAG_SORTANDFILTER;
-    hr = MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER, flags, &inputType, nullptr, &activates, &count);
+    hr = MFTEnumEx(
+        MFT_CATEGORY_VIDEO_DECODER,
+        flags,
+        &inputType,
+        nullptr,
+        &activations.values,
+        &activations.count);
     if (FAILED(hr)) {
         codecs.mediaFoundationTransforms = {L"HEVC decoder MFT enumeration failed " + std::to_wstring(static_cast<unsigned long>(hr))};
-        MFShutdown();
         return;
     }
 
-    for (UINT32 index = 0; index < count; ++index) {
-        if (!activates[index]) {
+    for (UINT32 index = 0; index < activations.count; ++index) {
+        if (!activations.values[index]) {
             continue;
         }
 
-        wchar_t* name = nullptr;
+        CoTaskMemWideString name;
         UINT32 nameLength = 0;
         std::wstring friendlyName = L"Unnamed HEVC decoder MFT";
-        if (SUCCEEDED(activates[index]->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute, &name, &nameLength)) && name) {
-            friendlyName.assign(name, name + nameLength);
-            CoTaskMemFree(name);
+        if (SUCCEEDED(activations.values[index]->GetAllocatedString(
+                MFT_FRIENDLY_NAME_Attribute,
+                &name.value,
+                &nameLength)) &&
+            name.value) {
+            friendlyName.assign(name.value, name.value + nameLength);
         }
 
         GUID clsid{};
-        if (SUCCEEDED(activates[index]->GetGUID(MFT_TRANSFORM_CLSID_Attribute, &clsid))) {
+        if (SUCCEEDED(activations.values[index]->GetGUID(MFT_TRANSFORM_CLSID_Attribute, &clsid))) {
             wchar_t clsidText[64]{};
             if (StringFromGUID2(clsid, clsidText, static_cast<int>(std::size(clsidText))) > 0) {
                 friendlyName += L" ";
@@ -277,30 +347,165 @@ void PopulateMediaFoundationTransforms(CodecCapabilities& codecs) {
             codecs.dolbyVisionExtensionDetected = true;
         }
         AddUnique(codecs.mediaFoundationTransforms, std::move(friendlyName));
-        activates[index]->Release();
     }
-    CoTaskMemFree(activates);
 
     if (codecs.mediaFoundationTransforms.empty()) {
         codecs.mediaFoundationTransforms = {L"No HEVC video decoder MFT reported"};
     }
+}
 
-    MFShutdown();
+class ComApartment {
+public:
+    ComApartment()
+        : result_(CoInitializeEx(nullptr, COINIT_MULTITHREADED)) {
+    }
+
+    ~ComApartment() {
+        if (SUCCEEDED(result_)) {
+            CoUninitialize();
+        }
+    }
+
+    bool Available() const {
+        return SUCCEEDED(result_) || result_ == RPC_E_CHANGED_MODE;
+    }
+
+    HRESULT Result() const {
+        return result_;
+    }
+
+private:
+    HRESULT result_ = E_FAIL;
+};
+
+CapabilityReport BuildCapabilityReport(const ComApartment& apartment) {
+    CapabilityReport report = MakeConservativeReport();
+    TryPopulateD3D11(report);
+    if (apartment.Available()) {
+        PopulateMediaFoundationTransforms(report.codecs);
+    } else {
+        report.codecs.mediaFoundationTransforms = {
+            L"COM initialization failed " +
+            std::to_wstring(static_cast<unsigned long>(apartment.Result())),
+        };
+    }
+    return report;
+}
+
+// This state and its published report intentionally have process lifetime.
+// A driver or MFT call may never return; leaking one bounded state object keeps
+// readers safe without a shutdown join or a static-destruction race.
+struct CapabilityProbeState {
+    CapabilityProbeState()
+        : conservative(MakeConservativeReport()) {
+    }
+
+    std::atomic_bool launchAttempted{false};
+    std::atomic<const CapabilityReport*> published{nullptr};
+    DWORD testDelayMs = 0;
+    CapabilityReport conservative;
+};
+
+CapabilityProbeState* ProcessCapabilityProbeState() noexcept {
+    static CapabilityProbeState* const state = []() noexcept -> CapabilityProbeState* {
+        try {
+            return new CapabilityProbeState();
+        } catch (...) {
+            OutputDebugStringW(L"[capabilities] unable to allocate process probe state\n");
+            return nullptr;
+        }
+    }();
+    return state;
+}
+
+DWORD CapabilityProbeDelayForTesting() noexcept {
+#if defined(_DEBUG)
+    wchar_t value[32]{};
+    constexpr DWORD valueCapacity = static_cast<DWORD>(sizeof(value) / sizeof(value[0]));
+    const DWORD length = GetEnvironmentVariableW(
+        L"ANVIL_PLAYER_TEST_CAPABILITY_DELAY_MS",
+        value,
+        valueCapacity);
+    if (length > 0 && length < valueCapacity) {
+        wchar_t* end = nullptr;
+        const unsigned long parsed = std::wcstoul(value, &end, 10);
+        if (end != value) {
+            return static_cast<DWORD>(std::min<unsigned long>(parsed, 30000UL));
+        }
+    }
+#endif
+    return 0;
+}
+
+unsigned __stdcall RunCapabilityProbe(void* opaque) noexcept {
+    auto* state = static_cast<CapabilityProbeState*>(opaque);
+    if (!state) {
+        return 0;
+    }
+    if (state->testDelayMs > 0) {
+        Sleep(state->testDelayMs);
+    }
+
+    ComApartment apartment;
+    try {
+        auto report = std::make_unique<CapabilityReport>(BuildCapabilityReport(apartment));
+        const CapabilityReport* published = report.release();
+        state->published.store(published, std::memory_order_release);
+    } catch (...) {
+        // The conservative snapshot remains valid. No worker exception may
+        // escape a thread entry point and terminate the process.
+        OutputDebugStringW(L"[capabilities] background probe failed with an exception\n");
+    }
+    return 0;
+}
+
+void StartCapabilityProbe(CapabilityProbeState* state) noexcept {
+    if (!state) {
+        return;
+    }
+    bool expected = false;
+    if (!state->launchAttempted.compare_exchange_strong(
+            expected,
+            true,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return;
+    }
+
+    state->testDelayMs = CapabilityProbeDelayForTesting();
+    const uintptr_t threadHandle = _beginthreadex(
+        nullptr,
+        0,
+        &RunCapabilityProbe,
+        state,
+        0,
+        nullptr);
+    if (threadHandle == 0) {
+        OutputDebugStringW(L"[capabilities] unable to start background probe\n");
+        return;
+    }
+    CloseHandle(reinterpret_cast<HANDLE>(threadHandle));
 }
 
 }  // namespace
 
 CapabilityReport CapabilityDetector::CollectBasic() {
-    CapabilityReport report;
-    report.display.colorSpace = L"Probe pending";
-    report.gpu.adapterName = L"Probe pending";
-    report.gpu.d3dFeatureLevel = L"D3D11 target";
-    report.gpu.hardwareDecodeProfiles = {L"Probe pending"};
-    TryPopulateD3D11(report);
-    report.audio.endpointName = L"Default Windows endpoint";
-    report.audio.encodedFormats = {L"AC-3", L"E-AC-3", L"TrueHD", L"DTS", L"DTS-HD"};
-    PopulateMediaFoundationTransforms(report.codecs);
-    return report;
+    CapabilityProbeState* const state = ProcessCapabilityProbeState();
+    if (!state) {
+        return MakeConservativeReport();
+    }
+
+    if (const CapabilityReport* const published =
+            state->published.load(std::memory_order_acquire)) {
+        return *published;
+    }
+
+    StartCapabilityProbe(state);
+    if (const CapabilityReport* const published =
+            state->published.load(std::memory_order_acquire)) {
+        return *published;
+    }
+    return state->conservative;
 }
 
 }  // namespace anvil::playback

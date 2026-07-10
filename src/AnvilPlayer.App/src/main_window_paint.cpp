@@ -1112,11 +1112,16 @@ void MainWindow::DrawVideoSurface(HDC hdc, const PlaybackSessionSnapshot& snapsh
     if (fullscreen_) {
         FillRectColor(hdc, videoSurface_, RGB(0, 0, 0));
         if (snapshot.media.has_value()) {
-            VideoFrame decodedFrame;
-            if (backend_ == PlaybackBackend::RawFrameBridge && videoDecoder_.LatestFrame(decodedFrame)) {
-                DrawDecodedVideoFrame(hdc, videoSurface_, decodedFrame);
-            } else if (!(backend_ == PlaybackBackend::NativeFfmpegD3D11 && nativeVideoDecoder_ && nativeVideoDecoder_->IsRunning()) &&
-                       !snapshot.media->previewImagePath.empty()) {
+            const bool drewDecodedFrame =
+                backend_ == PlaybackBackend::RawFrameBridge &&
+                videoDecoder_.VisitLatestFrame([&](const VideoFrame& frame) {
+                    DrawDecodedVideoFrame(hdc, videoSurface_, frame);
+                });
+            if (!drewDecodedFrame &&
+                !(backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+                  nativeVideoDecoder_ &&
+                  nativeVideoDecoder_->IsRunning()) &&
+                !snapshot.media->previewImagePath.empty()) {
                 DrawPreviewBitmap(hdc, videoSurface_, snapshot.media->previewImagePath);
             }
         }
@@ -1137,14 +1142,16 @@ void MainWindow::DrawVideoSurface(HDC hdc, const PlaybackSessionSnapshot& snapsh
         HFONT titleFont = CreateUiFont(compactSurface ? Scale(18) : Scale(22), FW_SEMIBOLD);
         HFONT bodyFont = CreateUiFont(compactSurface ? Scale(12) : Scale(13), FW_NORMAL);
         HFONT smallFont = CreateUiFont(Scale(11), FW_NORMAL);
-        VideoFrame decodedFrame;
         const bool nativeActive = (backend_ == PlaybackBackend::NativeFfmpegD3D11) &&
                                   nativeVideoDecoder_ && nativeVideoDecoder_->IsRunning();
-        if (backend_ == PlaybackBackend::RawFrameBridge && videoDecoder_.LatestFrame(decodedFrame)) {
-            DrawDecodedVideoFrame(hdc, videoSurface_, decodedFrame);
-        } else if (!nativeActive && !snapshot.media->previewImagePath.empty()) {
+        const bool drewDecodedFrame =
+            backend_ == PlaybackBackend::RawFrameBridge &&
+            videoDecoder_.VisitLatestFrame([&](const VideoFrame& frame) {
+                DrawDecodedVideoFrame(hdc, videoSurface_, frame);
+            });
+        if (!drewDecodedFrame && !nativeActive && !snapshot.media->previewImagePath.empty()) {
             DrawPreviewBitmap(hdc, videoSurface_, snapshot.media->previewImagePath);
-        } else if (!nativeActive) {
+        } else if (!drewDecodedFrame && !nativeActive) {
             ClearPreviewBitmap();
         }
         RECT titleScrim = MakeRect(inner.left - Scale(8),
@@ -2039,18 +2046,9 @@ void MainWindow::DrawMediaInfoContent(HDC hdc, const PlaybackSessionSnapshot& sn
     DrawField(hdc, L"Plan", snapshot.media->selectedDecodePath, cursor);
     DrawField(hdc, L"Runtime", RuntimeLabel(), cursor);
     if (nativeVideoDecoder_) {
-        NativeVideoFrame latest;
-        if (nativeVideoDecoder_->LatestFrame(latest)) {
-            std::wstring dynamicMetadata = latest.dynamicMetadataPath;
-            if (dynamicMetadata.empty() && latest.dovi && latest.dovi->valid) {
-                dynamicMetadata = L"dolby_vision_shader";
-            }
-            if (!dynamicMetadata.empty()) {
-                if (!latest.dynamicMetadataDetails.empty()) {
-                    dynamicMetadata += L" " + latest.dynamicMetadataDetails;
-                }
-                DrawField(hdc, L"Dynamic", dynamicMetadata, cursor);
-            }
+        const std::wstring dynamicMetadata = nativeVideoDecoder_->LatestDynamicMetadata();
+        if (!dynamicMetadata.empty()) {
+            DrawField(hdc, L"Dynamic", dynamicMetadata, cursor);
         }
     }
 }

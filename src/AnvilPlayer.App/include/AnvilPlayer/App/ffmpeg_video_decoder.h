@@ -26,6 +26,7 @@ extern "C" {
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
@@ -176,6 +177,7 @@ struct NativeAudioPacketSink {
     std::function<bool(const AVPacket*)> pushPacket;
     std::function<void(std::chrono::milliseconds)> reset;
     std::function<void()> endOfStream;
+    std::function<void()> startFailed;
 
     bool Enabled() const {
         return selectedTrackIndex != anvil::playback::kAudioTrackOff &&
@@ -187,6 +189,7 @@ struct NativeAudioPacketSink {
 struct NativeDecodeFailure {
     std::filesystem::path path;
     std::wstring message;
+    uint64_t windowCookie = 0;
 };
 
 // Native in-process FFmpeg video decoder. Demux+decode on a worker thread,
@@ -221,8 +224,12 @@ public:
                bool oneShotFrame = false,
                bool preferDolbyVisionHdrOutput = false,
                bool enableDolbyVisionEnhancementDecode = false,
-               NativeAudioPacketSink audioPacketSink = {});
+               NativeAudioPacketSink audioPacketSink = {},
+               uint64_t notificationCookie = 0);
 
+    // Non-blocking cancellation phase. Stop() performs the worker join and
+    // must run off the window thread.
+    void RequestStop();
     void Stop();
     bool Seek(std::chrono::milliseconds position);
     void SetPaused(bool paused, std::chrono::milliseconds position);
@@ -241,6 +248,28 @@ public:
 
     bool LatestFrame(NativeVideoFrame& frame) const;
 
+    // Visit without copying heavyweight frame ownership into a window-thread
+    // local.  The callback must be short and must not call back into this
+    // decoder; render-mailbox submission and held-frame copying satisfy that
+    // contract.
+    template <typename Visitor>
+    bool VisitLatestFrame(Visitor&& visitor) const {
+        std::unique_lock lock(mutex_, std::try_to_lock);
+        if (!lock.owns_lock() || !latestFrame_.HasContent()) {
+            return false;
+        }
+        const uint64_t activeSerial = CurrentTimelineSerial();
+        if (latestFrame_.timelineSerial != 0 && latestFrame_.timelineSerial != activeSerial) {
+            return false;
+        }
+        visitor(static_cast<const NativeVideoFrame&>(latestFrame_));
+        return true;
+    }
+
+    // Inspector-only snapshot.  Copies text/flags, never AVFrame, D3D or
+    // pixel-plane ownership.
+    std::wstring LatestDynamicMetadata() const;
+
     void ClearFrame();
 
     void AcknowledgeFrameNotification();
@@ -254,27 +283,51 @@ public:
     const std::filesystem::path& Path() const { return path_; }
 
 private:
+    // One bounded session budget prevents packet read-ahead, decoded CPU
+    // frames, Dolby Vision enhancement frames and reusable upload buffers from
+    // independently growing into multi-gigabyte working sets.
+    static constexpr std::size_t kSessionMemoryBudgetBytes = 384ull * 1024ull * 1024ull;
+    static constexpr std::size_t kPacketMemoryBudgetBytes = 160ull * 1024ull * 1024ull;
+    static constexpr std::size_t kDecodedFrameMemoryBudgetBytes = 128ull * 1024ull * 1024ull;
+    static constexpr std::size_t kEnhancementMemoryBudgetBytes = 64ull * 1024ull * 1024ull;
+    static constexpr std::size_t kReusableBufferMemoryBudgetBytes = 32ull * 1024ull * 1024ull;
+    // Leave room for the packet currently returned by av_read_frame. New
+    // reads stop at a 128 MiB target and accept at most one 32 MiB packet, so
+    // the retained queue cannot overshoot its 160 MiB session partition.
+    static constexpr std::size_t kMaxCachedPacketBytes = 32ull * 1024ull * 1024ull;
+    static_assert(kMaxCachedPacketBytes < kPacketMemoryBudgetBytes);
+    static_assert(kPacketMemoryBudgetBytes +
+                      kDecodedFrameMemoryBudgetBytes +
+                      kEnhancementMemoryBudgetBytes +
+                      kReusableBufferMemoryBudgetBytes <=
+                  kSessionMemoryBudgetBytes);
+
     // Queue depth is selected per frame type: hardware texture refs are cheap,
     // while CPU BGRA/YUV frames can be tens of MB each for 4K+ sources.
     static constexpr std::size_t kMaxHardwareQueuedFrames = 6;
     static constexpr std::size_t kMaxYuvQueuedFrames = 10;
     static constexpr std::size_t kMaxSmallBgraQueuedFrames = 12;
     static constexpr std::size_t kMaxLargeBgraQueuedFrames = 6;
-    static constexpr std::size_t kMaxCpuQueuedFrameBytes = 256ull * 1024ull * 1024ull;
-    static constexpr std::size_t kMinPacketReadAheadBytes = 128ull * 1024ull * 1024ull;
-    static constexpr std::size_t kMaxPacketReadAheadBytes = 1024ull * 1024ull * 1024ull;
-    static constexpr std::size_t kMaxReusableBgraBuffers = 12;
+    static constexpr std::size_t kMaxCpuQueuedFrameBytes = kDecodedFrameMemoryBudgetBytes;
+    static constexpr std::size_t kMinPacketReadAheadBytes = 32ull * 1024ull * 1024ull;
+    static constexpr std::size_t kMaxPacketReadAheadBytes =
+        kPacketMemoryBudgetBytes - kMaxCachedPacketBytes;
+    static constexpr std::size_t kMaxReusableBgraBuffers = 2;
     static constexpr int kStartupPacketReadAheadBatch = 4;
     static constexpr int kPlayingPacketReadAheadBatch = 4;
     static constexpr int kPausedPacketReadAheadBatch = 256;
     static constexpr std::chrono::milliseconds kPlayingPacketReadAheadTarget{15000};
-    static constexpr int kDolbyVisionEnhancementStartupPacketReadAheadBatch = 6;
-    static constexpr int kDolbyVisionEnhancementPlayingPacketReadAheadBatch = 4;
-    static constexpr int kDolbyVisionEnhancementPausedPacketReadAheadBatch = 24;
-    static constexpr std::chrono::milliseconds kDolbyVisionEnhancementPacketReadAheadTarget{1500};
-    static constexpr std::size_t kMaxDolbyVisionEnhancementQueuedFrames = 160;
-    static constexpr std::size_t kMaxDolbyVisionEnhancementQueuedBytes = 768ull * 1024ull * 1024ull;
+    static constexpr int kDolbyVisionEnhancementStartupPacketReadAheadBatch = 1;
+    static constexpr int kDolbyVisionEnhancementPlayingPacketReadAheadBatch = 1;
+    static constexpr int kDolbyVisionEnhancementPausedPacketReadAheadBatch = 2;
+    // A 1080p P010 FEL frame is about 6 MiB. Keep demux lead inside the
+    // bounded 64 MiB EL queue instead of reading 1.5 seconds ahead and
+    // discarding the exact EL frames the BL decoder has not produced yet.
+    static constexpr std::chrono::milliseconds kDolbyVisionEnhancementPacketReadAheadTarget{500};
+    static constexpr std::size_t kMaxDolbyVisionEnhancementQueuedFrames = 12;
+    static constexpr std::size_t kMaxDolbyVisionEnhancementQueuedBytes = kEnhancementMemoryBudgetBytes;
     static constexpr std::chrono::milliseconds kDolbyVisionEnhancementMatchDelta{80};
+    static constexpr std::chrono::milliseconds kDolbyVisionEnhancementPairDelta{8};
     static constexpr std::chrono::milliseconds kMinFrameEarlyTolerance{2};
     static constexpr std::chrono::milliseconds kMaxFrameEarlyTolerance{6};
     static constexpr std::chrono::milliseconds kFrameLateDropThreshold{120};
@@ -367,19 +420,19 @@ private:
     static AVPixelFormat ChooseHardwarePixelFormat(AVCodecContext* codecCtx, const AVPixelFormat* pixelFormats);
 
     bool ReceiveFrames(AVCodecContext* codecCtx, SwsContext*& swsCtx, AVFrame* frame, AVFrame* softwareFrame,
-                       std::vector<uint8_t>& bgraBuffer, AVRational timeBase,
-                       uint64_t& serial);
+                       AVRational timeBase, uint64_t& serial);
     bool DrainDecoder(AVCodecContext* codecCtx, SwsContext*& swsCtx, AVFrame* frame, AVFrame* softwareFrame,
-                      std::vector<uint8_t>& bgraBuffer, AVRational timeBase,
-                      uint64_t& serial);
+                      AVRational timeBase, uint64_t& serial);
     bool DecodeDolbyVisionEnhancementPacket(AVCodecContext* codecCtx,
                                             const AVPacket* packet,
                                             AVFrame* frame,
                                             AVRational timeBase);
     bool ReceiveDolbyVisionEnhancementFrames(AVCodecContext* codecCtx, AVFrame* frame, AVRational timeBase);
-    bool PublishFrame(AVFrame* frame, AVFrame* softwareFrame, SwsContext*& swsCtx, std::vector<uint8_t>& bgraBuffer,
+    bool PublishFrame(AVFrame* frame, AVFrame* softwareFrame, SwsContext*& swsCtx,
                       AVRational timeBase, uint64_t& serial);
     void AttachDolbyVisionEnhancementFrame(NativeVideoFrame& frame, std::chrono::milliseconds pts);
+    void TryPublishPendingDolbyVisionBaseFrame();
+    bool PublishPreparedDolbyVisionFrame(NativeVideoFrame&& frame);
     void LogDolbyVisionCpuReferenceSample(const NativeVideoFrame& frame);
     bool ShouldUsePrimaryDoviLibplacebo() const;
     bool TryPublishDoviLibplaceboFrame(AVFrame* frame,
@@ -441,6 +494,8 @@ private:
 
     bool EnqueueFrame(NativeVideoFrame&& frame);
     void DrainQueuedFrames();
+    void SchedulerLoop();
+    void WakeScheduler();
     void ScheduleDueFrames();
     static int InterruptCallback(void* opaque);
 
@@ -449,7 +504,9 @@ private:
         bool usingAudioClock = false;
     };
 
-    SchedulerClock CurrentSchedulerClockLocked(std::chrono::milliseconds firstQueuedPts);
+    SchedulerClock CurrentSchedulerClockLocked(
+        std::chrono::milliseconds firstQueuedPts,
+        const std::optional<std::chrono::milliseconds>& audioClock);
 
     void NotifyFrameReady();
     void NotifyDecodeFailure(const std::wstring& message) const;
@@ -460,15 +517,19 @@ private:
     uint64_t AdvanceTimelineSerial();
     void BeginSeekRecoveryLocked(std::chrono::milliseconds target, bool prerollAfterSeek, uint64_t timelineSerial);
     void ResetSeekRecoveryLocked();
+    void ApplyPendingClockResetLocked();
     void DropStaleFramesLocked();
     void StartSeekRecoveryVisualWarmupLocked(std::chrono::steady_clock::time_point now);
-    SchedulerClock SeekRecoverySchedulerClockLocked(std::chrono::milliseconds firstQueuedPts);
+    SchedulerClock SeekRecoverySchedulerClockLocked(
+        std::chrono::milliseconds firstQueuedPts,
+        const std::optional<std::chrono::milliseconds>& audioClock);
     void UpdateSeekRecoveryAfterPublishLocked(std::chrono::milliseconds publishedPts,
                                               std::chrono::steady_clock::time_point now);
 
     std::filesystem::path path_;
     std::chrono::milliseconds startPosition_{0};
     LogSinkPtr logSink_;
+    mutable std::mutex clockCallbackMutex_;
     ClockCallback clockCallback_;
     Microsoft::WRL::ComPtr<ID3D11Device> sharedD3DDevice_;
     bool preferHardwareDecode_ = false;
@@ -504,7 +565,7 @@ private:
     int dolbyVisionCompatId_ = 0;
     bool dolbyVisionElPresent_ = false;
     bool dolbyVisionBlPresent_ = false;
-    bool dolbyVisionEnhancementActive_ = false;
+    std::atomic_bool dolbyVisionEnhancementActive_{false};
     bool dolbyVisionEnhancementFirstFrameLogged_ = false;
     bool dolbyVisionEnhancementDynamicMetadataLogged_ = false;
     bool dolbyVisionEnhancementFailureLogged_ = false;
@@ -527,6 +588,11 @@ private:
     std::shared_ptr<const anvil::playback::DolbyVisionFrameMetadata> latestDolbyVisionEnhancementMetadata_;
     std::chrono::milliseconds latestDolbyVisionEnhancementMetadataPts_{0};
     std::deque<DolbyVisionEnhancementFrame> dolbyVisionEnhancementFrames_;
+    // The first BL frame after open/seek can be decoded before the matching EL
+    // frame reaches the bounded enhancement queue. Retain exactly one BL frame
+    // so the demux loop can catch the EL up without showing a black window or
+    // dropping the only frame that can release seek preroll.
+    std::optional<NativeVideoFrame> pendingDolbyVisionBaseFrame_;
     std::wstring preferredSubtitleLanguage_ = L"Auto";
     int selectedSubtitleTrackIndex_ = anvil::playback::kSubtitleTrackAuto;
     NativeAudioPacketSink audioPacketSink_;
@@ -541,6 +607,9 @@ private:
     bool subtitleAssActive_ = false;
     bool subtitleAssExternalFullTrack_ = false;
     bool subtitleAssLogged_ = false;
+    // Subtitle cues and libass stay decode-thread-owned. Frames carry a
+    // prepared snapshot; late cues replace queued/latest snapshots under
+    // mutex_, while the scheduler never enters the subtitle renderer.
     std::unique_ptr<LibassSubtitleRenderer> subtitleAssRenderer_;
     bool schedulePrimed_ = false;   // startup warm-up gate for the scheduler
     bool externalSubtitlesActive_ = false;
@@ -550,15 +619,22 @@ private:
     std::chrono::milliseconds fallbackClockBasePts_{0};
     SeekRecoveryState seekRecovery_;
     mutable std::mutex mutex_;
+    std::condition_variable frameQueueCv_;
     NativeVideoFrame latestFrame_;
     std::deque<NativeVideoFrame> frameQueue_;
     std::vector<std::shared_ptr<std::vector<uint8_t>>> reusableBgraBuffers_;
     NativeVideoQueueStats stats_;
+    // Window-facing telemetry is opportunistic. If a decode/scheduler worker
+    // is rendering subtitles or retiring a queue, Stats() returns this last
+    // completed snapshot instead of making the message pump wait on mutex_.
+    mutable std::mutex statsSnapshotMutex_;
+    mutable NativeVideoQueueStats lastStatsSnapshot_;
     std::atomic_bool stopping_{false};
     std::atomic_bool running_{false};
     std::atomic<HWND> notificationWindow_{nullptr};
     std::atomic_uint notificationMessage_{0};
     std::atomic_uint failureMessage_{0};
+    std::atomic<uint64_t> notificationCookie_{0};
     std::atomic_bool frameMessagePending_{false};
     std::atomic<int64_t> pendingSeekMs_{-1};
     std::atomic_bool pendingSeekInterruptsEnabled_{false};
@@ -570,9 +646,18 @@ private:
     std::atomic<int> seekFastResumeFramesRemaining_{0};
     std::atomic_bool seekFastResumeLogged_{false};
     std::atomic_bool seekPrerollPending_{false};
+    std::atomic_bool seekRecoveryActiveSnapshot_{false};
+    std::atomic_bool seekAudioHandoffReadySnapshot_{true};
     std::atomic<int64_t> seekRecoveryTargetMs_{-1};
     std::atomic_bool seekRecoveryDropLogged_{false};
     std::atomic<int64_t> pausedPositionMs_{0};
+    std::atomic<int64_t> pendingClockResetMs_{-1};
+    // Scheduler wake state is protected by schedulerMutex_; frameQueue_ and
+    // all scheduling/seek-recovery state remain protected by mutex_.
+    std::mutex schedulerMutex_;
+    std::condition_variable schedulerCv_;
+    bool schedulerWakeRequested_ = false;
+    std::thread schedulerThread_;
     std::thread decodeThread_;
 };
 

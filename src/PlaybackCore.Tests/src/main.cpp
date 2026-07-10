@@ -1,15 +1,23 @@
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
 #include "AnvilPlayer/Playback/PlayerController.h"
 #include "AnvilPlayer/Playback/PlaybackPlan.h"
 #include "AnvilPlayer/App/video_texture_sampling_math.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <process.h>
+#include <thread>
+#include <vector>
 
 using anvil::playback::PlaybackState;
 using anvil::playback::PlayerController;
@@ -61,6 +69,41 @@ std::filesystem::path MakeTempMediaFile() {
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
     file << "anvil";
     return path;
+}
+
+void TestCapabilityProbeDoesNotBlockRepeatedPrepare() {
+#if defined(_DEBUG)
+    // The probe worker reads this once before it starts. If capability
+    // collection ever moves back onto PrepareMedia's call stack, this test
+    // deterministically exceeds the deadline below.
+    assert(_wputenv_s(L"ANVIL_PLAYER_TEST_CAPABILITY_DELAY_MS", L"5000") == 0);
+#endif
+
+    const auto path = MakeTempMediaFile();
+    const auto startedAt = std::chrono::steady_clock::now();
+    PlayerController controller;
+    const auto initialReport = controller.CollectCapabilityReport();
+    const auto first = controller.PrepareMedia(
+        path,
+        false,
+        anvil::playback::MediaProbeOptions{{}, std::chrono::milliseconds{250}});
+    const auto second = controller.PrepareMedia(
+        path,
+        false,
+        anvil::playback::MediaProbeOptions{{}, std::chrono::milliseconds{250}});
+    const auto elapsed = std::chrono::steady_clock::now() - startedAt;
+
+#if defined(_DEBUG)
+    assert(_wputenv_s(L"ANVIL_PLAYER_TEST_CAPABILITY_DELAY_MS", L"") == 0);
+#endif
+    std::filesystem::remove(path);
+
+    assert(first.succeeded);
+    assert(second.succeeded);
+    assert(!initialReport.gpu.adapterName.empty());
+    assert(!initialReport.gpu.d3dFeatureLevel.empty());
+    assert(!initialReport.gpu.hardwareDecodeProfiles.empty());
+    assert(elapsed < std::chrono::milliseconds{2500});
 }
 
 void TestOpenAndTransport() {
@@ -130,6 +173,106 @@ void TestMissingFileLogsError() {
     assert(!controller.LogSink()->Entries().empty());
 }
 
+void TestPrepareCommitKeepsControllerResponsive() {
+    PlayerController controller;
+    const auto path = MakeTempMediaFile();
+
+    auto prepared = controller.PrepareMedia(path, false);
+    assert(prepared.succeeded);
+    // Preparation is side-effect free. A UI Snapshot never waits on or sees a
+    // partially probed descriptor; only the short commit changes state.
+    auto snapshot = controller.Snapshot();
+    assert(snapshot.state == PlaybackState::Empty);
+    assert(!snapshot.media.has_value());
+
+    assert(controller.CommitMedia(std::move(prepared)));
+    snapshot = controller.Snapshot();
+    assert(snapshot.state == PlaybackState::Ready);
+    assert(snapshot.media.has_value());
+    std::filesystem::remove(path);
+}
+
+void TestCancelledPrepareDoesNotCommit() {
+    PlayerController controller;
+    const auto path = MakeTempMediaFile();
+    std::stop_source cancellation;
+    cancellation.request_stop();
+
+    const auto startedAt = std::chrono::steady_clock::now();
+    auto prepared = controller.PrepareMedia(
+        path,
+        false,
+        anvil::playback::MediaProbeOptions{cancellation.get_token(), std::chrono::seconds{1}});
+    const auto elapsed = std::chrono::steady_clock::now() - startedAt;
+    assert(prepared.probe.cancelled);
+    assert(!prepared.succeeded);
+    assert(elapsed < std::chrono::milliseconds{100});
+    assert(!controller.CommitMedia(std::move(prepared)));
+    assert(controller.Snapshot().state == PlaybackState::Empty);
+    std::filesystem::remove(path);
+}
+
+void TestProbeDeadlineDoesNotBlockSnapshots() {
+    WSADATA winsock{};
+    assert(WSAStartup(MAKEWORD(2, 2), &winsock) == 0);
+
+    const SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    assert(listener != INVALID_SOCKET);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    assert(bind(listener, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0);
+    assert(listen(listener, 1) == 0);
+    int addressLength = sizeof(address);
+    assert(getsockname(listener, reinterpret_cast<sockaddr*>(&address), &addressLength) == 0);
+
+    std::atomic_bool stopServer{false};
+    std::atomic_bool accepted{false};
+    std::thread server([&]() {
+        const SOCKET client = accept(listener, nullptr, nullptr);
+        if (client != INVALID_SOCKET) {
+            accepted.store(true);
+            while (!stopServer.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{2});
+            }
+            shutdown(client, SD_BOTH);
+            closesocket(client);
+        }
+    });
+
+    PlayerController controller;
+    const std::wstring url = L"http://127.0.0.1:" + std::to_wstring(ntohs(address.sin_port)) + L"/stall";
+    const auto probeStartedAt = std::chrono::steady_clock::now();
+    auto preparation = std::async(std::launch::async, [&]() {
+        return controller.PrepareMedia(
+            std::filesystem::path{url},
+            false,
+            anvil::playback::MediaProbeOptions{{}, std::chrono::milliseconds{250}});
+    });
+
+    const auto acceptDeadline = std::chrono::steady_clock::now() + std::chrono::seconds{1};
+    while (!accepted.load() && std::chrono::steady_clock::now() < acceptDeadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+    const auto snapshotStartedAt = std::chrono::steady_clock::now();
+    const auto snapshot = controller.Snapshot();
+    const auto snapshotElapsed = std::chrono::steady_clock::now() - snapshotStartedAt;
+    assert(snapshot.state == PlaybackState::Empty);
+    assert(snapshotElapsed < std::chrono::milliseconds{50});
+
+    auto prepared = preparation.get();
+    const auto probeElapsed = std::chrono::steady_clock::now() - probeStartedAt;
+    stopServer.store(true);
+    closesocket(listener);
+    server.join();
+    WSACleanup();
+
+    assert(prepared.probe.timedOut);
+    assert(!prepared.succeeded);
+    assert(probeElapsed < std::chrono::seconds{2});
+}
+
 void TestLogFilteringAndFileOutput() {
     auto logPath = std::filesystem::temp_directory_path() /
         (L"anvil-player-log-test-" + std::to_wstring(_getpid()) + L".log");
@@ -143,6 +286,7 @@ void TestLogFilteringAndFileOutput() {
 
     sink.Write(LogLevel::Info, L"test", L"visible");
     assert(sink.Entries().size() == 1);
+    assert(sink.Flush(std::chrono::seconds{2}));
     assert(std::filesystem::exists(logPath));
     assert(std::filesystem::file_size(logPath) > 0);
 
@@ -151,7 +295,69 @@ void TestLogFilteringAndFileOutput() {
     assert(sink.Entries().size() == 2);
     assert(sink.FormatLatest(2).find(L"debug-visible") != std::wstring::npos);
 
+    assert(sink.Flush(std::chrono::seconds{2}));
+    sink.SetFilePath({});
+    assert(sink.Flush(std::chrono::seconds{2}));
     std::filesystem::remove(logPath);
+}
+
+void TestConcurrentLogWritesAreBufferedAndFlushed() {
+    const auto logPath = std::filesystem::temp_directory_path() /
+        (L"anvil-player-concurrent-log-test-" + std::to_wstring(_getpid()) + L".log");
+    std::filesystem::remove(logPath);
+
+    constexpr int threadCount = 4;
+    constexpr int entriesPerThread = 100;
+    InMemoryLogSink sink(LogLevel::Debug);
+    sink.SetFilePath(logPath);
+
+    std::vector<std::thread> writers;
+    for (int threadIndex = 0; threadIndex < threadCount; ++threadIndex) {
+        writers.emplace_back([&sink, threadIndex] {
+            for (int entryIndex = 0; entryIndex < entriesPerThread; ++entryIndex) {
+                sink.Write(LogLevel::Info,
+                           L"concurrent",
+                           L"thread=" + std::to_wstring(threadIndex) +
+                               L" entry=" + std::to_wstring(entryIndex));
+            }
+        });
+    }
+    for (auto& writer : writers) {
+        writer.join();
+    }
+
+    const auto entries = sink.Entries();
+    assert(entries.size() == static_cast<std::size_t>(threadCount * entriesPerThread));
+    assert(sink.Flush(std::chrono::seconds{5}));
+    sink.SetFilePath({});
+    assert(sink.Flush(std::chrono::seconds{2}));
+
+    std::ifstream file(logPath, std::ios::binary);
+    const std::string contents((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    assert(contents.size() > 3);
+    assert(static_cast<unsigned char>(contents[0]) == 0xEF);
+    assert(static_cast<unsigned char>(contents[1]) == 0xBB);
+    assert(static_cast<unsigned char>(contents[2]) == 0xBF);
+    assert(std::count(contents.begin(), contents.end(), '\n') == threadCount * entriesPerThread);
+
+    file.close();
+    std::filesystem::remove(logPath);
+}
+
+void TestInMemoryLogRetentionIsBounded() {
+    InMemoryLogSink sink(LogLevel::Debug);
+    for (int index = 0; index < 700; ++index) {
+        sink.Write(LogLevel::Debug, L"bounded", L"entry=" + std::to_wstring(index));
+    }
+
+    const auto entries = sink.Entries();
+    assert(entries.size() == 500);
+    assert(entries.front().message == L"entry=200");
+    assert(entries.back().message == L"entry=699");
+    const auto latest = sink.LatestEntries(14);
+    assert(latest.size() == 14);
+    assert(latest.front().message == L"entry=686");
+    assert(latest.back().message == L"entry=699");
 }
 
 void TestInvalidMediaFallsBackToExtensionProbe() {
@@ -272,10 +478,16 @@ void TestDolbyVisionPlaybackPlanUsesSoftwareReshape() {
 
 int main() {
     TestVideoTextureSamplingRegion();
+    TestCapabilityProbeDoesNotBlockRepeatedPrepare();
     TestOpenAndTransport();
     TestSeekAndVolumeClamp();
     TestMissingFileLogsError();
+    TestPrepareCommitKeepsControllerResponsive();
+    TestCancelledPrepareDoesNotCommit();
+    TestProbeDeadlineDoesNotBlockSnapshots();
     TestLogFilteringAndFileOutput();
+    TestConcurrentLogWritesAreBufferedAndFlushed();
+    TestInMemoryLogRetentionIsBounded();
     TestInvalidMediaFallsBackToExtensionProbe();
     TestRealAvformatProbeWhenFfmpegToolIsAvailable();
     TestCapabilityReportHasD3DShape();

@@ -623,14 +623,14 @@ void MainWindow::UpdateLayout() {
             const int resetWidth = Scale(58);
             const int resetHeight = Scale(24);
             const int zoomWidth = Scale(58);
-            const int buttonGap = Scale(6);
+            const int hdrButtonGap = Scale(6);
             const RECT zoomButton = MakeRect(editor.right - Scale(10) - zoomWidth,
                                              editor.top + Scale(7),
                                              editor.right - Scale(10),
                                              editor.top + Scale(7) + resetHeight);
-            const RECT resetButton = MakeRect(zoomButton.left - buttonGap - resetWidth,
+            const RECT resetButton = MakeRect(zoomButton.left - hdrButtonGap - resetWidth,
                                               editor.top + Scale(7),
-                                              zoomButton.left - buttonGap,
+                                              zoomButton.left - hdrButtonGap,
                                               editor.top + Scale(7) + resetHeight);
             if (resetButton.top >= settingsContentViewport_.top &&
                 resetButton.bottom <= settingsContentViewport_.bottom &&

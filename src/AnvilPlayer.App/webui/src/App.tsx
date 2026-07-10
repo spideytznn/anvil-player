@@ -396,6 +396,7 @@ function createActiveEmbyPlaybackReport(report: EmbyPlaybackReportRecord): Activ
 
 function useEmbyPlaybackReporting(state: PlayerState): void {
   const activeRef = useRef<ActiveEmbyPlaybackReport | null>(null)
+  const pendingMatchRef = useRef<{ reportId: string; matched: boolean } | null>(null)
   const [pendingPulse, setPendingPulse] = useState(0)
 
   useEffect(() => {
@@ -443,8 +444,16 @@ function useEmbyPlaybackReporting(state: PlayerState): void {
     const pending = loadPendingEmbyPlaybackReport()
     const pendingPathMatches = Boolean(pending && state.hasMedia && playbackPathMatchesEmbyReport(state.mediaPath, pending))
     const activePathMatches = Boolean(active && state.hasMedia && playbackPathMatchesEmbyReport(state.mediaPath, active.report))
-    if (pending && state.hasMedia && !pendingPathMatches) {
-      debugEmbyPlaybackReport(`no match itemId=${pending.target.itemId} mediaPath=${state.mediaPath.slice(0, 120)} reportUrl=${pending.target.url.slice(0, 120)}`)
+    if (!pending || !state.hasMedia) {
+      pendingMatchRef.current = null
+    } else if (
+      pendingMatchRef.current?.reportId !== pending.id ||
+      pendingMatchRef.current.matched !== pendingPathMatches
+    ) {
+      pendingMatchRef.current = { reportId: pending.id, matched: pendingPathMatches }
+      debugEmbyPlaybackReport(
+        `${pendingPathMatches ? 'match' : 'no match'} itemId=${pending.target.itemId} mediaPath=${state.mediaPath.slice(0, 120)} reportUrl=${pending.target.url.slice(0, 120)}`
+      )
     }
 
     if (active && pending && pending.id !== active.report.id && (!active.started || !active.matched || pendingPathMatches || (active.matched && state.hasMedia && !activePathMatches))) {

@@ -8,17 +8,32 @@
 #include <dxgi1_3.h>
 #include <dxgi1_5.h>
 
+#include <process.h>
+
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <new>
 #include <sstream>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace anvil::app {
+
+struct D3D11QueuedVideoFrame {
+    explicit D3D11QueuedVideoFrame(const NativeVideoFrame& source) : frame(source) {}
+    explicit D3D11QueuedVideoFrame(NativeVideoFrame&& source) noexcept : frame(std::move(source)) {}
+
+    NativeVideoFrame frame;
+};
+
+static_assert(std::is_nothrow_move_constructible_v<NativeVideoFrame>);
 
 using anvil::playback::LogLevel;
 using anvil::playback::DoviMappingMethod;
@@ -34,6 +49,176 @@ using anvil::playback::VideoMatrixCoefficients;
 using anvil::playback::VideoTransferCharacteristic;
 
 namespace {
+
+// Releasing the last decoded-frame reference can transitively free large CPU
+// planes, AVFrames, decoder surfaces, and D3D objects. The window thread must
+// therefore only transfer ownership, never destroy a replaced mailbox frame.
+//
+// This service is deliberately process-lifetime: its object and worker are not
+// statically destroyed, so shutdown cannot race a static destructor and no
+// WndProc ever waits for it. The reservation count bounds all envelopes,
+// including frames currently being rendered, waiting in a renderer mailbox,
+// and queued for retirement. If the bound or an allocation is unavailable,
+// the new frame is simply not submitted and the existing mailbox is untouched.
+constexpr std::size_t kFrameRetirementCapacity = 8;
+
+class FrameRetirementService {
+public:
+    bool Start() noexcept {
+        const uintptr_t threadHandle = _beginthreadex(
+            nullptr,
+            0,
+            &FrameRetirementService::ThreadEntry,
+            this,
+            0,
+            nullptr);
+        if (threadHandle == 0) {
+            return false;
+        }
+        CloseHandle(reinterpret_cast<HANDLE>(threadHandle));
+        return true;
+    }
+
+    D3D11QueuedVideoFrame* TryAcquire(const NativeVideoFrame& frame) noexcept {
+        if (!TryReserve()) {
+            return nullptr;
+        }
+
+        D3D11QueuedVideoFrame* queuedFrame = nullptr;
+        try {
+            queuedFrame = new (std::nothrow) D3D11QueuedVideoFrame(frame);
+        } catch (...) {
+            // A throwing frame-field copy leaves the source intact and the
+            // mailbox unchanged. Partially copied references are not final
+            // because the source still owns them.
+        }
+        if (!queuedFrame) {
+            ReleaseReservation();
+        }
+        return queuedFrame;
+    }
+
+    D3D11QueuedVideoFrame* TryAcquireForRetirement(NativeVideoFrame&& frame) noexcept {
+        if (!TryReserve()) {
+            return nullptr;
+        }
+
+        // Allocation is sequenced before object initialization. Combined with
+        // the statically guaranteed noexcept NativeVideoFrame move, a null
+        // allocation is the only failure here and leaves the source untouched.
+        D3D11QueuedVideoFrame* const queuedFrame =
+            new (std::nothrow) D3D11QueuedVideoFrame(std::move(frame));
+        if (!queuedFrame) {
+            ReleaseReservation();
+            return nullptr;
+        }
+        return queuedFrame;
+    }
+
+    void Retire(D3D11QueuedVideoFrame* frame) noexcept {
+        if (!frame) {
+            return;
+        }
+
+        AcquireSRWLockExclusive(&queueLock_);
+        if (queueSize_ >= retirementQueue_.size()) {
+            // This cannot occur for a correctly owned envelope: every queued
+            // item and this caller are included in the same capacity counter.
+            // In a corrupted/double-retire path, leak this already-bounded
+            // envelope rather than destroy it on a latency-sensitive caller.
+            ReleaseSRWLockExclusive(&queueLock_);
+            return;
+        }
+        retirementQueue_[queueTail_] = frame;
+        queueTail_ = (queueTail_ + 1) % retirementQueue_.size();
+        ++queueSize_;
+        ReleaseSRWLockExclusive(&queueLock_);
+        WakeConditionVariable(&queueCv_);
+    }
+
+private:
+    bool TryReserve() noexcept {
+        std::size_t outstanding = outstanding_.load(std::memory_order_relaxed);
+        while (outstanding < kFrameRetirementCapacity) {
+            if (outstanding_.compare_exchange_weak(
+                    outstanding,
+                    outstanding + 1,
+                    std::memory_order_acq_rel,
+                    std::memory_order_relaxed)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void ReleaseReservation() noexcept {
+        outstanding_.fetch_sub(1, std::memory_order_release);
+    }
+
+    static unsigned __stdcall ThreadEntry(void* context) noexcept {
+        static_cast<FrameRetirementService*>(context)->Run();
+    }
+
+    [[noreturn]] void Run() noexcept {
+        // The worker has process lifetime, so its COM apartment intentionally
+        // has the same lifetime and is never torn down ahead of queued frames.
+        (void)CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
+        for (;;) {
+            AcquireSRWLockExclusive(&queueLock_);
+            while (queueSize_ == 0) {
+                SleepConditionVariableSRW(&queueCv_, &queueLock_, INFINITE, 0);
+            }
+            D3D11QueuedVideoFrame* frame = retirementQueue_[queueHead_];
+            retirementQueue_[queueHead_] = nullptr;
+            queueHead_ = (queueHead_ + 1) % retirementQueue_.size();
+            --queueSize_;
+            ReleaseSRWLockExclusive(&queueLock_);
+
+            delete frame;
+            outstanding_.fetch_sub(1, std::memory_order_release);
+        }
+    }
+
+    std::atomic<std::size_t> outstanding_{0};
+    SRWLOCK queueLock_ = SRWLOCK_INIT;
+    CONDITION_VARIABLE queueCv_ = CONDITION_VARIABLE_INIT;
+    std::array<D3D11QueuedVideoFrame*, kFrameRetirementCapacity> retirementQueue_{};
+    std::size_t queueHead_ = 0;
+    std::size_t queueTail_ = 0;
+    std::size_t queueSize_ = 0;
+};
+
+FrameRetirementService* FrameRetirement() noexcept {
+    // The pointer itself has a trivial static lifetime. The pointee is leaked
+    // by design so neither it nor its synchronization primitives can be torn
+    // down while a detached retirement worker is still active.
+    static FrameRetirementService* const service = []() noexcept {
+        FrameRetirementService* candidate = new (std::nothrow) FrameRetirementService();
+        if (!candidate) {
+            return static_cast<FrameRetirementService*>(nullptr);
+        }
+        if (!candidate->Start()) {
+            delete candidate;
+            return static_cast<FrameRetirementService*>(nullptr);
+        }
+        return candidate;
+    }();
+    return service;
+}
+
+void RetireQueuedFrame(D3D11QueuedVideoFrame* frame) noexcept {
+    if (!frame) {
+        return;
+    }
+    if (FrameRetirementService* const retirement = FrameRetirement()) {
+        retirement->Retire(frame);
+    }
+    // If the process-lifetime service could not start, no envelope can have
+    // been acquired from it. A non-null frame here would indicate corruption;
+    // deliberately retain it rather than release heavyweight resources on the
+    // caller thread.
+}
 
 struct VideoColorConstants {
     int matrixType = 0;
@@ -130,6 +315,35 @@ static_assert(sizeof(DoviShaderConstants) % 16 == 0, "DoviShaderConstants must b
 uint64_t ElapsedMicroseconds(const std::chrono::steady_clock::time_point start,
                              const std::chrono::steady_clock::time_point end) {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+}
+
+void AccumulateRenderStats(D3D11RenderStats& destination, const D3D11RenderStats& source) {
+    destination.frames += source.frames;
+    destination.hardwareFrames += source.hardwareFrames;
+    destination.bgraFrames += source.bgraFrames;
+    destination.subtitleFrames += source.subtitleFrames;
+    destination.slowFrames += source.slowFrames;
+    destination.hardwareSrvCacheHits += source.hardwareSrvCacheHits;
+    destination.hardwareSrvCacheMisses += source.hardwareSrvCacheMisses;
+    destination.subtitleSurfaceRebuilds += source.subtitleSurfaceRebuilds;
+    destination.subtitleBitmapRects += source.subtitleBitmapRects;
+    destination.subtitleBitmapPixels += source.subtitleBitmapPixels;
+    destination.totalRenderUs += source.totalRenderUs;
+    destination.maxRenderUs = std::max(destination.maxRenderUs, source.maxRenderUs);
+    destination.colorPipelineUs += source.colorPipelineUs;
+    destination.hardwarePrepareUs += source.hardwarePrepareUs;
+    destination.bgraUploadUs += source.bgraUploadUs;
+    destination.subtitleUs += source.subtitleUs;
+    destination.presentUs += source.presentUs;
+    destination.maxPresentUs = std::max(destination.maxPresentUs, source.maxPresentUs);
+    destination.presentSyncFrames += source.presentSyncFrames;
+    destination.frameLatencyWaits += source.frameLatencyWaits;
+    destination.frameLatencyWaitTimeouts += source.frameLatencyWaitTimeouts;
+    destination.frameLatencyWaitUs += source.frameLatencyWaitUs;
+    destination.maxFrameLatencyWaitUs =
+        std::max(destination.maxFrameLatencyWaitUs, source.maxFrameLatencyWaitUs);
+    destination.frameStatsSamples += source.frameStatsSamples;
+    destination.frameStatsDisjoint += source.frameStatsDisjoint;
 }
 
 uint64_t HashCombine(const uint64_t seed, const uint64_t value) {
@@ -569,24 +783,129 @@ float SubtitleFontPixels(const D3D11_VIEWPORT& videoViewport, const double fontS
 }  // namespace
 
 D3D11VideoRenderer::~D3D11VideoRenderer() {
-    ReleaseAll();
+    // Normal window shutdown waits for the RequestStop completion message and
+    // destroys the renderer on a non-window reaper. The public stop path never
+    // joins; this only reaps the already-finished worker during destruction.
+    StopRenderThread();
 }
 
-bool D3D11VideoRenderer::Initialize(HWND host) {
-    ReleaseAll();
-    host_ = host;
-    if (!host_) return false;
+bool D3D11VideoRenderer::BeginInitialize(const HWND host,
+                                         const HWND completionWindow,
+                                         const UINT completionMessage,
+                                         const uint64_t completionCookie) {
+    if (!host) {
+        state_.store(D3D11RendererState::Failed, std::memory_order_release);
+        PostInitializationCompletion(
+            D3D11RendererState::Failed,
+            completionWindow,
+            completionMessage,
+            completionCookie);
+        return false;
+    }
 
     RECT rc{};
-    GetClientRect(host_, &rc);
+    GetClientRect(host, &rc);
     const UINT width = static_cast<UINT>(std::max(1, RectWidth(rc)));
     const UINT height = static_cast<UINT>(std::max(1, RectHeight(rc)));
 
+    try {
+        std::lock_guard lock(commandMutex_);
+        if (renderThread_.joinable() || !stopped_.load(std::memory_order_acquire)) {
+            return false;
+        }
+
+        host_.store(host, std::memory_order_release);
+        initialWidth_ = width;
+        initialHeight_ = height;
+        initializationCompletionWindow_ = completionWindow;
+        initializationCompletionMessage_ = completionMessage;
+        initializationCompletionCookie_ = completionCookie;
+        stopCompletionWindow_ = nullptr;
+        stopCompletionMessage_ = 0;
+        stopCompletionCookie_ = 0;
+        stopRequested_ = false;
+        acceptingCommands_ = true;
+        publishedDevice_.store(nullptr, std::memory_order_release);
+        stopped_.store(false, std::memory_order_release);
+        state_.store(D3D11RendererState::Initializing, std::memory_order_release);
+        renderThread_ = std::thread(&D3D11VideoRenderer::RenderThreadMain, this);
+    } catch (const std::system_error& error) {
+        {
+            std::lock_guard lock(commandMutex_);
+            stopRequested_ = true;
+            acceptingCommands_ = false;
+            host_.store(nullptr, std::memory_order_release);
+            publishedDevice_.store(nullptr, std::memory_order_release);
+            stopped_.store(true, std::memory_order_release);
+            state_.store(D3D11RendererState::Failed, std::memory_order_release);
+        }
+        LogInfo(L"render thread start failed error=" + Utf8ToWide(error.what()));
+        PostInitializationCompletion(
+            D3D11RendererState::Failed,
+            completionWindow,
+            completionMessage,
+            completionCookie);
+        return false;
+    }
+    return true;
+}
+
+bool D3D11VideoRenderer::Initialize(const HWND host) {
+    return BeginInitialize(host, nullptr, 0, 0);
+}
+
+D3D11RendererState D3D11VideoRenderer::State() const noexcept {
+    return state_.load(std::memory_order_acquire);
+}
+
+bool D3D11VideoRenderer::IsReady() const noexcept {
+    return State() == D3D11RendererState::Ready;
+}
+
+bool D3D11VideoRenderer::InitializationFailed() const noexcept {
+    return State() == D3D11RendererState::Failed;
+}
+
+ID3D11Device* D3D11VideoRenderer::Device() const noexcept {
+    if (state_.load(std::memory_order_acquire) != D3D11RendererState::Ready) {
+        return nullptr;
+    }
+    return publishedDevice_.load(std::memory_order_acquire);
+}
+
+bool D3D11VideoRenderer::IsStopRequested() const {
+    std::lock_guard lock(commandMutex_);
+    return stopRequested_;
+}
+
+void D3D11VideoRenderer::PostInitializationCompletion(const D3D11RendererState state,
+                                                      const HWND window,
+                                                      const UINT message,
+                                                      const uint64_t cookie) const noexcept {
+    if (window && message != 0) {
+        PostMessageW(window,
+                     message,
+                     static_cast<WPARAM>(cookie),
+                     static_cast<LPARAM>(state));
+    }
+}
+
+bool D3D11VideoRenderer::InitializeGpuOnRenderThread(const UINT width, const UINT height) {
+    // Every GPU/driver/DirectComposition operation in this method executes on
+    // the render worker. Cancellation is cooperative between calls: an
+    // uninterruptible driver call may finish, after which the worker observes
+    // stopRequested_ and immediately releases everything it created.
+    if (IsStopRequested()) {
+        return false;
+    }
+
     HRESULT hr = CreateDXGIFactory2(0, IID_PPV_ARGS(&factory_));
     if (FAILED(hr)) { LogHr(L"CreateDXGIFactory2", hr); return false; }
+    if (IsStopRequested()) return false;
 
     hr = factory_->EnumAdapters(0, &adapter_);
     if (FAILED(hr)) { adapter_.Reset(); }
+    if (IsStopRequested()) return false;
 
     D3D_FEATURE_LEVEL featureLevels[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0};
     D3D_FEATURE_LEVEL obtained = D3D_FEATURE_LEVEL_11_0;
@@ -594,18 +913,21 @@ bool D3D11VideoRenderer::Initialize(HWND host) {
     hr = D3D11CreateDevice(adapter_.Get(), adapter_ ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
                            nullptr, createFlags, featureLevels, static_cast<UINT>(std::size(featureLevels)),
                            D3D11_SDK_VERSION, &device_, &obtained, &context_);
+    if (IsStopRequested()) return false;
     if (FAILED(hr)) {
         // WARP fallback.
         hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                               featureLevels, static_cast<UINT>(std::size(featureLevels)),
                               D3D11_SDK_VERSION, &device_, &obtained, &context_);
         if (FAILED(hr)) { LogHr(L"D3D11CreateDevice", hr); return false; }
+        if (IsStopRequested()) return false;
     }
     EnableMultithreadProtection();
     Microsoft::WRL::ComPtr<IDXGIDevice1> dxgiDevice;
     if (SUCCEEDED(device_.As(&dxgiDevice)) && dxgiDevice) {
         dxgiDevice->SetMaximumFrameLatency(1);
     }
+    if (IsStopRequested()) return false;
 
     DXGI_SWAP_CHAIN_DESC1 desc{};
     desc.Width = width;
@@ -623,7 +945,10 @@ bool D3D11VideoRenderer::Initialize(HWND host) {
     // latency waitable flag on systems/drivers that expose it.
     desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
     hr = factory_->CreateSwapChainForComposition(device_.Get(), &desc, nullptr, &swapChain_);
-    if (SUCCEEDED(hr) && swapChain_ && CreateComposition()) {
+    if (IsStopRequested()) return false;
+    const bool createdWaitableComposition = SUCCEEDED(hr) && swapChain_ && CreateComposition();
+    if (IsStopRequested()) return false;
+    if (createdWaitableComposition) {
         useComposition_ = true;
         LogInfo(L"swap chain created via CreateSwapChainForComposition + DirectComposition waitable=true");
     } else {
@@ -635,7 +960,10 @@ bool D3D11VideoRenderer::Initialize(HWND host) {
 
         desc.Flags = 0;
         hr = factory_->CreateSwapChainForComposition(device_.Get(), &desc, nullptr, &swapChain_);
-        if (SUCCEEDED(hr) && swapChain_ && CreateComposition()) {
+        if (IsStopRequested()) return false;
+        const bool createdComposition = SUCCEEDED(hr) && swapChain_ && CreateComposition();
+        if (IsStopRequested()) return false;
+        if (createdComposition) {
             useComposition_ = true;
             LogInfo(L"swap chain created via CreateSwapChainForComposition + DirectComposition waitable=false");
         } else {
@@ -649,22 +977,29 @@ bool D3D11VideoRenderer::Initialize(HWND host) {
             useComposition_ = false;
 
             desc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
-            hr = factory_->CreateSwapChainForHwnd(device_.Get(), host_, &desc, nullptr, nullptr, &swapChain_);
+            const HWND swapChainHost = host_.load(std::memory_order_acquire);
+            if (IsStopRequested() || !swapChainHost || !IsWindow(swapChainHost)) return false;
+            hr = factory_->CreateSwapChainForHwnd(device_.Get(), swapChainHost, &desc, nullptr, nullptr, &swapChain_);
+            if (IsStopRequested()) return false;
             if (SUCCEEDED(hr)) {
                 LogInfo(L"swap chain created via CreateSwapChainForHwnd (composition fallback) waitable=true");
             } else {
                 desc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
-                hr = factory_->CreateSwapChainForHwnd(device_.Get(), host_, &desc, nullptr, nullptr, &swapChain_);
+                if (IsStopRequested()) return false;
+                hr = factory_->CreateSwapChainForHwnd(device_.Get(), swapChainHost, &desc, nullptr, nullptr, &swapChain_);
                 if (FAILED(hr)) { LogHr(L"CreateSwapChainForHwnd", hr); return false; }
+                if (IsStopRequested()) return false;
                 LogInfo(L"swap chain created via CreateSwapChainForHwnd (composition fallback) waitable=false");
             }
         }
     }
 
     ConfigureFramePacing();
+    if (IsStopRequested()) return false;
     if (!CreateRenderTarget()) return false;
+    if (IsStopRequested()) return false;
     if (!CreatePipeline()) return false;
-    ApplySwapChainColorSpace(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, mediaColor_);
+    if (IsStopRequested()) return false;
 
     viewport_.TopLeftX = 0.0f;
     viewport_.TopLeftY = 0.0f;
@@ -672,15 +1007,28 @@ bool D3D11VideoRenderer::Initialize(HWND host) {
     viewport_.Height = static_cast<float>(height);
     viewport_.MinDepth = 0.0f;
     viewport_.MaxDepth = 1.0f;
+    if (!ApplySwapChainColorSpace(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, mediaColor_)) {
+        // Color-space support is best-effort and was not fatal in the previous
+        // synchronous initialization path.
+    }
+    if (IsStopRequested()) return false;
     return true;
 }
 
 void D3D11VideoRenderer::ConfigureColorPipeline(const anvil::playback::VideoSettings& settings,
                                                 const anvil::playback::DisplayCapabilities& display,
                                                 const anvil::playback::VideoColorMetadata& mediaColor) {
-    videoSettings_ = settings;
-    displayCapabilities_ = display;
-    mediaColor_ = mediaColor;
+    {
+        std::lock_guard lock(commandMutex_);
+        pendingColorPipeline_ = PendingColorPipeline{settings, display, mediaColor};
+    }
+    commandCv_.notify_one();
+}
+
+void D3D11VideoRenderer::ApplyColorPipelineConfiguration(const PendingColorPipeline& configuration) {
+    videoSettings_ = configuration.settings;
+    displayCapabilities_ = configuration.display;
+    mediaColor_ = configuration.mediaColor;
     activePipelineLabel_.clear();
     activePipelineSignature_ = 0;
     hdrMetadataApplied_ = false;
@@ -688,6 +1036,14 @@ void D3D11VideoRenderer::ConfigureColorPipeline(const anvil::playback::VideoSett
 }
 
 void D3D11VideoRenderer::ConfigureSubtitleSettings(const anvil::playback::SubtitleSettings& settings) {
+    {
+        std::lock_guard lock(commandMutex_);
+        pendingSubtitleSettings_ = settings;
+    }
+    commandCv_.notify_one();
+}
+
+void D3D11VideoRenderer::ApplySubtitleConfiguration(const anvil::playback::SubtitleSettings& settings) {
     subtitleSettings_ = settings;
     activeSubtitleText_.clear();
     activeSubtitleBitmapKey_.clear();
@@ -695,12 +1051,36 @@ void D3D11VideoRenderer::ConfigureSubtitleSettings(const anvil::playback::Subtit
 }
 
 void D3D11VideoRenderer::OnResize() {
-    if (!swapChain_ || !host_) return;
+    {
+        std::lock_guard lock(commandMutex_);
+        if (!acceptingCommands_) {
+            return;
+        }
+    }
+
+    const HWND host = host_.load(std::memory_order_acquire);
+    if (!host) {
+        return;
+    }
     RECT rc{};
-    GetClientRect(host_, &rc);
+    GetClientRect(host, &rc);
     const UINT width = static_cast<UINT>(std::max(1, RectWidth(rc)));
     const UINT height = static_cast<UINT>(std::max(1, RectHeight(rc)));
 
+    {
+        std::lock_guard lock(commandMutex_);
+        if (!acceptingCommands_) {
+            return;
+        }
+        pendingResizeWidth_ = width;
+        pendingResizeHeight_ = height;
+        pendingResize_ = true;
+    }
+    commandCv_.notify_one();
+}
+
+void D3D11VideoRenderer::ResizeOnRenderThread(const UINT width, const UINT height) {
+    if (!swapChain_) return;
     backBuffer_.Reset();
     rtv_.Reset();
     // Composition swap chains do not use ALLOW_MODE_SWITCH; only set it for the
@@ -730,18 +1110,313 @@ void D3D11VideoRenderer::OnResize() {
 }
 
 void D3D11VideoRenderer::SetDiagnosticsEnabled(const bool enabled) {
+    {
+        std::lock_guard lock(commandMutex_);
+        pendingDiagnosticsEnabled_ = enabled;
+        pendingResetStats_ = true;
+    }
+    commandCv_.notify_one();
+}
+
+void D3D11VideoRenderer::SetDiagnosticsEnabledOnRenderThread(const bool enabled) {
     diagnosticsEnabled_ = enabled;
-    ResetRenderStats();
+    ResetRenderStatsOnRenderThread();
 }
 
 void D3D11VideoRenderer::ResetRenderStats() {
+    {
+        std::lock_guard lock(commandMutex_);
+        pendingResetStats_ = true;
+    }
+    commandCv_.notify_one();
+}
+
+void D3D11VideoRenderer::ResetRenderStatsOnRenderThread() {
     renderStats_ = {};
+    std::lock_guard lock(publishedStatsMutex_);
+    publishedRenderStats_ = {};
 }
 
 D3D11RenderStats D3D11VideoRenderer::TakeRenderStats() {
-    const D3D11RenderStats stats = renderStats_;
-    renderStats_ = {};
+    std::lock_guard lock(publishedStatsMutex_);
+    const D3D11RenderStats stats = publishedRenderStats_;
+    publishedRenderStats_ = {};
     return stats;
+}
+
+void D3D11VideoRenderer::PublishRenderStats() {
+    const D3D11RenderStats snapshot = renderStats_;
+    renderStats_ = {};
+    if (!diagnosticsEnabled_) {
+        return;
+    }
+    std::lock_guard lock(publishedStatsMutex_);
+    AccumulateRenderStats(publishedRenderStats_, snapshot);
+}
+
+bool D3D11VideoRenderer::HasPendingWorkLocked() const {
+    return pendingFrame_ != nullptr ||
+           pendingResize_ ||
+           pendingColorPipeline_.has_value() ||
+           pendingSubtitleSettings_.has_value() ||
+           pendingDiagnosticsEnabled_.has_value() ||
+           pendingResetStats_ ||
+           pendingClear_;
+}
+
+void D3D11VideoRenderer::RequestStop(const HWND completionWindow,
+                                     const UINT completionMessage,
+                                     const uint64_t completionCookie) {
+    bool postCompletionNow = false;
+    {
+        std::lock_guard lock(commandMutex_);
+        acceptingCommands_ = false;
+        if (stopped_.load(std::memory_order_acquire)) {
+            postCompletionNow = completionWindow != nullptr && completionMessage != 0;
+        } else {
+            stopRequested_ = true;
+            // Withdraw the borrowed HWND together with the device. A render
+            // worker returning from a stalled driver call will observe null
+            // before issuing any subsequent HWND-bound DComp/DXGI operation.
+            host_.store(nullptr, std::memory_order_release);
+            // Withdraw the borrowed device before the worker begins releasing
+            // it. A driver call already in progress remains confined to the
+            // render thread and is released immediately after it returns.
+            publishedDevice_.store(nullptr, std::memory_order_release);
+            state_.store(D3D11RendererState::Stopping, std::memory_order_release);
+            if (completionWindow && completionMessage != 0) {
+                stopCompletionWindow_ = completionWindow;
+                stopCompletionMessage_ = completionMessage;
+                stopCompletionCookie_ = completionCookie;
+            }
+            pendingResize_ = false;
+            pendingClear_ = false;
+        }
+    }
+    if (postCompletionNow) {
+        PostMessageW(completionWindow,
+                     completionMessage,
+                     static_cast<WPARAM>(completionCookie),
+                     0);
+        return;
+    }
+    commandCv_.notify_all();
+}
+
+bool D3D11VideoRenderer::IsStopped() const noexcept {
+    return stopped_.load(std::memory_order_acquire);
+}
+
+void D3D11VideoRenderer::StopRenderThread() {
+    RequestStop(nullptr, 0);
+    if (renderThread_.joinable()) {
+        renderThread_.join();
+    }
+}
+
+void D3D11VideoRenderer::RenderThreadMain() {
+    const HRESULT apartmentHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool uninitializeApartment = SUCCEEDED(apartmentHr);
+    if (FAILED(apartmentHr) && apartmentHr != RPC_E_CHANGED_MODE) {
+        LogHr(L"render thread CoInitializeEx", apartmentHr);
+    }
+
+    bool initialized = false;
+    try {
+        initialized = InitializeGpuOnRenderThread(initialWidth_, initialHeight_);
+    } catch (const std::exception& error) {
+        LogInfo(L"render initialization exception=" + Utf8ToWide(error.what()));
+    } catch (...) {
+        LogInfo(L"render initialization exception=unknown");
+    }
+
+    HWND initializationCompletionWindow = nullptr;
+    UINT initializationCompletionMessage = 0;
+    uint64_t initializationCompletionCookie = 0;
+    bool ready = false;
+    {
+        std::lock_guard lock(commandMutex_);
+        if (initialized && !stopRequested_) {
+            // Publish the raw device before the release-store of Ready. Device()
+            // performs the matching acquire-load and therefore cannot observe
+            // a partially initialized pipeline.
+            publishedDevice_.store(device_.Get(), std::memory_order_release);
+            state_.store(D3D11RendererState::Ready, std::memory_order_release);
+            initializationCompletionWindow = initializationCompletionWindow_;
+            initializationCompletionMessage = initializationCompletionMessage_;
+            initializationCompletionCookie = initializationCompletionCookie_;
+            initializationCompletionWindow_ = nullptr;
+            initializationCompletionMessage_ = 0;
+            initializationCompletionCookie_ = 0;
+            ready = true;
+        }
+    }
+
+    if (ready) {
+        PostInitializationCompletion(
+            D3D11RendererState::Ready,
+            initializationCompletionWindow,
+            initializationCompletionMessage,
+            initializationCompletionCookie);
+    } else {
+        D3D11QueuedVideoFrame* failedFrame = nullptr;
+        {
+            std::lock_guard lock(commandMutex_);
+            acceptingCommands_ = false;
+            failedFrame = pendingFrame_;
+            pendingFrame_ = nullptr;
+            pendingResize_ = false;
+            pendingColorPipeline_.reset();
+            pendingSubtitleSettings_.reset();
+            pendingDiagnosticsEnabled_.reset();
+            pendingResetStats_ = false;
+            pendingClear_ = false;
+        }
+        RetireQueuedFrame(failedFrame);
+        ReleaseAll();
+
+        HWND stopCompletionWindow = nullptr;
+        UINT stopCompletionMessage = 0;
+        uint64_t stopCompletionCookie = 0;
+        bool cancelled = false;
+        {
+            std::lock_guard lock(commandMutex_);
+            cancelled = stopRequested_;
+            publishedDevice_.store(nullptr, std::memory_order_release);
+            if (cancelled) {
+                state_.store(D3D11RendererState::Stopped, std::memory_order_release);
+                stopCompletionWindow = stopCompletionWindow_;
+                stopCompletionMessage = stopCompletionMessage_;
+                stopCompletionCookie = stopCompletionCookie_;
+            } else {
+                state_.store(D3D11RendererState::Failed, std::memory_order_release);
+                initializationCompletionWindow = initializationCompletionWindow_;
+                initializationCompletionMessage = initializationCompletionMessage_;
+                initializationCompletionCookie = initializationCompletionCookie_;
+            }
+            initializationCompletionWindow_ = nullptr;
+            initializationCompletionMessage_ = 0;
+            initializationCompletionCookie_ = 0;
+            stopCompletionWindow_ = nullptr;
+            stopCompletionMessage_ = 0;
+            stopCompletionCookie_ = 0;
+            stopped_.store(true, std::memory_order_release);
+        }
+
+        if (!cancelled) {
+            PostInitializationCompletion(
+                D3D11RendererState::Failed,
+                initializationCompletionWindow,
+                initializationCompletionMessage,
+                initializationCompletionCookie);
+        }
+        if (stopCompletionWindow && stopCompletionMessage != 0) {
+            PostMessageW(stopCompletionWindow,
+                         stopCompletionMessage,
+                         static_cast<WPARAM>(stopCompletionCookie),
+                         0);
+        }
+        if (uninitializeApartment) {
+            CoUninitialize();
+        }
+        return;
+    }
+
+    D3D11QueuedVideoFrame* shutdownFrame = nullptr;
+    for (;;) {
+        D3D11QueuedVideoFrame* frame = nullptr;
+        std::optional<PendingColorPipeline> colorPipeline;
+        std::optional<anvil::playback::SubtitleSettings> subtitleSettings;
+        std::optional<bool> diagnosticsEnabled;
+        bool resize = false;
+        UINT resizeWidth = 1;
+        UINT resizeHeight = 1;
+        bool resetStats = false;
+        bool clear = false;
+
+        {
+            std::unique_lock lock(commandMutex_);
+            commandCv_.wait(lock, [this]() {
+                return stopRequested_ || HasPendingWorkLocked();
+            });
+            if (stopRequested_) {
+                shutdownFrame = pendingFrame_;
+                pendingFrame_ = nullptr;
+                break;
+            }
+
+            frame = pendingFrame_;
+            pendingFrame_ = nullptr;
+            colorPipeline = std::move(pendingColorPipeline_);
+            pendingColorPipeline_.reset();
+            subtitleSettings = std::move(pendingSubtitleSettings_);
+            pendingSubtitleSettings_.reset();
+            diagnosticsEnabled = pendingDiagnosticsEnabled_;
+            pendingDiagnosticsEnabled_.reset();
+            resize = pendingResize_;
+            resizeWidth = pendingResizeWidth_;
+            resizeHeight = pendingResizeHeight_;
+            pendingResize_ = false;
+            resetStats = pendingResetStats_;
+            pendingResetStats_ = false;
+            clear = pendingClear_;
+            pendingClear_ = false;
+        }
+
+        if (colorPipeline) {
+            ApplyColorPipelineConfiguration(*colorPipeline);
+        }
+        if (subtitleSettings) {
+            ApplySubtitleConfiguration(*subtitleSettings);
+        }
+        if (diagnosticsEnabled) {
+            SetDiagnosticsEnabledOnRenderThread(*diagnosticsEnabled);
+        }
+        if (resetStats) {
+            ResetRenderStatsOnRenderThread();
+        }
+        if (resize) {
+            ResizeOnRenderThread(resizeWidth, resizeHeight);
+        }
+        if (clear) {
+            ClearOnRenderThread();
+        }
+        if (frame) {
+            RenderOnRenderThread(frame->frame);
+            PublishRenderStats();
+            RetireQueuedFrame(frame);
+        }
+    }
+
+    // Retire the final queued decoder/D3D references on this worker as part of
+    // asynchronous shutdown, not on the window thread that called RequestStop.
+    RetireQueuedFrame(shutdownFrame);
+    ReleaseAll();
+
+    HWND completionWindow = nullptr;
+    UINT completionMessage = 0;
+    uint64_t completionCookie = 0;
+    {
+        std::lock_guard lock(commandMutex_);
+        completionWindow = stopCompletionWindow_;
+        completionMessage = stopCompletionMessage_;
+        completionCookie = stopCompletionCookie_;
+        stopCompletionWindow_ = nullptr;
+        stopCompletionMessage_ = 0;
+        stopCompletionCookie_ = 0;
+        publishedDevice_.store(nullptr, std::memory_order_release);
+        state_.store(D3D11RendererState::Stopped, std::memory_order_release);
+        stopped_.store(true, std::memory_order_release);
+    }
+    if (completionWindow && completionMessage != 0) {
+        PostMessageW(completionWindow,
+                     completionMessage,
+                     static_cast<WPARAM>(completionCookie),
+                     0);
+    }
+    if (uninitializeApartment) {
+        CoUninitialize();
+    }
 }
 
 bool D3D11VideoRenderer::ConfigureFramePacing() {
@@ -839,6 +1514,61 @@ void D3D11VideoRenderer::PresentFrame(const UINT syncInterval,
 }
 
 void D3D11VideoRenderer::Render(const NativeVideoFrame& frame) {
+    {
+        std::lock_guard lock(commandMutex_);
+        if (!acceptingCommands_) {
+            return;
+        }
+    }
+
+    FrameRetirementService* const retirement = FrameRetirement();
+    if (!retirement) {
+        return;
+    }
+
+    // All large pixel planes and decoder references in NativeVideoFrame are
+    // shared_ptr/ComPtr-backed. The bounded envelope retains them without a
+    // deep pixel copy and can always be handed to the retirement worker without
+    // allocating after it replaces the mailbox entry.
+    D3D11QueuedVideoFrame* const queuedFrame = retirement->TryAcquire(frame);
+    if (!queuedFrame) {
+        return;
+    }
+
+    D3D11QueuedVideoFrame* replacedFrame = nullptr;
+    bool accepted = false;
+    {
+        std::lock_guard lock(commandMutex_);
+        if (acceptingCommands_) {
+            replacedFrame = pendingFrame_;
+            pendingFrame_ = queuedFrame;
+            accepted = true;
+        }
+    }
+    retirement->Retire(replacedFrame);
+    if (!accepted) {
+        retirement->Retire(queuedFrame);
+        return;
+    }
+    commandCv_.notify_one();
+}
+
+bool D3D11VideoRenderer::RetireFrame(NativeVideoFrame&& frame) noexcept {
+    FrameRetirementService* const retirement = FrameRetirement();
+    if (!retirement) {
+        return false;
+    }
+
+    D3D11QueuedVideoFrame* const queuedFrame =
+        retirement->TryAcquireForRetirement(std::move(frame));
+    if (!queuedFrame) {
+        return false;
+    }
+    retirement->Retire(queuedFrame);
+    return true;
+}
+
+void D3D11VideoRenderer::RenderOnRenderThread(const NativeVideoFrame& frame) {
     if (!device_ || !context_ || !swapChain_) return;
     if (((frame.dovi && frame.dovi->valid) ||
          (frame.enhancementDovi && frame.enhancementDovi->valid) ||
@@ -972,8 +1702,23 @@ void D3D11VideoRenderer::Render(const NativeVideoFrame& frame) {
 }
 
 void D3D11VideoRenderer::Clear() {
+    D3D11QueuedVideoFrame* droppedFrame = nullptr;
+    {
+        std::lock_guard lock(commandMutex_);
+        if (!acceptingCommands_) {
+            return;
+        }
+        droppedFrame = pendingFrame_;
+        pendingFrame_ = nullptr;
+        pendingClear_ = true;
+    }
+    RetireQueuedFrame(droppedFrame);
+    commandCv_.notify_one();
+}
+
+void D3D11VideoRenderer::ClearOnRenderThread() {
     if (!device_ || !context_ || !swapChain_ || !rtv_) return;
-    ResetRenderStats();
+    ResetRenderStatsOnRenderThread();
     hardwareSrvCache_.clear();
     subtitleTextureCache_.clear();
     hwSrvUV_.Reset();
@@ -996,19 +1741,21 @@ bool D3D11VideoRenderer::CreateRenderTarget() {
     Microsoft::WRL::ComPtr<ID3D11Texture2D> backBuffer;
     const HRESULT hr = swapChain_->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
     if (FAILED(hr)) { LogHr(L"GetBuffer", hr); return false; }
+    if (IsStopRequested()) return false;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> rtv;
     const HRESULT rtvHr = device_->CreateRenderTargetView(backBuffer.Get(), nullptr, &rtv);
     if (FAILED(rtvHr)) {
         LogHr(L"CreateRenderTargetView", rtvHr);
         return false;
     }
+    if (IsStopRequested()) return false;
     rtv_ = std::move(rtv);
     backBuffer_ = std::move(backBuffer);
     return true;
 }
 
 bool D3D11VideoRenderer::CreateComposition() {
-    if (!swapChain_ || !host_) {
+    if (!swapChain_ || IsStopRequested()) {
         return false;
     }
     Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;
@@ -1016,18 +1763,26 @@ bool D3D11VideoRenderer::CreateComposition() {
     if (FAILED(hr) || !dxgiDevice) { LogHr(L"D3D device As IDXGIDevice", hr); return false; }
     hr = DCompositionCreateDevice(dxgiDevice.Get(), IID_PPV_ARGS(&dcompDevice_));
     if (FAILED(hr) || !dcompDevice_) { LogHr(L"DCompositionCreateDevice", hr); return false; }
+    if (IsStopRequested()) return false;
+    const HWND host = host_.load(std::memory_order_acquire);
+    if (!host || !IsWindow(host)) return false;
     // CreateTargetForHwnd requires the target window to NOT have
     // WS_EX_NOREDIRECTIONBITMAP; videoHost_ uses dwExStyle = 0, so this holds.
-    hr = dcompDevice_->CreateTargetForHwnd(host_, TRUE, &dcompTarget_);
+    hr = dcompDevice_->CreateTargetForHwnd(host, TRUE, &dcompTarget_);
     if (FAILED(hr) || !dcompTarget_) { LogHr(L"CreateTargetForHwnd", hr); return false; }
+    if (IsStopRequested()) return false;
     hr = dcompDevice_->CreateVisual(&dcompVisual_);
     if (FAILED(hr) || !dcompVisual_) { LogHr(L"CreateVisual", hr); return false; }
+    if (IsStopRequested()) return false;
     hr = dcompVisual_->SetContent(swapChain_.Get());
     if (FAILED(hr)) { LogHr(L"SetContent swapchain", hr); return false; }
+    if (IsStopRequested()) return false;
     hr = dcompTarget_->SetRoot(dcompVisual_.Get());
     if (FAILED(hr)) { LogHr(L"SetRoot", hr); return false; }
+    if (IsStopRequested()) return false;
     hr = dcompDevice_->Commit();
     if (FAILED(hr)) { LogHr(L"DComposition Commit", hr); return false; }
+    if (IsStopRequested()) return false;
     return true;
 }
 
@@ -1840,10 +2595,12 @@ bool D3D11VideoRenderer::CreatePipeline() {
         LogHr(L"D3DCompile vs", E_FAIL);
         return false;
     }
+    if (IsStopRequested()) return false;
     if (FAILED(D3DCompile(psSrc, static_cast<SIZE_T>(std::strlen(psSrc)), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &psBlob, &errors))) {
         LogHr(L"D3DCompile ps", E_FAIL);
         return false;
     }
+    if (IsStopRequested()) return false;
     if (FAILED(D3DCompile(psNv12Src, static_cast<SIZE_T>(std::strlen(psNv12Src)), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &psNv12Blob, &errors))) {
         if (errors && errors->GetBufferPointer() && errors->GetBufferSize() > 0) {
             const std::string errText(static_cast<const char*>(errors->GetBufferPointer()), errors->GetBufferSize());
@@ -1852,14 +2609,20 @@ bool D3D11VideoRenderer::CreatePipeline() {
         LogHr(L"D3DCompile ps nv12", E_FAIL);
         return false;
     }
+    if (IsStopRequested()) return false;
     if (FAILED(D3DCompile(psSubtitleSrc, static_cast<SIZE_T>(std::strlen(psSubtitleSrc)), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &psSubtitleBlob, &errors))) {
         LogHr(L"D3DCompile ps subtitle", E_FAIL);
         return false;
     }
+    if (IsStopRequested()) return false;
     if (FAILED(device_->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &vs_))) return false;
+    if (IsStopRequested()) return false;
     if (FAILED(device_->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &ps_))) return false;
+    if (IsStopRequested()) return false;
     if (FAILED(device_->CreatePixelShader(psNv12Blob->GetBufferPointer(), psNv12Blob->GetBufferSize(), nullptr, &psNv12_))) return false;
+    if (IsStopRequested()) return false;
     if (FAILED(device_->CreatePixelShader(psSubtitleBlob->GetBufferPointer(), psSubtitleBlob->GetBufferSize(), nullptr, &psSubtitle_))) return false;
+    if (IsStopRequested()) return false;
 
     D3D11_SAMPLER_DESC samplerDesc{};
     samplerDesc.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
@@ -1870,6 +2633,7 @@ bool D3D11VideoRenderer::CreatePipeline() {
     samplerDesc.MinLOD = 0;
     samplerDesc.MaxLOD = D3D11_FLOAT32_MAX;
     if (FAILED(device_->CreateSamplerState(&samplerDesc, &sampler_))) return false;
+    if (IsStopRequested()) return false;
 
     D3D11_BLEND_DESC blendDesc{};
     blendDesc.RenderTarget[0].BlendEnable = TRUE;
@@ -1881,12 +2645,14 @@ bool D3D11VideoRenderer::CreatePipeline() {
     blendDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
     blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
     if (FAILED(device_->CreateBlendState(&blendDesc, &subtitleBlend_))) return false;
+    if (IsStopRequested()) return false;
 
     D3D11_BUFFER_DESC constantsDesc{};
     constantsDesc.ByteWidth = sizeof(VideoColorConstants);
     constantsDesc.Usage = D3D11_USAGE_DEFAULT;
     constantsDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     if (FAILED(device_->CreateBuffer(&constantsDesc, nullptr, &colorConstants_))) return false;
+    if (IsStopRequested()) return false;
 
     D3D11_BUFFER_DESC doviDesc{};
     doviDesc.ByteWidth = sizeof(DoviShaderConstants);
@@ -1897,12 +2663,14 @@ bool D3D11VideoRenderer::CreatePipeline() {
         LogHr(L"CreateBuffer dovi", doviHr);
         return false;
     }
+    if (IsStopRequested()) return false;
 
     D3D11_BUFFER_DESC subtitleConstantsDesc{};
     subtitleConstantsDesc.ByteWidth = sizeof(SubtitleShaderConstants);
     subtitleConstantsDesc.Usage = D3D11_USAGE_DEFAULT;
     subtitleConstantsDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     if (FAILED(device_->CreateBuffer(&subtitleConstantsDesc, nullptr, &subtitleConstants_))) return false;
+    if (IsStopRequested()) return false;
     return true;
 }
 
@@ -3151,7 +3919,9 @@ void D3D11VideoRenderer::DrawSubtitleOverlay() {
 }
 
 void D3D11VideoRenderer::ReleaseAll() {
-    ResetRenderStats();
+    publishedDevice_.store(nullptr, std::memory_order_release);
+    host_.store(nullptr, std::memory_order_release);
+    ResetRenderStatsOnRenderThread();
     hardwareSrvCache_.clear();
     subtitleTextureCache_.clear();
     subtitleSrv_.Reset();

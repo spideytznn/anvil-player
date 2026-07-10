@@ -71,7 +71,9 @@ bool WasapiAudioPlayer::Start(const std::filesystem::path& mediaPath,
                               const std::chrono::milliseconds startPosition,
                               const double volume,
                               const int selectedAudioTrackIndex) {
-    Stop();
+    if (!PrepareWorkerForStart()) {
+        return false;
+    }
     if (mediaPath.empty() || selectedAudioTrackIndex == anvil::playback::kAudioTrackOff) {
         return false;
     }
@@ -92,21 +94,26 @@ bool WasapiAudioPlayer::Start(const std::filesystem::path& mediaPath,
         lastStatus_ = L"wasapi shared pcm initializing";
     }
 
-    stopping_.store(false);
-    running_.store(true);
-    playbackThread_ = std::thread([this]() { PlaybackLoop(); });
-
-    std::unique_lock lock(stateMutex_);
-    const bool resolved = startCv_.wait_for(lock, std::chrono::seconds(3), [this]() {
-        return startResolved_;
-    });
-    const bool started = resolved && startSucceeded_;
-    lock.unlock();
-
-    if (!started) {
-        Stop();
+    {
+        std::scoped_lock lock(workerMutex_);
+        const uint64_t workerGeneration = startGeneration_.fetch_add(1) + 1;
+        stopping_.store(false);
+        running_.store(true);
+        runtimeState_.store(WasapiRuntimeState::Starting);
+        workerFinished_.store(false);
+        try {
+            playbackThread_ = std::thread([this, workerGeneration]() {
+                PlaybackLoop(workerGeneration);
+            });
+        } catch (...) {
+            workerFinished_.store(true);
+            running_.store(false);
+            stopping_.store(true);
+            runtimeState_.store(WasapiRuntimeState::Failed);
+            return false;
+        }
     }
-    return started;
+    return true;
 }
 
 bool WasapiAudioPlayer::StartPacketStream(const std::filesystem::path& mediaPath,
@@ -114,62 +121,148 @@ bool WasapiAudioPlayer::StartPacketStream(const std::filesystem::path& mediaPath
                                           const AVRational timeBase,
                                           const std::chrono::milliseconds startPosition,
                                           const double volume,
-                                          const int streamIndex) {
-    Stop();
+                                          const int streamIndex,
+                                          const uint64_t startGeneration) {
+    const auto failCurrentStart = [this, startGeneration](const std::wstring& status) {
+        FailPendingStart(startGeneration, status);
+        return false;
+    };
+    if (startGeneration == 0 || startGeneration != startGeneration_.load() || stopping_.load()) {
+        return false;
+    }
+    if (runtimeState_.load() != WasapiRuntimeState::Starting) {
+        return failCurrentStart(L"wasapi packet start state invalid");
+    }
+    if (!PrepareWorkerForStart()) {
+        return failCurrentStart(L"wasapi previous worker is still retiring");
+    }
     if (mediaPath.empty() || !codecParameters || codecParameters->codec_type != AVMEDIA_TYPE_AUDIO) {
-        return false;
+        return failCurrentStart(L"wasapi packet stream parameters invalid");
     }
 
-    packetCodecParameters_ = avcodec_parameters_alloc();
-    if (!packetCodecParameters_) {
-        return false;
+    AVCodecParameters* preparedParameters = avcodec_parameters_alloc();
+    if (!preparedParameters) {
+        return failCurrentStart(L"wasapi packet codec allocation failed");
     }
-    const int copyError = avcodec_parameters_copy(packetCodecParameters_, codecParameters);
+    const int copyError = avcodec_parameters_copy(preparedParameters, codecParameters);
     if (copyError < 0) {
-        avcodec_parameters_free(&packetCodecParameters_);
+        avcodec_parameters_free(&preparedParameters);
         LogError(L"packet stream codec copy failed: " + FfmpegErrorString(copyError));
-        return false;
+        return failCurrentStart(L"wasapi packet codec copy failed");
     }
 
-    path_ = mediaPath;
-    startPosition_ = startPosition;
-    selectedAudioTrackIndex_ = streamIndex;
-    packetStreamIndex_ = streamIndex;
-    packetTimeBase_ = timeBase;
-    volume_.store(std::clamp(volume, 0.0, 1.0));
-    paused_.store(false);
-    packetInputMode_.store(true);
-    packetStreamEof_.store(false);
-    pausePositionMs_.store(startPosition.count());
-    pendingSeekMs_.store(-1);
-    ioInterruptAfterSteadyMs_.store(0);
-    ResetPlaybackClock(startPosition);
     {
-        std::scoped_lock lock(packetMutex_);
+        std::scoped_lock lock(workerMutex_);
+        // The generation is checked while holding the same short lock used by
+        // Stop(). If cancellation won the race, no late audio worker may be
+        // created for the retired playback session.
+        if (startGeneration != startGeneration_.load() ||
+            runtimeState_.load() != WasapiRuntimeState::Starting || stopping_.load()) {
+            avcodec_parameters_free(&preparedParameters);
+            return false;
+        }
+        packetCodecParameters_ = preparedParameters;
+        path_ = mediaPath;
+        const int64_t armedPositionMs = pausePositionMs_.load();
+        startPosition_ = armedPositionMs >= 0
+                             ? std::chrono::milliseconds{armedPositionMs}
+                             : std::max(startPosition, std::chrono::milliseconds{0});
+        selectedAudioTrackIndex_ = streamIndex;
+        packetStreamIndex_ = streamIndex;
+        packetTimeBase_ = timeBase;
+        volume_.store(std::clamp(volume, 0.0, 1.0));
+        packetInputMode_.store(true);
+        packetStreamEof_.store(false);
+        pendingSeekMs_.store(-1);
+        ioInterruptAfterSteadyMs_.store(0);
+        ResetPlaybackClock(startPosition_);
+        {
+            std::scoped_lock packetLock(packetMutex_);
+            ClearPacketQueueLocked();
+        }
+        {
+            std::scoped_lock stateLock(stateMutex_);
+            startResolved_ = false;
+            startSucceeded_ = false;
+            lastStatus_ = L"wasapi packet pcm initializing";
+        }
+        running_.store(true);
+        workerFinished_.store(false);
+        try {
+            playbackThread_ = std::thread([this, startGeneration]() {
+                PlaybackLoop(startGeneration);
+            });
+        } catch (...) {
+            workerFinished_.store(true);
+            running_.store(false);
+            packetInputMode_.store(false);
+            return failCurrentStart(L"wasapi packet worker creation failed");
+        }
+    }
+    return true;
+}
+
+bool WasapiAudioPlayer::PrepareWorkerForStart() {
+    {
+        std::scoped_lock lock(workerMutex_);
+        if (playbackThread_.joinable()) {
+            if (!workerFinished_.load()) {
+                return false;
+            }
+            playbackThread_.detach();
+        }
+    }
+    packetInputMode_.store(false);
+    {
+        std::scoped_lock packetLock(packetMutex_);
         ClearPacketQueueLocked();
     }
+    if (packetCodecParameters_) {
+        avcodec_parameters_free(&packetCodecParameters_);
+    }
+    return true;
+}
+
+bool WasapiAudioPlayer::HasStartFailed() const {
+    const auto state = runtimeState_.load();
+    return state == WasapiRuntimeState::Failed || state == WasapiRuntimeState::Ended;
+}
+
+uint64_t WasapiAudioPlayer::ArmPendingStart(const std::chrono::milliseconds position) {
+    const uint64_t generation = startGeneration_.fetch_add(1) + 1;
+    stopping_.store(false);
+    paused_.store(false);
+    pendingSeekMs_.store(-1);
+    pausePositionMs_.store(std::max(position, std::chrono::milliseconds{0}).count());
     {
         std::scoped_lock lock(stateMutex_);
         startResolved_ = false;
         startSucceeded_ = false;
-        lastStatus_ = L"wasapi packet pcm initializing";
+        lastStatus_ = L"wasapi packet start armed";
+    }
+    runtimeState_.store(WasapiRuntimeState::Starting);
+    return generation;
+}
+
+void WasapiAudioPlayer::FailPendingStart(const uint64_t startGeneration,
+                                         std::wstring status) {
+    if (startGeneration == 0 ||
+        startGeneration != startGeneration_.load() ||
+        stopping_.load()) {
+        return;
     }
 
-    stopping_.store(false);
-    running_.store(true);
-    playbackThread_ = std::thread([this]() { PlaybackLoop(); });
-
-    std::unique_lock lock(stateMutex_);
-    const bool resolved = startCv_.wait_for(lock, std::chrono::seconds(3), [this]() {
-        return startResolved_;
-    });
-    const bool started = resolved && startSucceeded_;
-    lock.unlock();
-
-    if (!started) {
-        Stop();
+    std::scoped_lock lock(stateMutex_);
+    if (startGeneration != startGeneration_.load() ||
+        stopping_.load() ||
+        runtimeState_.load() != WasapiRuntimeState::Starting) {
+        return;
     }
-    return started;
+    startSucceeded_ = false;
+    startResolved_ = true;
+    lastStatus_ = status.empty() ? L"wasapi packet start failed" : std::move(status);
+    runtimeState_.store(WasapiRuntimeState::Failed);
+    startCv_.notify_all();
 }
 
 bool WasapiAudioPlayer::QueuePacket(const AVPacket* packet) {
@@ -222,21 +315,53 @@ void WasapiAudioPlayer::MarkPacketStreamEof() {
     packetCv_.notify_all();
 }
 
-void WasapiAudioPlayer::Stop() {
+void WasapiAudioPlayer::RequestStop() {
+    const uint64_t cancelledGeneration = startGeneration_.load();
     stopping_.store(true);
+    runtimeState_.store(WasapiRuntimeState::Stopping);
     paused_.store(false);
     pendingSeekMs_.store(-1);
     ioInterruptAfterSteadyMs_.store(0);
     packetStreamEof_.store(true);
     packetCv_.notify_all();
-    SignalStart(false);
+    SignalStart(false, cancelledGeneration);
+    startGeneration_.fetch_add(1);
+
+    const DWORD playbackThreadId = playbackThreadId_.load();
+    if (playbackThreadId != 0) {
+        // WASAPI endpoint discovery and activation use COM. Enable/disable is
+        // owned by PlaybackLoop; this requests cancellation without waiting.
+        CoCancelCall(playbackThreadId, 0);
+    }
+
+    std::unique_lock lock(workerMutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        return;
+    }
+    if (playbackThread_.joinable()) {
+        // FFmpeg's interrupt callback handles cooperative cancellation. This
+        // additionally wakes synchronous Windows I/O issued by that thread.
+        CancelSynchronousIo(playbackThread_.native_handle());
+    }
+}
+
+void WasapiAudioPlayer::Stop() {
+    RequestStop();
+
+    std::scoped_lock lock(workerMutex_);
+    if (playbackThread_.joinable()) {
+        // Repeat cancellation immediately before joining so a new blocking I/O
+        // operation cannot slip between the first request and the join.
+        CancelSynchronousIo(playbackThread_.native_handle());
+    }
     if (playbackThread_.joinable()) {
         playbackThread_.join();
     }
     running_.store(false);
+    runtimeState_.store(WasapiRuntimeState::Stopped);
     packetInputMode_.store(false);
     {
-        std::scoped_lock lock(packetMutex_);
+        std::scoped_lock packetLock(packetMutex_);
         ClearPacketQueueLocked();
     }
     if (packetCodecParameters_) {
@@ -246,26 +371,34 @@ void WasapiAudioPlayer::Stop() {
 }
 
 void WasapiAudioPlayer::Pause(const std::chrono::milliseconds position) {
-    if (!running_.load()) {
+    if (!running_.load() && runtimeState_.load() != WasapiRuntimeState::Starting) {
         SetPlaybackClockRunning(false);
         return;
     }
 
     const auto clamped = std::max(position, std::chrono::milliseconds{0});
+    paused_.store(true);
     pausePositionMs_.store(clamped.count());
     pendingSeekMs_.store(-1);
     ResetPlaybackClock(clamped);
     SetPlaybackClockRunning(false);
-    paused_.store(true);
 }
 
 bool WasapiAudioPlayer::Resume(const std::chrono::milliseconds position) {
-    if (!running_.load()) {
+    const bool pendingStart = !running_.load() && runtimeState_.load() == WasapiRuntimeState::Starting;
+    if ((!running_.load() && !pendingStart) || stopping_.load()) {
         return false;
     }
 
     const auto clamped = std::max(position, std::chrono::milliseconds{0});
-    pendingSeekMs_.store(clamped.count());
+    pausePositionMs_.store(clamped.count());
+    if (pendingStart) {
+        pendingSeekMs_.store(-1);
+        ResetPlaybackClock(clamped);
+        SetPlaybackClockRunning(false);
+    } else {
+        pendingSeekMs_.store(clamped.count());
+    }
     paused_.store(false);
     return true;
 }
@@ -281,18 +414,21 @@ void WasapiAudioPlayer::HoldPacketStream(const std::chrono::milliseconds positio
     }
 
     const auto clamped = std::max(position, std::chrono::milliseconds{0});
-    pausePositionMs_.store(clamped.count());
     paused_.store(true);
+    pausePositionMs_.store(clamped.count());
     ResetPlaybackClock(clamped);
     SetPlaybackClockRunning(false);
     packetCv_.notify_all();
 }
 
 bool WasapiAudioPlayer::ResumePacketStream() {
+    if (stopping_.load()) {
+        return false;
+    }
     if (!packetInputMode_.load()) {
         return Resume(std::chrono::milliseconds{std::max<int64_t>(0, pausePositionMs_.load())});
     }
-    if (!running_.load()) {
+    if (!running_.load() || stopping_.load()) {
         return false;
     }
 
@@ -302,7 +438,7 @@ bool WasapiAudioPlayer::ResumePacketStream() {
 }
 
 bool WasapiAudioPlayer::Seek(const std::chrono::milliseconds position) {
-    if (!running_.load()) {
+    if (!running_.load() || stopping_.load()) {
         return false;
     }
 
@@ -358,6 +494,9 @@ std::wstring WasapiAudioPlayer::LastStatus() const {
 }
 
 std::optional<std::chrono::milliseconds> WasapiAudioPlayer::PlaybackClock() const {
+    if (runtimeState_.load() == WasapiRuntimeState::Starting) {
+        return std::chrono::milliseconds{std::max<int64_t>(0, pausePositionMs_.load())};
+    }
     std::scoped_lock lock(clockMutex_);
     if (!clockValid_ || !clockRunning_) {
         return std::nullopt;
@@ -372,14 +511,18 @@ std::optional<std::chrono::milliseconds> WasapiAudioPlayer::PlaybackClock() cons
     return position;
 }
 
-void WasapiAudioPlayer::PlaybackLoop() {
+void WasapiAudioPlayer::PlaybackLoop(const uint64_t workerGeneration) {
+    playbackThreadId_.store(GetCurrentThreadId());
     CoInitScope com;
     if (!com.Ok()) {
         LogError(L"CoInitializeEx failed hr=0x" + HexHr(com.hr));
-        SignalStart(false);
+        SignalStart(false, workerGeneration);
         running_.store(false);
+        playbackThreadId_.store(0);
+        workerFinished_.store(true);
         return;
     }
+    CoCallCancellationScope callCancellation;
 
     AVFormatContext* formatCtx = nullptr;
     AVCodecContext* codecCtx = nullptr;
@@ -401,7 +544,7 @@ void WasapiAudioPlayer::PlaybackLoop() {
             audioClient->Stop();
         }
         if (!audioClientStarted) {
-            SignalStart(false);
+            SignalStart(false, workerGeneration);
         }
         SetPlaybackClockRunning(false);
         if (swrCtx) swr_free(&swrCtx);
@@ -415,6 +558,9 @@ void WasapiAudioPlayer::PlaybackLoop() {
     const bool packetInput = packetInputMode_.load();
 
     do {
+        if (stopping_.load()) {
+            break;
+        }
         const std::string pathUtf8 = WideToUtf8(path_.wstring());
         const bool networkSource = IsNetworkMediaPath(path_);
         const AVCodecParameters* inputCodecParameters = nullptr;
@@ -455,9 +601,15 @@ void WasapiAudioPlayer::PlaybackLoop() {
                 LogError(L"avformat_open_input failed: " + FfmpegErrorString(error));
                 break;
             }
+            if (stopping_.load()) {
+                break;
+            }
             error = avformat_find_stream_info(formatCtx, nullptr);
             if (error < 0) {
                 LogError(L"avformat_find_stream_info failed: " + FfmpegErrorString(error));
+                break;
+            }
+            if (stopping_.load()) {
                 break;
             }
             if (selectedAudioTrackIndex_ >= 0 &&
@@ -503,6 +655,9 @@ void WasapiAudioPlayer::PlaybackLoop() {
             LogError(L"avcodec_open2 failed: " + FfmpegErrorString(error));
             break;
         }
+        if (stopping_.load()) {
+            break;
+        }
 
         UINT32 bufferFrameCount = 0;
         if (!InitializeWasapi(audioClient, renderClient, outputFormat, bufferFrameCount)) {
@@ -546,7 +701,7 @@ void WasapiAudioPlayer::PlaybackLoop() {
             std::scoped_lock lock(stateMutex_);
             lastStatus_ = outputFormat.description;
         }
-        SignalStart(true);
+        SignalStart(true, workerGeneration);
 
         while (!stopping_.load()) {
             if (!HandlePause(audioClient.Get(), outputFormat, submittedFrames, audioClientStarted)) {
@@ -669,6 +824,18 @@ void WasapiAudioPlayer::PlaybackLoop() {
     } while (false);
 
     cleanup();
+    playbackThreadId_.store(0);
+    if (workerGeneration == startGeneration_.load()) {
+        const auto finalState = runtimeState_.load();
+        if (stopping_.load()) {
+            runtimeState_.store(WasapiRuntimeState::Stopped);
+        } else if (finalState == WasapiRuntimeState::Starting) {
+            runtimeState_.store(WasapiRuntimeState::Failed);
+        } else if (finalState == WasapiRuntimeState::Ready) {
+            runtimeState_.store(WasapiRuntimeState::Ended);
+        }
+    }
+    workerFinished_.store(true);
 }
 
 std::optional<std::chrono::milliseconds> WasapiAudioPlayer::TakePendingSeek() {
@@ -801,6 +968,7 @@ bool WasapiAudioPlayer::ApplyPendingPacketSeek(AVCodecContext* codecCtx,
                                                const WasapiFormat& outputFormat,
                                                uint64_t& submittedFrames,
                                                bool& audioClientStarted) {
+    (void)outputFormat;
     const auto target = TakePendingSeek();
     if (!target.has_value()) {
         return true;
@@ -1352,12 +1520,24 @@ void WasapiAudioPlayer::UpdatePlaybackClock(const WasapiFormat& outputFormat,
     clockUpdatedAt_ = std::chrono::steady_clock::now();
 }
 
-void WasapiAudioPlayer::SignalStart(const bool success) {
+void WasapiAudioPlayer::SignalStart(const bool success,
+                                    const uint64_t workerGeneration) {
     std::scoped_lock lock(stateMutex_);
+    if (workerGeneration != startGeneration_.load()) {
+        return;
+    }
+    const bool acceptedSuccess = success &&
+                                 !stopping_.load() &&
+                                 runtimeState_.load() == WasapiRuntimeState::Starting;
     if (!startResolved_) {
-        startSucceeded_ = success;
+        startSucceeded_ = acceptedSuccess;
         startResolved_ = true;
         startCv_.notify_all();
+    }
+    if (acceptedSuccess) {
+        runtimeState_.store(WasapiRuntimeState::Ready);
+    } else if (!stopping_.load()) {
+        runtimeState_.store(WasapiRuntimeState::Failed);
     }
 }
 

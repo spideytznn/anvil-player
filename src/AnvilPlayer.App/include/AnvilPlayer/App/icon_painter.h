@@ -29,6 +29,11 @@ public:
     // const-safe: lazy asset loading mutates only mutable cache members.
     bool Draw(HDC hdc, IconKind icon, RECT bounds, COLORREF color) const;
 
+    // Releases every cached GDI+ bitmap. MainWindow calls this on its UI
+    // thread before ownership is handed to a background destruction reaper,
+    // so the reaper never touches GDI+ objects.
+    void ClearCache() noexcept;
+
 private:
     std::filesystem::path ModuleDirectory() const;
     const std::filesystem::path& IconAssetDirectory() const;

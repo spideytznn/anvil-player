@@ -28,6 +28,8 @@ std::filesystem::path FindBundledFfplayFrom(std::filesystem::path start) {
     return {};
 }
 
+// Executable discovery can touch slow or disconnected filesystems. It is only
+// called by EmbeddedFfplayPlayer::ControlLoop, never by a window thread.
 std::filesystem::path FfplayExecutablePath() {
     std::error_code error;
 
@@ -72,6 +74,19 @@ std::wstring DolbyVisionLibplaceboFilter() {
            L"range=pc";
 }
 
+void CloseProcessHandles(PROCESS_INFORMATION& process) {
+    if (process.hThread) {
+        CloseHandle(process.hThread);
+        process.hThread = nullptr;
+    }
+    if (process.hProcess) {
+        CloseHandle(process.hProcess);
+        process.hProcess = nullptr;
+    }
+    process.dwProcessId = 0;
+    process.dwThreadId = 0;
+}
+
 }  // namespace
 
 BOOL CALLBACK FindProcessWindowProc(HWND hwnd, LPARAM lParam) {
@@ -92,7 +107,37 @@ BOOL CALLBACK FindProcessWindowProc(HWND hwnd, LPARAM lParam) {
 }
 
 EmbeddedFfplayPlayer::~EmbeddedFfplayPlayer() {
+    // MainWindow destruction is retired to a background reaper. Blocking here
+    // is intentional: no control worker may outlive the fields it accesses.
     Stop();
+    {
+        std::scoped_lock lock(controlMutex_);
+        exitRequested_ = true;
+        desiredRunning_ = false;
+        pendingStart_.reset();
+        ++desiredGeneration_;
+    }
+    controlCv_.notify_all();
+    if (controlThread_.joinable()) {
+        controlThread_.join();
+    }
+}
+
+bool EmbeddedFfplayPlayer::EnsureControlWorkerLocked() {
+    if (workerStarted_) {
+        return true;
+    }
+
+    workerStarted_ = true;
+    try {
+        controlThread_ = std::thread([this]() {
+            ControlLoop();
+        });
+    } catch (const std::system_error&) {
+        workerStarted_ = false;
+        return false;
+    }
+    return true;
 }
 
 bool EmbeddedFfplayPlayer::Start(HWND parent,
@@ -101,186 +146,96 @@ bool EmbeddedFfplayPlayer::Start(HWND parent,
                                  const std::chrono::milliseconds startPosition,
                                  const double volume,
                                  const bool useLibplaceboDolbyVision) {
-    Stop();
     if (!parent || mediaPath.empty()) {
         return false;
     }
 
-    windowTitle_ = L"Anvil Player Playback " +
-                   std::to_wstring(GetCurrentProcessId()) +
-                   L"-" +
-                   std::to_wstring(++launchSerial_);
-
-    const int volumePercent = std::clamp(static_cast<int>(volume * 100.0 + 0.5), 0, 100);
-    const int playbackWidth = std::max(1, RectWidth(bounds));
-    const int playbackHeight = std::max(1, RectHeight(bounds));
-    const bool networkMedia = IsNetworkMediaPath(mediaPath);
-    std::wstring commandLine =
-        QuoteArgument(FfplayExecutablePath().wstring()) +
-        L" -hide_banner -loglevel warning -autoexit "
-        L"-hwaccel d3d11va -framedrop -noborder "
-        L"-window_title " +
-        QuoteArgument(windowTitle_) +
-        L" -x " +
-        std::to_wstring(playbackWidth) +
-        L" -y " +
-        std::to_wstring(playbackHeight) +
-        L" -ss " +
-        FormatFfmpegSeekTime(startPosition) +
-        L" -volume " + std::to_wstring(volumePercent);
-    if (networkMedia) {
-        commandLine +=
-            L" -rw_timeout 15000000"
-            L" -seekable 1"
-            L" -http_seekable 1"
-            L" -reconnect_on_network_error 1"
-            L" -reconnect_streamed 1"
-            L" -reconnect_delay_max 2"
-            L" -user_agent " +
-            QuoteArgument(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36");
-    }
-    if (useLibplaceboDolbyVision) {
-        commandLine += L" -vf " + QuoteArgument(DolbyVisionLibplaceboFilter());
-    }
-    commandLine +=
-        L" " + QuoteArgument(mediaPath.wstring());
-    lastCommandLine_ = commandLine;
-
-    STARTUPINFOW startupInfo{};
-    startupInfo.cb = sizeof(startupInfo);
-    startupInfo.dwFlags |= STARTF_USESHOWWINDOW;
-    startupInfo.wShowWindow = SW_HIDE;
-    PROCESS_INFORMATION processInfo{};
-    const BOOL created = CreateProcessW(
-        nullptr,
-        commandLine.data(),
-        nullptr,
-        nullptr,
-        FALSE,
-        0,
-        nullptr,
-        nullptr,
-        &startupInfo,
-        &processInfo);
-
-    if (!created) {
-        return false;
-    }
-
-    process_ = processInfo;
-    parent_ = parent;
     {
-        std::scoped_lock lock(windowMutex_);
-        childWindow_ = nullptr;
+        std::scoped_lock lock(controlMutex_);
+        if (!EnsureControlWorkerLocked()) {
+            running_ = false;
+            return false;
+        }
+
+        const std::uint64_t generation = ++desiredGeneration_;
+        pendingStart_ = StartRequest{
+            generation,
+            parent,
+            bounds,
+            mediaPath,
+            startPosition,
+            volume,
+            useLibplaceboDolbyVision,
+        };
         pendingBounds_ = bounds;
+        ++boundsGeneration_;
+        desiredRunning_ = true;
+        running_ = true;
+        attached_ = false;
     }
-    stopping_ = false;
-    running_ = true;
-    attachThread_ = std::thread([this, parent, bounds, processId = processInfo.dwProcessId, title = windowTitle_]() {
-        AttachWindowLoop(parent, bounds, processId, title);
-    });
+    controlCv_.notify_all();
     return true;
 }
 
-void EmbeddedFfplayPlayer::Stop() {
-    stopping_ = true;
-    if (process_.hProcess) {
-        TerminateProcess(process_.hProcess, 0);
-        WaitForSingleObject(process_.hProcess, 2000);
+std::uint64_t EmbeddedFfplayPlayer::RequestStopLocked() {
+    const std::uint64_t generation = ++desiredGeneration_;
+    desiredRunning_ = false;
+    pendingStart_.reset();
+    if (!workerStarted_) {
+        settledGeneration_ = generation;
+        running_ = false;
+        attached_ = false;
     }
-    if (attachThread_.joinable()) {
-        attachThread_.join();
-    }
+    return generation;
+}
+
+void EmbeddedFfplayPlayer::RequestStop() {
     {
-        std::scoped_lock lock(windowMutex_);
-        childWindow_ = nullptr;
+        std::scoped_lock lock(controlMutex_);
+        RequestStopLocked();
     }
-    if (process_.hThread) {
-        CloseHandle(process_.hThread);
-        process_.hThread = nullptr;
+    // This is deliberately only a state publication and wakeup. Process
+    // termination, waits, handle closure, and HWND calls are worker-owned.
+    controlCv_.notify_all();
+}
+
+void EmbeddedFfplayPlayer::Stop() {
+    std::unique_lock lock(controlMutex_);
+    const std::uint64_t stopGeneration = RequestStopLocked();
+    controlCv_.notify_all();
+    if (!workerStarted_) {
+        return;
     }
-    if (process_.hProcess) {
-        CloseHandle(process_.hProcess);
-        process_.hProcess = nullptr;
-    }
-    running_ = false;
+    controlCv_.wait(lock, [this, stopGeneration]() {
+        return settledGeneration_ >= stopGeneration;
+    });
 }
 
 bool EmbeddedFfplayPlayer::IsRunning() const {
-    if (!process_.hProcess) {
-        return false;
-    }
-    return WaitForSingleObject(process_.hProcess, 0) == WAIT_TIMEOUT;
+    return running_.load();
 }
 
 bool EmbeddedFfplayPlayer::HasAttachedWindow() const {
-    std::scoped_lock lock(windowMutex_);
-    return childWindow_ && IsWindow(childWindow_);
+    return attached_.load();
 }
 
 void EmbeddedFfplayPlayer::SetBounds(const RECT bounds) {
-    std::scoped_lock lock(windowMutex_);
-    pendingBounds_ = bounds;
-    if (childWindow_ && IsWindow(childWindow_)) {
-        if (RectWidth(bounds) <= 0 || RectHeight(bounds) <= 0) {
-            ShowWindow(childWindow_, SW_HIDE);
-            return;
-        }
-        SetWindowPos(childWindow_,
-                     HWND_TOP,
-                     bounds.left,
-                     bounds.top,
-                     RectWidth(bounds),
-                     RectHeight(bounds),
-                     SWP_NOACTIVATE | SWP_FRAMECHANGED);
-        ShowWindow(childWindow_, SW_SHOWNOACTIVATE);
-    }
-}
-
-void EmbeddedFfplayPlayer::AttachWindowLoop(HWND parent, RECT bounds, const DWORD processId, const std::wstring title) {
-    constexpr int kAttempts = 80;
-    constexpr DWORD kDelayMs = 25;
-    for (int attempt = 0; attempt < kAttempts && !stopping_; ++attempt) {
-        if (!process_.hProcess || WaitForSingleObject(process_.hProcess, 0) != WAIT_TIMEOUT) {
-            return;
-        }
-
-        WindowSearch search{processId, &title, nullptr};
-        EnumWindows(FindProcessWindowProc, reinterpret_cast<LPARAM>(&search));
-        if (!search.window) {
-            Sleep(kDelayMs);
-            continue;
-        }
-
-        AttachWindow(parent, search.window, bounds);
-        return;
-    }
-}
-
-void EmbeddedFfplayPlayer::AttachWindow(HWND parent, HWND child, RECT bounds) {
-    if (!parent || !child || stopping_) {
-        return;
-    }
-
-    // Hide the ffplay window before reparenting so it never flashes as a
-    // standalone top-level window while play/seek restarts.
-    ShowWindow(child, SW_HIDE);
-    SetParent(child, parent);
-    LONG_PTR style = GetWindowLongPtrW(child, GWL_STYLE);
-    style &= ~(WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
-    style |= WS_CHILD | WS_CLIPSIBLINGS;
-    SetWindowLongPtrW(child, GWL_STYLE, style);
-
-    LONG_PTR exStyle = GetWindowLongPtrW(child, GWL_EXSTYLE);
-    exStyle &= ~(WS_EX_APPWINDOW | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE);
-    SetWindowLongPtrW(child, GWL_EXSTYLE, exStyle);
-
     {
-        std::scoped_lock lock(windowMutex_);
-        childWindow_ = child;
-        if (RectWidth(pendingBounds_) > 0 && RectHeight(pendingBounds_) > 0) {
-            bounds = pendingBounds_;
-        }
+        std::scoped_lock lock(controlMutex_);
+        pendingBounds_ = bounds;
+        ++boundsGeneration_;
+    }
+    controlCv_.notify_all();
+}
+
+std::wstring EmbeddedFfplayPlayer::LastCommandLine() const {
+    std::scoped_lock lock(commandLineMutex_);
+    return lastCommandLine_;
+}
+
+void EmbeddedFfplayPlayer::ApplyBounds(HWND child, const RECT bounds) {
+    if (!child || !IsWindow(child)) {
+        return;
     }
 
     const int width = RectWidth(bounds);
@@ -298,9 +253,244 @@ void EmbeddedFfplayPlayer::AttachWindow(HWND parent, HWND child, RECT bounds) {
                  width,
                  height,
                  SWP_NOACTIVATE | SWP_FRAMECHANGED);
-    // Reveal only after the child is correctly parented and sized. WebView is
-    // opaque, so external playback has to sit above the playback surface.
     ShowWindow(child, SW_SHOWNOACTIVATE);
+}
+
+void EmbeddedFfplayPlayer::AttachWindow(HWND parent, HWND child, const RECT bounds) {
+    if (!parent || !child || !IsWindow(parent) || !IsWindow(child)) {
+        return;
+    }
+
+    // All interactions with the foreign ffplay HWND happen on ControlLoop.
+    ShowWindow(child, SW_HIDE);
+    SetParent(child, parent);
+    LONG_PTR style = GetWindowLongPtrW(child, GWL_STYLE);
+    style &= ~(WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
+    style |= WS_CHILD | WS_CLIPSIBLINGS;
+    SetWindowLongPtrW(child, GWL_STYLE, style);
+
+    LONG_PTR exStyle = GetWindowLongPtrW(child, GWL_EXSTYLE);
+    exStyle &= ~(WS_EX_APPWINDOW | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE);
+    SetWindowLongPtrW(child, GWL_EXSTYLE, exStyle);
+    ApplyBounds(child, bounds);
+}
+
+void EmbeddedFfplayPlayer::ControlLoop() {
+    PROCESS_INFORMATION process{};
+    std::optional<StartRequest> activeRequest;
+    HWND childWindow = nullptr;
+    std::wstring windowTitle;
+    std::uint64_t appliedBoundsGeneration = 0;
+    int attachAttempts = 0;
+
+    auto retireActiveProcess = [&](const bool terminate) {
+        if (childWindow && IsWindow(childWindow)) {
+            ShowWindow(childWindow, SW_HIDE);
+        }
+        childWindow = nullptr;
+        attached_ = false;
+
+        if (process.hProcess) {
+            if (terminate && WaitForSingleObject(process.hProcess, 0) == WAIT_TIMEOUT) {
+                TerminateProcess(process.hProcess, 0);
+            }
+            if (terminate) {
+                WaitForSingleObject(process.hProcess, 2000);
+            }
+        }
+        CloseProcessHandles(process);
+        activeRequest.reset();
+    };
+
+    for (;;) {
+        bool exitRequested = false;
+        bool desiredRunning = false;
+        std::uint64_t desiredGeneration = 0;
+        RECT latestBounds{};
+        std::uint64_t boundsGeneration = 0;
+        {
+            std::scoped_lock lock(controlMutex_);
+            exitRequested = exitRequested_;
+            desiredRunning = desiredRunning_;
+            desiredGeneration = desiredGeneration_;
+            latestBounds = pendingBounds_;
+            boundsGeneration = boundsGeneration_;
+        }
+
+        if (activeRequest &&
+            (exitRequested || !desiredRunning || activeRequest->generation != desiredGeneration)) {
+            retireActiveProcess(true);
+            continue;
+        }
+
+        if (!activeRequest) {
+            std::optional<StartRequest> request;
+            {
+                std::unique_lock lock(controlMutex_);
+                if (exitRequested_) {
+                    running_ = false;
+                    attached_ = false;
+                    settledGeneration_ = std::max(settledGeneration_, desiredGeneration_);
+                    controlCv_.notify_all();
+                    break;
+                }
+
+                if (!desiredRunning_) {
+                    running_ = false;
+                    attached_ = false;
+                    settledGeneration_ = std::max(settledGeneration_, desiredGeneration_);
+                    controlCv_.notify_all();
+                    controlCv_.wait(lock, [this]() {
+                        return exitRequested_ || desiredRunning_;
+                    });
+                    continue;
+                }
+
+                if (!pendingStart_) {
+                    controlCv_.wait(lock, [this]() {
+                        return exitRequested_ || !desiredRunning_ || pendingStart_.has_value();
+                    });
+                    continue;
+                }
+                request = std::move(pendingStart_);
+                pendingStart_.reset();
+                if (request->generation > 0) {
+                    settledGeneration_ = std::max(settledGeneration_, request->generation - 1);
+                    controlCv_.notify_all();
+                }
+            }
+
+            windowTitle = L"Anvil Player Playback " +
+                          std::to_wstring(GetCurrentProcessId()) +
+                          L"-" + std::to_wstring(request->generation);
+            const int volumePercent = std::clamp(static_cast<int>(request->volume * 100.0 + 0.5), 0, 100);
+            const int playbackWidth = std::max(1, RectWidth(request->bounds));
+            const int playbackHeight = std::max(1, RectHeight(request->bounds));
+            std::wstring commandLine =
+                QuoteArgument(FfplayExecutablePath().wstring()) +
+                L" -hide_banner -loglevel warning -autoexit "
+                L"-hwaccel d3d11va -framedrop -noborder "
+                L"-window_title " + QuoteArgument(windowTitle) +
+                L" -x " + std::to_wstring(playbackWidth) +
+                L" -y " + std::to_wstring(playbackHeight) +
+                L" -ss " + FormatFfmpegSeekTime(request->startPosition) +
+                L" -volume " + std::to_wstring(volumePercent);
+            if (IsNetworkMediaPath(request->mediaPath)) {
+                commandLine +=
+                    L" -rw_timeout 15000000"
+                    L" -seekable 1"
+                    L" -http_seekable 1"
+                    L" -reconnect_on_network_error 1"
+                    L" -reconnect_streamed 1"
+                    L" -reconnect_delay_max 2"
+                    L" -user_agent " +
+                    QuoteArgument(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36");
+            }
+            if (request->useLibplaceboDolbyVision) {
+                commandLine += L" -vf " + QuoteArgument(DolbyVisionLibplaceboFilter());
+            }
+            commandLine += L" " + QuoteArgument(request->mediaPath.wstring());
+            {
+                std::scoped_lock lock(commandLineMutex_);
+                lastCommandLine_ = commandLine;
+            }
+
+            STARTUPINFOW startupInfo{};
+            startupInfo.cb = sizeof(startupInfo);
+            startupInfo.dwFlags = STARTF_USESHOWWINDOW;
+            startupInfo.wShowWindow = SW_HIDE;
+            PROCESS_INFORMATION createdProcess{};
+            const BOOL created = CreateProcessW(nullptr,
+                                                commandLine.data(),
+                                                nullptr,
+                                                nullptr,
+                                                FALSE,
+                                                0,
+                                                nullptr,
+                                                nullptr,
+                                                &startupInfo,
+                                                &createdProcess);
+
+            bool requestStillCurrent = false;
+            {
+                std::scoped_lock lock(controlMutex_);
+                requestStillCurrent = !exitRequested_ && desiredRunning_ &&
+                                      desiredGeneration_ == request->generation;
+            }
+            if (!created || !requestStillCurrent) {
+                if (created) {
+                    if (WaitForSingleObject(createdProcess.hProcess, 0) == WAIT_TIMEOUT) {
+                        TerminateProcess(createdProcess.hProcess, 0);
+                    }
+                    WaitForSingleObject(createdProcess.hProcess, 2000);
+                    CloseProcessHandles(createdProcess);
+                }
+                if (!created) {
+                    std::scoped_lock lock(controlMutex_);
+                    if (desiredGeneration_ == request->generation) {
+                        desiredRunning_ = false;
+                        running_ = false;
+                        settledGeneration_ = std::max(settledGeneration_, request->generation);
+                        controlCv_.notify_all();
+                    }
+                }
+                continue;
+            }
+
+            process = createdProcess;
+            activeRequest = std::move(request);
+            childWindow = nullptr;
+            attached_ = false;
+            running_ = true;
+            attachAttempts = 0;
+            appliedBoundsGeneration = 0;
+            continue;
+        }
+
+        if (WaitForSingleObject(process.hProcess, 0) != WAIT_TIMEOUT) {
+            const std::uint64_t completedGeneration = activeRequest->generation;
+            retireActiveProcess(false);
+            std::scoped_lock lock(controlMutex_);
+            if (desiredGeneration_ == completedGeneration) {
+                desiredRunning_ = false;
+                running_ = false;
+                settledGeneration_ = std::max(settledGeneration_, completedGeneration);
+                controlCv_.notify_all();
+            }
+            continue;
+        }
+
+        if (!childWindow && attachAttempts < 80) {
+            WindowSearch search{process.dwProcessId, &windowTitle, nullptr};
+            EnumWindows(FindProcessWindowProc, reinterpret_cast<LPARAM>(&search));
+            ++attachAttempts;
+            if (search.window) {
+                AttachWindow(activeRequest->parent, search.window, latestBounds);
+                if (IsWindow(search.window)) {
+                    childWindow = search.window;
+                    attached_ = true;
+                    appliedBoundsGeneration = boundsGeneration;
+                }
+            }
+        } else if (childWindow && boundsGeneration != appliedBoundsGeneration) {
+            ApplyBounds(childWindow, latestBounds);
+            appliedBoundsGeneration = boundsGeneration;
+        }
+        if (!childWindow) {
+            // Bounds are applied when the foreign window is eventually found;
+            // remember the version here so the worker does not spin meanwhile.
+            appliedBoundsGeneration = boundsGeneration;
+        }
+
+        std::unique_lock lock(controlMutex_);
+        controlCv_.wait_for(lock, std::chrono::milliseconds{25}, [this, generation = activeRequest->generation,
+                                                                  appliedBoundsGeneration]() {
+            return exitRequested_ || !desiredRunning_ || desiredGeneration_ != generation ||
+                   boundsGeneration_ != appliedBoundsGeneration;
+        });
+    }
+
+    retireActiveProcess(true);
 }
 
 }  // namespace anvil::app

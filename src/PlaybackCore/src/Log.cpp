@@ -3,11 +3,17 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <condition_variable>
+#include <cstdint>
 #include <cwctype>
+#include <deque>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
+#include <system_error>
+#include <thread>
 #include <utility>
+#include <vector>
 
 namespace anvil::playback {
 namespace {
@@ -70,43 +76,410 @@ std::wstring FormatEntry(const LogEntry& entry) {
 
 }  // namespace
 
+struct InMemoryLogSink::AsyncWriter {
+    enum class WorkKind {
+        Entry,
+        FilePathChanged,
+    };
+
+    struct WorkItem {
+        std::uint64_t sequence = 0;
+        WorkKind kind = WorkKind::Entry;
+        LogEntry entry;
+        std::filesystem::path filePath;
+        bool debuggerOutputEnabled = false;
+    };
+
+    struct State {
+        std::mutex mutex;
+        std::condition_variable workAvailable;
+        std::condition_variable progressChanged;
+        std::deque<WorkItem> pending;
+        std::uint64_t lastSubmitted = 0;
+        std::uint64_t completedThrough = 0;
+        bool stopping = false;
+        bool workerCompleted = false;
+    };
+
+    struct FileTarget {
+        void Select(std::filesystem::path newPath) {
+            if (path == newPath) {
+                return;
+            }
+            Close();
+            path = std::move(newPath);
+            retryAfter = {};
+        }
+
+        bool EnsureOpen() {
+            if (path.empty()) {
+                return false;
+            }
+            if (file.is_open()) {
+                return true;
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            if (now < retryAfter) {
+                return false;
+            }
+
+            std::error_code ignored;
+            const auto parent = path.parent_path();
+            if (!parent.empty()) {
+                std::filesystem::create_directories(parent, ignored);
+            }
+
+            ignored.clear();
+            const bool exists = std::filesystem::exists(path, ignored);
+            bool writeBom = !exists;
+            if (exists && !ignored) {
+                const auto size = std::filesystem::file_size(path, ignored);
+                writeBom = !ignored && size == 0;
+            }
+
+            file.clear();
+            file.open(path, std::ios::app | std::ios::binary);
+            if (!file) {
+                file.close();
+                file.clear();
+                retryAfter = now + retryDelay;
+                return false;
+            }
+
+            if (writeBom) {
+                constexpr unsigned char bom[] = {0xEF, 0xBB, 0xBF};
+                file.write(reinterpret_cast<const char*>(bom), sizeof(bom));
+            }
+            return true;
+        }
+
+        void Write(const std::string& line) {
+            if (!EnsureOpen()) {
+                return;
+            }
+            file.write(line.data(), static_cast<std::streamsize>(line.size()));
+            file.put('\n');
+            if (!file) {
+                Close();
+                retryAfter = std::chrono::steady_clock::now() + retryDelay;
+            }
+        }
+
+        void Flush() {
+            if (!file.is_open()) {
+                return;
+            }
+            file.flush();
+            if (!file) {
+                Close();
+                retryAfter = std::chrono::steady_clock::now() + retryDelay;
+            }
+        }
+
+        void Close() {
+            if (file.is_open()) {
+                file.flush();
+                file.close();
+            }
+            file.clear();
+        }
+
+        static constexpr std::chrono::seconds retryDelay{1};
+        std::filesystem::path path;
+        std::ofstream file;
+        std::chrono::steady_clock::time_point retryAfter{};
+    };
+
+    AsyncWriter()
+        : state_(std::make_shared<State>()) {
+    }
+
+    ~AsyncWriter() {
+        Shutdown();
+    }
+
+    void Enqueue(LogEntry entry,
+                 std::filesystem::path filePath,
+                 const bool debuggerOutputEnabled) {
+        WorkItem item;
+        item.kind = WorkKind::Entry;
+        item.entry = std::move(entry);
+        item.filePath = std::move(filePath);
+        item.debuggerOutputEnabled = debuggerOutputEnabled;
+        Enqueue(std::move(item));
+    }
+
+    void FilePathChanged(std::filesystem::path filePath) {
+        WorkItem item;
+        item.kind = WorkKind::FilePathChanged;
+        item.filePath = std::move(filePath);
+        Enqueue(std::move(item));
+    }
+
+    bool Flush(const std::chrono::milliseconds timeout) {
+        std::uint64_t target = 0;
+        {
+            std::scoped_lock lock(state_->mutex);
+            target = state_->lastSubmitted;
+            if (state_->completedThrough >= target) {
+                return true;
+            }
+        }
+
+        EnsureWorkerStarted();
+        std::unique_lock lock(state_->mutex);
+        const auto boundedTimeout = std::max(timeout, std::chrono::milliseconds{0});
+        state_->progressChanged.wait_for(lock, boundedTimeout, [&] {
+            return state_->completedThrough >= target || state_->workerCompleted;
+        });
+        return state_->completedThrough >= target;
+    }
+
+private:
+    static constexpr std::size_t maxPendingEntries = 2048;
+    static constexpr std::size_t maxBatchEntries = 128;
+    static constexpr std::chrono::milliseconds coalesceDelay{4};
+    static constexpr std::chrono::milliseconds shutdownDrainTimeout{200};
+    static constexpr std::chrono::milliseconds cancellationGraceTimeout{50};
+
+    void Enqueue(WorkItem item) {
+        {
+            std::scoped_lock lock(state_->mutex);
+            if (state_->stopping) {
+                return;
+            }
+
+            item.sequence = ++state_->lastSubmitted;
+            if (state_->pending.size() >= maxPendingEntries) {
+                // Keep producer latency and memory fixed; recent diagnostics are more useful
+                // than stale entries when the storage target is slower than the producers.
+                state_->pending.pop_front();
+            }
+            state_->pending.push_back(std::move(item));
+        }
+
+        EnsureWorkerStarted();
+        state_->workAvailable.notify_one();
+    }
+
+    bool EnsureWorkerStarted() {
+        std::scoped_lock threadLock(threadMutex_);
+        if (worker_.joinable()) {
+            return true;
+        }
+        {
+            std::scoped_lock stateLock(state_->mutex);
+            if (state_->stopping) {
+                return false;
+            }
+        }
+
+        try {
+            worker_ = std::thread(&AsyncWriter::WorkerLoop, state_);
+        } catch (const std::system_error&) {
+            return false;
+        }
+        return true;
+    }
+
+    static void WorkerLoop(const std::shared_ptr<State> state) {
+        {
+            FileTarget fileTarget;
+            std::vector<WorkItem> batch;
+            batch.reserve(maxBatchEntries);
+
+            while (true) {
+                batch.clear();
+                {
+                    std::unique_lock lock(state->mutex);
+                    state->workAvailable.wait(lock, [&] {
+                        return state->stopping || !state->pending.empty();
+                    });
+                    if (state->pending.empty() && state->stopping) {
+                        break;
+                    }
+
+                    if (!state->stopping && state->pending.size() < maxBatchEntries) {
+                        state->workAvailable.wait_for(lock, coalesceDelay, [&] {
+                            return state->stopping || state->pending.size() >= maxBatchEntries;
+                        });
+                    }
+
+                    const auto count = std::min(maxBatchEntries, state->pending.size());
+                    for (std::size_t index = 0; index < count; ++index) {
+                        batch.push_back(std::move(state->pending.front()));
+                        state->pending.pop_front();
+                    }
+                }
+
+                for (const auto& item : batch) {
+                    fileTarget.Select(item.filePath);
+                    if (item.kind == WorkKind::FilePathChanged) {
+                        continue;
+                    }
+
+                    const auto formatted = FormatEntry(item.entry);
+                    if (item.debuggerOutputEnabled) {
+                        const auto debuggerLine = formatted + L"\n";
+                        OutputDebugStringW(debuggerLine.c_str());
+                    }
+                    if (!item.filePath.empty()) {
+                        fileTarget.Write(WideToUtf8(formatted));
+                    }
+                }
+                fileTarget.Flush();
+
+                {
+                    std::scoped_lock lock(state->mutex);
+                    for (const auto& item : batch) {
+                        // FIFO processing means every earlier sequence was either written or
+                        // evicted from the bounded queue.
+                        state->completedThrough = std::max(state->completedThrough, item.sequence);
+                    }
+                }
+                state->progressChanged.notify_all();
+            }
+
+            fileTarget.Close();
+        }
+
+        {
+            std::scoped_lock lock(state->mutex);
+            state->workerCompleted = true;
+        }
+        state->progressChanged.notify_all();
+    }
+
+    void Shutdown() noexcept {
+        bool workRemains = false;
+        {
+            std::scoped_lock lock(state_->mutex);
+            workRemains = state_->completedThrough < state_->lastSubmitted;
+        }
+        if (workRemains) {
+            EnsureWorkerStarted();
+        }
+
+        bool hasWorker = false;
+        {
+            std::scoped_lock lock(threadMutex_);
+            hasWorker = worker_.joinable();
+        }
+        {
+            std::scoped_lock lock(state_->mutex);
+            state_->stopping = true;
+            if (!hasWorker) {
+                state_->pending.clear();
+                state_->completedThrough = state_->lastSubmitted;
+                state_->workerCompleted = true;
+            }
+        }
+        state_->workAvailable.notify_all();
+        state_->progressChanged.notify_all();
+
+        if (!hasWorker) {
+            return;
+        }
+
+        bool completed = false;
+        {
+            std::unique_lock lock(state_->mutex);
+            completed = state_->progressChanged.wait_for(lock, shutdownDrainTimeout, [&] {
+                return state_->workerCompleted;
+            });
+        }
+
+        if (!completed) {
+            {
+                std::scoped_lock lock(state_->mutex);
+                state_->pending.clear();
+                state_->completedThrough = state_->lastSubmitted;
+            }
+            {
+                std::scoped_lock lock(threadMutex_);
+                if (worker_.joinable()) {
+                    CancelSynchronousIo(worker_.native_handle());
+                }
+            }
+            std::unique_lock lock(state_->mutex);
+            completed = state_->progressChanged.wait_for(lock, cancellationGraceTimeout, [&] {
+                return state_->workerCompleted;
+            });
+        }
+
+        std::scoped_lock lock(threadMutex_);
+        if (!worker_.joinable()) {
+            return;
+        }
+        if (completed) {
+            worker_.join();
+        } else {
+            // WorkerLoop owns only shared state, so a blocked filesystem call can safely
+            // finish after the sink has gone away without holding up the caller.
+            worker_.detach();
+        }
+    }
+
+    std::shared_ptr<State> state_;
+    std::mutex threadMutex_;
+    std::thread worker_;
+};
+
 InMemoryLogSink::InMemoryLogSink()
     : InMemoryLogSink(DefaultLogLevel()) {
 }
 
 InMemoryLogSink::InMemoryLogSink(const LogLevel minimumLevel)
-    : minimumLevel_(minimumLevel) {
+    : minimumLevel_(minimumLevel), asyncWriter_(std::make_unique<AsyncWriter>()) {
+}
+
+InMemoryLogSink::~InMemoryLogSink() = default;
+
+bool InMemoryLogSink::Flush(const std::chrono::milliseconds timeout) {
+    return asyncWriter_->Flush(timeout);
 }
 
 void InMemoryLogSink::Write(LogLevel level, std::wstring category, std::wstring message) {
-    std::scoped_lock lock(mutex_);
-    if (!ShouldLog(level, minimumLevel_)) {
-        return;
+    LogEntry entry;
+    std::filesystem::path filePath;
+    bool debuggerOutputEnabled = false;
+    {
+        std::scoped_lock lock(mutex_);
+        if (!ShouldLog(level, minimumLevel_)) {
+            return;
+        }
+
+        entry = LogEntry{
+            std::chrono::system_clock::now(),
+            level,
+            std::move(category),
+            std::move(message),
+        };
+        entries_.push_back(entry);
+
+        constexpr std::size_t maxBufferedEntries = 500;
+        if (entries_.size() > maxBufferedEntries) {
+            entries_.pop_front();
+        }
+        filePath = filePath_;
+        debuggerOutputEnabled = debuggerOutputEnabled_;
     }
 
-    const LogEntry entry{
-        std::chrono::system_clock::now(),
-        level,
-        std::move(category),
-        std::move(message),
-    };
-    entries_.push_back(entry);
-
-    constexpr std::size_t maxBufferedEntries = 500;
-    if (entries_.size() > maxBufferedEntries) {
-        entries_.erase(entries_.begin(), entries_.begin() + static_cast<std::ptrdiff_t>(entries_.size() - maxBufferedEntries));
-    }
-
-    WriteFileLocked(entry);
-    if (debuggerOutputEnabled_) {
-        const auto line = FormatEntry(entry) + L"\n";
-        OutputDebugStringW(line.c_str());
+    if (!filePath.empty() || debuggerOutputEnabled) {
+        asyncWriter_->Enqueue(std::move(entry), std::move(filePath), debuggerOutputEnabled);
     }
 }
 
 std::vector<LogEntry> InMemoryLogSink::Entries() const {
     std::scoped_lock lock(mutex_);
-    return entries_;
+    return {entries_.begin(), entries_.end()};
+}
+
+std::vector<LogEntry> InMemoryLogSink::LatestEntries(const std::size_t count) const {
+    std::scoped_lock lock(mutex_);
+    const std::size_t start = entries_.size() > count ? entries_.size() - count : 0;
+    return {entries_.begin() + static_cast<std::ptrdiff_t>(start), entries_.end()};
 }
 
 std::wstring InMemoryLogSink::FormatLatest(const std::size_t count) const {
@@ -141,8 +514,11 @@ LogLevel InMemoryLogSink::MinimumLevel() const {
 }
 
 void InMemoryLogSink::SetFilePath(std::filesystem::path path) {
-    std::scoped_lock lock(mutex_);
-    filePath_ = std::move(path);
+    {
+        std::scoped_lock lock(mutex_);
+        filePath_ = path;
+    }
+    asyncWriter_->FilePathChanged(std::move(path));
 }
 
 std::filesystem::path InMemoryLogSink::FilePath() const {
@@ -153,27 +529,6 @@ std::filesystem::path InMemoryLogSink::FilePath() const {
 void InMemoryLogSink::EnableDebuggerOutput(const bool enabled) {
     std::scoped_lock lock(mutex_);
     debuggerOutputEnabled_ = enabled;
-}
-
-void InMemoryLogSink::WriteFileLocked(const LogEntry& entry) {
-    if (filePath_.empty()) {
-        return;
-    }
-
-    std::error_code ignored;
-    std::filesystem::create_directories(filePath_.parent_path(), ignored);
-    const bool writeBom = !std::filesystem::exists(filePath_, ignored) ||
-                          std::filesystem::file_size(filePath_, ignored) == 0;
-
-    std::ofstream file(filePath_, std::ios::app | std::ios::binary);
-    if (!file) {
-        return;
-    }
-    if (writeBom) {
-        const unsigned char bom[] = {0xEF, 0xBB, 0xBF};
-        file.write(reinterpret_cast<const char*>(bom), sizeof(bom));
-    }
-    file << WideToUtf8(FormatEntry(entry)) << "\n";
 }
 
 bool ShouldLog(const LogLevel level, const LogLevel minimumLevel) {

@@ -4,9 +4,25 @@
 
 #include <windows.h>
 
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <new>
+#include <process.h>
 #include <utility>
 
 namespace anvil::app {
+
+enum class PlayerReaperStatus : std::uint8_t {
+    Idle,
+    Running,
+    Completed,
+    Failed,
+};
+
+struct PlayerReaperState {
+    std::atomic<PlayerReaperStatus> status{PlayerReaperStatus::Idle};
+};
 
 namespace {
 
@@ -16,6 +32,26 @@ namespace {
 constexpr UINT_PTR kApplicationTimerId = 9001;
 constexpr UINT kEmbyReportRetryIntervalMs = 300;
 constexpr int kEmbyReportMaxRetries = 15;  // ~4.5s total, stops once delivered
+constexpr UINT kPlayerReaperPollIntervalMs = 50;
+
+struct PlayerReaperContext {
+    MainWindow* player = nullptr;
+    std::shared_ptr<PlayerReaperState> state;
+};
+
+unsigned __stdcall RunPlayerReaper(void* opaque) noexcept {
+    std::unique_ptr<PlayerReaperContext> context(static_cast<PlayerReaperContext*>(opaque));
+    MainWindow* player = context->player;
+    auto state = std::move(context->state);
+    context.reset();
+
+    // ReleaseUiThreadResourcesForBackgroundDestruction has already removed
+    // every COM/GDI+-affine object. Only backend-owned waits and plain C++
+    // state are allowed to remain here.
+    delete player;
+    state->status.store(PlayerReaperStatus::Completed, std::memory_order_release);
+    return 0;
+}
 
 void BringWindowToForeground(HWND window) {
     if (!window) {
@@ -31,8 +67,27 @@ void BringWindowToForeground(HWND window) {
 
 }  // namespace
 
-Application::Application() = default;
-Application::~Application() = default;
+Application::Application() {
+    try {
+        playerReaperState_ = std::make_shared<PlayerReaperState>();
+    } catch (...) {
+        // Without process-lifetime state there is no safe way to observe a
+        // detached destructor. Refuse to create players instead of allowing
+        // an unbounded chain of leaked/overlapping instances.
+        playerReaperUnavailable_ = true;
+        OutputDebugStringW(L"Anvil Player: unable to allocate player reaper state; player creation disabled\n");
+    }
+}
+
+Application::~Application() {
+    // An abnormal message-loop exit must not turn Application destruction into
+    // a UI-thread backend join. Release apartment/GDI resources while their
+    // runtimes are alive, then let process teardown reclaim the backend state.
+    if (player_) {
+        player_->ReleaseUiThreadResourcesForBackgroundDestruction();
+        (void)player_.release();
+    }
+}
 
 bool Application::Initialize(HINSTANCE instance, int commandShow, const AppArguments& arguments) {
     instance_ = instance;
@@ -46,7 +101,7 @@ bool Application::Initialize(HINSTANCE instance, int commandShow, const AppArgum
     library_->SetEmbyPlaybackReportRelay([this](const std::wstring& reportJson) {
         RelayEmbyPlaybackReport(reportJson);
     });
-    library_->SetTimerHandler([this] { TryDeliverPendingEmbyReport(); });
+    library_->SetTimerHandler([this] { OnApplicationTimer(); });
     library_->SetQuitHandler([this] { OnLibraryClosed(); });
     // The library window controls the per-WebView certificate policy; mirror it
     // onto the player WebView so both share the same trust posture.
@@ -68,12 +123,16 @@ int Application::Run() {
     while (GetMessageW(&message, nullptr, 0, 0)) {
         TranslateMessage(&message);
         DispatchMessageW(&message);
+        // Window callbacks run inside DispatchMessage. Deferring ownership
+        // changes prevents releasing a window while its HandleMessage frame is
+        // still on the stack.
+        ProcessDeferredWindowLifetime();
     }
     return static_cast<int>(message.wParam);
 }
 
 void Application::EnsurePlayerWindow() {
-    if (player_) {
+    if (player_ || PlayerReaperPreventsCreation()) {
         return;
     }
 
@@ -94,6 +153,12 @@ void Application::EnsurePlayerWindow() {
 }
 
 void Application::OpenInPlayer(const std::filesystem::path& path, double startPositionRatio) {
+    if ((player_ && player_->IsClosing()) || PlayerReaperPreventsCreation()) {
+        pendingPlayerOpenPath_ = path;
+        pendingPlayerOpenRatio_ = startPositionRatio;
+        ArmPlayerReaperPollIfNeeded();
+        return;
+    }
     EnsurePlayerWindow();
     if (!player_) {
         return;
@@ -106,6 +171,11 @@ void Application::OpenInPlayer(const std::filesystem::path& path, double startPo
 }
 
 void Application::FocusPlayer() {
+    if ((player_ && player_->IsClosing()) || PlayerReaperPreventsCreation()) {
+        pendingPlayerFocus_ = true;
+        ArmPlayerReaperPollIfNeeded();
+        return;
+    }
     EnsurePlayerWindow();
     if (player_) {
         BringWindowToForeground(player_->Handle());
@@ -140,19 +210,144 @@ void Application::TryDeliverPendingEmbyReport() {
     }
 }
 
+void Application::OnApplicationTimer() {
+    TryDeliverPendingEmbyReport();
+    ProcessDeferredWindowLifetime();
+}
+
 void Application::OnLibraryClosed() {
-    // Closing the library window quits the entire application.
+    // Closing the library quits the process after the player has completed its
+    // asynchronous shutdown.
+    shutdownRequested_ = true;
+    libraryResetPending_ = true;
     if (player_ && player_->Handle()) {
-        DestroyWindow(player_->Handle());
+        SendMessageW(player_->Handle(), WM_CLOSE, 0, 0);
     }
-    player_.reset();
-    library_.reset();
-    PostQuitMessage(0);
 }
 
 void Application::OnPlayerClosed() {
     // Closing the player window only destroys the player; the library stays.
-    player_.reset();
+    playerResetPending_ = true;
+}
+
+bool Application::PlayerReaperPreventsCreation() const noexcept {
+    if (playerReaperUnavailable_ || !playerReaperState_) {
+        return true;
+    }
+    return playerReaperState_->status.load(std::memory_order_acquire) != PlayerReaperStatus::Idle;
+}
+
+void Application::ArmPlayerReaperPollIfNeeded() const noexcept {
+    if (!playerReaperState_ || !library_ || !library_->Handle()) {
+        return;
+    }
+    const auto status = playerReaperState_->status.load(std::memory_order_acquire);
+    if (status == PlayerReaperStatus::Running || status == PlayerReaperStatus::Completed) {
+        SetTimer(library_->Handle(), kApplicationTimerId, kPlayerReaperPollIntervalMs, nullptr);
+    }
+}
+
+void Application::StartPlayerReaper(MainWindow* retiredPlayer) noexcept {
+    if (!retiredPlayer) {
+        return;
+    }
+    if (playerReaperUnavailable_ || !playerReaperState_) {
+        // Intentionally leak this one retired player and permanently block new
+        // ones. Deleting here could join a stuck backend on the UI thread.
+        playerReaperUnavailable_ = true;
+        return;
+    }
+
+    PlayerReaperStatus expected = PlayerReaperStatus::Idle;
+    if (!playerReaperState_->status.compare_exchange_strong(
+            expected,
+            PlayerReaperStatus::Running,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        // This should be unreachable because creation is gated on Idle. Keep
+        // both instances isolated and permanently stop further accumulation.
+        playerReaperUnavailable_ = true;
+        OutputDebugStringW(L"Anvil Player: overlapping player reaper prevented; player creation disabled\n");
+        return;
+    }
+
+    auto* context = new (std::nothrow) PlayerReaperContext{retiredPlayer, playerReaperState_};
+    if (!context) {
+        playerReaperState_->status.store(PlayerReaperStatus::Failed, std::memory_order_release);
+        playerReaperUnavailable_ = true;
+        OutputDebugStringW(L"Anvil Player: unable to allocate player reaper context; player creation disabled\n");
+        return;
+    }
+
+    const uintptr_t threadHandle = _beginthreadex(nullptr, 0, &RunPlayerReaper, context, 0, nullptr);
+    if (threadHandle == 0) {
+        delete context;
+        playerReaperState_->status.store(PlayerReaperStatus::Failed, std::memory_order_release);
+        playerReaperUnavailable_ = true;
+        OutputDebugStringW(L"Anvil Player: unable to start player reaper; player creation disabled\n");
+        return;
+    }
+
+    CloseHandle(reinterpret_cast<HANDLE>(threadHandle));
+    ArmPlayerReaperPollIfNeeded();
+}
+
+void Application::ReplayPendingPlayerRequest() {
+    if (shutdownRequested_ || player_ || PlayerReaperPreventsCreation()) {
+        return;
+    }
+    if (pendingPlayerOpenPath_) {
+        const auto path = std::move(*pendingPlayerOpenPath_);
+        const double ratio = pendingPlayerOpenRatio_;
+        pendingPlayerOpenPath_.reset();
+        pendingPlayerOpenRatio_ = 0.0;
+        pendingPlayerFocus_ = false;
+        OpenInPlayer(path, ratio);
+    } else if (pendingPlayerFocus_) {
+        pendingPlayerFocus_ = false;
+        FocusPlayer();
+    }
+}
+
+void Application::ProcessDeferredWindowLifetime() {
+    if (playerResetPending_) {
+        playerResetPending_ = false;
+        // MainWindow may own workers that are retiring a blocked driver or I/O
+        // call. Destruction therefore belongs to a reaper, never the message
+        // thread. WebView/ HWND teardown has already run on this thread.
+        if (player_) {
+            player_->ReleaseUiThreadResourcesForBackgroundDestruction();
+        }
+        MainWindow* retiredPlayer = player_.release();
+        if (retiredPlayer && !shutdownRequested_) {
+            StartPlayerReaper(retiredPlayer);
+        } else if (retiredPlayer) {
+            // Process shutdown must not race a detached MainWindow destructor
+            // against COM/GDI+ teardown in wWinMain. The OS reclaims the
+            // remaining process resources after the message loop exits.
+            (void)retiredPlayer;
+        }
+    }
+
+    if (playerReaperState_) {
+        const auto status = playerReaperState_->status.load(std::memory_order_acquire);
+        if (status == PlayerReaperStatus::Completed) {
+            playerReaperState_->status.store(PlayerReaperStatus::Idle, std::memory_order_release);
+        } else if (status == PlayerReaperStatus::Failed) {
+            playerReaperUnavailable_ = true;
+        }
+    }
+    ArmPlayerReaperPollIfNeeded();
+
+    ReplayPendingPlayerRequest();
+    if (libraryResetPending_) {
+        libraryResetPending_ = false;
+        library_.reset();
+    }
+    if (shutdownRequested_ && !player_ && !quitPosted_) {
+        quitPosted_ = true;
+        PostQuitMessage(0);
+    }
 }
 
 }  // namespace anvil::app

@@ -5,7 +5,6 @@
 #include "AnvilPlayer/Playback/PlaybackPlan.h"
 
 #include <algorithm>
-#include <cwctype>
 #include <cmath>
 #include <filesystem>
 #include <sstream>
@@ -30,61 +29,116 @@ std::chrono::milliseconds ScaleDuration(const std::chrono::milliseconds value, c
         static_cast<long long>(std::llround(static_cast<double>(value.count()) * rate))};
 }
 
-bool IsNetworkMediaPath(const std::filesystem::path& path) {
-    std::wstring value = path.wstring();
-    std::transform(value.begin(), value.end(), value.begin(), [](const wchar_t ch) {
-        return static_cast<wchar_t>(std::towlower(ch));
-    });
-    return value.rfind(L"http://", 0) == 0 ||
-           value.rfind(L"https://", 0) == 0;
-}
-
 }  // namespace
 
 PlayerController::PlayerController(std::shared_ptr<InMemoryLogSink> logSink)
     : settings_(MakeDefaultSettings()), logSink_(std::move(logSink)) {
+    // Start the process-wide capability probe before any media I/O so it can
+    // overlap the first open. CollectBasic is a non-blocking snapshot read.
+    (void)CapabilityDetector::CollectBasic();
     Log(LogLevel::Info, L"core", L"playback controller initialized");
 }
 
 bool PlayerController::OpenMedia(const std::filesystem::path& path, const bool extractPreview) {
-    std::scoped_lock lock(mutex_);
-    std::error_code existsError;
-    const bool networkMedia = IsNetworkMediaPath(path);
-    if (!networkMedia && !std::filesystem::exists(path, existsError)) {
-        state_ = PlaybackState::Error;
-        lastError_ = L"File does not exist";
-        Log(LogLevel::Error, L"open", lastError_ + L": " + path.wstring());
+    return CommitMedia(PrepareMedia(path, extractPreview));
+}
+
+PreparedMediaOpen PlayerController::PrepareMedia(const std::filesystem::path& path,
+                                                  const bool extractPreview,
+                                                  const MediaProbeOptions& options) const {
+    PreparedMediaOpen prepared;
+    prepared.path = path;
+    prepared.extractPreview = extractPreview;
+    if (options.stopToken.stop_requested()) {
+        prepared.probe.cancelled = true;
+        prepared.error = L"Open cancelled";
+        return prepared;
+    }
+
+    prepared.probe = MediaProbe::Probe(path, options);
+    if (prepared.probe.cancelled || prepared.probe.timedOut) {
+        prepared.error = prepared.probe.diagnostic.empty()
+                             ? (prepared.probe.cancelled ? L"Open cancelled" : L"Media probe timed out")
+                             : prepared.probe.diagnostic;
+        return prepared;
+    }
+    if (prepared.probe.failed) {
+        prepared.error = prepared.probe.diagnostic.empty() ? L"Unable to open media" : prepared.probe.diagnostic;
+        return prepared;
+    }
+    if (options.stopToken.stop_requested()) {
+        prepared.probe.cancelled = true;
+        prepared.error = L"Open cancelled";
+        return prepared;
+    }
+
+    prepared.capabilities = CapabilityDetector::CollectBasic();
+    PlayerSettings settings;
+    {
+        std::scoped_lock lock(mutex_);
+        settings = settings_;
+    }
+    prepared.plan = PlaybackPlanner::Build(prepared.probe.descriptor, settings, prepared.capabilities);
+    prepared.probe.descriptor.selectedDecodePath = prepared.plan.videoDecoder;
+    if (extractPreview && prepared.probe.descriptor.hasVideo && !options.stopToken.stop_requested()) {
+        prepared.preview = MediaPreview::ExtractFirstFrame(path);
+        if (prepared.preview.generated) {
+            prepared.probe.descriptor.previewImagePath = prepared.preview.imagePath;
+        }
+    }
+    if (options.stopToken.stop_requested()) {
+        prepared.probe.cancelled = true;
+        prepared.error = L"Open cancelled";
+        return prepared;
+    }
+    prepared.succeeded = true;
+    return prepared;
+}
+
+bool PlayerController::CommitMedia(PreparedMediaOpen prepared) {
+    if (!prepared.succeeded) {
+        if (prepared.probe.cancelled) {
+            return false;
+        }
+        const std::wstring error = prepared.error.empty() ? L"Unable to open media" : prepared.error;
+        {
+            std::scoped_lock lock(mutex_);
+            media_.reset();
+            committedPosition_ = std::chrono::milliseconds{0};
+            playbackRate_ = 1.0;
+            state_ = PlaybackState::Error;
+            lastError_ = error;
+        }
+        Log(LogLevel::Error, L"open", error + L": " + prepared.path.wstring());
         return false;
     }
 
-    auto probe = MediaProbe::Probe(path);
-    const auto capabilities = CapabilityDetector::CollectBasic();
-    const auto plan = PlaybackPlanner::Build(probe.descriptor, settings_, capabilities);
-    probe.descriptor.selectedDecodePath = plan.videoDecoder;
-    MediaPreviewResult preview;
-    if (extractPreview && probe.descriptor.hasVideo) {
-        preview = MediaPreview::ExtractFirstFrame(path);
-        if (preview.generated) {
-            probe.descriptor.previewImagePath = preview.imagePath;
-        }
+    MediaDescriptor media = std::move(prepared.probe.descriptor);
+    PlaybackPlan plan;
+    ToneMappingMode toneMapping = ToneMappingMode::Auto;
+    {
+        std::scoped_lock lock(mutex_);
+        plan = PlaybackPlanner::Build(media, settings_, prepared.capabilities);
+        toneMapping = settings_.video.toneMapping;
+        media.selectedDecodePath = plan.videoDecoder;
+        media_ = media;
+        committedPosition_ = std::chrono::milliseconds{0};
+        playbackRate_ = 1.0;
+        state_ = PlaybackState::Ready;
+        lastError_.clear();
     }
-    media_ = probe.descriptor;
-    committedPosition_ = std::chrono::milliseconds{0};
-    playbackRate_ = 1.0;
-    state_ = PlaybackState::Ready;
-    lastError_.clear();
 
-    Log(LogLevel::Info, L"open", L"file=" + path.wstring());
+    Log(LogLevel::Info, L"open", L"file=" + prepared.path.wstring());
     Log(LogLevel::Info,
         L"probe",
-        L"tool=" + (probe.probeTool.empty() ? L"unknown" : probe.probeTool) +
-            L" container=" + media_->container +
-            L" duration=" + FormatTimecode(media_->duration));
-    if (probe.fallbackUsed && !probe.diagnostic.empty()) {
-        Log(LogLevel::Warning, L"probe", L"fallback reason=" + probe.diagnostic);
+        L"tool=" + (prepared.probe.probeTool.empty() ? L"unknown" : prepared.probe.probeTool) +
+            L" container=" + media.container +
+            L" duration=" + FormatTimecode(media.duration));
+    if (prepared.probe.fallbackUsed && !prepared.probe.diagnostic.empty()) {
+        Log(LogLevel::Warning, L"probe", L"fallback reason=" + prepared.probe.diagnostic);
     }
-    if (media_->hasVideo) {
-        const auto& color = media_->videoColor;
+    if (media.hasVideo) {
+        const auto& color = media.videoColor;
         Log(LogLevel::Info,
             L"probe",
             L"color primaries=" + ToDisplayString(color.primaries) +
@@ -98,26 +152,35 @@ bool PlayerController::OpenMedia(const std::filesystem::path& path, const bool e
             Log(LogLevel::Info, L"probe", L"content_light " + FormatContentLight(color.contentLight));
         }
     }
-    for (const auto& stream : media_->streams) {
+    for (const auto& stream : media.streams) {
         Log(LogLevel::Info,
             stream.kind,
             L"stream=" + std::to_wstring(stream.index) +
                 L" codec=" + stream.codec +
                 L" details=" + stream.details);
     }
-    if (extractPreview && media_->hasVideo) {
-        if (preview.generated) {
-            Log(LogLevel::Info, L"preview", L"image=" + preview.imagePath.wstring());
+    if (prepared.extractPreview && media.hasVideo) {
+        if (prepared.preview.generated) {
+            Log(LogLevel::Info, L"preview", L"image=" + prepared.preview.imagePath.wstring());
         } else {
-            Log(LogLevel::Warning, L"preview", L"skipped reason=" + preview.diagnostic);
+            Log(LogLevel::Warning, L"preview", L"skipped reason=" + prepared.preview.diagnostic);
         }
-    } else if (media_->hasVideo) {
+    } else if (media.hasVideo) {
         Log(LogLevel::Debug, L"preview", L"skipped reason=deferred");
     }
     Log(LogLevel::Info, L"decoder", L"planned=" + plan.videoDecoder + L" reason=" + plan.videoReason);
-    Log(LogLevel::Info, L"renderer", L"mode=" + plan.videoMode + L" tone_mapping=" + ToDisplayString(settings_.video.toneMapping));
+    Log(LogLevel::Info, L"renderer", L"mode=" + plan.videoMode + L" tone_mapping=" + ToDisplayString(toneMapping));
     Log(LogLevel::Info, L"audio", L"output=" + plan.audioOutput + L" reason=" + plan.audioReason);
     return true;
+}
+
+void PlayerController::BeginOpen() {
+    std::scoped_lock lock(mutex_);
+    media_.reset();
+    committedPosition_ = std::chrono::milliseconds{0};
+    playbackRate_ = 1.0;
+    state_ = PlaybackState::Empty;
+    lastError_.clear();
 }
 
 void PlayerController::Close() {

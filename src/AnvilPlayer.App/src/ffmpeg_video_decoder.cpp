@@ -81,6 +81,23 @@ int64_t SteadyClockMs() {
         .count();
 }
 
+bool FitsWithinBudget(const std::size_t current,
+                      const std::size_t incoming,
+                      const std::size_t budget) {
+    return incoming <= budget && current <= budget - incoming;
+}
+
+std::size_t SaturatingAddBytes(const std::size_t lhs, const std::size_t rhs) {
+    if (rhs > std::numeric_limits<std::size_t>::max() - lhs) {
+        return std::numeric_limits<std::size_t>::max();
+    }
+    return lhs + rhs;
+}
+
+std::size_t BufferCapacityBytes(const std::shared_ptr<const std::vector<uint8_t>>& buffer) {
+    return buffer ? buffer->capacity() : 0;
+}
+
 uint64_t HashBytes(uint64_t hash, const void* data, const std::size_t size) {
     constexpr uint64_t kFnvPrime = 1099511628211ull;
     const auto* bytes = static_cast<const uint8_t*>(data);
@@ -258,7 +275,9 @@ void InterleaveYuv420P10RowToP010Uv(uint8_t* destination,
     }
 }
 
-bool PackYuv420P10FrameToP010(const AVFrame* frame, NativeYuvPlanes& out) {
+bool PackYuv420P10FrameToP010(const AVFrame* frame,
+                              NativeYuvPlanes& out,
+                              const std::size_t maxBytes) {
     if (!frame ||
         frame->format != AV_PIX_FMT_YUV420P10LE ||
         frame->width <= 0 ||
@@ -273,13 +292,25 @@ bool PackYuv420P10FrameToP010(const AVFrame* frame, NativeYuvPlanes& out) {
 
     const int width = frame->width;
     const int height = frame->height;
+    if (width > std::numeric_limits<int>::max() / 2) {
+        return false;
+    }
     const int yStride = width * 2;
-    const int uvStride = (width / 2) * 4;
+    const int uvStride = yStride;
     const int uvHeight = height / 2;
-    const std::size_t totalBytes = static_cast<std::size_t>(yStride) * height +
-                                   static_cast<std::size_t>(uvStride) * uvHeight;
-    auto buffer = std::make_shared<std::vector<uint8_t>>();
-    buffer->resize(totalBytes);
+    const std::size_t yBytes = static_cast<std::size_t>(yStride) * static_cast<std::size_t>(height);
+    const std::size_t uvBytes = static_cast<std::size_t>(uvStride) * static_cast<std::size_t>(uvHeight);
+    if (!FitsWithinBudget(yBytes, uvBytes, maxBytes)) {
+        return false;
+    }
+    const std::size_t totalBytes = yBytes + uvBytes;
+    std::shared_ptr<std::vector<uint8_t>> buffer;
+    try {
+        buffer = std::make_shared<std::vector<uint8_t>>();
+        buffer->resize(totalBytes);
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
 
     const uint8_t* srcY = frame->data[0];
     const int srcYStride = frame->linesize[0];
@@ -818,13 +849,18 @@ std::size_t PacketCacheCostBytes(const AVPacket* packet) {
         return 0;
     }
     std::size_t bytes = sizeof(AVPacket) + 256;
+    std::size_t payloadBytes = 0;
     if (packet->size > 0) {
-        bytes += static_cast<std::size_t>(packet->size);
+        payloadBytes = static_cast<std::size_t>(packet->size);
     }
+    if (packet->buf) {
+        payloadBytes = std::max(payloadBytes, packet->buf->size);
+    }
+    bytes = SaturatingAddBytes(bytes, payloadBytes);
     for (int index = 0; index < packet->side_data_elems; ++index) {
-        bytes += sizeof(AVPacketSideData);
+        bytes = SaturatingAddBytes(bytes, sizeof(AVPacketSideData));
         if (packet->side_data[index].size > 0) {
-            bytes += static_cast<std::size_t>(packet->side_data[index].size);
+            bytes = SaturatingAddBytes(bytes, static_cast<std::size_t>(packet->side_data[index].size));
         }
     }
     return bytes;
@@ -1019,7 +1055,8 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
                                const bool oneShotFrame,
                                const bool preferDolbyVisionHdrOutput,
                                const bool enableDolbyVisionEnhancementDecode,
-                               NativeAudioPacketSink audioPacketSink) {
+                               NativeAudioPacketSink audioPacketSink,
+                               const uint64_t notificationCookie) {
     Stop();
     if (mediaPath.empty()) {
         return false;
@@ -1084,6 +1121,7 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
     latestDolbyVisionEnhancementMetadata_.reset();
     latestDolbyVisionEnhancementMetadataPts_ = std::chrono::milliseconds{0};
     dolbyVisionEnhancementFrames_.clear();
+    pendingDolbyVisionBaseFrame_.reset();
     subtitleCanvasWidth_ = 0;
     subtitleCanvasHeight_ = 0;
     subtitleCanvasLogged_ = false;
@@ -1095,12 +1133,16 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
     externalSubtitlesActive_ = false;
     subtitleCues_.clear();
     externalSubtitleCues_.clear();
-    clockCallback_ = std::move(clockCallback);
+    {
+        std::scoped_lock lock(clockCallbackMutex_);
+        clockCallback_ = std::move(clockCallback);
+    }
     fallbackClockAnchor_.reset();
     fallbackClockBasePts_ = std::chrono::milliseconds{0};
     notificationWindow_.store(notificationWindow);
     notificationMessage_.store(notificationMessage);
     failureMessage_.store(failureMessage);
+    notificationCookie_.store(notificationCookie);
     frameMessagePending_.store(false);
     pendingSeekMs_.store(-1);
     pendingSeekInterruptsEnabled_.store(false);
@@ -1112,8 +1154,11 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
     seekFastResumeFramesRemaining_.store(0);
     seekFastResumeLogged_.store(false);
     seekPrerollPending_.store(false);
+    seekRecoveryActiveSnapshot_.store(false);
+    seekAudioHandoffReadySnapshot_.store(true);
     seekRecoveryTargetMs_.store(startPosition.count() > 0 ? startPosition.count() : -1);
     seekRecoveryDropLogged_.store(false);
+    pendingClockResetMs_.store(-1);
     stopping_.store(false);
     schedulePrimed_ = false;
     {
@@ -1140,11 +1185,24 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
         ResetSeekRecoveryLocked();
     }
     running_.store(true);
-    decodeThread_ = std::thread([this]() { DecodeLoop(); });
+    {
+        std::scoped_lock lock(schedulerMutex_);
+        schedulerWakeRequested_ = true;
+    }
+    try {
+        schedulerThread_ = std::thread([this]() { SchedulerLoop(); });
+        decodeThread_ = std::thread([this]() { DecodeLoop(); });
+    } catch (const std::system_error& error) {
+        Stop();
+        LogThread(LogLevel::Error,
+                  L"decoder",
+                  L"worker_start_failed reason=" + Utf8ToWide(error.what()));
+        return false;
+    }
     return true;
 }
 
-void FfmpegVideoDecoder::Stop() {
+void FfmpegVideoDecoder::RequestStop() {
     stopping_.store(true);
     pendingSeekMs_.store(-1);
     pendingSeekInterruptsEnabled_.store(false);
@@ -1158,8 +1216,20 @@ void FfmpegVideoDecoder::Stop() {
     seekFastResumeFramesRemaining_.store(0);
     seekFastResumeLogged_.store(false);
     seekPrerollPending_.store(false);
+    seekRecoveryActiveSnapshot_.store(false);
+    seekAudioHandoffReadySnapshot_.store(true);
     seekRecoveryTargetMs_.store(-1);
     seekRecoveryDropLogged_.store(false);
+    pendingClockResetMs_.store(-1);
+    WakeScheduler();
+    frameQueueCv_.notify_all();
+}
+
+void FfmpegVideoDecoder::Stop() {
+    RequestStop();
+    if (schedulerThread_.joinable()) {
+        schedulerThread_.join();
+    }
     if (decodeThread_.joinable()) {
         decodeThread_.join();
     }
@@ -1168,7 +1238,30 @@ void FfmpegVideoDecoder::Stop() {
         std::scoped_lock lock(mutex_);
         ResetSeekRecoveryLocked();
     }
-    clockCallback_ = {};
+    {
+        std::scoped_lock lock(clockCallbackMutex_);
+        clockCallback_ = {};
+    }
+
+    // Everything below is session-owned and may retain tens of MiB. Stop() is
+    // invoked by MainWindow's background stop worker, so retire it here rather
+    // than making the next window-thread Start() pay for the previous session.
+    std::deque<DolbyVisionEnhancementFrame> retiredEnhancementFrames;
+    std::optional<NativeVideoFrame> retiredPendingDolbyVisionBaseFrame;
+    std::deque<NativeSubtitleCue> retiredSubtitleCues;
+    std::deque<NativeSubtitleCue> retiredExternalSubtitleCues;
+    std::vector<std::shared_ptr<std::vector<uint8_t>>> retiredReusableBuffers;
+    retiredEnhancementFrames.swap(dolbyVisionEnhancementFrames_);
+    retiredPendingDolbyVisionBaseFrame.swap(pendingDolbyVisionBaseFrame_);
+    retiredSubtitleCues.swap(subtitleCues_);
+    retiredExternalSubtitleCues.swap(externalSubtitleCues_);
+    {
+        std::scoped_lock lock(mutex_);
+        retiredReusableBuffers.swap(reusableBgraBuffers_);
+    }
+    latestDolbyVisionEnhancementMetadata_.reset();
+    latestDolbyVisionEnhancementMetadataPts_ = std::chrono::milliseconds{0};
+    doviLibplaceboFilter_.reset();
     sharedD3DDevice_.Reset();
     subtitleAssRenderer_.reset();
     subtitleAssActive_ = false;
@@ -1183,18 +1276,28 @@ bool FfmpegVideoDecoder::Seek(const std::chrono::milliseconds position) {
     const auto clamped = std::max(position, std::chrono::milliseconds{0});
     const bool prerollAfterSeek = !playbackPaused_.load();
     pendingSeekMs_.store(clamped.count());
+    // Publish the request before invalidating the old timeline.  Producers
+    // stop enqueueing first; once the serial advances, only background
+    // scheduler/decode workers can observe and retire the stale frames.  The
+    // caller (normally the window thread) updates scalar control state only.
+    const uint64_t seekTimelineSerial = AdvanceTimelineSerial();
     frameMessagePending_.store(false);
     seekRecoveryTargetMs_.store(clamped.count());
     seekRecoveryDropLogged_.store(false);
     seekPrerollPending_.store(prerollAfterSeek);
+    seekRecoveryActiveSnapshot_.store(prerollAfterSeek);
+    seekAudioHandoffReadySnapshot_.store(!prerollAfterSeek);
     if (prerollAfterSeek) {
         seekFastResumeFramesRemaining_.store(kSeekFastResumeFrameCount);
         seekFastResumeLogged_.store(false);
     }
     {
-        std::scoped_lock lock(mutex_);
-        latestFrame_ = {};
-        frameQueue_.clear();
+        std::unique_lock lock(mutex_, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            WakeScheduler();
+            frameQueueCv_.notify_all();
+            return true;
+        }
         schedulePrimed_ = false;
         fallbackClockAnchor_.reset();
         fallbackClockBasePts_ = clamped;
@@ -1208,9 +1311,11 @@ bool FfmpegVideoDecoder::Seek(const std::chrono::milliseconds position) {
         stats_.usingHardwareDecode = usingHardware;
         stats_.networkBytesPerSecond = networkBytesPerSecond;
         stats_.clockPosition = clamped;
-        BeginSeekRecoveryLocked(clamped, prerollAfterSeek, CurrentTimelineSerial());
+        BeginSeekRecoveryLocked(clamped, prerollAfterSeek, seekTimelineSerial);
         UpdateBufferedStatsLocked();
     }
+    WakeScheduler();
+    frameQueueCv_.notify_all();
     return true;
 }
 
@@ -1218,13 +1323,19 @@ void FfmpegVideoDecoder::SetPaused(const bool paused, const std::chrono::millise
     const auto clamped = std::max(position, std::chrono::milliseconds{0});
     pausedPositionMs_.store(clamped.count());
     playbackPaused_.store(paused);
+    pendingClockResetMs_.store(clamped.count());
     {
-        std::scoped_lock lock(mutex_);
-        fallbackClockAnchor_.reset();
-        fallbackClockBasePts_ = clamped;
-        stats_.clockPosition = clamped;
+        std::unique_lock lock(mutex_, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            WakeScheduler();
+            frameQueueCv_.notify_all();
+            return;
+        }
+        ApplyPendingClockResetLocked();
         UpdateBufferedStatsLocked();
     }
+    WakeScheduler();
+    frameQueueCv_.notify_all();
 }
 
 int FfmpegVideoDecoder::InterruptCallback(void* opaque) {
@@ -1245,8 +1356,8 @@ int FfmpegVideoDecoder::InterruptCallback(void* opaque) {
 }
 
 bool FfmpegVideoDecoder::LatestFrame(NativeVideoFrame& frame) const {
-    std::scoped_lock lock(mutex_);
-    if (!latestFrame_.HasContent()) {
+    std::unique_lock lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock() || !latestFrame_.HasContent()) {
         return false;
     }
     const uint64_t activeSerial = CurrentTimelineSerial();
@@ -1257,32 +1368,42 @@ bool FfmpegVideoDecoder::LatestFrame(NativeVideoFrame& frame) const {
     return true;
 }
 
+std::wstring FfmpegVideoDecoder::LatestDynamicMetadata() const {
+    std::unique_lock lock(mutex_, std::try_to_lock);
+    if (!lock.owns_lock() || !latestFrame_.HasContent()) {
+        return {};
+    }
+    const uint64_t activeSerial = CurrentTimelineSerial();
+    if (latestFrame_.timelineSerial != 0 && latestFrame_.timelineSerial != activeSerial) {
+        return {};
+    }
+
+    std::wstring metadata = latestFrame_.dynamicMetadataPath;
+    if (metadata.empty() && latestFrame_.dovi && latestFrame_.dovi->valid) {
+        metadata = L"dolby_vision_shader";
+    }
+    if (!metadata.empty() && !latestFrame_.dynamicMetadataDetails.empty()) {
+        metadata += L" " + latestFrame_.dynamicMetadataDetails;
+    }
+    return metadata;
+}
+
 void FfmpegVideoDecoder::ClearFrame() {
-    std::scoped_lock lock(mutex_);
-    ResetSeekRecoveryLocked();
-    latestFrame_.bgra.reset();
-    latestFrame_.yuv = {};
-    latestFrame_.serial = 0;
-    latestFrame_.timelineSerial = 0;
-    latestFrame_.width = latestFrame_.height = latestFrame_.stride = 0;
-    latestFrame_.d3dTexture.Reset();
-    latestFrame_.hardwareFrameRef.reset();
-    latestFrame_.d3dArraySlice = 0;
-    latestFrame_.d3dFormat = DXGI_FORMAT_UNKNOWN;
-    latestFrame_.softwareFormat = AV_PIX_FMT_NONE;
-    latestFrame_.color = {};
-    latestFrame_.dynamicMetadataPath.clear();
-    latestFrame_.dynamicMetadataDetails.clear();
-    latestFrame_.subtitleText.clear();
-    latestFrame_.subtitleBitmaps.clear();
-    latestFrame_.subtitlesPrepared = false;
-    frameQueue_.clear();
-    stats_.queueDepth = 0;
-    stats_.packetQueueDepth = 0;
-    stats_.packetQueueBytes = 0;
-    stats_.readAheadEnd = std::chrono::milliseconds{0};
-    stats_.readAheadDuration = std::chrono::milliseconds{0};
-    UpdateBufferedStatsLocked();
+    NativeVideoFrame retiredLatestFrame;
+    std::deque<NativeVideoFrame> retiredFrameQueue;
+    {
+        std::scoped_lock lock(mutex_);
+        ResetSeekRecoveryLocked();
+        retiredLatestFrame = std::move(latestFrame_);
+        retiredFrameQueue.swap(frameQueue_);
+        stats_.queueDepth = 0;
+        stats_.packetQueueDepth = 0;
+        stats_.packetQueueBytes = 0;
+        stats_.readAheadEnd = std::chrono::milliseconds{0};
+        stats_.readAheadDuration = std::chrono::milliseconds{0};
+        UpdateBufferedStatsLocked();
+    }
+    frameQueueCv_.notify_all();
 }
 
 void FfmpegVideoDecoder::AcknowledgeFrameNotification() {
@@ -1304,6 +1425,8 @@ void FfmpegVideoDecoder::BeginSeekRecoveryLocked(const std::chrono::milliseconds
     seekPrerollPending_.store(prerollAfterSeek);
     stats_.seekRecoveryActive = prerollAfterSeek;
     stats_.seekRecoveryAudioHandoffReady = !prerollAfterSeek;
+    seekRecoveryActiveSnapshot_.store(prerollAfterSeek);
+    seekAudioHandoffReadySnapshot_.store(!prerollAfterSeek);
     stats_.timelineSerial = timelineSerial;
     stats_.buffering = prerollAfterSeek;
     if (!prerollAfterSeek) {
@@ -1324,8 +1447,21 @@ void FfmpegVideoDecoder::ResetSeekRecoveryLocked() {
     seekPrerollPending_.store(false);
     stats_.seekRecoveryActive = false;
     stats_.seekRecoveryAudioHandoffReady = true;
+    seekRecoveryActiveSnapshot_.store(false);
+    seekAudioHandoffReadySnapshot_.store(true);
     stats_.timelineSerial = CurrentTimelineSerial();
     stats_.buffering = false;
+}
+
+void FfmpegVideoDecoder::ApplyPendingClockResetLocked() {
+    const int64_t resetMs = pendingClockResetMs_.exchange(-1);
+    if (resetMs < 0) {
+        return;
+    }
+    const std::chrono::milliseconds position{resetMs};
+    fallbackClockAnchor_.reset();
+    fallbackClockBasePts_ = position;
+    stats_.clockPosition = position;
 }
 
 void FfmpegVideoDecoder::DropStaleFramesLocked() {
@@ -1364,18 +1500,21 @@ void FfmpegVideoDecoder::StartSeekRecoveryVisualWarmupLocked(const std::chrono::
     seekRecovery_.publishedFrames = 0;
     stats_.seekRecoveryActive = true;
     stats_.seekRecoveryAudioHandoffReady = false;
+    seekRecoveryActiveSnapshot_.store(true);
+    seekAudioHandoffReadySnapshot_.store(false);
     stats_.buffering = false;
     fallbackClockAnchor_.reset();
     fallbackClockBasePts_ = frameQueue_.front().pts;
 }
 
 FfmpegVideoDecoder::SchedulerClock FfmpegVideoDecoder::SeekRecoverySchedulerClockLocked(
-    const std::chrono::milliseconds firstQueuedPts) {
+    const std::chrono::milliseconds firstQueuedPts,
+    const std::optional<std::chrono::milliseconds>& audioClock) {
     if (seekRecovery_.phase != SeekRecoveryPhase::VisualWarmup) {
-        return CurrentSchedulerClockLocked(firstQueuedPts);
+        return CurrentSchedulerClockLocked(firstQueuedPts, audioClock);
     }
     if (seekRecovery_.timelineSerial != CurrentTimelineSerial()) {
-        return CurrentSchedulerClockLocked(firstQueuedPts);
+        return CurrentSchedulerClockLocked(firstQueuedPts, audioClock);
     }
 
     const auto now = std::chrono::steady_clock::now();
@@ -1386,10 +1525,8 @@ FfmpegVideoDecoder::SchedulerClock FfmpegVideoDecoder::SeekRecoverySchedulerCloc
 
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         now - seekRecovery_.clockAnchorTime);
-    auto position = seekRecovery_.clockAnchorPts + std::max(elapsed, std::chrono::milliseconds{0});
-    if (position < firstQueuedPts) {
-        position = firstQueuedPts;
-    }
+    const auto position = seekRecovery_.clockAnchorPts +
+                          std::max(elapsed, std::chrono::milliseconds{0});
     return {position, false};
 }
 
@@ -1467,13 +1604,37 @@ void FfmpegVideoDecoder::UpdateSeekRecoveryAfterPublishLocked(
     seekRecovery_ = {};
     stats_.seekRecoveryActive = false;
     stats_.seekRecoveryAudioHandoffReady = true;
+    seekRecoveryActiveSnapshot_.store(false);
+    seekAudioHandoffReadySnapshot_.store(true);
     fallbackClockAnchor_ = now;
     fallbackClockBasePts_ = publishedPts;
 }
 
 NativeVideoQueueStats FfmpegVideoDecoder::Stats() const {
-    std::scoped_lock lock(mutex_);
-    return stats_;
+    NativeVideoQueueStats snapshot;
+    {
+        std::unique_lock lock(mutex_, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            std::unique_lock snapshotLock(statsSnapshotMutex_, std::try_to_lock);
+            if (snapshotLock.owns_lock()) {
+                snapshot = lastStatsSnapshot_;
+            }
+        } else {
+            snapshot = stats_;
+        }
+    }
+    {
+        std::unique_lock snapshotLock(statsSnapshotMutex_, std::try_to_lock);
+        if (snapshotLock.owns_lock()) {
+            lastStatsSnapshot_ = snapshot;
+        }
+    }
+    // These two gates are control-plane state, not telemetry. They must be
+    // current even when the decoder frame mutex is busy so the window can
+    // never resume shared-demux audio before seek visual warm-up completes.
+    snapshot.seekRecoveryActive = seekRecoveryActiveSnapshot_.load();
+    snapshot.seekRecoveryAudioHandoffReady = seekAudioHandoffReadySnapshot_.load();
+    return snapshot;
 }
 
 bool FfmpegVideoDecoder::WaitForPreroll(const std::chrono::milliseconds targetDuration,
@@ -1519,6 +1680,7 @@ bool FfmpegVideoDecoder::WaitForEnhancementPreroll(const std::chrono::millisecon
         }
         bool ready = false;
         bool notify = false;
+        bool queueChanged = false;
         {
             std::scoped_lock lock(mutex_);
             const auto closeToTarget = [minPts](const NativeVideoFrame& frame) {
@@ -1541,6 +1703,7 @@ bool FfmpegVideoDecoder::WaitForEnhancementPreroll(const std::chrono::millisecon
                     frameQueue_.pop_front();
                     ++stats_.droppedLate;
                 }
+                queueChanged = framesToDrop > 0;
                 if (publishReadyFrame) {
                     NativeVideoFrame frameToPublish = std::move(frameQueue_.front());
                     frameQueue_.pop_front();
@@ -1549,6 +1712,7 @@ bool FfmpegVideoDecoder::WaitForEnhancementPreroll(const std::chrono::millisecon
                     stats_.buffering = false;
                     schedulePrimed_ = true;
                     notify = true;
+                    queueChanged = true;
                 }
                 UpdateBufferedStatsLocked();
                 ready = true;
@@ -1565,6 +1729,7 @@ bool FfmpegVideoDecoder::WaitForEnhancementPreroll(const std::chrono::millisecon
                         frameQueue_.pop_front();
                         ++stats_.droppedLate;
                     }
+                    queueChanged = framesToDrop > 0;
                     if (!baseOnlyDropLogged) {
                         baseOnlyDropLogged = true;
                         LogThread(LogLevel::Debug,
@@ -1576,9 +1741,13 @@ bool FfmpegVideoDecoder::WaitForEnhancementPreroll(const std::chrono::millisecon
                     const std::size_t dropped = frameQueue_.size();
                     frameQueue_.clear();
                     stats_.droppedLate += dropped;
+                    queueChanged = dropped > 0;
                 }
                 UpdateBufferedStatsLocked();
             }
+        }
+        if (queueChanged) {
+            frameQueueCv_.notify_all();
         }
         if (notify) {
             NotifyFrameReady();
@@ -1648,7 +1817,6 @@ void FfmpegVideoDecoder::DecodeLoop() {
     AVFrame* softwareFrame = nullptr;
     AVFrame* enhancementFrame = nullptr;
     AVPacket* packet = nullptr;
-    std::vector<uint8_t> bgraBuffer;
     int videoStreamIndex = -1;
     int audioStreamIndex = -1;
     int enhancementStreamIndex = -1;
@@ -1761,8 +1929,14 @@ void FfmpegVideoDecoder::DecodeLoop() {
                           L"audio",
                           L"packet_sink stream=" + std::to_wstring(audioStreamIndex) +
                               L" active=" + (audioPacketSinkActive ? L"true" : L"false"));
+                if (!audioPacketSinkActive && audioPacketSink_.startFailed) {
+                    audioPacketSink_.startFailed();
+                }
             } else {
                 LogThread(LogLevel::Warning, L"audio", L"packet_sink unavailable reason=no_audio_stream");
+                if (audioPacketSink_.startFailed) {
+                    audioPacketSink_.startFailed();
+                }
             }
         }
         subtitleCanvasWidth_ = codecpar ? codecpar->width : 0;
@@ -1952,6 +2126,7 @@ void FfmpegVideoDecoder::DecodeLoop() {
         std::size_t packetQueueBytes = 0;
         std::chrono::milliseconds packetTimelineEnd = startPosition_;
         bool inputEof = false;
+        bool packetBudgetExceeded = false;
         bool readFrameWaitLogged = false;
         bool firstReadFrameLogged = false;
         bool networkEofClearAttempted = false;
@@ -1961,10 +2136,11 @@ void FfmpegVideoDecoder::DecodeLoop() {
         int videoPacketCacheLogCount = 0;
         int readFrameErrorLogCount = 0;
         bool sharedDemuxCapacityReadAheadLogged = false;
+        bool packetBudgetLimitLogged = false;
         uint64_t networkBytesWindow = 0;
         auto networkBytesWindowStartedAt = std::chrono::steady_clock::now();
         const auto fallbackPacketDuration = EstimatedVideoPacketDuration(formatCtx->streams[videoStreamIndex]);
-        const std::size_t packetCacheBudgetBytes =
+        const std::size_t packetCacheTargetBytes =
             PacketReadAheadBudgetBytes(kMinPacketReadAheadBytes, kMaxPacketReadAheadBytes);
         auto enhancementOverlayReadAheadActive = [&]() {
             return enableDolbyVisionEnhancementDecode_ &&
@@ -1979,7 +2155,10 @@ void FfmpegVideoDecoder::DecodeLoop() {
         };
         LogThread(LogLevel::Info,
                   L"decoder",
-                  L"packet_read_ahead mode=adaptive budget_mb=" + std::to_wstring(packetCacheBudgetBytes / (1024 * 1024)) +
+                  L"packet_read_ahead mode=adaptive target_mb=" +
+                      std::to_wstring(packetCacheTargetBytes / (1024 * 1024)) +
+                      L" hard_budget_mb=" + std::to_wstring(kPacketMemoryBudgetBytes / (1024 * 1024)) +
+                      L" max_packet_mb=" + std::to_wstring(kMaxCachedPacketBytes / (1024 * 1024)) +
                       L" playing_target_ms=" + std::to_wstring(activePacketReadAheadTarget().count()) +
                       (enhancementOverlayReadAheadActive() ? L" el_overlay=low_latency" : L"") +
                       L" estimated_packet_ms=" + std::to_wstring(fallbackPacketDuration.count()));
@@ -1994,18 +2173,20 @@ void FfmpegVideoDecoder::DecodeLoop() {
         };
 
         auto updatePacketStats = [&]() {
-            std::scoped_lock lock(mutex_);
-            stats_.packetQueueDepth = packetQueue.size();
-            stats_.packetQueueBytes = packetQueueBytes;
-            if (packetQueue.empty()) {
-                stats_.readAheadEnd = std::chrono::milliseconds{0};
-                stats_.readAheadDuration = std::chrono::milliseconds{0};
-            } else {
-                stats_.readAheadEnd = packetQueueEnd();
-                stats_.readAheadDuration =
-                    std::max(std::chrono::milliseconds{0}, stats_.readAheadEnd - packetQueue.front().pts);
+            {
+                std::scoped_lock lock(mutex_);
+                stats_.packetQueueDepth = packetQueue.size();
+                stats_.packetQueueBytes = packetQueueBytes;
+                if (packetQueue.empty()) {
+                    stats_.readAheadEnd = std::chrono::milliseconds{0};
+                    stats_.readAheadDuration = std::chrono::milliseconds{0};
+                } else {
+                    stats_.readAheadEnd = packetQueueEnd();
+                    stats_.readAheadDuration =
+                        std::max(std::chrono::milliseconds{0}, stats_.readAheadEnd - packetQueue.front().pts);
+                }
+                UpdateBufferedStatsLocked();
             }
-            UpdateBufferedStatsLocked();
         };
 
         auto clearPacketQueue = [&]() {
@@ -2015,7 +2196,7 @@ void FfmpegVideoDecoder::DecodeLoop() {
         };
 
         auto packetQueueAtTarget = [&]() {
-            return packetQueueBytes >= packetCacheBudgetBytes;
+            return packetQueueBytes >= packetCacheTargetBytes;
         };
 
         auto packetQueueDuration = [&]() {
@@ -2049,6 +2230,23 @@ void FfmpegVideoDecoder::DecodeLoop() {
             return lhs >= rhs ? lhs - rhs : rhs - lhs;
         };
 
+        auto enhancementQueueSaturated = [&]() {
+            if (dolbyVisionEnhancementFrames_.empty()) {
+                return false;
+            }
+            std::size_t queuedBytes = 0;
+            for (const auto& queued : dolbyVisionEnhancementFrames_) {
+                queuedBytes = SaturatingAddBytes(queuedBytes,
+                                                 BufferCapacityBytes(queued.yuv.data));
+            }
+            const std::size_t representativeFrameBytes =
+                BufferCapacityBytes(dolbyVisionEnhancementFrames_.front().yuv.data);
+            return dolbyVisionEnhancementFrames_.size() >= kMaxDolbyVisionEnhancementQueuedFrames ||
+                   !FitsWithinBudget(queuedBytes,
+                                     representativeFrameBytes,
+                                     kMaxDolbyVisionEnhancementQueuedBytes);
+        };
+
         auto enhancementReadyForNextVideoPacket = [&]() {
             if (!enhancementOverlayReadAheadActive() || packetQueue.empty()) {
                 return true;
@@ -2057,7 +2255,11 @@ void FfmpegVideoDecoder::DecodeLoop() {
                 return inputEof;
             }
 
-            const auto targetPts = packetQueue.front().pts;
+            auto targetPts = packetQueue.front().pts;
+            if (pendingDolbyVisionBaseFrame_.has_value() &&
+                pendingDolbyVisionBaseFrame_->timelineSerial == CurrentTimelineSerial()) {
+                targetPts = std::max(targetPts, pendingDolbyVisionBaseFrame_->pts);
+            }
             auto bestDelta = absEnhancementDelta(dolbyVisionEnhancementFrames_.front().pts, targetPts);
             for (std::size_t index = 1; index < dolbyVisionEnhancementFrames_.size(); ++index) {
                 bestDelta = std::min(bestDelta,
@@ -2073,12 +2275,30 @@ void FfmpegVideoDecoder::DecodeLoop() {
                 return true;
             }
             if (lastPts + kDolbyVisionEnhancementMatchDelta < targetPts) {
-                return inputEof || packetQueueAtTarget();
+                // Let the BL decoder consume one packet and prune its stale EL
+                // window when the bounded EL queue cannot advance further.
+                return inputEof || packetQueueAtTarget() || enhancementQueueSaturated();
             }
             return true;
         };
 
         auto cacheVideoPacket = [&](AVPacket* source) {
+            const std::size_t packetBytes = PacketCacheCostBytes(source);
+            if (packetBytes > kMaxCachedPacketBytes ||
+                !FitsWithinBudget(packetQueueBytes, packetBytes, kPacketMemoryBudgetBytes)) {
+                if (!packetBudgetLimitLogged) {
+                    packetBudgetLimitLogged = true;
+                    LogThread(LogLevel::Warning,
+                              L"decoder",
+                              L"packet_cache rejected bytes=" + std::to_wstring(packetBytes) +
+                                  L" queued_bytes=" + std::to_wstring(packetQueueBytes) +
+                                  L" hard_budget_bytes=" + std::to_wstring(kPacketMemoryBudgetBytes));
+                }
+                packetBudgetExceeded = true;
+                inputEof = true;
+                av_packet_unref(source);
+                return false;
+            }
             const auto fallbackStart = packetQueue.empty() ? packetTimelineEnd : packetQueue.back().end;
             auto cached = CachedVideoPacket::MoveFrom(source,
                                                       streamTimeBase,
@@ -2096,13 +2316,19 @@ void FfmpegVideoDecoder::DecodeLoop() {
             return true;
         };
 
-        auto readAheadPackets = [&](const int maxVideoPackets) {
+        auto readAheadPackets = [&](const int maxVideoPackets,
+                                    const bool allowBeyondDurationTarget = false) {
             int videoPacketsRead = 0;
             while (!stopping_.load() &&
                    !HasPendingSeek() &&
                    !inputEof &&
-                   !packetQueueAtTarget() &&
+                   (allowBeyondDurationTarget || !packetQueueAtTarget()) &&
                    videoPacketsRead < maxVideoPackets) {
+                if (enhancementOverlayReadAheadActive() &&
+                    !packetQueue.empty() &&
+                    enhancementQueueSaturated()) {
+                    break;
+                }
                 if (!readFrameWaitLogged) {
                     readFrameWaitLogged = true;
                     LogThread(LogLevel::Debug,
@@ -2282,7 +2508,11 @@ void FfmpegVideoDecoder::DecodeLoop() {
                 packetQueueAtTarget()) {
                 return false;
             }
-            readAheadPackets(kDolbyVisionEnhancementPlayingPacketReadAheadBatch);
+            // A pending BL/EL synchronization point takes precedence over the
+            // normal packet-duration target. The packet byte budget remains a
+            // hard bound, so reading a few more interleaved packets cannot make
+            // the queue unbounded.
+            readAheadPackets(kDolbyVisionEnhancementPlayingPacketReadAheadBatch, true);
             return true;
         };
 
@@ -2324,7 +2554,7 @@ void FfmpegVideoDecoder::DecodeLoop() {
             while (!stopping_.load() && !HasPendingSeek()) {
                 const int sendResult = avcodec_send_packet(codecCtx, cached.packet);
                 if (sendResult == AVERROR(EAGAIN)) {
-                    if (!ReceiveFrames(codecCtx, swsCtx, frame, softwareFrame, bgraBuffer, streamTimeBase, serial)) {
+                    if (!ReceiveFrames(codecCtx, swsCtx, frame, softwareFrame, streamTimeBase, serial)) {
                         return false;
                     }
                     if (++eagainCount > 8) {
@@ -2340,8 +2570,8 @@ void FfmpegVideoDecoder::DecodeLoop() {
                                   L"send_packet_backpressure reason=" + FfmpegErrorString(sendResult) +
                                       L" pts_ms=" + std::to_wstring(cached.pts.count()));
                     }
-                    ScheduleDueFrames();
-                    if (!ReceiveFrames(codecCtx, swsCtx, frame, softwareFrame, bgraBuffer, streamTimeBase, serial)) {
+                    WakeScheduler();
+                    if (!ReceiveFrames(codecCtx, swsCtx, frame, softwareFrame, streamTimeBase, serial)) {
                         return false;
                     }
                     if (++backpressureCount > kSendPacketBackpressureRetries) {
@@ -2371,7 +2601,7 @@ void FfmpegVideoDecoder::DecodeLoop() {
                 break;
             }
 
-            if (!ReceiveFrames(codecCtx, swsCtx, frame, softwareFrame, bgraBuffer, streamTimeBase, serial)) {
+            if (!ReceiveFrames(codecCtx, swsCtx, frame, softwareFrame, streamTimeBase, serial)) {
                 return false;
             }
             return true;
@@ -2381,6 +2611,7 @@ void FfmpegVideoDecoder::DecodeLoop() {
             if (HasPendingSeek()) {
                 clearPacketQueue();
                 inputEof = false;
+                packetBudgetExceeded = false;
                 if (!ApplyPendingSeek(formatCtx,
                                       codecCtx,
                                       subtitleCodecCtx,
@@ -2393,7 +2624,6 @@ void FfmpegVideoDecoder::DecodeLoop() {
                 continue;
             }
 
-            ScheduleDueFrames();
             const bool paused = playbackPaused_.load();
             const bool hasPreroll = hasDecodedPreroll();
             const bool elOverlay = enhancementOverlayReadAheadActive();
@@ -2462,6 +2692,10 @@ void FfmpegVideoDecoder::DecodeLoop() {
             }
 
             if (inputEof) {
+                if (packetBudgetExceeded) {
+                    NotifyDecodeFailure(L"Video packet exceeds the decoder's bounded memory budget");
+                    break;
+                }
                 if (networkSource && !stopping_.load() && !HasPendingSeek()) {
                     std::chrono::milliseconds eofPosition{0};
                     {
@@ -2488,7 +2722,7 @@ void FfmpegVideoDecoder::DecodeLoop() {
                     ReceiveDolbyVisionEnhancementFrames(enhancementCodecCtx, enhancementFrame, enhancementTimeBase);
                 }
                 avcodec_send_packet(codecCtx, nullptr);
-                if (DrainDecoder(codecCtx, swsCtx, frame, softwareFrame, bgraBuffer, streamTimeBase, serial)) {
+                if (DrainDecoder(codecCtx, swsCtx, frame, softwareFrame, streamTimeBase, serial)) {
                     // swsCtx may have been allocated inside DrainDecoder.
                 }
                 break;
@@ -2514,6 +2748,7 @@ void FfmpegVideoDecoder::DecodeLoop() {
     doviLibplaceboFilter_.reset();
     DrainQueuedFrames();
     running_.store(false);
+    WakeScheduler();
     if (!startupComplete && !startupFailure.empty()) {
         NotifyDecodeFailure(startupFailure);
     }
@@ -3152,8 +3387,7 @@ AVPixelFormat FfmpegVideoDecoder::ChooseHardwarePixelFormat(AVCodecContext* code
 
 // Returns true if at least one frame was published.
 bool FfmpegVideoDecoder::ReceiveFrames(AVCodecContext* codecCtx, SwsContext*& swsCtx, AVFrame* frame, AVFrame* softwareFrame,
-                                       std::vector<uint8_t>& bgraBuffer, AVRational timeBase,
-                                       uint64_t& serial) {
+                                       const AVRational timeBase, uint64_t& serial) {
     while (!stopping_.load() && !HasPendingSeek()) {
         const int ret = avcodec_receive_frame(codecCtx, frame);
         if (ret == AVERROR(EAGAIN)) {
@@ -3188,7 +3422,7 @@ bool FfmpegVideoDecoder::ReceiveFrames(AVCodecContext* codecCtx, SwsContext*& sw
                           L" size=" + std::to_wstring(frame->width) + L"x" + std::to_wstring(frame->height) +
                           L" pts_ms=" + std::to_wstring(FramePts(frame, timeBase).count()));
         }
-        if (!PublishFrame(frame, softwareFrame, swsCtx, bgraBuffer, timeBase, serial)) {
+        if (!PublishFrame(frame, softwareFrame, swsCtx, timeBase, serial)) {
             av_frame_unref(frame);
             return false;
         }
@@ -3202,8 +3436,7 @@ bool FfmpegVideoDecoder::ReceiveFrames(AVCodecContext* codecCtx, SwsContext*& sw
 
 // Drain decoder after EOF (no more packets).
 bool FfmpegVideoDecoder::DrainDecoder(AVCodecContext* codecCtx, SwsContext*& swsCtx, AVFrame* frame, AVFrame* softwareFrame,
-                                      std::vector<uint8_t>& bgraBuffer, AVRational timeBase,
-                                      uint64_t& serial) {
+                                      const AVRational timeBase, uint64_t& serial) {
     while (!stopping_.load() && !HasPendingSeek()) {
         const int ret = avcodec_receive_frame(codecCtx, frame);
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
@@ -3215,7 +3448,7 @@ bool FfmpegVideoDecoder::DrainDecoder(AVCodecContext* codecCtx, SwsContext*& sws
                       L"drain_receive_failed reason=" + FfmpegErrorString(ret));
             return false;
         }
-        if (!PublishFrame(frame, softwareFrame, swsCtx, bgraBuffer, timeBase, serial)) {
+        if (!PublishFrame(frame, softwareFrame, swsCtx, timeBase, serial)) {
             av_frame_unref(frame);
             return false;
         }
@@ -3311,37 +3544,70 @@ bool FfmpegVideoDecoder::ReceiveDolbyVisionEnhancementFrames(AVCodecContext* cod
 
         NativeYuvPlanes enhancementYuv;
         const auto packStart = std::chrono::steady_clock::now();
-        if (PackYuv420P10FrameToP010(frame, enhancementYuv)) {
+        if (PackYuv420P10FrameToP010(frame, enhancementYuv, kEnhancementMemoryBudgetBytes)) {
+            const std::size_t incomingBytes = BufferCapacityBytes(enhancementYuv.data);
+            std::size_t queuedBytes = 0;
+            for (const auto& queuedFrame : dolbyVisionEnhancementFrames_) {
+                queuedBytes = SaturatingAddBytes(queuedBytes, BufferCapacityBytes(queuedFrame.yuv.data));
+            }
+            const bool queueWouldOverflow =
+                dolbyVisionEnhancementFrames_.size() >= kMaxDolbyVisionEnhancementQueuedFrames ||
+                !FitsWithinBudget(queuedBytes, incomingBytes, kMaxDolbyVisionEnhancementQueuedBytes);
+            // Before the first BL/EL match, keep the oldest EL window. The BL
+            // decoder can start later than the EL decoder after a keyframe
+            // seek; sliding this queue forward used to discard EL PTS 0 (or
+            // the seek target) before the first BL frame was produced.
+            const bool preserveInitialWindow =
+                queueWouldOverflow &&
+                !dolbyVisionEnhancementOverlayLogged_ &&
+                !pendingDolbyVisionBaseFrame_.has_value() &&
+                !dolbyVisionEnhancementFrames_.empty();
+            if (!preserveInitialWindow) {
+                while (!dolbyVisionEnhancementFrames_.empty() &&
+                       (dolbyVisionEnhancementFrames_.size() >= kMaxDolbyVisionEnhancementQueuedFrames ||
+                        !FitsWithinBudget(queuedBytes, incomingBytes, kMaxDolbyVisionEnhancementQueuedBytes))) {
+                    const std::size_t removedBytes =
+                        BufferCapacityBytes(dolbyVisionEnhancementFrames_.front().yuv.data);
+                    queuedBytes = removedBytes <= queuedBytes ? queuedBytes - removedBytes : 0;
+                    dolbyVisionEnhancementFrames_.pop_front();
+                }
+            } else if (!dolbyVisionEnhancementStartupFallbackLogged_) {
+                dolbyVisionEnhancementStartupFallbackLogged_ = true;
+                LogThread(LogLevel::Debug,
+                          L"decoder",
+                          L"dolby_vision_el_overlay hold_initial_window frames=" +
+                              std::to_wstring(dolbyVisionEnhancementFrames_.size()));
+            }
+            if (preserveInitialWindow) {
+                // Drop the newest EL frame only until the first BL frame is
+                // available. Once a BL is pending, the queue slides toward its
+                // exact PTS and each new EL frame is matched immediately.
+            } else if (!FitsWithinBudget(queuedBytes, incomingBytes, kMaxDolbyVisionEnhancementQueuedBytes)) {
+                if (!dolbyVisionEnhancementFailureLogged_) {
+                    dolbyVisionEnhancementFailureLogged_ = true;
+                    LogThread(LogLevel::Warning,
+                              L"decoder",
+                              L"dolby_vision_el_overlay unavailable reason=frame_exceeds_memory_budget bytes=" +
+                                  std::to_wstring(incomingBytes));
+                }
+                av_frame_unref(frame);
+                continue;
+            }
             DolbyVisionEnhancementFrame queued;
             queued.pts = pts;
             queued.yuv = std::move(enhancementYuv);
-            queued.dovi = (metadata && metadata->valid) ? metadata : latestDolbyVisionEnhancementMetadata_;
-            queued.details = DoviFrameSummary(queued.dovi.get());
-            dolbyVisionEnhancementFrames_.push_back(std::move(queued));
-            std::size_t queuedBytes = 0;
-            for (const auto& queuedFrame : dolbyVisionEnhancementFrames_) {
-                if (queuedFrame.yuv.data) {
-                    queuedBytes += queuedFrame.yuv.data->size();
-                }
-            }
-            while (dolbyVisionEnhancementFrames_.size() > kMaxDolbyVisionEnhancementQueuedFrames ||
-                   queuedBytes > kMaxDolbyVisionEnhancementQueuedBytes) {
-                if (dolbyVisionEnhancementFrames_.front().yuv.data &&
-                    queuedBytes >= dolbyVisionEnhancementFrames_.front().yuv.data->size()) {
-                    queuedBytes -= dolbyVisionEnhancementFrames_.front().yuv.data->size();
-                }
-                dolbyVisionEnhancementFrames_.pop_front();
-            }
-            if (!dolbyVisionEnhancementFirstPackedLogged_) {
+                queued.dovi = (metadata && metadata->valid) ? metadata : latestDolbyVisionEnhancementMetadata_;
+                queued.details = DoviFrameSummary(queued.dovi.get());
+                dolbyVisionEnhancementFrames_.push_back(std::move(queued));
+                TryPublishPendingDolbyVisionBaseFrame();
+                if (!dolbyVisionEnhancementFirstPackedLogged_) {
                 dolbyVisionEnhancementFirstPackedLogged_ = true;
                 const auto packMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - packStart).count();
                 LogThread(LogLevel::Debug,
                           L"decoder",
                           L"dolby_vision_el_packed bytes=" +
-                              std::to_wstring(dolbyVisionEnhancementFrames_.back().yuv.data
-                                                  ? dolbyVisionEnhancementFrames_.back().yuv.data->size()
-                                                  : 0) +
+                              std::to_wstring(incomingBytes) +
                               L" pack_ms=" + std::to_wstring(packMs));
             }
         } else if (!dolbyVisionEnhancementFailureLogged_) {
@@ -3702,7 +3968,7 @@ void FfmpegVideoDecoder::AttachDolbyVisionEnhancementFrame(NativeVideoFrame& fra
         }
     }
 
-    if (bestDelta > kDolbyVisionEnhancementMatchDelta) {
+    if (bestDelta > kDolbyVisionEnhancementPairDelta) {
         while (!dolbyVisionEnhancementFrames_.empty() &&
                dolbyVisionEnhancementFrames_.front().pts + kDolbyVisionEnhancementMatchDelta < pts) {
             dolbyVisionEnhancementFrames_.pop_front();
@@ -3784,6 +4050,60 @@ void FfmpegVideoDecoder::AttachDolbyVisionEnhancementFrame(NativeVideoFrame& fra
     }
 }
 
+bool FfmpegVideoDecoder::PublishPreparedDolbyVisionFrame(NativeVideoFrame&& frame) {
+    const bool logFirstDoviQueue = !dolbyVisionFirstQueueLogged_;
+    if (logFirstDoviQueue) {
+        LogThread(LogLevel::Debug,
+                  L"decoder",
+                  L"dolby_vision_yuv_queue_ready serial=" + std::to_wstring(frame.serial) +
+                      L" pts_ms=" + std::to_wstring(frame.pts.count()) +
+                      L" fel_overlay=" + (frame.HasEnhancementYuv() ? L"yes" : L"no") +
+                      L" subtitles_deferred=true");
+    }
+    const bool published = oneShotFrame_
+                               ? PublishImmediateFrame(std::move(frame))
+                               : EnqueueFrame(std::move(frame));
+    if (logFirstDoviQueue) {
+        dolbyVisionFirstQueueLogged_ = true;
+        LogThread(LogLevel::Debug,
+                  L"decoder",
+                  L"dolby_vision_yuv_queue_result enqueued=" +
+                      std::wstring(published ? L"true" : L"false"));
+    }
+    return published;
+}
+
+void FfmpegVideoDecoder::TryPublishPendingDolbyVisionBaseFrame() {
+    if (!pendingDolbyVisionBaseFrame_.has_value()) {
+        return;
+    }
+    if (pendingDolbyVisionBaseFrame_->timelineSerial != CurrentTimelineSerial()) {
+        pendingDolbyVisionBaseFrame_.reset();
+        return;
+    }
+
+    AttachDolbyVisionEnhancementFrame(*pendingDolbyVisionBaseFrame_,
+                                      pendingDolbyVisionBaseFrame_->pts);
+    if (!pendingDolbyVisionBaseFrame_->HasEnhancementYuv()) {
+        // If the EL has already advanced beyond this BL PTS, that exact pair
+        // cannot arrive later. Release the retained BL so the next decoded BL
+        // can become the new synchronization candidate.
+        if (!dolbyVisionEnhancementFrames_.empty() &&
+            dolbyVisionEnhancementFrames_.front().pts >
+                pendingDolbyVisionBaseFrame_->pts + kDolbyVisionEnhancementMatchDelta) {
+            pendingDolbyVisionBaseFrame_.reset();
+        }
+        return;
+    }
+
+    NativeVideoFrame ready = std::move(*pendingDolbyVisionBaseFrame_);
+    pendingDolbyVisionBaseFrame_.reset();
+    dolbyVisionEnhancementStartupMisses_ = 0;
+    dolbyVisionEnhancementStartupFallbackLogged_ = false;
+    dolbyVisionEnhancementBaseOnlyDropLogged_ = false;
+    (void)PublishPreparedDolbyVisionFrame(std::move(ready));
+}
+
 void FfmpegVideoDecoder::LogDolbyVisionCpuReferenceSample(const NativeVideoFrame& frame) {
     if (dolbyVisionCpuReferenceLogged_ ||
         !frame.enhancementDovi ||
@@ -3818,8 +4138,8 @@ void FfmpegVideoDecoder::LogDolbyVisionCpuReferenceSample(const NativeVideoFrame
     LogThread(LogLevel::Info, L"decoder", stream.str());
 }
 
-bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, SwsContext*& swsCtx, std::vector<uint8_t>& bgraBuffer,
-                                      AVRational timeBase, uint64_t& serial) {
+bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, SwsContext*& swsCtx,
+                                      const AVRational timeBase, uint64_t& serial) {
     const auto pts = FramePts(frame, timeBase);
     if (ShouldDropSeekPreroll(pts)) {
         return true;
@@ -3924,7 +4244,7 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
 
         NativeYuvPlanes packedYuv;
         const auto packStart = std::chrono::steady_clock::now();
-        if (!PackYuv420P10FrameToP010(frame, packedYuv)) {
+        if (!PackYuv420P10FrameToP010(frame, packedYuv, kDecodedFrameMemoryBudgetBytes)) {
             LogThread(LogLevel::Warning,
                       L"decoder",
                       L"dolby_vision_yuv_path fallback=bgra reason=pack_p010_failed");
@@ -3941,6 +4261,10 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
             }
 
             queued.yuv = std::move(packedYuv);
+            queued.pts = pts;
+            queued.serial = ++serial;
+            queued.timelineSerial = frameTimelineSerial;
+            RefreshFrameSubtitles(queued);
             AttachDolbyVisionEnhancementFrame(queued, pts);
             if (enhancementOverlayPath && !queued.HasEnhancementYuv()) {
                 bool hasRenderedFrame = false;
@@ -3949,17 +4273,23 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
                     hasRenderedFrame = stats_.rendered > 0 || latestFrame_.HasContent();
                 }
                 ++dolbyVisionEnhancementStartupMisses_;
+                const bool retainedBase = !pendingDolbyVisionBaseFrame_.has_value();
+                if (retainedBase) {
+                    pendingDolbyVisionBaseFrame_ = std::move(queued);
+                }
                 if (!hasRenderedFrame && dolbyVisionEnhancementStartupMisses_ == 1) {
                     LogThread(LogLevel::Debug,
                               L"decoder",
                               L"dolby_vision_el_overlay startup_wait_for_match bl_pts_ms=" +
-                                  std::to_wstring(pts.count()));
+                                  std::to_wstring(pts.count()) +
+                                  L" retained=" + (retainedBase ? L"true" : L"false"));
                 } else if (hasRenderedFrame && !dolbyVisionEnhancementBaseOnlyDropLogged_) {
                     dolbyVisionEnhancementBaseOnlyDropLogged_ = true;
                     LogThread(LogLevel::Debug,
                               L"decoder",
-                              L"dolby_vision_el_overlay drop_base_only bl_pts_ms=" +
-                                  std::to_wstring(pts.count()));
+                              L"dolby_vision_el_overlay hold_base_for_match bl_pts_ms=" +
+                                  std::to_wstring(pts.count()) +
+                                  L" retained=" + (retainedBase ? L"true" : L"false"));
                 }
                 return true;
             } else if (enhancementOverlayPath) {
@@ -3967,30 +4297,7 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
                 dolbyVisionEnhancementStartupFallbackLogged_ = false;
                 dolbyVisionEnhancementBaseOnlyDropLogged_ = false;
             }
-            queued.pts = pts;
-            queued.serial = ++serial;
-            queued.timelineSerial = frameTimelineSerial;
-            RefreshFrameSubtitles(queued);
-            const bool logFirstDoviQueue = !dolbyVisionFirstQueueLogged_;
-            if (logFirstDoviQueue) {
-                LogThread(LogLevel::Debug,
-                          L"decoder",
-                          L"dolby_vision_yuv_queue_ready serial=" + std::to_wstring(queued.serial) +
-                              L" pts_ms=" + std::to_wstring(queued.pts.count()) +
-                              L" fel_overlay=" + (queued.HasEnhancementYuv() ? L"yes" : L"no") +
-                              L" subtitles_deferred=true");
-            }
-            if (oneShotFrame_) {
-                return PublishImmediateFrame(std::move(queued));
-            }
-            const bool enqueued = EnqueueFrame(std::move(queued));
-            if (logFirstDoviQueue) {
-                dolbyVisionFirstQueueLogged_ = true;
-                LogThread(LogLevel::Debug,
-                          L"decoder",
-                          L"dolby_vision_yuv_queue_result enqueued=" + std::wstring(enqueued ? L"true" : L"false"));
-            }
-            return enqueued;
+            return PublishPreparedDolbyVisionFrame(std::move(queued));
         }
     }
 
@@ -4230,7 +4537,11 @@ bool FfmpegVideoDecoder::ApplyPendingSeek(AVFormatContext* formatCtx,
         std::chrono::steady_clock::now() - seekStart).count();
     const bool seekInterrupted = seekError == AVERROR_EXIT ||
                                  (seekError < 0 && seekElapsedMs >= seekIoTimeout.count());
-    const uint64_t seekTimelineSerial = seekError >= 0 ? AdvanceTimelineSerial() : CurrentTimelineSerial();
+    // Seek() already advanced the generation before returning to its caller,
+    // making every pre-seek frame stale immediately.  Reuse that serial here
+    // so rapid latest-only seek requests cannot briefly revive an older
+    // timeline while FFmpeg is between two I/O operations.
+    const uint64_t seekTimelineSerial = CurrentTimelineSerial();
     LogThread(seekError < 0 ? LogLevel::Warning : LogLevel::Info,
               L"decoder",
               L"runtime_seek target=" + anvil::playback::FormatTimecode(*target) +
@@ -4244,7 +4555,10 @@ bool FfmpegVideoDecoder::ApplyPendingSeek(AVFormatContext* formatCtx,
         LogThread(LogLevel::Warning, L"decoder", L"runtime_seek failed reason=" + FfmpegErrorString(seekError));
         {
             std::scoped_lock lock(mutex_);
-            ResetSeekRecoveryLocked();
+            // Keep the audio handoff gate closed until either a newer seek
+            // completes or the failing session is stopped. Resetting recovery
+            // here can overwrite the atomics published by a concurrently
+            // queued seek and briefly resume audio on the wrong timeline.
             stats_.buffering = false;
         }
         if (stopping_.load()) {
@@ -4280,6 +4594,7 @@ bool FfmpegVideoDecoder::ApplyPendingSeek(AVFormatContext* formatCtx,
     dolbyVisionEnhancementFirstFrameLogged_ = false;
     dolbyVisionEnhancementDynamicMetadataLogged_ = false;
     dolbyVisionEnhancementFailureLogged_ = false;
+    dolbyVisionEnhancementOverlayLogged_ = false;
     dolbyVisionEnhancementNoMatchLogged_ = false;
     dolbyVisionEnhancementFirstPackedLogged_ = false;
     dolbyVisionCpuReferenceLogged_ = false;
@@ -4292,6 +4607,7 @@ bool FfmpegVideoDecoder::ApplyPendingSeek(AVFormatContext* formatCtx,
     latestDolbyVisionEnhancementMetadata_.reset();
     latestDolbyVisionEnhancementMetadataPts_ = std::chrono::milliseconds{0};
     dolbyVisionEnhancementFrames_.clear();
+    pendingDolbyVisionBaseFrame_.reset();
     if (externalSubtitlesActive_) {
         subtitleCues_ = externalSubtitleCues_;
     } else {
@@ -4305,11 +4621,13 @@ bool FfmpegVideoDecoder::ApplyPendingSeek(AVFormatContext* formatCtx,
         }
     }
 
+    NativeVideoFrame retiredLatestFrame;
+    std::deque<NativeVideoFrame> retiredFrameQueue;
     {
         std::scoped_lock lock(mutex_);
         const bool prerollAfterSeek = !playbackPaused_.load();
-        latestFrame_ = {};
-        frameQueue_.clear();
+        retiredLatestFrame = std::move(latestFrame_);
+        retiredFrameQueue.swap(frameQueue_);
         schedulePrimed_ = false;
         fallbackClockAnchor_.reset();
         fallbackClockBasePts_ = *target;
@@ -4342,13 +4660,7 @@ bool FfmpegVideoDecoder::DecodeSubtitlePacket(AVCodecContext* subtitleCodecCtx,
         const auto duration = PacketDuration(packet, subtitleTimeBase).value_or(std::chrono::milliseconds{4000});
         if (subtitleAssRenderer_ &&
             subtitleAssRenderer_->ProcessPacket(packet->data, packet->size, pts, duration)) {
-            {
-                std::scoped_lock lock(mutex_);
-                for (auto& frame : frameQueue_) {
-                    frame.subtitlesPrepared = false;
-                }
-            }
-            if (RefreshLatestFrameSubtitles()) {
+            if (RefreshQueuedFrameSubtitles()) {
                 NotifyFrameReady();
             }
             return true;
@@ -4467,6 +4779,9 @@ void FfmpegVideoDecoder::RefreshFrameSubtitles(NativeVideoFrame& frame, const bo
     if (!force && frame.subtitlesPrepared) {
         return;
     }
+    if (!force) {
+        PruneExpiredSubtitleCues(frame.pts - subtitleDelay_);
+    }
     frame.subtitleText = SubtitleTextForPts(frame.pts);
     const bool seekFastResumeFrame =
         !force &&
@@ -4543,9 +4858,6 @@ bool FfmpegVideoDecoder::RefreshQueuedFrameSubtitles() {
     std::scoped_lock lock(mutex_);
     if (latestFrame_.HasContent()) {
         latestChanged = refreshChanged(latestFrame_);
-    }
-    if (subtitleAssActive_) {
-        return latestChanged;
     }
     for (auto& frame : frameQueue_) {
         refreshChanged(frame);
@@ -4928,50 +5240,66 @@ void FfmpegVideoDecoder::LogZeroCopyFallbackOnce(const std::wstring& reason) {
 }
 
 std::shared_ptr<std::vector<uint8_t>> FfmpegVideoDecoder::AcquireReusableBgraBuffer(const std::size_t needed) {
-    if (needed == 0) {
+    if (needed == 0 || needed > kDecodedFrameMemoryBudgetBytes) {
         return {};
     }
 
-    std::scoped_lock lock(mutex_);
-    for (const auto& buffer : reusableBgraBuffers_) {
-        if (buffer && buffer.use_count() == 1 && buffer->capacity() >= needed) {
-            buffer->resize(needed);
-            return buffer;
+    std::shared_ptr<std::vector<uint8_t>> buffer;
+    bool retainedInPool = false;
+    {
+        std::scoped_lock lock(mutex_);
+        for (const auto& retained : reusableBgraBuffers_) {
+            if (retained && retained.use_count() == 1 && retained->capacity() >= needed) {
+                buffer = retained;
+                retainedInPool = true;
+                break;
+            }
+        }
+
+        if (!buffer && needed <= kReusableBufferMemoryBudgetBytes) {
+            for (auto it = reusableBgraBuffers_.begin(); it != reusableBgraBuffers_.end(); ++it) {
+                if (*it && it->use_count() == 1) {
+                    buffer = *it;
+                    reusableBgraBuffers_.erase(it);
+                    break;
+                }
+            }
         }
     }
 
-    for (const auto& buffer : reusableBgraBuffers_) {
-        if (buffer && buffer.use_count() == 1) {
-            buffer->resize(needed);
-            return buffer;
+    try {
+        if (!buffer) {
+            buffer = std::make_shared<std::vector<uint8_t>>();
         }
-    }
-
-    if (reusableBgraBuffers_.size() < kMaxReusableBgraBuffers) {
-        auto buffer = std::make_shared<std::vector<uint8_t>>();
         buffer->resize(needed);
-        reusableBgraBuffers_.push_back(buffer);
-        return buffer;
+    } catch (const std::bad_alloc&) {
+        return {};
     }
 
-    auto transient = std::make_shared<std::vector<uint8_t>>();
-    transient->resize(needed);
-    return transient;
+    if (buffer->capacity() > kDecodedFrameMemoryBudgetBytes) {
+        return {};
+    }
+
+    if (!retainedInPool && buffer->capacity() <= kReusableBufferMemoryBudgetBytes) {
+        std::scoped_lock lock(mutex_);
+        std::size_t retainedBytes = 0;
+        for (const auto& retained : reusableBgraBuffers_) {
+            retainedBytes = SaturatingAddBytes(retainedBytes, retained ? retained->capacity() : 0);
+        }
+        if (reusableBgraBuffers_.size() < kMaxReusableBgraBuffers &&
+            FitsWithinBudget(retainedBytes, buffer->capacity(), kReusableBufferMemoryBudgetBytes)) {
+            reusableBgraBuffers_.push_back(buffer);
+        }
+    }
+    return buffer;
 }
 
 std::size_t FfmpegVideoDecoder::FrameQueueCostBytes(const NativeVideoFrame& frame) {
-    const std::size_t enhancementBytes =
-        frame.HasEnhancementYuv() && frame.enhancementYuv.data ? frame.enhancementYuv.data->size() : 0;
-    if (frame.HasD3DTexture()) {
-        return enhancementBytes;
-    }
-    if (frame.HasYuv()) {
-        return (frame.yuv.data ? frame.yuv.data->size() : 0) + enhancementBytes;
-    }
-    if (frame.HasPixels()) {
-        return (frame.bgra ? frame.bgra->size() : 0) + enhancementBytes;
-    }
-    return enhancementBytes;
+    std::size_t bytes = 0;
+    bytes = SaturatingAddBytes(bytes, BufferCapacityBytes(frame.yuv.data));
+    bytes = SaturatingAddBytes(bytes, BufferCapacityBytes(frame.bgra));
+    bytes = SaturatingAddBytes(bytes, BufferCapacityBytes(frame.enhancementYuv.data));
+    return bytes;
 }
 
 std::size_t FfmpegVideoDecoder::MaxQueueDepthForFrame(const NativeVideoFrame& frame) {
@@ -4993,19 +5321,23 @@ bool FfmpegVideoDecoder::HasQueueCapacityLocked(const NativeVideoFrame& frame) c
     }
 
     const std::size_t incomingBytes = FrameQueueCostBytes(frame);
-    if (incomingBytes == 0) {
-        return true;
+    if (incomingBytes > kMaxCpuQueuedFrameBytes) {
+        return false;
     }
 
-    std::size_t queuedBytes = 0;
+    std::size_t queuedBytes = FrameQueueCostBytes(latestFrame_);
+    if (queuedBytes > kMaxCpuQueuedFrameBytes) {
+        return false;
+    }
     for (const auto& queued : frameQueue_) {
-        queuedBytes += FrameQueueCostBytes(queued);
-        if (queuedBytes >= kMaxCpuQueuedFrameBytes) {
+        const std::size_t queuedFrameBytes = FrameQueueCostBytes(queued);
+        if (!FitsWithinBudget(queuedBytes, queuedFrameBytes, kMaxCpuQueuedFrameBytes)) {
             return false;
         }
+        queuedBytes += queuedFrameBytes;
     }
 
-    return frameQueue_.empty() || queuedBytes + incomingBytes <= kMaxCpuQueuedFrameBytes;
+    return FitsWithinBudget(queuedBytes, incomingBytes, kMaxCpuQueuedFrameBytes);
 }
 
 void FfmpegVideoDecoder::UpdateBufferedStatsLocked() {
@@ -5069,15 +5401,20 @@ bool FfmpegVideoDecoder::SeekPrerollReadyLocked() const {
                                     : (softwareFrame ? std::chrono::milliseconds{300}
                                                      : std::chrono::milliseconds{160});
     const auto decodedSpan = frameQueue_.back().pts - frameQueue_.front().pts;
-    const bool queuedFramesReady = frameQueue_.size() >= minQueuedFrames;
-    const bool videoReady = softwareFrame
-                                ? queuedFramesReady
-                                : (queuedFramesReady || decodedSpan >= minDecodedSpan);
     const bool decodedQueueFull = frameQueue_.size() >= effectiveMaxQueueDepth;
     const bool decodedQueueAtCapacity = frameQueue_.size() >= maxQueueDepth;
-    const bool softwareQueueFullWithLead =
+    // Large 4K libplacebo frames usually hit the 128 MiB byte budget before
+    // the nominal six-frame depth. Treat that byte saturation as a full queue;
+    // otherwise seek preroll waits for a fifth frame that can never be queued.
+    const bool softwareQueueSaturated =
         softwareFrame &&
-        decodedQueueFull &&
+        (decodedQueueFull || !HasQueueCapacityLocked(frameQueue_.front()));
+    const bool queuedFramesReady = frameQueue_.size() >= minQueuedFrames;
+    const bool videoReady = softwareFrame
+                                ? (queuedFramesReady || softwareQueueSaturated)
+                                : (queuedFramesReady || decodedSpan >= minDecodedSpan);
+    const bool softwareQueueFullWithLead =
+        softwareQueueSaturated &&
         stats_.readAheadDuration >= kSeekPrerollSoftwareQueueFullMinReadAhead;
     const bool hardwareQueueFull =
         !softwareFrame &&
@@ -5111,6 +5448,22 @@ bool FfmpegVideoDecoder::SeekPrerollReadyLocked() const {
 }
 
 bool FfmpegVideoDecoder::EnqueueFrame(NativeVideoFrame&& frame) {
+    if (!frame.subtitlesPrepared) {
+        RefreshFrameSubtitles(frame);
+    }
+    const std::size_t incomingBytes = FrameQueueCostBytes(frame);
+    if (incomingBytes > kMaxCpuQueuedFrameBytes) {
+        {
+            std::scoped_lock lock(mutex_);
+            ++stats_.droppedQueueFull;
+        }
+        LogThread(LogLevel::Error,
+                  L"decoder",
+                  L"decoded_frame exceeds_memory_budget bytes=" + std::to_wstring(incomingBytes) +
+                      L" budget_bytes=" + std::to_wstring(kMaxCpuQueuedFrameBytes));
+        return false;
+    }
+
     while (!stopping_.load()) {
         if (HasPendingSeek()) {
             return true;
@@ -5122,11 +5475,17 @@ bool FfmpegVideoDecoder::EnqueueFrame(NativeVideoFrame&& frame) {
             UpdateBufferedStatsLocked();
             return true;
         }
-        ScheduleDueFrames();
+        WakeScheduler();
         bool queued = false;
         {
-            std::scoped_lock lock(mutex_);
+            std::unique_lock lock(mutex_);
             DropStaleFramesLocked();
+            const uint64_t currentSerial = CurrentTimelineSerial();
+            if (frame.timelineSerial != 0 && frame.timelineSerial != currentSerial) {
+                ++stats_.droppedStale;
+                UpdateBufferedStatsLocked();
+                return true;
+            }
             if (HasQueueCapacityLocked(frame)) {
                 frameQueue_.push_back(std::move(frame));
                 stats_.buffering = seekPrerollPending_.load();
@@ -5135,27 +5494,59 @@ bool FfmpegVideoDecoder::EnqueueFrame(NativeVideoFrame&& frame) {
             } else if (playbackPaused_.load()) {
                 ++stats_.droppedQueueFull;
                 queued = true;
+            } else {
+                frameQueueCv_.wait_for(lock, std::chrono::milliseconds{2}, [this, &frame]() {
+                    return stopping_.load() ||
+                           HasPendingSeek() ||
+                           playbackPaused_.load() ||
+                           HasQueueCapacityLocked(frame);
+                });
             }
         }
         if (queued) {
-            ScheduleDueFrames();
+            WakeScheduler();
             return true;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds{1});
     }
     return false;
 }
 
 void FfmpegVideoDecoder::DrainQueuedFrames() {
-    while (!stopping_.load()) {
+    WakeScheduler();
+    std::unique_lock lock(mutex_);
+    frameQueueCv_.wait(lock, [this]() {
+        return stopping_.load() || frameQueue_.empty();
+    });
+}
+
+void FfmpegVideoDecoder::WakeScheduler() {
+    {
+        std::scoped_lock lock(schedulerMutex_);
+        schedulerWakeRequested_ = true;
+    }
+    schedulerCv_.notify_one();
+}
+
+void FfmpegVideoDecoder::SchedulerLoop() {
+    std::unique_lock lock(schedulerMutex_);
+    while (!stopping_.load() && running_.load()) {
+        schedulerWakeRequested_ = false;
+        lock.unlock();
         ScheduleDueFrames();
+        bool hasQueuedFrames = false;
         {
-            std::scoped_lock lock(mutex_);
-            if (frameQueue_.empty()) {
-                return;
-            }
+            std::scoped_lock queueLock(mutex_);
+            hasQueuedFrames = !frameQueue_.empty();
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        lock.lock();
+        const auto wakeRequested = [this]() {
+            return stopping_.load() || !running_.load() || schedulerWakeRequested_;
+        };
+        if (hasQueuedFrames) {
+            schedulerCv_.wait_for(lock, std::chrono::milliseconds{2}, wakeRequested);
+        } else {
+            schedulerCv_.wait(lock, wakeRequested);
+        }
     }
 }
 
@@ -5170,12 +5561,53 @@ void FfmpegVideoDecoder::ScheduleDueFrames() {
     int seekPrerollReadAheadMs = 0;
     int seekPrerollWaitMs = 0;
     std::chrono::milliseconds publishedClockPosition{0};
+    bool queueChanged = false;
+
+    // Seek() is a window-thread control operation.  Once it publishes a
+    // pending request, never let this worker publish an old queued frame while
+    // the decode worker is still interrupting or completing FFmpeg seek I/O.
+    if (HasPendingSeek()) {
+        return;
+    }
 
     {
         std::scoped_lock lock(mutex_);
-        DropStaleFramesLocked();
+        ApplyPendingClockResetLocked();
+        if (HasPendingSeek()) {
+            return;
+        }
         if (frameQueue_.empty()) {
             UpdateBufferedStatsLocked();
+            return;
+        }
+    }
+
+    std::optional<std::chrono::milliseconds> audioClock;
+    if (!playbackPaused_.load()) {
+        ClockCallback callback;
+        {
+            std::scoped_lock lock(clockCallbackMutex_);
+            callback = clockCallback_;
+        }
+        if (callback) {
+            audioClock = callback();
+        }
+    }
+
+    {
+        std::scoped_lock lock(mutex_);
+        ApplyPendingClockResetLocked();
+        if (HasPendingSeek()) {
+            return;
+        }
+        const std::size_t queueDepthBeforeStaleDrop = frameQueue_.size();
+        DropStaleFramesLocked();
+        queueChanged = frameQueue_.size() != queueDepthBeforeStaleDrop;
+        if (frameQueue_.empty()) {
+            UpdateBufferedStatsLocked();
+            if (queueChanged) {
+                frameQueueCv_.notify_all();
+            }
             return;
         }
 
@@ -5183,6 +5615,9 @@ void FfmpegVideoDecoder::ScheduleDueFrames() {
             UpdateBufferedStatsLocked();
             if (!SeekPrerollReadyLocked()) {
                 stats_.buffering = true;
+                if (queueChanged) {
+                    frameQueueCv_.notify_all();
+                }
                 return;
             }
             const auto now = std::chrono::steady_clock::now();
@@ -5201,8 +5636,8 @@ void FfmpegVideoDecoder::ScheduleDueFrames() {
 
         const bool seekRecoveryVisualWarmup = seekRecovery_.phase == SeekRecoveryPhase::VisualWarmup;
         auto clock = seekRecoveryVisualWarmup
-                         ? SeekRecoverySchedulerClockLocked(frameQueue_.front().pts)
-                         : CurrentSchedulerClockLocked(frameQueue_.front().pts);
+                         ? SeekRecoverySchedulerClockLocked(frameQueue_.front().pts, audioClock)
+                         : CurrentSchedulerClockLocked(frameQueue_.front().pts, audioClock);
         if (!seekRecoveryVisualWarmup && !schedulePrimed_ && stats_.rendered == 0) {
             clock.position = frameQueue_.front().pts;
             clock.usingAudioClock = false;
@@ -5236,6 +5671,7 @@ void FfmpegVideoDecoder::ScheduleDueFrames() {
                 lateBy > kFrameLateDropThreshold &&
                 frameQueue_.size() > 1) {
                 frameQueue_.pop_front();
+                queueChanged = true;
                 UpdateBufferedStatsLocked();
                 ++stats_.droppedLate;
                 continue;
@@ -5249,6 +5685,7 @@ void FfmpegVideoDecoder::ScheduleDueFrames() {
 
             NativeVideoFrame candidate = std::move(frameQueue_.front());
             frameQueue_.pop_front();
+            queueChanged = true;
             UpdateBufferedStatsLocked();
 
             const bool anotherFrameDue = !frameQueue_.empty() &&
@@ -5265,8 +5702,6 @@ void FfmpegVideoDecoder::ScheduleDueFrames() {
         }
 
         if (hasFrame) {
-            PruneExpiredSubtitleCues(clock.position - subtitleDelay_);
-            RefreshFrameSubtitles(frameToPublish);
             stats_.driftMs = static_cast<int>((frameToPublish.pts - clock.position).count());
             ++stats_.rendered;
             firstPublishedFrame = stats_.rendered == 1;
@@ -5276,6 +5711,10 @@ void FfmpegVideoDecoder::ScheduleDueFrames() {
             UpdateSeekRecoveryAfterPublishLocked(frameToPublish.pts, std::chrono::steady_clock::now());
             publishedQueueDepth = stats_.queueDepth;
         }
+    }
+
+    if (queueChanged) {
+        frameQueueCv_.notify_all();
     }
 
     if (hasFrame) {
@@ -5298,15 +5737,15 @@ void FfmpegVideoDecoder::ScheduleDueFrames() {
     }
 }
 
-FfmpegVideoDecoder::SchedulerClock FfmpegVideoDecoder::CurrentSchedulerClockLocked(const std::chrono::milliseconds firstQueuedPts) {
+FfmpegVideoDecoder::SchedulerClock FfmpegVideoDecoder::CurrentSchedulerClockLocked(
+    const std::chrono::milliseconds firstQueuedPts,
+    const std::optional<std::chrono::milliseconds>& audioClock) {
     if (playbackPaused_.load()) {
         return {std::chrono::milliseconds{pausedPositionMs_.load()}, false};
     }
 
-    if (clockCallback_) {
-        if (const auto audioClock = clockCallback_()) {
-            return {*audioClock, true};
-        }
+    if (audioClock.has_value()) {
+        return {*audioClock, true};
     }
 
     const auto now = std::chrono::steady_clock::now();
@@ -5326,7 +5765,9 @@ void FfmpegVideoDecoder::NotifyFrameReady() {
     if (!window || message == 0 || frameMessagePending_.exchange(true)) {
         return;
     }
-    PostMessageW(window, message, 0, 0);
+    if (!PostMessageW(window, message, static_cast<WPARAM>(notificationCookie_.load()), 0)) {
+        frameMessagePending_.store(false);
+    }
 }
 
 void FfmpegVideoDecoder::NotifyDecodeFailure(const std::wstring& message) const {
@@ -5336,7 +5777,7 @@ void FfmpegVideoDecoder::NotifyDecodeFailure(const std::wstring& message) const 
         return;
     }
 
-    auto* payload = new (std::nothrow) NativeDecodeFailure{path_, message};
+    auto* payload = new (std::nothrow) NativeDecodeFailure{path_, message, notificationCookie_.load()};
     if (!payload) {
         return;
     }

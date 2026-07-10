@@ -21,11 +21,13 @@ constexpr UINT_PTR kUiAnimationTimer = 1002;
 constexpr UINT_PTR kFullscreenChromeHideTimer = 1003;
 constexpr UINT_PTR kVideoPressTimer = 1004;
 constexpr UINT_PTR kScrollbarAutoHideTimer = 1005;
+constexpr UINT_PTR kAsyncCompletionPollTimer = 1006;
 constexpr UINT kIdlePlaybackTimerMs = 250;
 constexpr UINT kPlayingPlaybackTimerMs = 100;
 constexpr UINT kUiAnimationTimerMs = 16;
 constexpr UINT kVideoLongPressTimerMs = 320;
 constexpr UINT kScrollbarAutoHideTimerMs = 950;
+constexpr UINT kAsyncCompletionPollTimerMs = 40;
 
 // Custom WM_APP messages posted from decode threads to the UI thread.
 constexpr UINT kVideoFrameReadyMessage = WM_APP + 1;
@@ -36,6 +38,11 @@ constexpr UINT kRuntimeStopCompleteMessage = WM_APP + 5;
 constexpr UINT kOpenPathMessage = WM_APP + 6;
 constexpr UINT kNativeVideoDecodeFailedMessage = WM_APP + 7;
 constexpr UINT kLocalFolderScanResultMessage = WM_APP + 8;
+constexpr UINT kOpenMediaCompleteMessage = WM_APP + 9;
+constexpr UINT kPlaybackSupervisorStoppedMessage = WM_APP + 10;
+constexpr UINT kInspectorFolderScanCompleteMessage = WM_APP + 11;
+constexpr UINT kRenderThreadStoppedMessage = WM_APP + 12;
+constexpr UINT kRenderInitializationCompleteMessage = WM_APP + 13;
 
 // DWM attribute constants for window chrome customization.
 constexpr DWORD kDwmUseImmersiveDarkMode = 20;
