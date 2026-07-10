@@ -1,4 +1,5 @@
 export interface PlayerState {
+  uiLanguage: 'en' | 'zh'
   playbackState: 'Empty' | 'Stopped' | 'Playing' | 'Paused' | 'Opening' | string
   lastError: string
   mediaName: string
@@ -16,6 +17,12 @@ export interface PlayerState {
   backendLabel: string
   sidebarCollapsed: boolean
   fullscreen: boolean
+  customTitleBar: boolean
+  refreshRateSyncEnabled: boolean
+  refreshRateMaximumMultiple: boolean
+  refreshRateSyncUnavailable: boolean
+  refreshRateSyncActive: boolean
+  refreshRateSyncHz: number
   fullscreenTransportVisible: boolean
   subtitleMenuOpen: boolean
   inspectorTab: 'recent' | 'folder' | 'media' | 'system' | 'log' | 'settings'
@@ -141,6 +148,27 @@ export interface WebDavDirectoryFailed {
   message: string
 }
 
+export interface MediaDetailsProbed {
+  type: 'mediaDetailsProbed'
+  requestId: string
+  path: string
+  videoSpec: string
+  audioSpec: string
+  streamSpecs: Array<{
+    id: string
+    type: 'video' | 'audio' | 'subtitle'
+    title: string
+    subtitle: string
+    details: Array<{ label: string; value: string }>
+  }>
+}
+
+export interface MediaDetailsProbeFailed {
+  type: 'mediaDetailsProbeFailed'
+  requestId: string
+  message: string
+}
+
 export type NativeMessage =
   | { type?: 'state'; state?: PlayerState }
   | LocalFolderPickResult
@@ -152,7 +180,12 @@ export type NativeMessage =
   | SmbDirectoryFailed
   | WebDavDirectoryListed
   | WebDavDirectoryFailed
+  | MediaDetailsProbed
+  | MediaDetailsProbeFailed
+  | { type: 'windowChrome'; customTitleBar: boolean }
   | { type: 'deliverEmbyPlaybackReport'; report: unknown }
+  | { type: 'bilibiliTrailerSearchCompleted'; requestId: string; response: unknown }
+  | { type: 'bilibiliTrailerSearchFailed'; requestId: string; message: string }
 
 export interface TrackOption {
   index: number
@@ -175,18 +208,35 @@ export type NativeCommand =
   | { type: 'command'; command: 'connectSmbShare'; path: string; username?: string; password?: string }
   | { type: 'command'; command: 'listWebDavDirectory'; requestId: string; url: string; username?: string; password?: string }
   | { type: 'command'; command: 'scanWebDavFolder'; url: string; name?: string; username?: string; password?: string }
+  | { type: 'command'; command: 'cancelLibraryScan'; path: string; webDav: boolean }
+  | { type: 'command'; command: 'cancelLibraryProbe'; requestId: string }
   | { type: 'command'; command: 'debugLog'; message: string }
+  | { type: 'command'; command: 'searchBilibiliTrailers'; requestId: string; keyword: string }
+  | { type: 'command'; command: 'probeMediaDetails'; requestId: string; path: string }
   | { type: 'command'; command: 'setWebUiRoute'; route: 'player' | 'library' }
-  | { type: 'command'; command: 'requestPlayback'; path: string; startPositionRatio?: number }
+  | { type: 'command'; command: 'requestPlayback'; path: string; startPositionRatio?: number; audioTrackIndex?: number; subtitleTrackIndex?: number }
+  | { type: 'command'; command: 'openExternalUrl'; url: string }
   | { type: 'command'; command: 'focusPlayer' }
+  | { type: 'command'; command: 'requestWindowChrome' }
+  | { type: 'command'; command: 'beginWindowDrag' }
+  | { type: 'command'; command: 'minimizeWindow' }
+  | { type: 'command'; command: 'toggleMaximizeWindow' }
+  | { type: 'command'; command: 'closeWindow' }
   | { type: 'command'; command: 'deliverEmbyPlaybackReport'; report: unknown }
   | { type: 'command'; command: 'setAllowInsecureCertificates'; enabled: boolean }
+  | { type: 'command'; command: 'setLibraryWebViewMuted'; muted: boolean }
   | { type: 'command'; command: 'playPause' }
   | { type: 'command'; command: 'stop' }
   | { type: 'command'; command: 'back' }
   | { type: 'command'; command: 'forward' }
   | { type: 'command'; command: 'toggleSidebar' }
   | { type: 'command'; command: 'toggleFullscreen' }
+  | { type: 'command'; command: 'setRefreshRateSync'; enabled: boolean }
+  | { type: 'command'; command: 'setRefreshRateMaximumMultiple'; enabled: boolean }
+  | { type: 'command'; command: 'dismissRefreshRateSyncUnavailable' }
+  | { type: 'command'; command: 'setGlobalRefreshRateSync'; enabled: boolean }
+  | { type: 'command'; command: 'setGlobalRefreshRateMaximumMultiple'; enabled: boolean }
+  | { type: 'command'; command: 'setUiLanguage'; language: 'en' | 'zh' }
   | { type: 'command'; command: 'showFullscreenTransport' }
   | { type: 'command'; command: 'subtitleMenu' }
   | { type: 'command'; command: 'hideSubtitleMenu' }
@@ -225,6 +275,15 @@ export type NativeCommand =
       width: number
       height: number
     }
+  | {
+      type: 'command'
+      command: 'videoGeometry'
+      scale: number
+      left: number
+      top: number
+      width: number
+      height: number
+    }
   | { type: 'command'; command: 'openSubtitleFile' }
   | { type: 'command'; command: 'toggleDanmakuEnabled' }
   | { type: 'command'; command: 'cycleDanmakuMode' }
@@ -250,6 +309,7 @@ export type NativeCommand =
   | { type: 'command'; command: 'seekToRatio'; ratio: number }
 
 export const EMPTY_STATE: PlayerState = {
+  uiLanguage: 'zh',
   playbackState: 'Empty',
   lastError: '',
   mediaName: 'No media loaded',
@@ -267,6 +327,12 @@ export const EMPTY_STATE: PlayerState = {
   backendLabel: 'Native FFmpeg / D3D11',
   sidebarCollapsed: false,
   fullscreen: false,
+  customTitleBar: false,
+  refreshRateSyncEnabled: false,
+  refreshRateMaximumMultiple: true,
+  refreshRateSyncUnavailable: false,
+  refreshRateSyncActive: false,
+  refreshRateSyncHz: 0,
   fullscreenTransportVisible: true,
   subtitleMenuOpen: false,
   inspectorTab: 'recent',

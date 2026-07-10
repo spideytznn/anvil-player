@@ -506,6 +506,11 @@ void MainWindow::UpdateLayout() {
         videoSurface_ = content;
         playbackSurface_ = videoSurface_;
     }
+    if (webUiActive_ && webUiPlayerRouteActive_ && webUiVideoGeometryValid_ &&
+        RectWidth(webUiVideoBounds_) > 0 && RectHeight(webUiVideoBounds_) > 0) {
+        videoSurface_ = webUiVideoBounds_;
+        playbackSurface_ = videoSurface_;
+    }
     const int progressInset = compact ? Scale(18) : Scale(24);
     progress_ = MakeRect(transportBar_.left + progressInset,
                          transportBar_.top + (compact ? Scale(26) : Scale(30)),
@@ -902,6 +907,9 @@ void MainWindow::UpdateVideoHost() {
                     InflateRect(&transportCutout, 1, 1);
                     subtractCutout(transportCutout, Scale(8));
                 }
+            }
+            if (fullscreen_ && refreshRateSyncUnavailable_) {
+                subtractCutout(bounds, 0);
             }
             if (!SetWindowRgn(videoHost_, region, TRUE)) {
                 DeleteObject(region);

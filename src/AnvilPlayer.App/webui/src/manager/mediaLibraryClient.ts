@@ -2,6 +2,7 @@ import { isObject } from './storageCodec'
 import type { EpisodeItem, LibraryHomeSection, LibraryQuery, LibrarySource, LibraryView, MediaFilterKey, MediaItem, NavKey, SeasonItem, SortKey, SortOrder, SourceDraft } from './types'
 
 const LIBRARY_CACHE_KEY = 'anvil-player.library.cache.v1'
+const HIDDEN_MEDIA_KEY = 'anvil-player.library.hidden-media.v1'
 const LIBRARY_CACHE_WRITE_DELAY_MS = 250
 
 export interface MediaLibraryClient {
@@ -12,6 +13,8 @@ export interface MediaLibraryClient {
   getContinueWatching: () => Promise<MediaItem[]>
   saveSourceDraft: (draft: SourceDraft) => Promise<LibrarySource>
   updateItem: (item: MediaItem) => Promise<void>
+  removeItem: (itemId: string) => Promise<void>
+  hideItem: (item: MediaItem) => Promise<void>
   removeSource: (sourceId: string) => Promise<void>
   upsertSourceItems: (source: LibrarySource, sourceItems: MediaItem[], sourceHomeSections?: LibraryHomeSection[]) => Promise<void>
 }
@@ -164,6 +167,12 @@ function compactSeasonForCache(season: SeasonItem): SeasonItem {
 
 function compactItemForCache(item: MediaItem): MediaItem {
   const compactItem = compactNestedItemForCache(item)
+  if (item.cast?.length) {
+    compactItem.cast = item.cast.slice(0, 12)
+  }
+  if (item.streamSpecs?.length) {
+    compactItem.streamSpecs = item.streamSpecs
+  }
   if (item.episodes?.length) {
     compactItem.episodes = item.episodes.map(compactEpisodeForCache)
   }
@@ -178,6 +187,12 @@ function compactItemForCache(item: MediaItem): MediaItem {
 
 function minimalItemForCache(item: MediaItem): MediaItem {
   const minimalItem = minimalNestedItemForCache(item)
+  if (item.cast?.length) {
+    minimalItem.cast = item.cast.slice(0, 12)
+  }
+  if (item.streamSpecs?.length) {
+    minimalItem.streamSpecs = item.streamSpecs
+  }
   if (item.episodes?.length) {
     minimalItem.episodes = item.episodes.map(minimalEpisodeForCache)
   }
@@ -246,7 +261,20 @@ function tinyNestedItemForCache(item: MediaItem): MediaItem {
     path: item.path,
     externalIds: item.externalIds,
     metadataProvider: item.metadataProvider,
-    metadataMatchedAt: item.metadataMatchedAt
+    metadataMatchedAt: item.metadataMatchedAt,
+    metadataLocked: item.metadataLocked,
+    metadataMatchTitle: item.metadataMatchTitle,
+    fileSizeBytes: item.fileSizeBytes,
+    fileModifiedAt: item.fileModifiedAt,
+    fileFingerprint: item.fileFingerprint,
+    availability: item.availability,
+    missingSince: item.missingSince,
+    mediaSourceId: item.mediaSourceId,
+    providerItemId: item.providerItemId,
+    versionLabel: item.versionLabel,
+    collectionDissolved: item.collectionDissolved,
+    trailerUrl: item.trailerUrl,
+    trailerUrls: item.trailerUrls
   }
 }
 
@@ -297,6 +325,34 @@ function flatTinyItemForCache(item: MediaItem): MediaItem {
 interface CacheWriteAttempt {
   compactItem: (item: MediaItem) => MediaItem
   includeHomeSections: boolean
+}
+
+function normalizedIdentity(value: string): string {
+  return value.trim().replace(/\\/g, '/').toLowerCase()
+}
+
+function hiddenIdentityKeys(item: MediaItem): string[] {
+  const prefix = `${item.sourceId}|`
+  return [
+    item.id ? `${prefix}id:${item.id}` : '',
+    item.providerItemId ? `${prefix}id:${item.providerItemId}` : '',
+    item.path ? `${prefix}path:${normalizedIdentity(item.path)}` : '',
+    item.playbackPath ? `${prefix}path:${normalizedIdentity(item.playbackPath)}` : '',
+    item.externalIds?.tmdb ? `${prefix}tmdb:${item.type}:${item.externalIds.tmdb}` : ''
+  ].filter(Boolean)
+}
+
+function loadHiddenMediaKeys(): Set<string> {
+  try {
+    const parsed: unknown = JSON.parse(window.localStorage.getItem(HIDDEN_MEDIA_KEY) || '[]')
+    return new Set(Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === 'string') : [])
+  } catch {
+    return new Set()
+  }
+}
+
+function saveHiddenMediaKeys(keys: Set<string>): void {
+  window.localStorage.setItem(HIDDEN_MEDIA_KEY, JSON.stringify([...keys]))
 }
 
 const CACHE_WRITE_ATTEMPTS: CacheWriteAttempt[] = [
@@ -358,6 +414,9 @@ export function createEmptyLibraryClient(): MediaLibraryClient {
   let sources: LibrarySource[] = cached.sources
   let items: MediaItem[] = cached.items
   let homeSections: LibraryHomeSection[] = cached.homeSections
+  const hiddenMediaKeys = loadHiddenMediaKeys()
+  const isHidden = (item: MediaItem): boolean => hiddenIdentityKeys(item).some((key) => hiddenMediaKeys.has(key))
+  items = items.filter((item) => !isHidden(item))
   const scheduleCacheWrite = createCacheWriter(() => ({ version: 1, sources, items, homeSections }))
 
   return {
@@ -366,13 +425,13 @@ export function createEmptyLibraryClient(): MediaLibraryClient {
     },
 
     async listAllItems() {
-      return [...items]
+      return items.filter((item) => !isHidden(item))
     },
 
     async listItems(query) {
       const queryItems = query.navKey.startsWith('source:')
-        ? items
-        : localLibraryItems(items, sources)
+        ? items.filter((item) => !isHidden(item))
+        : localLibraryItems(items.filter((item) => !isHidden(item)), sources)
       return sortItems(
         filterByMediaFilter(
           filterByView(
@@ -392,12 +451,12 @@ export function createEmptyLibraryClient(): MediaLibraryClient {
         : homeSections
       return rows.map((section) => ({
         ...section,
-        cards: [...section.cards]
+        cards: section.cards.filter((card) => !card.itemId || !hiddenMediaKeys.has(`${section.sourceId}|id:${card.itemId}`))
       }))
     },
 
     async getContinueWatching() {
-      return items.filter((item) => item.continueWatching || (item.progress > 0 && item.progress < 1))
+      return items.filter((item) => !isHidden(item) && (item.continueWatching || (item.progress > 0 && item.progress < 1)))
     },
 
     async saveSourceDraft(draft) {
@@ -424,6 +483,21 @@ export function createEmptyLibraryClient(): MediaLibraryClient {
       scheduleCacheWrite()
     },
 
+    async removeItem(itemId) {
+      items = items.filter((candidate) => candidate.id !== itemId)
+      scheduleCacheWrite()
+    },
+
+    async hideItem(item) {
+      hiddenIdentityKeys(item).forEach((key) => hiddenMediaKeys.add(key))
+      for (const version of item.versions ?? []) {
+        hiddenIdentityKeys(version).forEach((key) => hiddenMediaKeys.add(key))
+      }
+      saveHiddenMediaKeys(hiddenMediaKeys)
+      items = items.filter((candidate) => !isHidden(candidate))
+      scheduleCacheWrite()
+    },
+
     async removeSource(sourceId) {
       sources = sources.filter((source) => source.id !== sourceId)
       items = items.filter((item) => item.sourceId !== sourceId)
@@ -435,7 +509,7 @@ export function createEmptyLibraryClient(): MediaLibraryClient {
       sources = [source, ...sources.filter((candidate) => candidate.id !== source.id)]
       items = [
         ...items.filter((item) => item.sourceId !== source.id),
-        ...sourceItems.map((item) => ({ ...item, sourceId: source.id }))
+        ...sourceItems.map((item) => ({ ...item, sourceId: source.id })).filter((item) => !isHidden(item))
       ]
       homeSections = [
         ...homeSections.filter((section) => section.sourceId !== source.id),

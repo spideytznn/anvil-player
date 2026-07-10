@@ -38,7 +38,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <AdditionalLibraryDirectories>$(SolutionDir)third_party\ffmpeg\lib;$(SolutionDir)third_party\webview2\lib\win-$(Platform);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>avformat.lib;avcodec.lib;avutil.lib;avfilter.lib;swscale.lib;swresample.lib;WebView2LoaderStatic.lib;comdlg32.lib;d3d11.lib;d3dcompiler.lib;dxgi.lib;dxguid.lib;dwmapi.lib;dcomp.lib;gdiplus.lib;shell32.lib;shlwapi.lib;ole32.lib;version.lib;mpr.lib;netapi32.lib;winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>avformat.lib;avcodec.lib;avutil.lib;avfilter.lib;swscale.lib;swresample.lib;WebView2LoaderStatic.lib;advapi32.lib;comdlg32.lib;d3d11.lib;d3dcompiler.lib;dxgi.lib;dxguid.lib;dwmapi.lib;dcomp.lib;gdiplus.lib;shell32.lib;shlwapi.lib;ole32.lib;version.lib;mpr.lib;netapi32.lib;winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Manifest>
       <AdditionalManifestFiles>app.manifest;%(AdditionalManifestFiles)</AdditionalManifestFiles>
@@ -60,6 +60,7 @@ if exist "$(SolutionDir)third_party\webview2-runtime\Microsoft.WebView2.FixedVer
     <ClCompile Include="src\app_arguments.cpp" />
     <ClCompile Include="src\application.cpp" />
     <ClCompile Include="src\d3d11_video_renderer.cpp" />
+    <ClCompile Include="src\display_refresh_rate.cpp" />
     <ClCompile Include="src\library_commands.cpp" />
     <ClCompile Include="src\library_window.cpp" />
     <ClCompile Include="src\embedded_ffplay.cpp" />
@@ -94,6 +95,7 @@ if exist "$(SolutionDir)third_party\webview2-runtime\Microsoft.WebView2.FixedVer
     <ClInclude Include="include\AnvilPlayer\App\color_math.h" />
     <ClInclude Include="include\AnvilPlayer\App\color_metadata_util.h" />
     <ClInclude Include="include\AnvilPlayer\App\d3d11_video_renderer.h" />
+    <ClInclude Include="include\AnvilPlayer\App\display_refresh_rate.h" />
     <ClInclude Include="include\AnvilPlayer\App\embedded_ffplay.h" />
     <ClInclude Include="include\AnvilPlayer\App\external_video_decoder.h" />
     <ClInclude Include="include\AnvilPlayer\App\ffmpeg_video_decoder.h" />

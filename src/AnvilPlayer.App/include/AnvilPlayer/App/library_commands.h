@@ -112,6 +112,13 @@ std::vector<WebDavEntry> WebDavPropFind(const std::wstring& url, const std::wstr
 std::vector<SmbDirectoryEntry> ListWebDavDirectories(const std::wstring& url, const std::wstring& username, const std::wstring& password, std::wstring& errorMessage, const WebDavRequestOptions& options = {});
 std::vector<LocalFolderScanItem> ScanWebDavMediaFiles(const std::wstring& rootUrl, const std::wstring& username, const std::wstring& password, bool& truncated, std::wstring& errorMessage, const WebDavRequestOptions& options = {});
 
+// Experimental Bilibili trailer discovery. The search page is visited first
+// so WinHTTP receives the anonymous Bilibili cookies required by the search
+// endpoint. The returned string is the endpoint's UTF-8 JSON response.
+std::string SearchBilibiliVideos(const std::wstring& keyword,
+                                 std::wstring& errorMessage,
+                                 const WebDavRequestOptions& options = {});
+
 // --- JSON builders (library result messages) ---
 
 std::wstring MediaPathItemsJson(const std::vector<std::filesystem::path>& paths, std::size_t maxCount);

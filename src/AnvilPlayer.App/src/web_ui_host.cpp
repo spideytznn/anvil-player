@@ -502,6 +502,17 @@ struct WebUiHost::Impl {
         }
     }
 
+    void SetMuted(const bool muted) const {
+        const auto current = state;
+        if (current->activeGeneration.load(std::memory_order_acquire) == 0 || !current->webview) {
+            return;
+        }
+        ComPtr<ICoreWebView2_8> webview8;
+        if (SUCCEEDED(current->webview.As(&webview8)) && webview8) {
+            webview8->put_IsMuted(muted ? TRUE : FALSE);
+        }
+    }
+
     bool Ready() const {
         const auto current = state;
         return current->activeGeneration.load(std::memory_order_acquire) != 0 && current->webview;
@@ -548,6 +559,10 @@ void WebUiHost::SetAllowInsecureCertificates(const bool allow) const {
 
 bool WebUiHost::Ready() const {
     return impl_->Ready();
+}
+
+void WebUiHost::SetMuted(const bool muted) const {
+    impl_->SetMuted(muted);
 }
 
 HRESULT WebUiHost::LastCreateResult() const {

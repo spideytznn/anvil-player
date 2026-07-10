@@ -4,6 +4,17 @@
 
 import type { MediaItem } from '../manager/types'
 
+const mediaIndexCollator = new Intl.Collator('zh-Hans-CN', {
+  numeric: true,
+  sensitivity: 'base'
+})
+
+export function compareMediaIndex(left: string, right: string): number {
+  if (left === 'SP') return right === 'SP' ? 0 : 1
+  if (right === 'SP') return -1
+  return mediaIndexCollator.compare(left, right)
+}
+
 export interface MetadataEditForm {
   title: string
   originalTitle: string
@@ -55,14 +66,78 @@ export function clearLocalMetadata(item: MediaItem): MediaItem {
     tags: undefined,
     externalIds: undefined,
     metadataProvider: undefined,
-    metadataMatchedAt: undefined
+    metadataMatchedAt: undefined,
+    metadataLocked: undefined,
+    metadataMatchTitle: undefined,
+    trailerUrl: undefined,
+    trailerUrls: undefined
   }
+}
+
+export function dissolveMediaCollection(item: MediaItem): MediaItem[] {
+  const episodeItems = [
+    ...(item.seasons ?? []).flatMap((season) => season.episodes.map((episode) => episode.item)),
+    ...(item.episodes ?? []).map((episode) => episode.item)
+  ].filter((episode): episode is MediaItem => Boolean(episode?.path || episode?.playbackPath || episode?.mediaSourceId))
+  const nestedItems = episodeItems.length
+    ? episodeItems.flatMap((episode) => [episode, ...(episode.versions ?? [])])
+    : [
+        { ...item, versions: undefined, seasons: undefined, episodes: undefined },
+        ...(item.versions ?? [])
+      ]
+  const seen = new Set<string>()
+  return nestedItems.filter((candidate) => {
+    const key = mediaPathKey(candidate)
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  }).map((candidate) => ({
+    ...clearLocalMetadata({
+      ...candidate,
+      type: 'movie',
+      versions: undefined,
+      seasons: undefined,
+      episodes: undefined
+    }),
+    collectionDissolved: true
+  }))
 }
 
 export function localVersionLabel(item: MediaItem, index: number): string {
   const fileName = localFileName(item.path, '')
   if (fileName && fileName !== item.title) return fileName
   return item.quality || `版本 ${index + 1}`
+}
+
+export function mediaVersionLabel(item: MediaItem): string {
+  const text = [
+    item.versionLabel,
+    item.quality,
+    item.videoSpec,
+    item.path,
+    ...(item.streamSpecs ?? []).filter((stream) => stream.type === 'video').flatMap((stream) => [
+      stream.title,
+      stream.subtitle,
+      ...stream.details.map((detail) => detail.value)
+    ])
+  ].filter(Boolean).join(' ')
+  const resolution = /(?:4096|3840)\s*[x×]\s*2160|\b2160p?\b|\b4k\b/i.test(text)
+    ? '4K'
+    : /1920\s*[x×]\s*1080|\b1080[pi]?\b/i.test(text)
+      ? '1080P'
+      : /1280\s*[x×]\s*720|\b720[pi]?\b/i.test(text)
+        ? '720P'
+        : ''
+  const dynamicRange = /dolby[ ._-]?vision|\bdovi\b|\bdv\b/i.test(text)
+    ? 'Dolby Vision'
+    : /hdr10\+/i.test(text)
+      ? 'HDR10+'
+      : /\bhdr(?:10)?\b/i.test(text)
+        ? 'HDR'
+        : resolution
+          ? 'SDR'
+          : ''
+  return [resolution, dynamicRange].filter(Boolean).join(' ')
 }
 
 export function duplicateMetadataKey(item: MediaItem): string {
@@ -82,7 +157,8 @@ export function mediaPathKey(item: MediaItem): string {
 }
 
 export function itemHasPlaybackPath(item: MediaItem): boolean {
-  return Boolean(item.path || item.playbackPath || item.seasons?.some((season) =>
+  if (item.availability === 'missing') return false
+  return Boolean(item.path || item.playbackPath || item.mediaSourceId || item.seasons?.some((season) =>
     season.episodes.some((episode) => episode.item?.path || episode.item?.playbackPath)
   ) || item.episodes?.some((episode) => episode.item?.path || episode.item?.playbackPath))
 }
@@ -102,7 +178,10 @@ export function itemMergeRank(item: MediaItem): number {
 
 function stripMergedVersionRelations(item: MediaItem): MediaItem {
   const { versions, similarItems, cast, streamSpecs, studios, tags, ...versionItem } = item
-  return versionItem
+  return {
+    ...versionItem,
+    versionLabel: mediaVersionLabel(item)
+  }
 }
 
 function mergeWatchState(primary: MediaItem, rows: MediaItem[]): Pick<MediaItem, 'progress' | 'continueWatching' | 'watched' | 'favorite' | 'addedDaysAgo'> {
@@ -135,6 +214,8 @@ function mergeDuplicateMovieItems(primary: MediaItem, rows: MediaItem[]): MediaI
   return {
     ...primary,
     ...watchState,
+    metadataLocked: rows.some((item) => item.metadataLocked),
+    metadataMatchTitle: primary.metadataMatchTitle || rows.find((item) => item.metadataMatchTitle)?.metadataMatchTitle,
     versions: versions.length ? versions : undefined
   }
 }
@@ -163,11 +244,55 @@ function mergeSeriesSeasons(rows: MediaItem[]): MediaItem['seasons'] {
         seenEpisodes.add(episodeKey)
         existing.episodes.push(episode)
       })
-      existing.episodes.sort((left, right) => left.index.localeCompare(right.index, 'zh-Hans-CN'))
+      existing.episodes.sort((left, right) => compareMediaIndex(left.index, right.index))
       existing.episodeCount = existing.episodes.length
     })
   })
-  return [...seasonsByKey.values()].sort((left, right) => left.index.localeCompare(right.index, 'zh-Hans-CN'))
+
+  const representedPaths = new Set(
+    [...seasonsByKey.values()]
+      .flatMap((season) => season.episodes)
+      .map((episode) => episode.item ? mediaPathKey(episode.item) : '')
+      .filter(Boolean)
+  )
+  const looseItems = rows.filter((item) => {
+    if (!item.path && !item.playbackPath) return false
+    return !representedPaths.has(mediaPathKey(item))
+  })
+  if (looseItems.length) {
+    const existingSpecials = seasonsByKey.get('SP')
+    const specialEpisodes = existingSpecials ? [...existingSpecials.episodes] : []
+    const seenSpecialPaths = new Set(specialEpisodes.map(episodeMergeKey))
+    looseItems.forEach((item) => {
+      const pathKey = mediaPathKey(item)
+      if (seenSpecialPaths.has(pathKey)) return
+      seenSpecialPaths.add(pathKey)
+      const specialItem: MediaItem = {
+        ...item,
+        seasons: undefined,
+        episodes: undefined,
+        versions: undefined
+      }
+      specialEpisodes.push({
+        id: `${item.id}:special`,
+        title: localFileName(item.path || item.playbackPath, item.originalTitle || item.title),
+        index: `SP${String(specialEpisodes.length + 1).padStart(2, '0')}`,
+        duration: item.runtime,
+        poster: item.backdrop || item.poster,
+        item: specialItem
+      })
+    })
+    seasonsByKey.set('SP', {
+      id: existingSpecials?.id ?? `${looseItems[0].id}:specials`,
+      title: 'Specials',
+      index: 'SP',
+      episodeCount: specialEpisodes.length,
+      poster: existingSpecials?.poster || looseItems[0].poster,
+      episodes: specialEpisodes
+    })
+  }
+
+  return [...seasonsByKey.values()].sort((left, right) => compareMediaIndex(left.index, right.index))
 }
 
 function mergeDuplicateSeriesItems(primary: MediaItem, rows: MediaItem[]): MediaItem {
@@ -181,6 +306,8 @@ function mergeDuplicateSeriesItems(primary: MediaItem, rows: MediaItem[]): Media
   return {
     ...primary,
     ...watchState,
+    metadataLocked: rows.some((item) => item.metadataLocked),
+    metadataMatchTitle: primary.metadataMatchTitle || rows.find((item) => item.metadataMatchTitle)?.metadataMatchTitle,
     runtime: seasons?.length
       ? `${seasons.reduce((total, season) => total + season.episodes.length, 0)} 集`
       : primary.runtime,
@@ -189,6 +316,11 @@ function mergeDuplicateSeriesItems(primary: MediaItem, rows: MediaItem[]): Media
     seasons,
     episodes
   }
+}
+
+function normalizeLooseSeriesItem(item: MediaItem): MediaItem {
+  if (item.type !== 'series') return item
+  return mergeDuplicateSeriesItems(item, [item])
 }
 
 export function mergeDuplicateMetadataItems(sourceItems: MediaItem[]): { items: MediaItem[]; mergedCount: number; representativeIdByMergedId: Map<string, string> } {
@@ -216,18 +348,22 @@ export function mergeDuplicateMetadataItems(sourceItems: MediaItem[]): { items: 
   })
 
   if (!mergedItemsById.size) {
-    return { items: sourceItems, mergedCount: 0, representativeIdByMergedId }
+    return {
+      items: sourceItems.map(normalizeLooseSeriesItem),
+      mergedCount: 0,
+      representativeIdByMergedId
+    }
   }
 
   const result: MediaItem[] = []
   sourceItems.forEach((item) => {
     const representativeId = representativeIdByMergedId.get(item.id)
     if (!representativeId) {
-      result.push(item)
+      result.push(normalizeLooseSeriesItem(item))
       return
     }
     if (representativeId !== item.id) return
-    result.push(mergedItemsById.get(item.id) ?? item)
+    result.push(normalizeLooseSeriesItem(mergedItemsById.get(item.id) ?? item))
   })
   return { items: result, mergedCount, representativeIdByMergedId }
 }
@@ -313,12 +449,18 @@ export function buildManualMetadataItem(item: MediaItem, form: MetadataEditForm)
     overview: form.overview.trim(),
     externalIds: hasExternalIds ? externalIds : undefined,
     metadataProvider: 'manual',
-    metadataMatchedAt: Date.now()
+    metadataMatchedAt: Date.now(),
+    metadataMatchTitle: form.title.trim() || item.title
   }
 }
 
 export function mergeLocalScannedItem(existingItem: MediaItem | undefined, scannedItem: MediaItem): MediaItem {
   if (!existingItem) return scannedItem
+  const fileChanged = Boolean(
+    existingItem.fileFingerprint &&
+    scannedItem.fileFingerprint &&
+    existingItem.fileFingerprint !== scannedItem.fileFingerprint
+  )
 
   const preservedState: Pick<MediaItem, 'progress' | 'continueWatching' | 'watched' | 'favorite'> = {
     progress: existingItem.progress,
@@ -330,7 +472,14 @@ export function mergeLocalScannedItem(existingItem: MediaItem | undefined, scann
   if (!existingItem.metadataProvider) {
     return {
       ...scannedItem,
-      ...preservedState
+      ...preservedState,
+      streamSpecs: fileChanged ? undefined : existingItem.streamSpecs,
+      videoSpec: fileChanged ? scannedItem.videoSpec : existingItem.videoSpec,
+      audioSpec: fileChanged ? scannedItem.audioSpec : existingItem.audioSpec,
+      trailerUrl: existingItem.trailerUrl,
+      trailerUrls: existingItem.trailerUrls,
+      availability: 'available',
+      missingSince: undefined
     }
   }
 
@@ -351,12 +500,21 @@ export function mergeLocalScannedItem(existingItem: MediaItem | undefined, scann
     tagline: existingItem.tagline,
     overview: existingItem.overview,
     cast: existingItem.cast,
+    streamSpecs: fileChanged ? undefined : existingItem.streamSpecs,
+    videoSpec: fileChanged ? scannedItem.videoSpec : existingItem.videoSpec,
+    audioSpec: fileChanged ? scannedItem.audioSpec : existingItem.audioSpec,
     similarItems: existingItem.similarItems,
     studios: existingItem.studios,
     tags: existingItem.tags,
     versions: existingItem.versions,
     externalIds: existingItem.externalIds,
     metadataProvider: existingItem.metadataProvider,
-    metadataMatchedAt: existingItem.metadataMatchedAt
+    metadataMatchedAt: existingItem.metadataMatchedAt,
+    metadataLocked: existingItem.metadataLocked,
+    metadataMatchTitle: existingItem.metadataMatchTitle,
+    trailerUrl: existingItem.trailerUrl,
+    trailerUrls: existingItem.trailerUrls,
+    availability: 'available',
+    missingSince: undefined
   }
 }

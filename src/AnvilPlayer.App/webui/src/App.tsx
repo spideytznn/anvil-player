@@ -20,7 +20,8 @@ import {
   SkipForward,
   SlidersHorizontal,
   Square,
-  Volume2
+  Volume2,
+  X
 } from 'lucide-react'
 import { applyAppearanceSettings } from './appearance'
 import {
@@ -90,6 +91,12 @@ const en = {
   audio: 'Audio',
   resolution: 'Resolution',
   frameRate: 'Frame rate',
+  refreshRateSync: 'Smart refresh-rate sync',
+  refreshRateSyncHint: 'Current video only · applied in fullscreen',
+  maximumRefreshMultiple: 'Maximum multiple',
+  refreshRateUnavailableTitle: 'Exact refresh rate unavailable',
+  refreshRateUnavailableBody: 'This display does not provide the exact refresh rate required by the current video. Desktop refresh rate will be kept for this fullscreen session.',
+  confirm: 'OK',
   hdr: 'HDR',
   hdrControls: 'HDR controls',
   hdrOutput: 'HDR output',
@@ -185,6 +192,12 @@ const zh: Record<keyof typeof en, string> = {
   audio: '音频',
   resolution: '分辨率',
   frameRate: '帧率',
+  refreshRateSync: '智能刷新率同步',
+  refreshRateSyncHint: '仅当前视频 · 进入全屏时生效',
+  maximumRefreshMultiple: '最大倍率刷新率',
+  refreshRateUnavailableTitle: '缺少所需刷新率',
+  refreshRateUnavailableBody: '当前显示器没有提供此视频所需的精确刷新率，本次全屏将保持桌面刷新率。',
+  confirm: '确定',
   hdr: 'HDR',
   hdrControls: 'HDR 控制',
   hdrOutput: 'HDR 输出',
@@ -636,6 +649,18 @@ function postTransportGeometry(bounds: RectSnapshot): void {
   })
 }
 
+function postVideoGeometry(bounds: RectSnapshot): void {
+  postNativeCommand({
+    type: 'command',
+    command: 'videoGeometry',
+    scale: window.devicePixelRatio || 1,
+    left: bounds.left,
+    top: bounds.top,
+    width: bounds.width,
+    height: bounds.height
+  })
+}
+
 function danmakuModeLabel(mode: number, t: Copy): string {
   switch (mode) {
     case 1: return t.danmakuModeTop
@@ -1079,13 +1104,31 @@ function TopBar({ state, t }: { state: PlayerState; t: Copy }): JSX.Element {
 }
 
 function VideoStage({ state, t }: { state: PlayerState; t: Copy }): JSX.Element {
+  const stageRef = useRef<HTMLDivElement>(null)
   const playbackFailed = state.hasMedia && state.playbackState === 'Error'
   const failureMessage = state.lastError || t.playbackFailedHint
   const nativeRuntime = state.backendLabel.toLowerCase().includes('native') || state.runtimeLabel.toLowerCase().includes('native')
 
+  useLayoutEffect(() => {
+    const stage = stageRef.current
+    if (!stage || state.fullscreen) return
+
+    const syncGeometry = (): void => {
+      postVideoGeometry(rectSnapshotFromElement(stage))
+    }
+    syncGeometry()
+    const observer = new ResizeObserver(syncGeometry)
+    observer.observe(stage)
+    window.addEventListener('resize', syncGeometry)
+    return () => {
+      observer.disconnect()
+      window.removeEventListener('resize', syncGeometry)
+    }
+  }, [state.fullscreen])
+
   return (
     <main className="video-shell">
-      <div className="video-stage">
+      <div className="video-stage" ref={stageRef}>
         {playbackFailed && (
           <div className="playback-error-overlay" aria-live="assertive">
             <div className="playback-error-panel">
@@ -1181,6 +1224,36 @@ function InspectorContent({
           <span>{t.settings}</span>
         </div>
         <HdrCurveEditor state={state} t={t} />
+        <div className="refresh-rate-setting">
+          <div>
+            <strong>{t.refreshRateSync}</strong>
+            <small>{state.refreshRateSyncActive && state.refreshRateSyncHz > 0
+              ? `${state.refreshRateSyncHz.toFixed(3).replace(/\.0+$/, '')} Hz`
+              : t.refreshRateSyncHint}</small>
+          </div>
+          <label className={`refresh-rate-maximum ${state.refreshRateSyncEnabled ? '' : 'is-disabled'}`}>
+            <input
+              type="checkbox"
+              checked={state.refreshRateMaximumMultiple}
+              disabled={!state.refreshRateSyncEnabled}
+              onChange={(event) => postNativeCommand({ type: 'command', command: 'setRefreshRateMaximumMultiple', enabled: event.currentTarget.checked })}
+            />
+            <span>{t.maximumRefreshMultiple}</span>
+          </label>
+          <button
+            className={`refresh-rate-toggle ${state.refreshRateSyncEnabled ? 'is-active' : ''}`}
+            type="button"
+            role="switch"
+            aria-checked={state.refreshRateSyncEnabled}
+            aria-label={t.refreshRateSync}
+            onClick={() => postNativeCommand({ type: 'command', command: 'setRefreshRateSync', enabled: !state.refreshRateSyncEnabled })}
+          >
+            <span className="refresh-rate-toggle-track" aria-hidden="true">
+              <span className="refresh-rate-toggle-thumb" />
+            </span>
+            <span className="refresh-rate-toggle-label">{state.refreshRateSyncEnabled ? t.on : t.off}</span>
+          </button>
+        </div>
         <InfoRow label={t.backend} value={state.backendLabel} emptyLabel={t.none} />
         <InfoRow label={t.volume} value={`${Math.round(state.volume * 100)}%`} emptyLabel={t.none} />
       </div>
@@ -1825,7 +1898,7 @@ export default function App(): JSX.Element {
     updateAnchor()
     window.addEventListener('resize', updateAnchor)
     return () => window.removeEventListener('resize', updateAnchor)
-  }, [])
+  }, [state.fullscreen])
 
   useLayoutEffect(() => {
     syncSubtitleAnchor()
@@ -1861,6 +1934,10 @@ export default function App(): JSX.Element {
     applyDocumentLanguage(language)
     saveUiLanguage(language)
   }, [language])
+
+  useEffect(() => {
+    if (state.uiLanguage !== language) setLanguage(state.uiLanguage)
+  }, [state.uiLanguage, language])
 
   useEffect(() => {
     if (state.subtitleMenuOpen) {
@@ -1907,8 +1984,29 @@ export default function App(): JSX.Element {
   }
 
   return (
-    <div
-      className={`app-shell ${state.sidebarCollapsed ? 'inspector-collapsed' : ''} ${state.fullscreen ? 'is-fullscreen' : ''} ${state.fullscreenTransportVisible ? 'fullscreen-transport-visible' : ''}`}
+    <div className={`player-window ${state.customTitleBar && !state.fullscreen ? 'has-custom-titlebar' : ''}`}>
+      {state.customTitleBar && !state.fullscreen ? <header
+        className="player-window-titlebar"
+        onPointerDown={(event) => {
+          if (event.button === 0 && event.target === event.currentTarget) {
+            postNativeCommand({ type: 'command', command: 'beginWindowDrag' })
+          }
+        }}
+        onDoubleClick={(event) => {
+          if (event.target === event.currentTarget) {
+            postNativeCommand({ type: 'command', command: 'toggleMaximizeWindow' })
+          }
+        }}
+      >
+        <span>Anvil Player</span>
+        <div className="player-window-controls">
+          <button type="button" aria-label="最小化" onClick={() => { postNativeCommand({ type: 'command', command: 'minimizeWindow' }) }}><i className="is-minimize" /></button>
+          <button type="button" aria-label="最大化或还原" onClick={() => { postNativeCommand({ type: 'command', command: 'toggleMaximizeWindow' }) }}><i className="is-maximize" /></button>
+          <button className="is-close" type="button" aria-label="关闭" onClick={() => { postNativeCommand({ type: 'command', command: 'closeWindow' }) }}><X size={15} /></button>
+        </div>
+      </header> : null}
+      <div
+        className={`app-shell ${state.sidebarCollapsed ? 'inspector-collapsed' : ''} ${state.fullscreen ? 'is-fullscreen' : ''} ${state.fullscreenTransportVisible ? 'fullscreen-transport-visible' : ''}`}
       onPointerMoveCapture={revealFullscreenTransport}
       onPointerDownCapture={(event) => {
         if (!state.subtitleMenuOpen && !subtitlePopoverOpen) return
@@ -1924,6 +2022,22 @@ export default function App(): JSX.Element {
         <Inspector state={state} t={t} />
       </section>
       {subtitlePopoverMounted && <SubtitlePopover state={state} t={t} open={subtitlePopoverOpen} anchor={subtitleAnchor} />}
+      {state.fullscreen && state.refreshRateSyncUnavailable && (
+        <div className="refresh-rate-dialog-backdrop" role="presentation">
+          <section className="refresh-rate-dialog line-panel" role="alertdialog" aria-modal="true" aria-labelledby="refresh-rate-dialog-title" aria-describedby="refresh-rate-dialog-body">
+            <AlertTriangle size={24} aria-hidden="true" />
+            <div>
+              <h2 id="refresh-rate-dialog-title">{t.refreshRateUnavailableTitle}</h2>
+              <p id="refresh-rate-dialog-body">{t.refreshRateUnavailableBody}</p>
+            </div>
+            <div className="refresh-rate-dialog-actions">
+              <button className="line-button text-button is-active" type="button" onClick={() => postNativeCommand({ type: 'command', command: 'dismissRefreshRateSyncUnavailable' })}>
+                {t.confirm}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
       {subtitleAnchorReady && (!state.fullscreen || subtitleVisualActive) && (
         <button
           className="subtitle-top-icon"
@@ -1950,6 +2064,7 @@ export default function App(): JSX.Element {
         subtitleVisualActive={subtitleVisualActive}
         onSubtitleMenu={toggleSubtitleMenu}
       />
+      </div>
     </div>
   )
 }

@@ -3,9 +3,9 @@
 @tailwind utilities;
 
 :root {
-  --bg: #020407;
-  --panel: #060a0f;
-  --panel-raised: #0a1017;
+  --bg: #010306;
+  --panel: #05090e;
+  --panel-raised: #0a1118;
   --panel-soft: #03060a;
   --viewport: #000102;
   --line: #171e27;
@@ -55,17 +55,93 @@ input:focus-visible {
   outline-offset: 2px;
 }
 
+.player-window {
+  display: flex;
+  width: 100vw;
+  height: 100vh;
+  flex-direction: column;
+  overflow: hidden;
+  background: linear-gradient(180deg, #05070a 0, #010306 160px);
+}
+
+.player-window-titlebar {
+  display: flex;
+  height: 38px;
+  flex: 0 0 38px;
+  align-items: center;
+  justify-content: space-between;
+  background: transparent;
+  color: rgba(239, 241, 245, 0.82);
+  font-size: 13px;
+  user-select: none;
+}
+
+.player-window-titlebar > span {
+  padding-left: 16px;
+  font-weight: 560;
+  pointer-events: none;
+}
+
+.player-window-controls {
+  display: flex;
+  height: 100%;
+  align-items: stretch;
+}
+
+.player-window-controls button {
+  display: inline-flex;
+  width: 42px;
+  height: 100%;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: rgba(239, 241, 245, 0.82);
+  padding: 0;
+}
+
+.player-window-controls button:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+}
+
+.player-window-controls button.is-close:hover {
+  background: #c42b1c;
+}
+
+.player-window-controls i {
+  display: block;
+  position: relative;
+  width: 11px;
+  height: 11px;
+}
+
+.player-window-controls i.is-minimize::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  bottom: 2px;
+  left: 0;
+  height: 1px;
+  background: currentColor;
+}
+
+.player-window-controls i.is-maximize {
+  border: 1px solid currentColor;
+  border-radius: 1px;
+}
+
 .app-shell {
   position: relative;
   display: grid;
-  width: 100vw;
-  height: 100vh;
+  width: 100%;
+  min-height: 0;
+  flex: 1 1 auto;
   grid-template-rows: 56px minmax(0, 1fr) 96px;
   gap: 12px;
   padding: 16px;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.006), transparent 34%),
-    var(--bg);
+  background: transparent;
   box-sizing: border-box;
   contain: layout paint;
 }
@@ -1051,7 +1127,7 @@ input:focus-visible {
   position: absolute;
   left: var(--subtitle-open-left);
   top: var(--subtitle-open-top);
-  z-index: 240;
+  z-index: 540;
   width: var(--subtitle-popover-width);
   height: var(--subtitle-popover-height);
   overflow: hidden;
@@ -1059,6 +1135,10 @@ input:focus-visible {
   box-shadow: 0 20px 42px rgba(0, 0, 0, 0.5);
   transform-origin: var(--subtitle-anchor-right) var(--subtitle-anchor-top);
   will-change: left, top, width, height, border-radius;
+}
+
+.player-window.has-custom-titlebar .subtitle-popover {
+  translate: 0 -38px;
 }
 
 .subtitle-popover.is-open {
@@ -1076,7 +1156,7 @@ input:focus-visible {
   position: absolute;
   left: var(--subtitle-anchor-left);
   top: var(--subtitle-anchor-top);
-  z-index: 360;
+  z-index: 550;
   display: flex;
   width: var(--subtitle-anchor-width);
   height: var(--subtitle-anchor-height);
@@ -1091,6 +1171,10 @@ input:focus-visible {
   transition:
     opacity 180ms ease,
     transform 260ms var(--motion-fluid);
+}
+
+.player-window.has-custom-titlebar .subtitle-top-icon {
+  translate: 0 -38px;
 }
 
 .subtitle-top-icon:hover {
@@ -1769,6 +1853,160 @@ input:focus-visible {
     scroll-behavior: auto !important;
     transition-duration: 1ms !important;
   }
+}
+
+.refresh-rate-setting {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.refresh-rate-setting > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.refresh-rate-setting strong {
+  font-size: 12px;
+}
+
+.refresh-rate-setting small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.refresh-rate-maximum {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 10px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.refresh-rate-maximum input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.refresh-rate-maximum.is-disabled {
+  opacity: 0.42;
+  cursor: default;
+}
+
+.refresh-rate-toggle {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 7px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: color 160ms ease, background 160ms ease, border-color 160ms ease;
+}
+
+.refresh-rate-toggle:hover {
+  border-color: var(--line);
+  background: rgba(255, 255, 255, 0.025);
+  color: var(--text);
+}
+
+.refresh-rate-toggle-track {
+  position: relative;
+  width: 30px;
+  height: 17px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--panel-soft);
+  transition: border-color 180ms ease, background 180ms ease;
+}
+
+.refresh-rate-toggle-thumb {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--dim);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+  transition: transform 220ms var(--motion-fluid), background 180ms ease;
+}
+
+.refresh-rate-toggle.is-active {
+  color: var(--accent-strong);
+}
+
+.refresh-rate-toggle.is-active .refresh-rate-toggle-track {
+  border-color: rgba(223, 118, 95, 0.72);
+  background: rgba(223, 118, 95, 0.18);
+}
+
+.refresh-rate-toggle.is-active .refresh-rate-toggle-thumb {
+  background: var(--accent-strong);
+  transform: translateX(13px);
+}
+
+.refresh-rate-toggle-label {
+  min-width: 1.6em;
+  font-size: 11px;
+  font-weight: 700;
+  text-align: left;
+}
+
+.refresh-rate-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 900;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(0, 2, 5, 0.62);
+  backdrop-filter: blur(8px);
+}
+
+.refresh-rate-dialog {
+  display: grid;
+  width: min(440px, 100%);
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 14px;
+  padding: 20px;
+  border-color: rgba(223, 118, 95, 0.44);
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.62);
+}
+
+.refresh-rate-dialog > svg {
+  color: var(--accent-strong);
+}
+
+.refresh-rate-dialog h2 {
+  margin: 0 0 7px;
+  font-size: 16px;
+}
+
+.refresh-rate-dialog p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.refresh-rate-dialog-actions {
+  display: flex;
+  grid-column: 1 / -1;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
 }
 
 * {

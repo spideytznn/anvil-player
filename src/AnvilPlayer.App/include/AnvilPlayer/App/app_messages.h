@@ -50,6 +50,7 @@ constexpr DWORD kDwmWindowCornerPreference = 33;
 constexpr DWORD kDwmBorderColor = 34;
 constexpr DWORD kDwmCaptionColor = 35;
 constexpr DWORD kDwmTextColor = 36;
+constexpr int kDwmCornerDoNotRound = 1;
 constexpr int kDwmCornerRound = 2;
 
 // Runtime labels shown in the inspector / used in logs.

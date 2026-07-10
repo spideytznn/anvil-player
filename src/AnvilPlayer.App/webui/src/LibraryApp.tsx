@@ -1,5 +1,6 @@
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type Dispatch, type FormEvent, type ReactNode, type SetStateAction } from 'react'
 import {
+  Activity,
   ArrowDownWideNarrow,
   ArrowLeft,
   ArrowUpNarrowWide,
@@ -17,17 +18,21 @@ import {
   HardDrive,
   Heart,
   Languages,
+  LockKeyhole,
   ListFilter,
   MoreHorizontal,
   Play,
   Plus,
   Search,
+  SearchCheck,
   Server,
   Settings2,
   ShieldOff,
   Star,
   Trash2,
   Tv,
+  Volume2,
+  VolumeX,
   Wand2,
   X
 } from 'lucide-react'
@@ -47,12 +52,24 @@ import {
 } from './manager/embyClient'
 import { buildLocalFolderLibrary, buildLocalFolderSource } from './manager/localFolderLibrary'
 import {
+  fetchTmdbTrailerUrls,
   scrapeTmdbItem,
+  scrapeTmdbCandidate,
+  searchTmdbCandidates,
   tmdbApiBaseUrl,
+  type TmdbMatchCandidate,
   type TmdbAuthMode,
   type TmdbNetworkMode,
   type TmdbSettings
 } from './manager/tmdbClient'
+import {
+  loadTrailerSettings,
+  saveTrailerSettings,
+  searchBilibiliTrailerUrls,
+  trailerUrlMatchesSource,
+  type TrailerSettings,
+  type TrailerSource
+} from './manager/trailerClient'
 import {
   credentialedWebDavUrl,
   loadWebDavCredentials,
@@ -66,6 +83,7 @@ import {
   applyDocumentLanguage,
   getInitialLanguage,
   saveUiLanguage,
+  tmdbLanguageForUi,
   type UiLanguage
 } from './uiSettings'
 import './library.css'
@@ -95,13 +113,14 @@ import {
 import {
   buildManualMetadataItem,
   clearLocalMetadata,
+  compareMediaIndex,
   duplicateMetadataKey,
+  dissolveMediaCollection,
   hasImageBackground,
   imageBackgroundUrl,
-  itemHasPlaybackPath,
   itemMergeRank,
   localFileName,
-  localVersionLabel,
+  mediaVersionLabel,
   mediaPathKey,
   mergeDuplicateMetadataItems,
   mergeLocalScannedItem,
@@ -109,6 +128,26 @@ import {
   type MetadataEditForm
 } from './library/merge'
 import { useTmdbSettings } from './library/useTmdbSettings'
+import { MetadataMatchDialog } from './library/MetadataMatchDialog'
+import { MetadataDeleteDialog } from './library/MetadataDeleteDialog'
+import { MediaManagementDialog } from './library/MediaManagementDialog'
+import { TaskCenter, type BackgroundTask } from './library/TaskCenter'
+
+const LIBRARY_LISTING_PAGE_SIZE = 60
+const DISSOLVED_COLLECTION_PATHS_KEY = 'anvil-player.library.dissolved-paths.v1'
+
+function loadDissolvedCollectionPaths(): Set<string> {
+  try {
+    const parsed: unknown = JSON.parse(localStorage.getItem(DISSOLVED_COLLECTION_PATHS_KEY) || '[]')
+    return new Set(Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === 'string') : [])
+  } catch {
+    return new Set()
+  }
+}
+
+function saveDissolvedCollectionPaths(paths: Set<string>): void {
+  localStorage.setItem(DISSOLVED_COLLECTION_PATHS_KEY, JSON.stringify([...paths]))
+}
 
 interface NavItem {
   key: NavKey
@@ -124,40 +163,64 @@ interface FileServiceDirectory {
 }
 
 const primaryNav: NavItem[] = [
-  { key: 'continue', label: '继续观看', icon: <Clock3 size={16} /> },
-  { key: 'recent', label: '最近添加', icon: <Grid3X3 size={16} /> },
-  { key: 'movies', label: '电影', icon: <Film size={16} /> },
-  { key: 'series', label: '剧集', icon: <Tv size={16} /> }
+  { key: 'continue', label: 'continue', icon: <Clock3 size={16} /> },
+  { key: 'recent', label: 'recent', icon: <Grid3X3 size={16} /> },
+  { key: 'movies', label: 'movies', icon: <Film size={16} /> },
+  { key: 'series', label: 'series', icon: <Tv size={16} /> }
 ]
 
 const smartNav: NavItem[] = [
-  { key: 'unwatched', label: '未看', icon: <Clock3 size={16} /> },
-  { key: 'watched', label: '已看', icon: <Check size={16} /> },
-  { key: 'favorites', label: '收藏', icon: <Heart size={16} /> },
-  { key: 'playlist', label: '片单', icon: <Wand2 size={16} /> },
-  { key: 'genre', label: '类型', icon: <ListFilter size={16} /> },
-  { key: 'rating', label: '评分', icon: <Star size={16} /> },
-  { key: 'release', label: '发行年份', icon: <Database size={16} /> }
+  { key: 'unwatched', label: 'unwatched', icon: <Clock3 size={16} /> },
+  { key: 'watched', label: 'watched', icon: <Check size={16} /> },
+  { key: 'favorites', label: 'favorites', icon: <Heart size={16} /> },
+  { key: 'playlist', label: 'playlist', icon: <Wand2 size={16} /> },
+  { key: 'genre', label: 'genre', icon: <ListFilter size={16} /> },
+  { key: 'rating', label: 'rating', icon: <Star size={16} /> },
+  { key: 'release', label: 'release', icon: <Database size={16} /> }
 ]
 
-const viewTabs: Array<{ key: LibraryView; label: string }> = [
-  { key: 'home', label: '全部' },
-  { key: 'movies', label: '电影' },
-  { key: 'series', label: '剧集' }
-]
+const navTranslations: Record<string, Record<UiLanguage, string>> = {
+  continue: { zh: '继续观看', en: 'Continue watching' },
+  recent: { zh: '最近添加', en: 'Recently added' },
+  movies: { zh: '电影', en: 'Movies' },
+  series: { zh: '剧集', en: 'Series' },
+  unwatched: { zh: '未看', en: 'Unwatched' },
+  watched: { zh: '已看', en: 'Watched' },
+  favorites: { zh: '收藏', en: 'Favorites' },
+  playlist: { zh: '片单', en: 'Playlists' },
+  genre: { zh: '类型', en: 'Genres' },
+  rating: { zh: '评分', en: 'Rating' },
+  release: { zh: '发行年份', en: 'Release year' }
+}
 
-const sortOptions: Array<{ key: SortKey; label: string }> = [
-  { key: 'recent', label: '最近添加' },
-  { key: 'title', label: '标题' },
-  { key: 'rating', label: '评分' },
-  { key: 'year', label: '发行年份' }
-]
+let currentLibraryLanguage: UiLanguage = 'zh'
+
+function localizedNav(items: NavItem[], language: UiLanguage): NavItem[] {
+  return items.map((item) => ({ ...item, label: navTranslations[item.label]?.[language] ?? item.label }))
+}
+
+function localizedViewTabs(language: UiLanguage): Array<{ key: LibraryView; label: string }> {
+  return [
+    { key: 'home', label: language === 'zh' ? '全部' : 'All' },
+    { key: 'movies', label: navTranslations.movies[language] },
+    { key: 'series', label: navTranslations.series[language] }
+  ]
+}
+
+function localizedSortOptions(language: UiLanguage): Array<{ key: SortKey; label: string }> {
+  return [
+    { key: 'recent', label: navTranslations.recent[language] },
+    { key: 'title', label: language === 'zh' ? '标题' : 'Title' },
+    { key: 'rating', label: navTranslations.rating[language] },
+    { key: 'year', label: navTranslations.release[language] }
+  ]
+}
 
 function mediaTypeLabel(type: MediaItem['type']): string {
   switch (type) {
-    case 'movie': return '电影'
-    case 'series': return '剧集'
-    default: return '文件夹'
+    case 'movie': return currentLibraryLanguage === 'zh' ? '电影' : 'Movie'
+    case 'series': return currentLibraryLanguage === 'zh' ? '剧集' : 'Series'
+    default: return currentLibraryLanguage === 'zh' ? '文件夹' : 'Folder'
   }
 }
 
@@ -166,7 +229,7 @@ function sourceKindLabel(kind: SourceKind): string {
     case 'Emby': return 'Emby'
     case 'WebDAV': return 'WebDAV'
     case 'SMB': return 'SMB'
-    default: return '文件系统'
+    default: return currentLibraryLanguage === 'zh' ? '文件系统' : 'File system'
   }
 }
 
@@ -199,11 +262,12 @@ function sourceIcon(kind: SourceKind, size = 16): ReactNode {
   }
 }
 
-function navLabel(navKey: NavKey, sourceMap: Map<string, LibrarySource>): string {
+function navLabel(navKey: NavKey, sourceMap: Map<string, LibrarySource>, language: UiLanguage = 'zh'): string {
   if (navKey.startsWith('source:')) {
     return sourceMap.get(navKey.slice('source:'.length))?.name ?? '媒体源'
   }
-  return [...primaryNav, ...smartNav].find((item) => item.key === navKey)?.label ?? '媒体库'
+  const item = [...primaryNav, ...smartNav].find((candidate) => candidate.key === navKey)
+  return item ? navTranslations[item.label]?.[language] ?? item.label : (language === 'zh' ? '媒体库' : 'Library')
 }
 
 function errorText(error: unknown): string {
@@ -236,6 +300,8 @@ function MediaArtwork(props: {
           className="library-art-image"
           src={imageUrl}
           alt=""
+          loading="lazy"
+          decoding="async"
           draggable={false}
           onError={() => setImageFailed(true)}
         />
@@ -630,13 +696,15 @@ function MediaPoster(props: {
 }): JSX.Element {
   return (
     <button
-      className={`library-poster-card ${props.selected ? 'is-selected' : ''}`}
+      className={`library-poster-card ${props.selected ? 'is-selected' : ''} ${props.item.availability === 'missing' ? 'is-missing' : ''}`}
       type="button"
       onClick={() => props.onSelect(props.item.id)}
     >
       <MediaArtwork background={props.item.poster} className="library-poster-art">
         <div className="library-poster-shine" />
         <span className="library-poster-type">{mediaTypeLabel(props.item.type)}</span>
+        {props.item.availability === 'missing' ? <span className="library-poster-warning">{currentLibraryLanguage === 'zh' ? '缺失' : 'Missing'}</span> : null}
+        {(props.item.versions?.length ?? 0) > 0 ? <span className="library-poster-versions">{(props.item.versions?.length ?? 0) + 1}×</span> : null}
       </MediaArtwork>
       {props.item.progress > 0 && props.item.progress < 1 ? (
         <span className="library-progress-track">
@@ -722,16 +790,229 @@ function LibraryHomeSections(props: {
   )
 }
 
+function embeddedTrailerUrl(value: string | undefined): string | undefined {
+  if (!value) return undefined
+  try {
+    const url = new URL(value)
+    const host = url.hostname.toLowerCase().replace(/^www\./, '')
+    let videoId = ''
+    if (host === 'youtu.be') {
+      videoId = url.pathname.split('/').filter(Boolean)[0] ?? ''
+    } else if (host === 'youtube.com' || host === 'm.youtube.com' || host === 'youtube-nocookie.com') {
+      if (url.pathname === '/watch') videoId = url.searchParams.get('v') ?? ''
+      else videoId = url.pathname.match(/^\/(?:embed|shorts)\/([^/?#]+)/)?.[1] ?? ''
+    }
+    if (videoId) {
+      const origin = encodeURIComponent(window.location.origin)
+      return `https://www.youtube.com/embed/${encodeURIComponent(videoId)}?autoplay=1&rel=0&playsinline=1&enablejsapi=1&origin=${origin}`
+    }
+    if (host === 'bilibili.com' || host.endsWith('.bilibili.com')) {
+      const bvid = url.pathname.match(/\/video\/(BV[0-9A-Za-z]+)/i)?.[1]
+      if (bvid) {
+        return `https://player.bilibili.com/player.html?bvid=${encodeURIComponent(bvid)}&autoplay=1&muted=0&danmaku=0&poster=1`
+      }
+    }
+    const vimeoId = host === 'vimeo.com' || host === 'player.vimeo.com'
+      ? url.pathname.match(/\/(?:video\/)?(\d+)/)?.[1]
+      : undefined
+    if (vimeoId) return `https://player.vimeo.com/video/${vimeoId}?autoplay=1`
+  } catch {
+    return undefined
+  }
+  return undefined
+}
+
+function youtubeVideoId(value: string | undefined): string | undefined {
+  if (!value) return undefined
+  try {
+    const url = new URL(value)
+    const host = url.hostname.toLowerCase().replace(/^www\./, '')
+    if (host === 'youtu.be') return url.pathname.split('/').filter(Boolean)[0]
+    if (host !== 'youtube.com' && host !== 'm.youtube.com' && host !== 'youtube-nocookie.com') return undefined
+    return url.pathname === '/watch'
+      ? url.searchParams.get('v') ?? undefined
+      : url.pathname.match(/^\/(?:embed|shorts)\/([^/?#]+)/)?.[1]
+  } catch {
+    return undefined
+  }
+}
+
+interface YouTubePlayerInstance {
+  destroy: () => void
+  mute: () => void
+  unMute: () => void
+  playVideo: () => void
+}
+
+interface YouTubeApi {
+  Player: new (element: HTMLElement, options: Record<string, unknown>) => YouTubePlayerInstance
+}
+
+declare global {
+  interface Window {
+    YT?: YouTubeApi
+    onYouTubeIframeAPIReady?: () => void
+  }
+}
+
+let youtubeApiPromise: Promise<YouTubeApi> | undefined
+
+function loadYouTubeApi(): Promise<YouTubeApi> {
+  if (window.YT?.Player) return Promise.resolve(window.YT)
+  if (youtubeApiPromise) return youtubeApiPromise
+  const attempt = new Promise<YouTubeApi>((resolve, reject) => {
+    const previousReady = window.onYouTubeIframeAPIReady
+    window.onYouTubeIframeAPIReady = () => {
+      previousReady?.()
+      if (window.YT?.Player) resolve(window.YT)
+      else reject(new Error('YouTube player API unavailable'))
+    }
+    let script = document.querySelector<HTMLScriptElement>('script[data-anvil-youtube-api]')
+    if (!script) {
+      script = document.createElement('script')
+      script.src = 'https://www.youtube.com/iframe_api'
+      script.async = true
+      script.dataset.anvilYoutubeApi = 'true'
+      script.onerror = () => {
+        script?.remove()
+        reject(new Error('YouTube player API failed to load'))
+      }
+      document.head.appendChild(script)
+    }
+    window.setTimeout(() => reject(new Error('YouTube player API timed out')), 12000)
+  })
+  youtubeApiPromise = attempt.catch((error) => {
+    youtubeApiPromise = undefined
+    throw error
+  })
+  return youtubeApiPromise
+}
+
+function YouTubeTrailer(props: {
+  videoId: string
+  backdropStyle: CSSProperties
+  muted: boolean
+  onPlaybackStarted: () => void
+  onAutoplayMuted: () => void
+  onError: () => void
+}): JSX.Element {
+  const playerHostRef = useRef<HTMLDivElement>(null)
+  const playerRef = useRef<YouTubePlayerInstance | undefined>(undefined)
+  const [ready, setReady] = useState(false)
+  const [playbackStarted, setPlaybackStarted] = useState(false)
+
+  useEffect(() => {
+    let disposed = false
+    let player: YouTubePlayerInstance | undefined
+    const timeout = window.setTimeout(() => {
+      if (!disposed && !ready) {
+        postNativeCommand({ type: 'command', command: 'debugLog', message: `trailer youtube ready timeout id=${props.videoId}` })
+        props.onError()
+      }
+    }, 15000)
+    void loadYouTubeApi().then((api) => {
+      if (disposed || !playerHostRef.current) return
+      const reactHost = playerHostRef.current
+      const playerFrame = document.createElement('iframe')
+      const origin = encodeURIComponent(window.location.origin)
+      playerFrame.src = `https://www.youtube.com/embed/${encodeURIComponent(props.videoId)}?autoplay=1&playsinline=1&rel=0&controls=0&disablekb=1&fs=0&iv_load_policy=3&enablejsapi=1&origin=${origin}`
+      playerFrame.allow = 'autoplay; encrypted-media; picture-in-picture; fullscreen'
+      playerFrame.allowFullscreen = true
+      playerFrame.referrerPolicy = 'origin'
+      playerFrame.style.width = '100%'
+      playerFrame.style.height = '100%'
+      playerFrame.style.border = '0'
+      reactHost.replaceChildren(playerFrame)
+      player = new api.Player(playerFrame, {
+        events: {
+          onReady: (event: { target: YouTubePlayerInstance }) => {
+            if (disposed) return
+            window.clearTimeout(timeout)
+            setReady(true)
+            postNativeCommand({ type: 'command', command: 'debugLog', message: `trailer youtube ready id=${props.videoId}` })
+            playerRef.current = event.target
+            if (props.muted) event.target.mute()
+            else event.target.unMute()
+            event.target.playVideo()
+          },
+          onError: (event: { data: number }) => {
+            postNativeCommand({ type: 'command', command: 'debugLog', message: `trailer youtube error id=${props.videoId} code=${event.data}` })
+            if (!disposed) props.onError()
+          },
+          onStateChange: (event: { data: number }) => {
+            if (disposed || event.data !== 1 || playbackStarted) return
+            postNativeCommand({ type: 'command', command: 'debugLog', message: `trailer youtube playing id=${props.videoId}` })
+            setPlaybackStarted(true)
+            props.onPlaybackStarted()
+          },
+          onAutoplayBlocked: () => {
+            if (disposed) return
+            window.clearTimeout(timeout)
+            setReady(true)
+            postNativeCommand({ type: 'command', command: 'debugLog', message: `trailer youtube autoplay blocked id=${props.videoId}` })
+            player?.mute()
+            player?.playVideo()
+            props.onAutoplayMuted()
+          }
+        }
+      })
+    }).catch((error) => {
+      postNativeCommand({
+        type: 'command',
+        command: 'debugLog',
+        message: `trailer youtube api failed id=${props.videoId} error=${error instanceof Error ? error.message : String(error)}`
+      })
+      if (!disposed) props.onError()
+    })
+    return () => {
+      disposed = true
+      playerRef.current = undefined
+      window.clearTimeout(timeout)
+      try {
+        player?.destroy()
+      } catch {
+        // The iframe may already have been removed during WebView navigation.
+      }
+      playerHostRef.current?.replaceChildren()
+    }
+  }, [props.videoId])
+
+  useEffect(() => {
+    if (props.muted) playerRef.current?.mute()
+    else playerRef.current?.unMute()
+  }, [props.muted])
+
+  return (
+    <div className={`library-detail-trailer-shell ${playbackStarted ? 'is-playing' : ''}`}>
+      <div className="library-detail-backdrop-image is-trailer-placeholder" style={props.backdropStyle} />
+      <div className={`library-detail-trailer-host ${ready ? 'is-ready' : ''}`}>
+        <div ref={playerHostRef} />
+      </div>
+      {!ready ? <div className="library-detail-trailer-loading"><span /></div> : null}
+    </div>
+  )
+}
+
 function DetailPanel(props: {
   item: MediaItem
   source: LibrarySource
+  language: UiLanguage
+  trailerSource: TrailerSource
+  trailerSoundEnabled: boolean
+  trailerAutoPlay: boolean
+  trailerAutoPlayReady: boolean
   playIntent: string
   isResolvingPlayback: boolean
   canScrapeMetadata: boolean
   isScrapingMetadata: boolean
   canEditMetadata: boolean
-  onPlayIntent: (item: MediaItem) => void
+  onPlayIntent: (item: MediaItem, audioTrackIndex: number, subtitleTrackIndex: number) => void
+  onTrailerIntent: (item: MediaItem) => Promise<string[]>
+  onRemoveFromLibrary: (item: MediaItem) => void
   onScrapeIntent: (item: MediaItem) => void
+  onRematchIntent: (item: MediaItem) => void
+  onSearchMatch: (item: MediaItem) => void
+  onToggleMetadataLock: (item: MediaItem) => void
   onEditMetadata: (item: MediaItem) => void
   onClearMetadata: (item: MediaItem) => void
   onSelectItem: (item: MediaItem) => void
@@ -739,35 +1020,81 @@ function DetailPanel(props: {
   onClose: () => void
 }): JSX.Element {
   const backdropStyle: CSSProperties = { background: props.item.backdrop }
-  const seasons = props.item.seasons ?? []
+  const seasons = useMemo(
+    () => [...(props.item.seasons ?? [])].sort((left, right) => compareMediaIndex(left.index, right.index)),
+    [props.item.seasons]
+  )
   const [activeSeasonId, setActiveSeasonId] = useState('')
+  const [expandedEpisodeId, setExpandedEpisodeId] = useState('')
+  const [selectedEpisodeVersionId, setSelectedEpisodeVersionId] = useState('')
+  const [selectedVersionId, setSelectedVersionId] = useState(props.item.id)
+  const [selectedAudioStreamId, setSelectedAudioStreamId] = useState('')
+  const [selectedSubtitleStreamId, setSelectedSubtitleStreamId] = useState('subtitle-auto')
   const [metadataMenuOpen, setMetadataMenuOpen] = useState(false)
+  const [trailerPlaying, setTrailerPlaying] = useState(false)
+  const [trailerPlaybackStarted, setTrailerPlaybackStarted] = useState(false)
+  const initialTrailerUrls = (): string[] => [...new Set([
+    props.item.trailerUrl,
+    ...(props.item.trailerUrls ?? [])
+  ].filter((url): url is string => typeof url === 'string' && trailerUrlMatchesSource(url, props.trailerSource)))]
+  const [resolvedTrailerUrls, setResolvedTrailerUrls] = useState<string[]>(initialTrailerUrls)
+  const [trailerUrlIndex, setTrailerUrlIndex] = useState(0)
+  const [isResolvingTrailer, setIsResolvingTrailer] = useState(false)
+  const [trailerPlaybackFailed, setTrailerPlaybackFailed] = useState(false)
+  const [trailerMuted, setTrailerMuted] = useState(
+    !props.trailerSoundEnabled
+  )
+  const autoPlayedTrailerRef = useRef('')
+  const [overviewExpanded, setOverviewExpanded] = useState(false)
+  const [overviewOverflowing, setOverviewOverflowing] = useState(false)
+  const [overviewExpandedHeight, setOverviewExpandedHeight] = useState(0)
+  const overviewRef = useRef<HTMLParagraphElement>(null)
+  const resolvedTrailerUrl = resolvedTrailerUrls[trailerUrlIndex]
+  const trailerEmbedUrl = useMemo(() => embeddedTrailerUrl(resolvedTrailerUrl), [resolvedTrailerUrl])
+  const trailerYouTubeId = useMemo(() => youtubeVideoId(resolvedTrailerUrl), [resolvedTrailerUrl])
   const activeSeason = seasons.find((season) => season.id === activeSeasonId) ?? seasons[0]
-  const seasonOptions = seasons.map((season) => ({ key: season.id, label: season.index }))
+  const seasonLabel = (index: string): string => index === 'SP'
+    ? props.language === 'zh' ? '外传' : 'Specials'
+    : index
+  const seasonOptions = seasons.map((season) => ({ key: season.id, label: seasonLabel(season.index) }))
   const activeSeasonSelectId = activeSeason?.id ?? seasonOptions[0]?.key ?? ''
   const episodeRows = activeSeason?.episodes ?? props.item.episodes ?? []
-  const versionRows = props.item.versions ?? []
-  const streamDetailValue = (type: 'video' | 'audio', label: string): string => {
-    const stream = props.item.streamSpecs?.find((row) => row.type === type)
-    return stream?.details.find((detail) => detail.label === label)?.value ?? ''
+  const episodeCount = seasons.length
+    ? seasons.reduce((total, season) => total + (season.episodes.length || season.episodeCount), 0)
+    : props.item.episodes?.length ?? 0
+  const detailRuntime = props.item.type === 'series'
+    ? episodeCount > 0
+      ? props.language === 'zh' ? `共${episodeCount}集` : `${episodeCount} episodes`
+      : props.item.runtime
+    : props.item.runtime
+  const expandedEpisode = episodeRows.find((episode) => episode.id === expandedEpisodeId)
+  const expandedEpisodeVersions = expandedEpisode?.item ? [expandedEpisode.item, ...(expandedEpisode.item.versions ?? [])] : []
+  const selectedEpisodeVersion = expandedEpisodeVersions.find((version) => version.id === selectedEpisodeVersionId) ?? expandedEpisodeVersions[0]
+  const playbackVersions = useMemo(() => [props.item, ...(props.item.versions ?? [])], [props.item])
+  const selectedPlaybackVersion = playbackVersions.find((version) => version.id === selectedVersionId) ?? playbackVersions[0]
+  const versionOptions = playbackVersions.map((version, index) => ({
+    key: version.id,
+    label: mediaVersionLabel(version) || `${props.language === 'zh' ? '版本' : 'Version'} ${index + 1}`
+  }))
+  const audioStreams = selectedPlaybackVersion.streamSpecs?.filter((stream) => stream.type === 'audio') ?? []
+  const subtitleStreams = selectedPlaybackVersion.streamSpecs?.filter((stream) => stream.type === 'subtitle') ?? []
+  const selectedAudioStream = audioStreams.find((stream) => stream.id === selectedAudioStreamId)
+    ?? audioStreams.find((stream) => stream.isDefault)
+    ?? audioStreams[0]
+  const selectedSubtitleStream = subtitleStreams.find((stream) => stream.id === selectedSubtitleStreamId)
+  const audioOptions = audioStreams.map((stream) => ({
+    key: stream.id,
+    label: cleanJoin([stream.title, stream.subtitle], ' · ')
+  }))
+  const subtitleOptions = [
+    { key: 'subtitle-auto', label: props.language === 'zh' ? '自动' : 'Auto' },
+    { key: 'subtitle-off', label: props.language === 'zh' ? '关' : 'Off' },
+    ...subtitleStreams.map((stream) => ({ key: stream.id, label: cleanJoin([stream.title, stream.subtitle], ' · ') }))
+  ]
+  const streamIndex = (id: string | undefined, fallback: number): number => {
+    const match = id?.match(/(\d+)$/)
+    return match ? Number(match[1]) : fallback
   }
-  const compactCodec = (value: string): string => value.replace(/\./g, '').replace(/-/g, '')
-  const compactResolution = (value: string): string => {
-    const match = value.match(/x(\d{3,4})$/i)
-    return match ? `${match[1]}p` : value
-  }
-  const videoBrief = cleanJoin([
-    compactResolution(streamDetailValue('video', '分辨率') || props.item.quality),
-    compactCodec(streamDetailValue('video', '编码'))
-  ], ' ')
-  const audioStream = props.item.streamSpecs?.find((row) => row.type === 'audio')
-  const audioDefault = audioStream?.details.some((detail) => detail.label === '默认' && detail.value === '是')
-  const audioBrief = cleanJoin([
-    streamDetailValue('audio', '语言'),
-    compactCodec(streamDetailValue('audio', '编码')),
-    streamDetailValue('audio', '声道'),
-    audioDefault ? '(默认)' : ''
-  ], ' ')
 
   useEffect(() => {
     if (!seasons.length) {
@@ -779,119 +1106,357 @@ function DetailPanel(props: {
     }
   }, [activeSeasonId, seasons])
 
+  useEffect(() => {
+    setSelectedVersionId(props.item.id)
+    setTrailerPlaying(false)
+    setTrailerPlaybackStarted(false)
+    setResolvedTrailerUrls(initialTrailerUrls())
+    setTrailerUrlIndex(0)
+    setIsResolvingTrailer(false)
+    setTrailerPlaybackFailed(false)
+    const defaultMuted = !props.trailerSoundEnabled
+    setTrailerMuted(defaultMuted)
+    postNativeCommand({ type: 'command', command: 'setLibraryWebViewMuted', muted: defaultMuted })
+    setOverviewExpanded(false)
+    setOverviewOverflowing(false)
+    setOverviewExpandedHeight(0)
+  }, [props.item.id, props.trailerSource])
+
+  useEffect(() => {
+    const defaultMuted = !props.trailerSoundEnabled
+    setTrailerMuted(defaultMuted)
+    postNativeCommand({ type: 'command', command: 'setLibraryWebViewMuted', muted: defaultMuted })
+  }, [props.trailerSoundEnabled])
+
+  useEffect(() => {
+    const urls = initialTrailerUrls()
+    if (urls.length) setResolvedTrailerUrls(urls)
+  }, [props.item.trailerUrl, props.item.trailerUrls, props.trailerSource])
+
+  async function toggleTrailer(): Promise<void> {
+    setTrailerPlaybackFailed(false)
+    if (trailerPlaying) {
+      setTrailerPlaying(false)
+      setTrailerPlaybackStarted(false)
+      setTrailerMuted(false)
+      postNativeCommand({ type: 'command', command: 'setLibraryWebViewMuted', muted: false })
+      return
+    }
+    setTrailerPlaybackStarted(false)
+    if (trailerEmbedUrl && resolvedTrailerUrls.length > 1) {
+      const defaultMuted = !props.trailerSoundEnabled
+      setTrailerMuted(defaultMuted)
+      postNativeCommand({ type: 'command', command: 'setLibraryWebViewMuted', muted: defaultMuted })
+      setTrailerPlaying((playing) => !playing)
+      return
+    }
+    setIsResolvingTrailer(true)
+    try {
+      const urls = await props.onTrailerIntent(props.item)
+      if (urls.length) {
+        setResolvedTrailerUrls(urls)
+        setTrailerUrlIndex(0)
+        const defaultMuted = !props.trailerSoundEnabled
+        setTrailerMuted(defaultMuted)
+        postNativeCommand({ type: 'command', command: 'setLibraryWebViewMuted', muted: defaultMuted })
+        setTrailerPlaying(true)
+      } else if (trailerEmbedUrl) {
+        const defaultMuted = !props.trailerSoundEnabled
+        setTrailerMuted(defaultMuted)
+        postNativeCommand({ type: 'command', command: 'setLibraryWebViewMuted', muted: defaultMuted })
+        setTrailerPlaying(true)
+      }
+    } finally {
+      setIsResolvingTrailer(false)
+    }
+  }
+
+  useEffect(() => () => {
+    postNativeCommand({ type: 'command', command: 'setLibraryWebViewMuted', muted: false })
+  }, [])
+
+  useEffect(() => {
+    if (!props.trailerAutoPlay) {
+      autoPlayedTrailerRef.current = ''
+      return
+    }
+    if (!props.trailerAutoPlayReady) return
+    const autoPlayKey = `${props.item.id}:${props.trailerSource}`
+    if (autoPlayedTrailerRef.current === autoPlayKey) return
+    autoPlayedTrailerRef.current = autoPlayKey
+    postNativeCommand({ type: 'command', command: 'debugLog', message: `trailer auto start item=${props.item.id} source=${props.trailerSource}` })
+    void toggleTrailer()
+  }, [props.item.id, props.trailerSource, props.trailerAutoPlay, props.trailerAutoPlayReady])
+
+  useEffect(() => {
+    const nextAudioStreams = selectedPlaybackVersion.streamSpecs?.filter((stream) => stream.type === 'audio') ?? []
+    setSelectedAudioStreamId((nextAudioStreams.find((stream) => stream.isDefault) ?? nextAudioStreams[0])?.id ?? '')
+    setSelectedSubtitleStreamId('subtitle-auto')
+  }, [selectedPlaybackVersion.id])
+
+  useLayoutEffect(() => {
+    const overview = overviewRef.current
+    if (!overview) return undefined
+    const updateOverflow = (): void => {
+      setOverviewExpandedHeight(overview.scrollHeight)
+      if (overviewExpanded) return
+      setOverviewOverflowing(overview.scrollHeight > overview.clientHeight + 1)
+    }
+    updateOverflow()
+    const observer = new ResizeObserver(updateOverflow)
+    observer.observe(overview)
+    return () => observer.disconnect()
+  }, [overviewExpanded, props.item.id, props.item.overview])
+
+  function playMediaAndCloseTrailer(item: MediaItem, audioTrackIndex: number, subtitleTrackIndex: number): void {
+    setTrailerPlaying(false)
+    setTrailerPlaybackStarted(false)
+    setTrailerMuted(false)
+    postNativeCommand({ type: 'command', command: 'setLibraryWebViewMuted', muted: false })
+    props.onPlayIntent(item, audioTrackIndex, subtitleTrackIndex)
+  }
+
   return (
     <aside className="library-detail">
       <div className="library-detail-backdrop">
-        <div className="library-detail-backdrop-image" style={backdropStyle} />
-        <button
-          className="library-detail-close"
-          type="button"
-          title="关闭详情"
-          onPointerDown={(event) => event.stopPropagation()}
-          onClick={(event) => {
-            event.stopPropagation()
-            props.onClose()
-          }}
-        >
-          <X size={15} />
-        </button>
-        <div className="library-detail-gradient" />
-        <div className="library-detail-copy">
+        {trailerPlaying && trailerYouTubeId ? (
+          <YouTubeTrailer
+            videoId={trailerYouTubeId}
+            backdropStyle={backdropStyle}
+            muted={trailerMuted}
+            onPlaybackStarted={() => setTrailerPlaybackStarted(true)}
+            onAutoplayMuted={() => {
+              setTrailerMuted(true)
+              postNativeCommand({ type: 'command', command: 'setLibraryWebViewMuted', muted: true })
+            }}
+            onError={() => {
+              if (trailerUrlIndex + 1 < resolvedTrailerUrls.length) {
+                setTrailerUrlIndex((index) => index + 1)
+                return
+              }
+              setTrailerPlaybackFailed(true)
+              setTrailerPlaying(false)
+              setTrailerPlaybackStarted(false)
+            }}
+          />
+        ) : trailerPlaying && trailerEmbedUrl ? (
+          <iframe
+            className={`library-detail-trailer ${trailerPlaybackStarted ? 'is-playing' : ''}`}
+            src={trailerEmbedUrl}
+            title={`${props.item.title} trailer`}
+            allow="autoplay; encrypted-media; picture-in-picture; fullscreen"
+            referrerPolicy="strict-origin-when-cross-origin"
+            allowFullScreen
+            onLoad={() => {
+              postNativeCommand({ type: 'command', command: 'debugLog', message: `trailer iframe loaded item=${props.item.id} source=${props.trailerSource}` })
+              setTrailerPlaybackStarted(true)
+            }}
+          />
+        ) : (
+          <div className="library-detail-backdrop-image" style={backdropStyle} />
+        )}
+        {trailerPlaying ? (
+          <button
+            className={`library-trailer-mute ${trailerMuted ? 'is-muted' : ''}`}
+            type="button"
+            title={trailerMuted
+              ? (props.language === 'zh' ? '恢复声音' : 'Unmute')
+              : (props.language === 'zh' ? '静音' : 'Mute')}
+            aria-label={trailerMuted
+              ? (props.language === 'zh' ? '恢复声音' : 'Unmute')
+              : (props.language === 'zh' ? '静音' : 'Mute')}
+            onClick={() => {
+              const nextMuted = !trailerMuted
+              setTrailerMuted(nextMuted)
+              postNativeCommand({ type: 'command', command: 'setLibraryWebViewMuted', muted: nextMuted })
+            }}
+          >
+            {trailerMuted ? <VolumeX size={17} /> : <Volume2 size={17} />}
+          </button>
+        ) : null}
+        {!trailerPlaying ? (
+          <button
+            className="library-detail-close"
+            type="button"
+            title={props.language === 'zh' ? '关闭详情' : 'Close details'}
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation()
+              props.onClose()
+            }}
+          >
+            <X size={15} />
+          </button>
+        ) : null}
+        {!trailerPlaybackStarted ? <div className="library-detail-gradient" /> : null}
+        {!trailerPlaybackStarted ? (
+          <div className="library-detail-copy">
           <span className="library-source-pill">
             {sourceIcon(props.source.kind, 13)}
             {props.source.name}
           </span>
           <h2>{props.item.title}</h2>
-          <p>{props.item.originalTitle}</p>
-        </div>
+          <div className="library-metadata-line">
+            <span>
+              <Star size={13} />
+              {props.item.rating.toFixed(1)}
+            </span>
+            <span>{props.item.year}</span>
+            <span>{detailRuntime}</span>
+          </div>
+            <p>{props.item.originalTitle}</p>
+          </div>
+        ) : null}
       </div>
 
       <div className="library-detail-body">
-        <div className="library-detail-actions">
+        {props.item.type !== 'series' ? (
+          <><div className="library-version-row">
+          <span>{props.language === 'zh' ? '视频' : 'Video'}</span>
+          {playbackVersions.length > 1 ? (
+            <ToolbarSelect
+              className="library-version-select"
+              value={selectedPlaybackVersion.id}
+              options={versionOptions}
+              ariaLabel={props.language === 'zh' ? '选择播放版本' : 'Select playback version'}
+              onChange={setSelectedVersionId}
+            />
+          ) : (
+            <strong>{versionOptions[0]?.label}</strong>
+          )}
+        </div>
+        <div className="library-version-row">
+          <span>{props.language === 'zh' ? '音频' : 'Audio'}</span>
+          {audioOptions.length > 1 ? (
+            <ToolbarSelect
+              className="library-version-select"
+              value={selectedAudioStream?.id ?? audioOptions[0]?.key ?? ''}
+              options={audioOptions}
+              ariaLabel={props.language === 'zh' ? '预选音轨' : 'Preselect audio track'}
+              onChange={setSelectedAudioStreamId}
+            />
+          ) : (
+            <strong>{audioOptions[0]?.label || (props.language === 'zh' ? '自动' : 'Auto')}</strong>
+          )}
+        </div>
+        <div className="library-version-row">
+          <span>{props.language === 'zh' ? '字幕' : 'Subtitles'}</span>
+          {subtitleOptions.length > 1 ? (
+            <ToolbarSelect
+              className="library-version-select"
+              value={selectedSubtitleStream?.id ?? selectedSubtitleStreamId}
+              options={subtitleOptions}
+              ariaLabel={props.language === 'zh' ? '预选字幕' : 'Preselect subtitles'}
+              onChange={setSelectedSubtitleStreamId}
+            />
+          ) : (
+            <strong>{props.language === 'zh' ? '关' : 'Off'}</strong>
+          )}
+          </div></>
+        ) : null}
+        <div className={`library-detail-actions ${props.item.type === 'series' ? 'is-series' : ''}`}>
           <button
             className="library-primary-action"
             type="button"
-            disabled={props.isResolvingPlayback}
-            onClick={() => props.onPlayIntent(props.item)}
+            disabled={props.isResolvingPlayback || props.item.availability === 'missing'}
+            onClick={() => playMediaAndCloseTrailer(
+              selectedPlaybackVersion,
+              props.item.type === 'series' ? -2 : streamIndex(selectedAudioStream?.id, -2),
+              props.item.type === 'series'
+                ? -2
+                : selectedSubtitleStreamId === 'subtitle-auto'
+                  ? -2
+                  : selectedSubtitleStreamId === 'subtitle-off'
+                    ? -1
+                    : selectedSubtitleStream ? streamIndex(selectedSubtitleStream.id, -2) : -2
+            )}
           >
-            <Play size={16} />
+            <Play size={17} />
             <span>{props.item.progress > 0 && props.item.progress < 1 ? '继续播放' : '播放'}</span>
           </button>
-          <button className={`library-icon-action ${props.item.favorite ? 'is-active' : ''}`} type="button" title="收藏">
-            <Heart size={16} />
+          <button
+            className={`library-trailer-action ${trailerPlaying ? 'is-active' : ''}`}
+            type="button"
+            disabled={isResolvingTrailer}
+            title={trailerPlaybackFailed
+              ? (props.language === 'zh' ? '预告片加载失败，点击重试' : 'Trailer failed to load; click to retry')
+              : !trailerEmbedUrl
+                ? props.trailerSource === 'bilibili'
+                  ? (props.language === 'zh' ? '从 B 站搜索预告片' : 'Find trailer on Bilibili')
+                  : (props.language === 'zh' ? '从 TMDB 查找预告片' : 'Find trailer on TMDB')
+                : undefined}
+            onClick={() => { void toggleTrailer() }}
+          >
+            <Film size={17} />
+            <span>{isResolvingTrailer ? (props.language === 'zh' ? '查找中…' : 'Finding…') : (props.language === 'zh' ? '预告片' : 'Trailer')}</span>
+          </button>
+        </div>
+        <div className="library-utility-actions">
+          <button className={`library-tool-action ${props.item.favorite ? 'is-active' : ''}`} type="button" title="收藏">
+            <Heart size={18} />
+            <span>{props.language === 'zh' ? '收藏' : 'Favorite'}</span>
           </button>
           {props.canScrapeMetadata ? (
             <button
-              className="library-icon-action"
+              className="library-tool-action"
               type="button"
               title="TMDB 刮削"
               disabled={props.isScrapingMetadata}
               onClick={() => props.onScrapeIntent(props.item)}
             >
-              <Wand2 size={16} />
+              <Wand2 size={18} />
+              <span>{props.language === 'zh' ? '刮削' : 'Scrape'}</span>
             </button>
           ) : null}
+          <button className="library-tool-action is-danger" type="button" title={props.language === 'zh' ? '从媒体库移除' : 'Remove from library'} onClick={() => props.onRemoveFromLibrary(props.item)}>
+            <Trash2 size={18} />
+            <span>{props.language === 'zh' ? '删除' : 'Remove'}</span>
+          </button>
           {props.canEditMetadata ? (
             <div className="library-detail-menu">
               <button
-                className={`library-icon-action ${metadataMenuOpen ? 'is-active' : ''}`}
+                className={`library-tool-action ${metadataMenuOpen ? 'is-active' : ''}`}
                 type="button"
                 title="更多"
                 aria-expanded={metadataMenuOpen}
                 onClick={() => setMetadataMenuOpen((open) => !open)}
               >
-                <MoreHorizontal size={16} />
+                <MoreHorizontal size={18} />
+                <span>{props.language === 'zh' ? '更多' : 'More'}</span>
               </button>
               {metadataMenuOpen ? (
                 <div className="library-detail-menu-panel">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setMetadataMenuOpen(false)
-                      props.onEditMetadata(props.item)
-                    }}
-                  >
-                    修改元数据
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setMetadataMenuOpen(false)
-                      props.onClearMetadata(props.item)
-                    }}
-                  >
-                    删除元数据
-                  </button>
+                  <button type="button" onClick={() => { setMetadataMenuOpen(false); props.onEditMetadata(props.item) }}>修改元数据</button>
+                  <button type="button" onClick={() => { setMetadataMenuOpen(false); props.onClearMetadata(props.item) }}>删除元数据</button>
                 </div>
               ) : null}
             </div>
           ) : (
-            <button className="library-icon-action" type="button" title="更多">
-              <MoreHorizontal size={16} />
+            <button className="library-tool-action" type="button" title="更多">
+              <MoreHorizontal size={18} />
+              <span>{props.language === 'zh' ? '更多' : 'More'}</span>
             </button>
           )}
         </div>
 
         {props.playIntent ? <div className="library-intent">{props.playIntent}</div> : null}
 
-        <div className="library-metadata-line">
-          <span>
-            <Star size={13} />
-            {props.item.rating.toFixed(1)}
-          </span>
-          <span>{props.item.year}</span>
-          <span>{props.item.runtime}</span>
-          {!videoBrief && props.item.quality ? <span>{props.item.quality}</span> : null}
-        </div>
-
-        {(videoBrief || audioBrief) ? (
-          <div className="library-media-brief">
-            {videoBrief ? (
-              <span><strong>视频</strong>{videoBrief}</span>
-            ) : null}
-            {audioBrief ? (
-              <span><strong>音频</strong>{audioBrief}</span>
-            ) : null}
+        {props.canScrapeMetadata ? (
+          <div className={`library-match-status ${props.item.metadataLocked ? 'is-locked' : ''}`}>
+            <div>
+              <SearchCheck size={15} />
+              <span>{props.item.metadataProvider
+                ? `${props.language === 'zh' ? '识别为' : 'Matched as'}：${props.item.metadataMatchTitle || props.item.title}`
+                : (props.language === 'zh' ? '尚未识别元数据' : 'Metadata not identified')}</span>
+            </div>
+            <div>
+              <button type="button" disabled={props.isScrapingMetadata || props.item.metadataLocked} onClick={() => props.onRematchIntent(props.item)}>{props.language === 'zh' ? '重新识别' : 'Re-identify'}</button>
+              <button type="button" disabled={props.isScrapingMetadata || props.item.metadataLocked} onClick={() => props.onSearchMatch(props.item)}>{props.language === 'zh' ? '搜索并选择' : 'Search & select'}</button>
+              <button type="button" className={props.item.metadataLocked ? 'is-active' : ''} onClick={() => props.onToggleMetadataLock(props.item)}>
+                <LockKeyhole size={13} />
+                {props.item.metadataLocked ? (props.language === 'zh' ? '已锁定' : 'Locked') : (props.language === 'zh' ? '锁定元数据' : 'Lock metadata')}
+              </button>
+            </div>
           </div>
         ) : null}
 
@@ -900,7 +1465,26 @@ function DetailPanel(props: {
         </div>
 
         <p className="library-tagline">{props.item.tagline}</p>
-        <p className="library-overview">{props.item.overview}</p>
+        <div className="library-overview-block">
+          <p
+            ref={overviewRef}
+            className={`library-overview ${overviewExpanded ? 'is-expanded' : 'is-collapsed'}`}
+            style={{ '--overview-expanded-height': `${overviewExpandedHeight}px` } as CSSProperties}
+          >
+            {props.item.overview}
+          </p>
+          {overviewOverflowing || overviewExpanded ? (
+            <button type="button" onClick={() => setOverviewExpanded((expanded) => !expanded)}>
+              {overviewExpanded
+                ? props.language === 'zh' ? '收起' : 'Collapse'
+                : props.language === 'zh' ? '展开' : 'More'}
+            </button>
+          ) : null}
+        </div>
+
+        {props.item.availability === 'missing' ? (
+          <div className="library-missing-warning">{props.language === 'zh' ? '扫描时未找到这个文件，播放已禁用。重新出现后会自动恢复。' : 'This file was not found during the last scan. Playback will return when it becomes available.'}</div>
+        ) : null}
 
         <div className="library-info-list">
           <div>
@@ -916,33 +1500,6 @@ function DetailPanel(props: {
             <strong>{props.item.watched ? '已看完' : props.item.progress > 0 ? '观看中' : '未观看'}</strong>
           </div>
         </div>
-
-        {versionRows.length ? (
-          <section className="library-episode-section">
-            <div className="library-section-heading">
-              <span>其他版本</span>
-              <span className="library-section-count">共 {versionRows.length + 1} 个</span>
-            </div>
-            <HorizontalScroller className="library-episode-row">
-              {versionRows.map((version, index) => (
-                <button
-                  className="library-episode-card"
-                  type="button"
-                  disabled={props.isResolvingPlayback || !itemHasPlaybackPath(version)}
-                  key={version.id}
-                  onClick={() => props.onPlayIntent(version)}
-                >
-                  <MediaArtwork background={version.poster || props.item.poster} className="library-episode-thumb">
-                    <Play size={18} />
-                  </MediaArtwork>
-                  <span>{version.quality || `版本 ${index + 2}`}</span>
-                  <strong>{localVersionLabel(version, index + 1)}</strong>
-                  <small>{version.runtime || version.year || props.source.name}</small>
-                </button>
-              ))}
-            </HorizontalScroller>
-          </section>
-        ) : null}
 
         {seasons.length || props.item.episodes?.length ? (
           <section className="library-episode-section">
@@ -961,7 +1518,7 @@ function DetailPanel(props: {
                     onChange={setActiveSeasonId}
                   />
                 ) : (
-                  <span className="library-season-badge">{activeSeason?.index ?? 'S1'}</span>
+                  <span className="library-season-badge">{seasonLabel(activeSeason?.index ?? 'S1')}</span>
                 )}
               </div>
             ) : null}
@@ -974,7 +1531,12 @@ function DetailPanel(props: {
                   key={episode.id}
                   onClick={() => {
                     if (!episode.item) return
-                    props.onPlayIntent(episode.item)
+                    if (episode.item.versions?.length) {
+                      setExpandedEpisodeId((current) => current === episode.id ? '' : episode.id)
+                      setSelectedEpisodeVersionId(episode.item.id)
+                      return
+                    }
+                    playMediaAndCloseTrailer(episode.item, -2, -2)
                   }}
                 >
                   <MediaArtwork background={episode.poster} className="library-episode-thumb">
@@ -986,6 +1548,23 @@ function DetailPanel(props: {
                 </button>
               ))}
             </HorizontalScroller>
+            {expandedEpisode?.item?.versions?.length ? (
+              <div className="library-episode-version-picker">
+                <span>{props.language === 'zh' ? `${expandedEpisode.title} · 选择版本` : `${expandedEpisode.title} · Select version`}</span>
+                <div>
+                  <button className="library-episode-version-play" type="button" onClick={() => selectedEpisodeVersion && playMediaAndCloseTrailer(selectedEpisodeVersion, -2, -2)}>
+                    <Play size={14} />{props.language === 'zh' ? '播放' : 'Play'}
+                  </button>
+                  <ToolbarSelect
+                    className="library-version-select"
+                    value={selectedEpisodeVersion?.id ?? expandedEpisode.item.id}
+                    options={expandedEpisodeVersions.map((version) => ({ key: version.id, label: mediaVersionLabel(version) }))}
+                    ariaLabel={props.language === 'zh' ? '选择剧集版本' : 'Select episode version'}
+                    onChange={setSelectedEpisodeVersionId}
+                  />
+                </div>
+              </div>
+            ) : null}
           </section>
         ) : null}
 
@@ -1335,6 +1914,12 @@ const settingsCopy: Record<UiLanguage, {
   tone: string
   playerTone: string
   playbackHint: string
+  refreshRateSync: string
+  refreshRateSyncCaption: string
+  refreshRateSyncRequirement: string
+  enabled: string
+  disabled: string
+  maximumRefreshMultiple: string
   tmdb: string
   tmdbCaption: string
   networkMode: string
@@ -1349,6 +1934,15 @@ const settingsCopy: Record<UiLanguage, {
   credential: string
   metadataLanguage: string
   testConnection: string
+  trailerSource: string
+  trailerSourceCaption: string
+  experimental: string
+  youtube: string
+  bilibili: string
+  bilibiliKeyword: string
+  bilibiliKeywordHint: string
+  trailerDefaultSound: string
+  autoPlayTrailer: string
   chinese: string
   english: string
 }> = {
@@ -1361,6 +1955,12 @@ const settingsCopy: Record<UiLanguage, {
     tone: '色调',
     playerTone: '跟随播放器',
     playbackHint: '播放相关设置仍在播放器侧边栏中调整。',
+    refreshRateSync: '智能刷新率同步',
+    refreshRateSyncCaption: '全局默认。播放视频进入全屏时，自动选择与帧率整数倍匹配的最高刷新率。',
+    refreshRateSyncRequirement: '请先在显卡控制面板创建片源所需的精确刷新率，例如 23.976 Hz 或 119.880 Hz。',
+    enabled: '开启',
+    disabled: '关闭',
+    maximumRefreshMultiple: '使用最大倍率刷新率',
     tmdb: 'TMDB 刮削',
     tmdbCaption: '用于本地文件系统媒体的海报、简介、评分和演职员信息。',
     networkMode: '网络',
@@ -1375,6 +1975,15 @@ const settingsCopy: Record<UiLanguage, {
     credential: '凭据',
     metadataLanguage: '语言',
     testConnection: '测试连接',
+    trailerSource: '预告片来源',
+    trailerSourceCaption: '选择详情页预告片的搜索与播放来源。B 站搜索为实验性功能，结果可能受网络和平台风控影响。',
+    experimental: '实验性',
+    youtube: 'YouTube',
+    bilibili: '哔哩哔哩',
+    bilibiliKeyword: 'B 站搜索关键词',
+    bilibiliKeywordHint: '支持 {title}、{originalTitle} 和 {year} 占位符',
+    trailerDefaultSound: '预告片默认开启声音',
+    autoPlayTrailer: '打开媒体详情时自动播放预告片',
     chinese: '中文',
     english: 'English'
   },
@@ -1387,6 +1996,12 @@ const settingsCopy: Record<UiLanguage, {
     tone: 'Tone',
     playerTone: 'Follow player',
     playbackHint: 'Playback-specific settings remain in the player sidebar.',
+    refreshRateSync: 'Smart refresh-rate sync',
+    refreshRateSyncCaption: 'Global default. In fullscreen, select the highest refresh rate that is an integer multiple of the video frame rate.',
+    refreshRateSyncRequirement: 'Create the exact required mode in the GPU control panel first, such as 23.976 Hz or 119.880 Hz.',
+    enabled: 'Enabled',
+    disabled: 'Disabled',
+    maximumRefreshMultiple: 'Use maximum refresh multiple',
     tmdb: 'TMDB scraping',
     tmdbCaption: 'Used for posters, overview, ratings, and cast on local filesystem media.',
     networkMode: 'Network',
@@ -1401,6 +2016,15 @@ const settingsCopy: Record<UiLanguage, {
     credential: 'Credential',
     metadataLanguage: 'Language',
     testConnection: 'Test connection',
+    trailerSource: 'Trailer source',
+    trailerSourceCaption: 'Choose the trailer search and playback provider. Bilibili search is experimental and may be affected by network or platform restrictions.',
+    experimental: 'Experimental',
+    youtube: 'YouTube',
+    bilibili: 'Bilibili',
+    bilibiliKeyword: 'Bilibili search keywords',
+    bilibiliKeywordHint: 'Supports {title}, {originalTitle}, and {year} placeholders',
+    trailerDefaultSound: 'Enable trailer sound by default',
+    autoPlayTrailer: 'Autoplay trailers when opening media details',
     chinese: '中文',
     english: 'English'
   }
@@ -1414,11 +2038,17 @@ function LibrarySettingsPage(props: {
   isTestingTmdb: boolean
   onTmdbSettingsChange: (settings: TmdbSettings) => void
   onTestTmdb: () => void
+  trailerSettings: TrailerSettings
+  onTrailerSettingsChange: (settings: TrailerSettings) => void
+  refreshRateSyncEnabled: boolean
+  onRefreshRateSyncChange: (enabled: boolean) => void
+  refreshRateMaximumMultiple: boolean
+  onRefreshRateMaximumMultipleChange: (enabled: boolean) => void
 }): JSX.Element {
   const t = settingsCopy[props.language]
-  const languageOptions: Array<{ value: UiLanguage; label: string }> = [
-    { value: 'zh', label: t.chinese },
-    { value: 'en', label: t.english }
+  const languageOptions: Array<{ key: UiLanguage; label: string }> = [
+    { key: 'zh', label: t.chinese },
+    { key: 'en', label: t.english }
   ]
   const tmdbNetworkOptions: Array<{ value: TmdbNetworkMode; label: string }> = [
     { value: 'official', label: t.officialNetwork },
@@ -1443,24 +2073,19 @@ function LibrarySettingsPage(props: {
         </div>
       </div>
 
-      <section className="library-settings-panel">
+      <section className="library-settings-panel library-language-panel">
         <div className="library-settings-panel-title">
           <Languages size={16} />
           <span>{t.interfaceLanguage}</span>
         </div>
         <p>{t.languageCaption}</p>
-        <div className="library-setting-options" role="group" aria-label={t.interfaceLanguage}>
-          {languageOptions.map((option) => (
-            <button
-              key={option.value}
-              className={option.value === props.language ? 'is-selected' : ''}
-              type="button"
-              onClick={() => props.onLanguageChange(option.value)}
-            >
-              <span>{option.label}</span>
-            </button>
-          ))}
-        </div>
+        <ToolbarSelect
+          className="library-settings-select"
+          value={props.language}
+          options={languageOptions}
+          ariaLabel={t.interfaceLanguage}
+          onChange={props.onLanguageChange}
+        />
       </section>
 
       <section className="library-settings-panel">
@@ -1511,11 +2136,7 @@ function LibrarySettingsPage(props: {
           </label>
           <label className="library-settings-field">
             <span>{t.metadataLanguage}</span>
-            <input
-              value={props.tmdbSettings.language}
-              onChange={(event) => updateTmdbSettings({ language: event.target.value })}
-              placeholder="zh-CN"
-            />
+            <input value={props.tmdbSettings.language} readOnly aria-readonly="true" />
           </label>
           <label className="library-settings-field">
             <span>{t.apiBaseUrl}</span>
@@ -1553,6 +2174,96 @@ function LibrarySettingsPage(props: {
 
       <section className="library-settings-panel">
         <div className="library-settings-panel-title">
+          <Tv size={16} />
+          <span>{t.refreshRateSync}</span>
+        </div>
+        <p>{t.refreshRateSyncCaption}</p>
+        <p className="library-settings-warning">{t.refreshRateSyncRequirement}</p>
+        <div className="library-refresh-sync-controls">
+          <div className="library-setting-options" role="group" aria-label={t.refreshRateSync}>
+            <button className={props.refreshRateSyncEnabled ? 'is-selected' : ''} type="button" onClick={() => props.onRefreshRateSyncChange(true)}>
+              <span>{t.enabled}</span>
+            </button>
+            <button className={!props.refreshRateSyncEnabled ? 'is-selected' : ''} type="button" onClick={() => props.onRefreshRateSyncChange(false)}>
+              <span>{t.disabled}</span>
+            </button>
+          </div>
+          <label className={`library-checkbox-option ${props.refreshRateSyncEnabled ? '' : 'is-disabled'}`}>
+            <input
+              type="checkbox"
+              checked={props.refreshRateMaximumMultiple}
+              disabled={!props.refreshRateSyncEnabled}
+              onChange={(event) => props.onRefreshRateMaximumMultipleChange(event.currentTarget.checked)}
+            />
+            <span>{t.maximumRefreshMultiple}</span>
+          </label>
+        </div>
+      </section>
+
+      <section className="library-settings-panel">
+        <div className="library-settings-panel-title">
+          <Film size={16} />
+          <span>{t.trailerSource}</span>
+          <small className="library-settings-experimental">{t.experimental}</small>
+        </div>
+        <p>{t.trailerSourceCaption}</p>
+        <div className="library-setting-options" role="group" aria-label={t.trailerSource}>
+          {([
+            { value: 'youtube', label: t.youtube },
+            { value: 'bilibili', label: t.bilibili }
+          ] as Array<{ value: TrailerSource; label: string }>).map((option) => (
+            <button
+              key={option.value}
+              className={props.trailerSettings.source === option.value ? 'is-selected' : ''}
+              type="button"
+              onClick={() => props.onTrailerSettingsChange({ ...props.trailerSettings, source: option.value })}
+            >
+              <span>{option.label}</span>
+            </button>
+          ))}
+        </div>
+        {props.trailerSettings.source === 'bilibili' ? (
+          <>
+            <label className="library-settings-field library-trailer-keyword-field">
+              <span>{t.bilibiliKeyword}</span>
+              <input
+                value={props.trailerSettings.bilibiliKeywordTemplate}
+                onChange={(event) => props.onTrailerSettingsChange({
+                  ...props.trailerSettings,
+                  bilibiliKeywordTemplate: event.target.value
+                })}
+                placeholder="{title} {year} 预告"
+              />
+              <small>{t.bilibiliKeywordHint}</small>
+            </label>
+          </>
+        ) : null}
+        <label className="library-checkbox-option library-trailer-preference">
+          <input
+            type="checkbox"
+            checked={props.trailerSettings.soundEnabled}
+            onChange={(event) => props.onTrailerSettingsChange({
+              ...props.trailerSettings,
+              soundEnabled: event.currentTarget.checked
+            })}
+          />
+          <span>{t.trailerDefaultSound}</span>
+        </label>
+        <label className="library-checkbox-option library-trailer-preference">
+          <input
+            type="checkbox"
+            checked={props.trailerSettings.autoPlayOnDetails}
+            onChange={(event) => props.onTrailerSettingsChange({
+              ...props.trailerSettings,
+              autoPlayOnDetails: event.currentTarget.checked
+            })}
+          />
+          <span>{t.autoPlayTrailer}</span>
+        </label>
+      </section>
+
+      <section className="library-settings-panel">
+        <div className="library-settings-panel-title">
           <Settings2 size={16} />
           <span>{t.appearance}</span>
         </div>
@@ -1576,10 +2287,20 @@ export default function LibraryApp(): JSX.Element {
   )
   const client = useMemo(() => createEmptyLibraryClient(), [])
   const [language, setLanguage] = useState<UiLanguage>(() => getInitialLanguage())
+  const [customTitleBarEnabled, setCustomTitleBarEnabled] = useState(false)
+  currentLibraryLanguage = language
+  const [refreshRateSyncEnabled, setRefreshRateSyncEnabled] = useState(() => localStorage.getItem('anvil-player.refresh-rate-sync') === 'true')
+  const [refreshRateMaximumMultiple, setRefreshRateMaximumMultiple] = useState(() => localStorage.getItem('anvil-player.refresh-rate-maximum-multiple') !== 'false')
   const { settings: tmdbSettings, status: tmdbStatus, isTesting: isTestingTmdb, updateSettings: updateTmdbSettings, testConnection: testTmdbSettingsConnection } = useTmdbSettings()
+  const [trailerSettings, setTrailerSettings] = useState<TrailerSettings>(() => loadTrailerSettings())
+  const changeInterfaceLanguage = (nextLanguage: UiLanguage): void => {
+    setLanguage(nextLanguage)
+    updateTmdbSettings({ ...tmdbSettings, language: tmdbLanguageForUi(nextLanguage) })
+  }
   const [sources, setSources] = useState<LibrarySource[]>([])
   const [allItems, setAllItems] = useState<MediaItem[]>([])
   const [visibleItems, setVisibleItems] = useState<MediaItem[]>([])
+  const [listingPage, setListingPage] = useState(1)
   const [detailItemsById, setDetailItemsById] = useState<Map<string, MediaItem>>(() => new Map())
   const [loadedDetailIds, setLoadedDetailIds] = useState<Set<string>>(() => new Set())
   const [continueItems, setContinueItems] = useState<MediaItem[]>([])
@@ -1596,6 +2317,7 @@ export default function LibraryApp(): JSX.Element {
   const [activeLibraryViewId, setActiveLibraryViewId] = useState('')
   const [selectedId, setSelectedId] = useState('')
   const [isDetailOpen, setIsDetailOpen] = useState(false)
+  const listingSectionRef = useRef<HTMLElement | null>(null)
   const [sourceSetupMode, setSourceSetupMode] = useState<SourceSetupMode>(() => savedConnection ? 'hidden' : 'select')
   const [connectionName, setConnectionName] = useState(() => savedConnection?.name ?? '')
   const [serverProtocol, setServerProtocol] = useState<ServerProtocol>(() => savedAddress?.protocol ?? 'http')
@@ -1631,6 +2353,35 @@ export default function LibraryApp(): JSX.Element {
   const [scrapingSourceMetadataId, setScrapingSourceMetadataId] = useState('')
   const [scanningLocalFolderSourceIds, setScanningLocalFolderSourceIds] = useState<Set<string>>(() => new Set())
   const [metadataEditorItem, setMetadataEditorItem] = useState<MediaItem | undefined>()
+  const [metadataDeleteItem, setMetadataDeleteItem] = useState<MediaItem | undefined>()
+  const [metadataMatchItem, setMetadataMatchItem] = useState<MediaItem | undefined>()
+  const [metadataCandidates, setMetadataCandidates] = useState<TmdbMatchCandidate[]>([])
+  const [isSearchingMetadata, setIsSearchingMetadata] = useState(false)
+  const [applyingMetadataCandidateId, setApplyingMetadataCandidateId] = useState('')
+  const [backgroundTasks, setBackgroundTasks] = useState<BackgroundTask[]>([])
+  const [taskCenterOpen, setTaskCenterOpen] = useState(false)
+  const [mediaManagementOpen, setMediaManagementOpen] = useState(false)
+
+  useEffect(() => {
+    if (!taskCenterOpen && !mediaManagementOpen) return undefined
+    const closeOnOutsidePointer = (event: PointerEvent): void => {
+      const target = event.target
+      if (target instanceof Element && target.closest('.library-toolbar-popover-anchor')) return
+      setTaskCenterOpen(false)
+      setMediaManagementOpen(false)
+    }
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key !== 'Escape') return
+      setTaskCenterOpen(false)
+      setMediaManagementOpen(false)
+    }
+    window.addEventListener('pointerdown', closeOnOutsidePointer)
+    window.addEventListener('keydown', closeOnEscape)
+    return () => {
+      window.removeEventListener('pointerdown', closeOnOutsidePointer)
+      window.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [mediaManagementOpen, taskCenterOpen])
   const [isSavingManualMetadata, setIsSavingManualMetadata] = useState(false)
   const [isConnecting, setIsConnecting] = useState(false)
   const [isPickingLocalFolder, setIsPickingLocalFolder] = useState(false)
@@ -1646,8 +2397,110 @@ export default function LibraryApp(): JSX.Element {
   const webDavBrowseRequestIdRef = useRef('')
   const localScanUpdateChainRef = useRef<Promise<void>>(Promise.resolve())
   const pendingFolderScanCountsRef = useRef<Map<string, number>>(new Map())
+  const allItemsRef = useRef<MediaItem[]>([])
+  const mediaProbeRequestedIdsRef = useRef<Set<string>>(new Set())
+  const mediaProbeTimeoutsRef = useRef<Map<string, number>>(new Map())
+  const castRefreshRequestedIdsRef = useRef<Set<string>>(new Set())
+  const taskStatusRef = useRef<Map<string, BackgroundTask['status']>>(new Map())
+  const taskRetryRef = useRef<Map<string, () => void>>(new Map())
+  const taskNativeCancelRef = useRef<Map<string, () => void>>(new Map())
+  const dissolvedCollectionPathsRef = useRef<Set<string>>(loadDissolvedCollectionPaths())
+
+  useEffect(() => {
+    allItemsRef.current = allItems
+  }, [allItems])
+
+  function setTask(task: BackgroundTask, retry?: () => void): void {
+    taskStatusRef.current.set(task.id, task.status)
+    if (retry) taskRetryRef.current.set(task.id, retry)
+    setBackgroundTasks((current) => [task, ...current.filter((row) => row.id !== task.id)].slice(0, 100))
+  }
+
+  function updateTask(id: string, patch: Partial<BackgroundTask>): void {
+    if (patch.status) taskStatusRef.current.set(id, patch.status)
+    setBackgroundTasks((current) => current.map((task) => task.id === id
+      ? { ...task, ...patch, updatedAt: Date.now() }
+      : task))
+  }
+
+  function advanceTask(id: string, patch: Partial<BackgroundTask>): void {
+    if (patch.status) taskStatusRef.current.set(id, patch.status)
+    setBackgroundTasks((current) => current.map((task) => task.id === id
+      ? { ...task, ...patch, completed: Math.min(task.total, task.completed + 1), updatedAt: Date.now() }
+      : task))
+  }
+
+  function startTask(id: string, kind: BackgroundTask['kind'], title: string, detail: string, total: number, retry?: () => void): void {
+    const now = Date.now()
+    setTask({ id, kind, title, detail, status: 'running', completed: 0, total, startedAt: now, updatedAt: now }, retry)
+  }
+
+  async function waitWhileTaskPaused(id: string): Promise<boolean> {
+    while (taskStatusRef.current.get(id) === 'paused') {
+      await new Promise((resolve) => window.setTimeout(resolve, 120))
+    }
+    return taskStatusRef.current.get(id) === 'cancelled'
+  }
+
+  function pauseTask(task: BackgroundTask): void {
+    updateTask(task.id, { status: 'paused' })
+    taskNativeCancelRef.current.get(task.id)?.()
+    if (task.kind === 'probe' && task.id.startsWith('probe:')) {
+      const requestId = task.id.slice('probe:'.length)
+      window.clearTimeout(mediaProbeTimeoutsRef.current.get(requestId))
+      mediaProbeTimeoutsRef.current.delete(requestId)
+    }
+  }
+
+  function resumeTask(task: BackgroundTask): void {
+    if (task.kind === 'scan' || task.kind === 'probe') {
+      taskRetryRef.current.get(task.id)?.()
+      return
+    }
+    updateTask(task.id, { status: 'running' })
+  }
+
+  function retryTask(task: BackgroundTask): void {
+    taskRetryRef.current.get(task.id)?.()
+  }
+
+  function cancelTask(task: BackgroundTask): void {
+    taskNativeCancelRef.current.get(task.id)?.()
+    updateTask(task.id, { status: 'cancelled' })
+    if (task.kind === 'probe' && task.id.startsWith('probe:')) {
+      const requestId = task.id.slice('probe:'.length)
+      window.clearTimeout(mediaProbeTimeoutsRef.current.get(requestId))
+      mediaProbeTimeoutsRef.current.delete(requestId)
+      mediaProbeRequestedIdsRef.current.delete(requestId)
+    }
+    if (task.kind === 'scan' && task.id.startsWith('scan:')) {
+      const sourceId = task.id.slice('scan:'.length)
+      pendingFolderScanCountsRef.current.delete(sourceId)
+      setScanningLocalFolderSourceIds((current) => {
+        const next = new Set(current)
+        next.delete(sourceId)
+        return next
+      })
+      setScanProgressBySourceId((current) => {
+        const existing = current.get(sourceId)
+        if (!existing) return current
+        const next = new Map(current)
+        next.set(sourceId, { ...existing, active: false })
+        return next
+      })
+    }
+  }
 
   function beginSourceScan(source: LibrarySource, totalFolders: number, foundItems = 0, lastPath = source.location): void {
+    startTask(`scan:${source.id}`, 'scan', `${language === 'zh' ? '扫描' : 'Scan'} · ${source.name}`, lastPath, Math.max(1, totalFolders), () => rescanFileSystemSource(source))
+    taskNativeCancelRef.current.set(`scan:${source.id}`, () => {
+      scanLocationsForSource(source).forEach((path) => postNativeCommand({
+        type: 'command',
+        command: 'cancelLibraryScan',
+        path,
+        webDav: source.kind === 'WebDAV'
+      }))
+    })
     setScanProgressBySourceId((current) => {
       const next = new Map(current)
       next.set(source.id, {
@@ -1667,6 +2520,11 @@ export default function LibraryApp(): JSX.Element {
   }
 
   function completeSourceScanFolder(source: LibrarySource, foundItems: number, stillActive: boolean, path: string, truncated?: boolean): void {
+    const taskId = `scan:${source.id}`
+    advanceTask(taskId, {
+      detail: `${path} · ${foundItems}`,
+      status: stillActive ? 'running' : 'completed'
+    })
     setScanProgressBySourceId((current) => {
       const existing = current.get(source.id)
       const totalFolders = Math.max(1, existing?.totalFolders ?? pendingFolderScanCountsRef.current.get(source.id) ?? 1)
@@ -1688,6 +2546,11 @@ export default function LibraryApp(): JSX.Element {
   }
 
   function failSourceScanFolder(source: LibrarySource, stillActive: boolean, path: string): void {
+    updateTask(`scan:${source.id}`, {
+      detail: path,
+      status: stillActive ? 'running' : 'failed',
+      error: language === 'zh' ? '扫描失败，可重试' : 'Scan failed. Retry available.'
+    })
     setScanProgressBySourceId((current) => {
       const existing = current.get(source.id)
       const totalFolders = Math.max(1, existing?.totalFolders ?? pendingFolderScanCountsRef.current.get(source.id) ?? 1)
@@ -1737,7 +2600,22 @@ export default function LibraryApp(): JSX.Element {
   useEffect(() => {
     applyDocumentLanguage(language)
     saveUiLanguage(language)
+    postNativeCommand({ type: 'command', command: 'setUiLanguage', language })
   }, [language])
+
+  useEffect(() => {
+    localStorage.setItem('anvil-player.refresh-rate-sync', String(refreshRateSyncEnabled))
+    postNativeCommand({ type: 'command', command: 'setGlobalRefreshRateSync', enabled: refreshRateSyncEnabled })
+  }, [refreshRateSyncEnabled])
+
+  useEffect(() => {
+    localStorage.setItem('anvil-player.refresh-rate-maximum-multiple', String(refreshRateMaximumMultiple))
+    postNativeCommand({ type: 'command', command: 'setGlobalRefreshRateMaximumMultiple', enabled: refreshRateMaximumMultiple })
+  }, [refreshRateMaximumMultiple])
+
+  useEffect(() => {
+    saveTrailerSettings(trailerSettings)
+  }, [trailerSettings])
 
   useEffect(() => {
     activeNavRef.current = activeNav
@@ -1833,7 +2711,30 @@ export default function LibraryApp(): JSX.Element {
     async function applyLocalFolderScan(result: LocalFolderScanCompleted | LocalFolderPickResult, activate: boolean): Promise<void> {
       const knownSource = sources.find((source) => locationKey(source.location) === locationKey(result.folder.path))
         ?? fileSystemSourceByLocationRef.current.get(locationKey(result.folder.path))
-      const snapshot = buildLocalFolderLibrary(result, knownSource ? { source: knownSource } : undefined)
+      const rawSnapshot = buildLocalFolderLibrary(result, knownSource ? { source: knownSource } : undefined)
+      const dissolvedPaths = dissolvedCollectionPathsRef.current
+      const expandedItems = rawSnapshot.items.flatMap((item): MediaItem[] => {
+        const episodeItems = (item.seasons ?? []).flatMap((season) => season.episodes.map((episode) => episode.item))
+          .filter((episode): episode is MediaItem => Boolean(episode?.path || episode?.playbackPath))
+        if (episodeItems.some((episode) => dissolvedPaths.has(locationKey(episode.path || episode.playbackPath || '')))) {
+          return episodeItems.map((episode) => ({
+            ...episode,
+            type: 'movie',
+            seasons: undefined,
+            episodes: undefined,
+            collectionDissolved: true
+          }))
+        }
+        if (dissolvedPaths.has(locationKey(item.path || item.playbackPath || ''))) {
+          return [{ ...item, type: 'movie', collectionDissolved: true }]
+        }
+        return [item]
+      })
+      const snapshot = {
+        ...rawSnapshot,
+        source: { ...rawSnapshot.source, itemCount: expandedItems.length },
+        items: expandedItems
+      }
       if (!activate && ignoredLocalFolderScanSourceIdsRef.current.has(snapshot.source.id)) {
         return
       }
@@ -1841,6 +2742,24 @@ export default function LibraryApp(): JSX.Element {
       const existingSourceItems = existingRows.filter((item) => item.sourceId === snapshot.source.id)
       const existingById = new Map(existingSourceItems.map((item) => [item.id, item]))
       const scannedItems = snapshot.items.map((item) => mergeLocalScannedItem(existingById.get(item.id), item))
+      const scannedPathKeys = new Set(result.items.map((item) => locationKey(item.path)))
+      const itemPathKeys = (item: MediaItem): string[] => [
+        item.path,
+        item.playbackPath,
+        ...(item.versions ?? []).flatMap((version) => [version.path, version.playbackPath]),
+        ...(item.seasons ?? []).flatMap((season) => season.episodes.flatMap((episode) => [episode.item?.path, episode.item?.playbackPath]))
+      ].filter((path): path is string => Boolean(path)).map(locationKey)
+      const missingItems = existingSourceItems
+        .filter((item) => mediaItemBelongsToScanRoot(item, result.folder.path))
+        .filter((item) => {
+          const paths = itemPathKeys(item)
+          return paths.length > 0 && paths.every((path) => !scannedPathKeys.has(path))
+        })
+        .map((item): MediaItem => ({
+          ...item,
+          availability: 'missing',
+          missingSince: item.missingSince ?? Date.now()
+        }))
       const mergesPartialWebDavFolder = Boolean(
         knownSource?.kind === 'WebDAV' &&
         ((knownSource.folders?.length ?? 0) > 1 || (loadWebDavCredentials(knownSource.id)?.selectedPaths?.length ?? 0) > 1)
@@ -1848,9 +2767,17 @@ export default function LibraryApp(): JSX.Element {
       const mergedItems = mergesPartialWebDavFolder
         ? [
             ...existingSourceItems.filter((item) => !mediaItemBelongsToScanRoot(item, result.folder.path)),
-            ...scannedItems
+            ...scannedItems,
+            ...missingItems
           ]
-        : scannedItems
+        : [...scannedItems, ...missingItems]
+
+      const addedCount = snapshot.items.filter((item) => !existingById.has(item.id)).length
+      const changedCount = snapshot.items.filter((item) => {
+        const existing = existingById.get(item.id)
+        return Boolean(existing?.fileFingerprint && item.fileFingerprint && existing.fileFingerprint !== item.fileFingerprint)
+      }).length
+      const unchangedCount = Math.max(0, scannedItems.length - addedCount - changedCount)
 
       await client.upsertSourceItems({ ...snapshot.source, itemCount: mergedItems.length }, mergedItems)
       const pendingScanCount = pendingFolderScanCountsRef.current.get(snapshot.source.id) ?? 0
@@ -1897,6 +2824,9 @@ export default function LibraryApp(): JSX.Element {
       setConnectMessage(result.truncated
         ? `已扫描 ${snapshot.source.name}，达到上限，加入 ${mergedItems.length} 个媒体文件`
         : `已扫描 ${snapshot.source.name}，加入 ${mergedItems.length} 个媒体文件`)
+      if (!result.truncated) {
+        setConnectMessage(`增量扫描完成：新增 ${addedCount}，变化 ${changedCount}，未变化 ${unchangedCount}，缺失 ${missingItems.length}`)
+      }
     }
 
     async function importLocalFolder(result: LocalFolderPickResult): Promise<void> {
@@ -1995,8 +2925,10 @@ export default function LibraryApp(): JSX.Element {
       setConnectMessage(result.message || `扫描 ${source.name} 失败`)
     }
 
-    return subscribeNativeMessages((message) => {
-      if (message.type === 'localFolderPicked') {
+    const unsubscribe = subscribeNativeMessages((message) => {
+      if (message.type === 'windowChrome') {
+        setCustomTitleBarEnabled(message.customTitleBar)
+      } else if (message.type === 'localFolderPicked') {
         void importLocalFolder(message)
       } else if (message.type === 'localFolderScanCompleted') {
         localScanUpdateChainRef.current = localScanUpdateChainRef.current.then(() => completeLocalFolderScan(message))
@@ -2038,8 +2970,41 @@ export default function LibraryApp(): JSX.Element {
         setWebDavDirectories([])
         setConnectTone('error')
         setConnectMessage(message.message || '读取 WebDAV 文件夹失败')
+      } else if (message.type === 'mediaDetailsProbed') {
+        mediaProbeRequestedIdsRef.current.delete(message.requestId)
+        window.clearTimeout(mediaProbeTimeoutsRef.current.get(message.requestId))
+        mediaProbeTimeoutsRef.current.delete(message.requestId)
+        if (['cancelled', 'paused'].includes(taskStatusRef.current.get(`probe:${message.requestId}`) ?? '')) return
+        updateTask(`probe:${message.requestId}`, { status: 'completed', completed: 1 })
+        const item = allItemsRef.current.find((candidate) => candidate.id === message.requestId)
+          ?? detailItemsById.get(message.requestId)
+        if (!item) return
+        const updatedItem: MediaItem = {
+          ...item,
+          videoSpec: message.videoSpec || item.videoSpec,
+          audioSpec: message.audioSpec || item.audioSpec,
+          streamSpecs: message.streamSpecs
+        }
+        const replace = (candidate: MediaItem): MediaItem => candidate.id === updatedItem.id ? updatedItem : candidate
+        allItemsRef.current = allItemsRef.current.map(replace)
+        setAllItems(allItemsRef.current)
+        setVisibleItems((current) => current.map(replace))
+        setContinueItems((current) => current.map(replace))
+        setDetailItemsById((current) => new Map(current).set(updatedItem.id, updatedItem))
+        void client.updateItem(updatedItem)
+      } else if (message.type === 'mediaDetailsProbeFailed') {
+        mediaProbeRequestedIdsRef.current.delete(message.requestId)
+        window.clearTimeout(mediaProbeTimeoutsRef.current.get(message.requestId))
+        mediaProbeTimeoutsRef.current.delete(message.requestId)
+        if (['cancelled', 'paused'].includes(taskStatusRef.current.get(`probe:${message.requestId}`) ?? '')) return
+        updateTask(`probe:${message.requestId}`, { status: 'failed', error: message.message })
+        if (message.requestId === selectedId) {
+          setPlayIntent(`媒体信息读取失败：${message.message}`)
+        }
       }
     })
+    postNativeCommand({ type: 'command', command: 'requestWindowChrome' })
+    return unsubscribe
   }, [activeLibraryViewId, activeNav, activeView, client, debouncedQuery, mediaFilter, selectedId, sortKey, sortOrder, sources])
 
   useEffect(() => {
@@ -2188,6 +3153,28 @@ export default function LibraryApp(): JSX.Element {
     }
   }, [activeNav, isDetailOpen, selectedId, sources, visibleItems])
 
+  useEffect(() => {
+    setListingPage(1)
+  }, [activeLibraryViewId, activeNav, activeView, debouncedQuery, mediaFilter, sortKey, sortOrder])
+
+  const listingPageCount = Math.max(1, Math.ceil(visibleItems.length / LIBRARY_LISTING_PAGE_SIZE))
+  const effectiveListingPage = Math.min(listingPage, listingPageCount)
+  const pagedVisibleItems = useMemo(() => {
+    const start = (effectiveListingPage - 1) * LIBRARY_LISTING_PAGE_SIZE
+    return visibleItems.slice(start, start + LIBRARY_LISTING_PAGE_SIZE)
+  }, [effectiveListingPage, visibleItems])
+  const listingRangeStart = visibleItems.length
+    ? (effectiveListingPage - 1) * LIBRARY_LISTING_PAGE_SIZE + 1
+    : 0
+  const listingRangeEnd = Math.min(
+    effectiveListingPage * LIBRARY_LISTING_PAGE_SIZE,
+    visibleItems.length
+  )
+
+  useEffect(() => {
+    if (listingPage > listingPageCount) setListingPage(listingPageCount)
+  }, [listingPage, listingPageCount])
+
   const sourceMap = useMemo(() => new Map(sources.map((source) => [source.id, source])), [sources])
   const embySourceIds = useMemo(
     () => new Set(sources.filter((source) => source.kind === 'Emby').map((source) => source.id)),
@@ -2225,6 +3212,50 @@ export default function LibraryApp(): JSX.Element {
       ?? allItems.find((item) => item.id === selectedId && (!activeSource || item.sourceId === activeSource.id))
       ?? detailItemsById.get(selectedId)
   const selectedDetailItem = selectedItem ? detailItemsById.get(selectedItem.id) ?? selectedItem : undefined
+  useEffect(() => {
+    if (!isDetailOpen || !selectedDetailItem || selectedDetailItem.streamSpecs?.length) return
+    const source = sourceMap.get(selectedDetailItem.sourceId)
+    if (!source || source.kind === 'Emby' || mediaProbeRequestedIdsRef.current.has(selectedDetailItem.id)) return
+    const nestedItem = selectedDetailItem.versions?.find((item) => item.playbackPath || item.path)
+      ?? selectedDetailItem.seasons?.flatMap((season) => season.episodes).find((episode) => episode.item?.playbackPath || episode.item?.path)?.item
+      ?? selectedDetailItem.episodes?.find((episode) => episode.item?.playbackPath || episode.item?.path)?.item
+    let probePath = selectedDetailItem.playbackPath || selectedDetailItem.path || nestedItem?.playbackPath || nestedItem?.path || ''
+    if (!probePath) return
+    if (source.kind === 'WebDAV') {
+      const credentials = loadWebDavCredentials(source.id)
+      if (credentials) probePath = credentialedWebDavUrl(probePath, credentials.username, credentials.password)
+    }
+    mediaProbeRequestedIdsRef.current.add(selectedDetailItem.id)
+    const taskId = `probe:${selectedDetailItem.id}`
+    const requestProbe = (): void => {
+      startTask(taskId, 'probe', `${language === 'zh' ? '媒体探测' : 'Media probe'} · ${selectedDetailItem.title}`, probePath, 1, requestProbe)
+      postNativeCommand({ type: 'command', command: 'probeMediaDetails', requestId: selectedDetailItem.id, path: probePath })
+    }
+    taskNativeCancelRef.current.set(taskId, () => postNativeCommand({ type: 'command', command: 'cancelLibraryProbe', requestId: selectedDetailItem.id }))
+    requestProbe()
+    const timeout = window.setTimeout(() => {
+      mediaProbeRequestedIdsRef.current.delete(selectedDetailItem.id)
+      updateTask(taskId, { status: 'failed', error: language === 'zh' ? '媒体探测超时' : 'Media probe timed out' })
+      if (selectedId === selectedDetailItem.id) {
+        setPlayIntent('媒体信息读取超时，请关闭详情后重试')
+      }
+    }, 25000)
+    mediaProbeTimeoutsRef.current.set(selectedDetailItem.id, timeout)
+    return () => {
+      window.clearTimeout(timeout)
+      mediaProbeTimeoutsRef.current.delete(selectedDetailItem.id)
+      mediaProbeRequestedIdsRef.current.delete(selectedDetailItem.id)
+    }
+  }, [isDetailOpen, language, selectedDetailItem, selectedId, sourceMap])
+  useEffect(() => {
+    if (!isDetailOpen || !selectedDetailItem || selectedDetailItem.cast?.length ||
+        selectedDetailItem.metadataProvider !== 'tmdb' || !selectedDetailItem.externalIds?.tmdb ||
+        castRefreshRequestedIdsRef.current.has(selectedDetailItem.id)) return
+    castRefreshRequestedIdsRef.current.add(selectedDetailItem.id)
+    void scrapeTmdbItem(selectedDetailItem, tmdbSettings)
+      .then((updatedItem) => applyUpdatedMediaItem(updatedItem))
+      .catch(() => castRefreshRequestedIdsRef.current.delete(selectedDetailItem.id))
+  }, [isDetailOpen, selectedDetailItem, tmdbSettings])
   const activeMetadataEditorItem = metadataEditorItem
     ? detailItemsById.get(metadataEditorItem.id)
       ?? allItems.find((item) => item.id === metadataEditorItem.id)
@@ -2259,7 +3290,7 @@ export default function LibraryApp(): JSX.Element {
   const showLibraryViewTabs = !isInsideEmbyLibraryView
   const showContinueSection = Boolean(!isInsideEmbyLibraryView && (!isActiveEmby || mediaFilter === 'all'))
   const showSortControl = Boolean(activeLibraryViewId || (!isActiveEmby && activeView !== 'home'))
-  const listingBaseTitle = activeLibraryCard?.title ?? (activeSource ? `${activeSource.name} 主页` : navLabel(activeNav, sourceMap))
+  const listingBaseTitle = activeLibraryCard?.title ?? (activeSource ? `${activeSource.name} ${language === 'zh' ? '主页' : 'Home'}` : navLabel(activeNav, sourceMap, language))
   const listingTitle = mediaFilter === 'all'
     ? listingBaseTitle
     : `${listingBaseTitle} · ${mediaFilter === 'inProgress' ? '继续观看' : '筛选'}`
@@ -2276,36 +3307,40 @@ export default function LibraryApp(): JSX.Element {
     : undefined
   const canConnectEmby = Boolean(serverHost.trim() && username.trim() && (password || editingSession))
   const settingsLabels = settingsCopy[language]
+  const localizedPrimaryNav = localizedNav(primaryNav, language)
+  const localizedSmartNav = localizedNav(smartNav, language)
+  const viewTabs = localizedViewTabs(language)
+  const sortOptions = localizedSortOptions(language)
   const pageEyebrow = sourceSetupMode === 'settings'
     ? settingsLabels.globalSettings
     : sourceSetupMode === 'select'
-    ? '媒体源'
+    ? language === 'zh' ? '媒体源' : 'Media source'
     : sourceSetupMode === 'emby'
-      ? '媒体源 · Emby'
+      ? `${language === 'zh' ? '媒体源' : 'Media source'} · Emby`
       : sourceSetupMode === 'localFolder'
-      ? editingFileSystemSource ? `文件系统 · ${editingFileSystemSource.location}` : '媒体源 · 文件系统'
+      ? editingFileSystemSource ? `${language === 'zh' ? '文件系统' : 'File system'} · ${editingFileSystemSource.location}` : `${language === 'zh' ? '媒体源' : 'Media source'} · ${language === 'zh' ? '文件系统' : 'File system'}`
       : sourceSetupMode === 'smb'
-      ? editingSource ? `文件系统 · ${editingSource.location}` : '媒体源 · SMB'
+      ? editingSource ? `${language === 'zh' ? '文件系统' : 'File system'} · ${editingSource.location}` : `${language === 'zh' ? '媒体源' : 'Media source'} · SMB`
       : sourceSetupMode === 'webdav'
-      ? editingSource ? `文件系统 · ${editingSource.location}` : '媒体源 · WebDAV'
+      ? editingSource ? `${language === 'zh' ? '文件系统' : 'File system'} · ${editingSource.location}` : `${language === 'zh' ? '媒体源' : 'Media source'} · WebDAV`
       : activeSource
         ? activeLibraryCard
           ? `${sourceKindLabel(activeSource.kind)} · ${activeSource.name}`
           : `${sourceKindLabel(activeSource.kind)} · ${activeSource.location}`
-        : `独立管理器 · ${navLabel(activeNav, sourceMap)}`
+        : `${language === 'zh' ? '独立管理器' : 'Library manager'} · ${navLabel(activeNav, sourceMap, language)}`
   const pageTitle = sourceSetupMode === 'settings'
     ? settingsLabels.settings
     : sourceSetupMode === 'select'
-    ? '添加媒体源'
+    ? language === 'zh' ? '添加媒体源' : 'Add media source'
     : sourceSetupMode === 'emby'
-      ? '添加 Emby 源'
+      ? language === 'zh' ? '添加 Emby 源' : 'Add Emby source'
       : sourceSetupMode === 'localFolder'
-      ? editingFileSystemSource?.name ?? '添加本地文件夹'
+      ? editingFileSystemSource?.name ?? (language === 'zh' ? '添加本地文件夹' : 'Add local folder')
       : sourceSetupMode === 'smb'
-      ? editingSource?.name ?? '添加 SMB'
+      ? editingSource?.name ?? (language === 'zh' ? '添加 SMB' : 'Add SMB')
       : sourceSetupMode === 'webdav'
-      ? editingSource?.name ?? '添加 WebDAV'
-      : activeLibraryCard?.title ?? activeSource?.name ?? '媒体库'
+      ? editingSource?.name ?? (language === 'zh' ? '添加 WebDAV' : 'Add WebDAV')
+      : activeLibraryCard?.title ?? activeSource?.name ?? (language === 'zh' ? '媒体库' : 'Library')
 
   const fallbackSource: LibrarySource = {
     id: 'unknown',
@@ -2661,21 +3696,56 @@ export default function LibraryApp(): JSX.Element {
     }
   }
 
-  async function scrapeMediaMetadata(item: MediaItem): Promise<void> {
+  async function cacheArtworkRows(items: MediaItem[], taskId: string, title: string): Promise<void> {
+    const urls = Array.from(new Set(items.flatMap((item) => [
+      imageBackgroundUrl(item.poster),
+      imageBackgroundUrl(item.backdrop),
+      ...(item.cast ?? []).map((person) => imageBackgroundUrl(person.image))
+    ]).filter((url): url is string => Boolean(url))))
+    if (!urls.length) return
+    startTask(taskId, 'artwork', title, language === 'zh' ? '下载海报、背景和人物图片' : 'Downloading posters, backdrops and cast images', urls.length, () => { void cacheArtworkRows(items, taskId, title) })
+    let failed = 0
+    for (const url of urls) {
+      if (await waitWhileTaskPaused(taskId)) return
+      await new Promise<void>((resolve) => {
+        const image = new Image()
+        image.onload = () => resolve()
+        image.onerror = () => { failed += 1; resolve() }
+        image.src = url
+      })
+      advanceTask(taskId, {})
+    }
+    if (taskStatusRef.current.get(taskId) === 'cancelled') return
+    updateTask(taskId, failed
+      ? { status: 'failed', error: `${failed} ${language === 'zh' ? '张图片下载失败' : 'images failed'}` }
+      : { status: 'completed', completed: urls.length })
+  }
+
+  async function scrapeMediaMetadata(item: MediaItem, ignoreSavedMatch = false): Promise<void> {
     const source = sourceFor(item.sourceId)
     if (source.kind === 'Emby') return
+    if (item.metadataLocked && !ignoreSavedMatch) {
+      setPlayIntent(language === 'zh' ? '元数据已锁定，请先解锁。' : 'Metadata is locked. Unlock it first.')
+      return
+    }
 
+    const taskId = `metadata:${item.id}`
+    startTask(taskId, 'metadata', `${language === 'zh' ? '元数据刮削' : 'Metadata'} · ${item.title}`, 'TMDB', 1, () => { void scrapeMediaMetadata(item, ignoreSavedMatch) })
     setScrapingMetadataItemId(item.id)
     setPlayIntent('正在从 TMDB 刮削元数据...')
     debugLibraryPlayback(`tmdb scrape start id=${item.id} title=${item.title}`)
     try {
-      const updatedItem = await scrapeTmdbItem(item, tmdbSettings)
+      const updatedItem = await scrapeTmdbItem(item, tmdbSettings, { ignoreSavedMatch })
+      if (await waitWhileTaskPaused(taskId)) return
       await applyUpdatedMediaItem(updatedItem)
+      updateTask(taskId, { status: 'completed', completed: 1, detail: `TMDB ${updatedItem.externalIds?.tmdb ?? ''}` })
+      await cacheArtworkRows([updatedItem], `artwork:${item.id}`, `${language === 'zh' ? '图片下载' : 'Artwork'} · ${updatedItem.title}`)
       setPlayIntent(`已用 TMDB 更新 ${updatedItem.title}`)
       debugLibraryPlayback(`tmdb scrape ok id=${item.id} tmdb=${updatedItem.externalIds?.tmdb ?? 'unknown'}`)
     } catch (error) {
       const message = error instanceof Error ? error.message : 'TMDB 刮削失败'
       setPlayIntent(message)
+      updateTask(taskId, { status: 'failed', error: message })
       debugLibraryPlayback(`tmdb scrape failed id=${item.id} error=${message}`)
     } finally {
       setScrapingMetadataItemId((current) => current === item.id ? '' : current)
@@ -2688,6 +3758,97 @@ export default function LibraryApp(): JSX.Element {
     const clearedItem = clearLocalMetadata(item)
     await applyUpdatedMediaItem(clearedItem)
     setPlayIntent(`已删除 ${clearedItem.title} 的元数据`)
+  }
+
+  async function resolveMediaTrailer(item: MediaItem): Promise<string[]> {
+    try {
+      debugLibraryPlayback(`trailer lookup start item=${item.id} source=${trailerSettings.source}`)
+      const urls = trailerSettings.source === 'bilibili'
+        ? await searchBilibiliTrailerUrls(item, trailerSettings)
+        : await fetchTmdbTrailerUrls(item, tmdbSettings)
+      debugLibraryPlayback(`trailer lookup result item=${item.id} source=${trailerSettings.source} count=${urls.length}`)
+      if (!urls.length) {
+        const provider = trailerSettings.source === 'bilibili' ? (language === 'zh' ? 'B 站' : 'Bilibili') : 'TMDB'
+        setPlayIntent(language === 'zh' ? `${provider}没有找到可信的预告片` : `${provider} did not return a reliable trailer`)
+        return []
+      }
+      const updatedItem = { ...item, trailerUrl: urls[0], trailerUrls: urls }
+      if (sourceFor(item.sourceId).kind === 'Emby') {
+        setDetailItemsById((current) => new Map(current).set(item.id, updatedItem))
+      } else {
+        await applyUpdatedMediaItem(updatedItem)
+      }
+      return urls
+    } catch (error) {
+      const message = error instanceof Error ? error.message : (language === 'zh' ? '预告片查询失败' : 'Trailer lookup failed')
+      debugLibraryPlayback(`trailer lookup failed item=${item.id} source=${trailerSettings.source} error=${message}`)
+      setPlayIntent(message)
+      return []
+    }
+  }
+
+  async function dissolveAndClearMediaCollection(item: MediaItem): Promise<void> {
+    const source = sourceFor(item.sourceId)
+    if (source.kind === 'Emby') return
+    const members = dissolveMediaCollection(item)
+    members.forEach((member) => {
+      const path = member.path || member.playbackPath
+      if (path) dissolvedCollectionPathsRef.current.add(locationKey(path))
+    })
+    saveDissolvedCollectionPaths(dissolvedCollectionPathsRef.current)
+    const sourceItems = [
+      ...allItems.filter((candidate) => candidate.sourceId === item.sourceId && candidate.id !== item.id),
+      ...members
+    ]
+    await client.upsertSourceItems({ ...source, itemCount: sourceItems.length }, sourceItems)
+    const visibleRows = await refreshLibraryRowsFor({
+      navKey: activeNav,
+      view: activeView,
+      search: debouncedQuery,
+      filterKey: mediaFilter,
+      sortKey,
+      sortOrder,
+      libraryViewId: activeLibraryViewId
+    })
+    setDetailItemsById((current) => {
+      const next = new Map(current)
+      next.delete(item.id)
+      members.forEach((member) => next.set(member.id, member))
+      return next
+    })
+    setSelectedId(visibleRows.find((row) => members.some((member) => member.id === row.id))?.id ?? '')
+    setIsDetailOpen(false)
+    setPlayIntent(language === 'zh'
+      ? `已删除元数据并解散为 ${members.length} 个独立视频`
+      : `Metadata removed and dissolved into ${members.length} individual videos`)
+  }
+
+  async function removeMediaFromLibrary(item: MediaItem): Promise<void> {
+    const message = language === 'zh'
+      ? `从媒体库中移除“${item.title}”？\n\n只会删除媒体库展示和缓存，不会删除真实文件。`
+      : `Remove “${item.title}” from the library?\n\nThis only removes the library entry and cache. The real file will not be deleted.`
+    if (!window.confirm(message)) return
+    await client.hideItem(item)
+    const visibleRows = await refreshLibraryRowsFor({
+      navKey: activeNav,
+      view: activeView,
+      search: debouncedQuery,
+      filterKey: mediaFilter,
+      sortKey,
+      sortOrder,
+      libraryViewId: activeLibraryViewId
+    })
+    setDetailItemsById((current) => {
+      const next = new Map(current)
+      next.delete(item.id)
+      return next
+    })
+    setSelectedId(visibleRows[0]?.id ?? '')
+    setIsDetailOpen(false)
+    setConnectTone('success')
+    setConnectMessage(language === 'zh'
+      ? `已从媒体库移除“${item.title}”，真实文件未删除。`
+      : `Removed “${item.title}” from the library. The real file was not deleted.`)
   }
 
   async function clearSourceMetadata(sourceId: string): Promise<void> {
@@ -2804,7 +3965,12 @@ export default function LibraryApp(): JSX.Element {
     const source = sourceMap.get(sourceId)
     if (!source || source.kind === 'Emby') return
 
-    const sourceItems = allItems.filter((item) => item.sourceId === sourceId && item.type !== 'folder')
+    const sourceItems = allItems.filter((item) =>
+      item.sourceId === sourceId &&
+      item.type !== 'folder' &&
+      item.availability !== 'missing' &&
+      !item.metadataLocked
+    )
     if (!sourceItems.length) {
       setConnectTone('error')
       setConnectMessage('这个文件系统源里没有可刮削的媒体文件。')
@@ -2817,6 +3983,8 @@ export default function LibraryApp(): JSX.Element {
     }
 
     setScrapingSourceMetadataId(sourceId)
+    const taskId = `metadata-source:${sourceId}`
+    startTask(taskId, 'metadata', `${language === 'zh' ? '批量刮削' : 'Batch metadata'} · ${source.name}`, 'TMDB', sourceItems.length, () => { void scrapeSourceMetadata(sourceId) })
     setConnectTone('idle')
     setConnectMessage(`正在刮削 ${source.name}：0 / ${sourceItems.length}`)
     debugLibraryPlayback(`tmdb source scrape start source=${sourceId} count=${sourceItems.length}`)
@@ -2826,7 +3994,9 @@ export default function LibraryApp(): JSX.Element {
 
     try {
       for (let index = 0; index < sourceItems.length; index += 1) {
+        if (await waitWhileTaskPaused(taskId)) break
         const item = sourceItems[index]
+        updateTask(taskId, { detail: item.title })
         setConnectMessage(`正在刮削 ${source.name}：${index + 1} / ${sourceItems.length} · ${item.title}`)
         try {
           const updatedItem = await scrapeTmdbItem(updatedItems.get(item.id) ?? item, tmdbSettings)
@@ -2837,7 +4007,10 @@ export default function LibraryApp(): JSX.Element {
           const message = error instanceof Error ? error.message : 'TMDB 刮削失败'
           debugLibraryPlayback(`tmdb source scrape item failed source=${sourceId} item=${item.id} error=${message}`)
         }
+        advanceTask(taskId, {})
       }
+
+      if (taskStatusRef.current.get(taskId) === 'cancelled') return
 
       const nextAllItems = allItems.map((item) => updatedItems.get(item.id) ?? item)
       const rawNextSourceItems = nextAllItems.filter((item) => item.sourceId === sourceId)
@@ -2882,6 +4055,10 @@ export default function LibraryApp(): JSX.Element {
       })
 
       const successCount = updatedItems.size
+      updateTask(taskId, failedCount
+        ? { status: 'failed', error: `${failedCount} ${language === 'zh' ? '项失败' : 'failed'}` }
+        : { status: 'completed', completed: sourceItems.length })
+      await cacheArtworkRows([...updatedItems.values()], `artwork-source:${sourceId}`, `${language === 'zh' ? '批量图片下载' : 'Batch artwork'} · ${source.name}`)
       setConnectTone(successCount > 0 ? 'success' : 'error')
       setConnectMessage(`刮削完成：成功 ${successCount} 个，失败 ${failedCount} 个，合并 ${mergedCount} 个重复项。`)
       debugLibraryPlayback(`tmdb source scrape done source=${sourceId} ok=${successCount} failed=${failedCount} merged=${mergedCount}`)
@@ -2889,13 +4066,14 @@ export default function LibraryApp(): JSX.Element {
       const message = error instanceof Error ? error.message : '文件系统源刮削失败'
       setConnectTone('error')
       setConnectMessage(message)
+      updateTask(taskId, { status: 'failed', error: message })
       debugLibraryPlayback(`tmdb source scrape failed source=${sourceId} error=${message}`)
     } finally {
       setScrapingSourceMetadataId((current) => current === sourceId ? '' : current)
     }
   }
 
-  async function playMediaItem(item: MediaItem): Promise<void> {
+  async function playMediaItem(item: MediaItem, audioTrackIndex = -2, subtitleTrackIndex = -2): Promise<void> {
     const source = sourceFor(item.sourceId)
     debugLibraryPlayback(`play click id=${item.id} title=${item.title} source=${source.name} kind=${source.kind}`)
     if (source.kind !== 'Emby') {
@@ -2934,7 +4112,9 @@ export default function LibraryApp(): JSX.Element {
           type: 'command',
           command: 'requestPlayback',
           path: playablePath,
-          startPositionRatio: item.progress > 0 && item.progress < 1 ? item.progress : undefined
+          startPositionRatio: item.progress > 0 && item.progress < 1 ? item.progress : undefined,
+          audioTrackIndex,
+          subtitleTrackIndex
         })
         debugLibraryPlayback(`play local requestPlayback posted id=${localPlayableItem.id} path=${localPlayableItem.path ?? ''}`)
       }, 0)
@@ -2966,7 +4146,9 @@ export default function LibraryApp(): JSX.Element {
           type: 'command',
           command: 'requestPlayback',
           path: target.url,
-          startPositionRatio: item.progress > 0 && item.progress < 1 ? item.progress : undefined
+          startPositionRatio: item.progress > 0 && item.progress < 1 ? item.progress : undefined,
+          audioTrackIndex,
+          subtitleTrackIndex
         })
         debugLibraryPlayback(`play requestPlayback posted targetId=${target.itemId}`)
       }, 0)
@@ -3140,6 +4322,95 @@ export default function LibraryApp(): JSX.Element {
     }
 
     postNativeCommand({ type: 'command', command: 'pickLocalFolder' })
+  }
+
+  function rescanFileSystemSource(source: LibrarySource): void {
+    if (source.kind === 'Emby') return
+    if (source.kind !== 'WebDAV') {
+      rescanLocalFolder(source)
+      return
+    }
+    const credentials = loadWebDavCredentials(source.id)
+    const paths = credentials?.selectedPaths?.length ? credentials.selectedPaths : scanLocationsForSource(source)
+    if (!credentials || !paths.length) {
+      setConnectTone('error')
+      setConnectMessage(language === 'zh' ? 'WebDAV 凭据或扫描目录不可用。' : 'WebDAV credentials or scan paths are unavailable.')
+      return
+    }
+    pendingFolderScanCountsRef.current.set(source.id, paths.length)
+    beginSourceScan(source, paths.length, source.itemCount, paths[0])
+    setScanningLocalFolderSourceIds((current) => new Set(current).add(source.id))
+    paths.forEach((url) => postNativeCommand({
+      type: 'command',
+      command: 'scanWebDavFolder',
+      url,
+      username: credentials.username,
+      password: credentials.password
+    }))
+  }
+
+  async function searchMetadataMatches(item: MediaItem, query?: string): Promise<void> {
+    setMetadataMatchItem(item)
+    setIsSearchingMetadata(true)
+    setMetadataCandidates([])
+    try {
+      setMetadataCandidates(await searchTmdbCandidates(tmdbSettings, item, query))
+    } catch (error) {
+      setPlayIntent(error instanceof Error ? error.message : 'TMDB search failed')
+    } finally {
+      setIsSearchingMetadata(false)
+    }
+  }
+
+  async function applyMetadataCandidate(candidate: TmdbMatchCandidate): Promise<void> {
+    if (!metadataMatchItem) return
+    const candidateKey = `${candidate.type}:${candidate.id}`
+    const taskId = `metadata:${metadataMatchItem.id}`
+    setApplyingMetadataCandidateId(candidateKey)
+    startTask(taskId, 'metadata', `${language === 'zh' ? '确认匹配' : 'Confirm match'} · ${metadataMatchItem.title}`, candidate.title, 1)
+    try {
+      const updatedItem = await scrapeTmdbCandidate(metadataMatchItem, tmdbSettings, candidate)
+      if (await waitWhileTaskPaused(taskId)) return
+      await applyUpdatedMediaItem(updatedItem)
+      updateTask(taskId, { status: 'completed', completed: 1, detail: `TMDB ${candidate.id} · ${candidate.title}` })
+      setMetadataMatchItem(undefined)
+      setMetadataCandidates([])
+      setPlayIntent(`${language === 'zh' ? '已识别为' : 'Matched as'}：${candidate.title}`)
+      await cacheArtworkRows([updatedItem], `artwork:${updatedItem.id}`, `${language === 'zh' ? '图片下载' : 'Artwork'} · ${candidate.title}`)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'TMDB match failed'
+      updateTask(taskId, { status: 'failed', error: message })
+      setPlayIntent(message)
+    } finally {
+      setApplyingMetadataCandidateId('')
+    }
+  }
+
+  async function toggleMetadataLock(item: MediaItem): Promise<void> {
+    const updatedItem = { ...item, metadataLocked: !item.metadataLocked }
+    await applyUpdatedMediaItem(updatedItem)
+    setPlayIntent(updatedItem.metadataLocked
+      ? (language === 'zh' ? '元数据已锁定，扫描和自动刮削不会覆盖。' : 'Metadata locked and protected from automatic updates.')
+      : (language === 'zh' ? '元数据已解锁。' : 'Metadata unlocked.'))
+  }
+
+  async function removeMissingMediaItem(item: MediaItem): Promise<void> {
+    if (item.availability !== 'missing') return
+    const source = sourceFor(item.sourceId)
+    const remainingItems = allItems.filter((candidate) => candidate.sourceId === item.sourceId && candidate.id !== item.id)
+    await client.upsertSourceItems({ ...source, itemCount: remainingItems.length }, remainingItems)
+    setAllItems((current) => current.filter((candidate) => candidate.id !== item.id))
+    setVisibleItems((current) => current.filter((candidate) => candidate.id !== item.id))
+    setContinueItems((current) => current.filter((candidate) => candidate.id !== item.id))
+    setDetailItemsById((current) => {
+      const next = new Map(current)
+      next.delete(item.id)
+      return next
+    })
+    if (selectedId === item.id) {
+      setSelectedId('')
+      setIsDetailOpen(false)
+    }
   }
 
   function rescanLocalFolder(source: LibrarySource): void {
@@ -3510,6 +4781,15 @@ export default function LibraryApp(): JSX.Element {
     setPlayIntent('')
   }
 
+  function changeListingPage(page: number): void {
+    const nextPage = Math.max(1, Math.min(page, listingPageCount))
+    if (nextPage === effectiveListingPage) return
+    setListingPage(nextPage)
+    window.requestAnimationFrame(() => {
+      listingSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    })
+  }
+
   function changeSortKey(sort: SortKey): void {
     if (sort === sortKey) {
       setSortOrder((current) => current === 'descending' ? 'ascending' : 'descending')
@@ -3660,10 +4940,38 @@ export default function LibraryApp(): JSX.Element {
   }
 
   return (
-    <div className={`library-shell ${useMainOnlyLayout ? 'is-library-home' : ''}`}>
+    <div className="library-window">
+      {customTitleBarEnabled ? <header
+        className="library-window-titlebar"
+        onPointerDown={(event) => {
+          if (event.button === 0 && event.target === event.currentTarget) {
+            postNativeCommand({ type: 'command', command: 'beginWindowDrag' })
+          }
+        }}
+        onDoubleClick={(event) => {
+          if (event.target === event.currentTarget) {
+            postNativeCommand({ type: 'command', command: 'toggleMaximizeWindow' })
+          }
+        }}
+      >
+        <span>Anvil Player</span>
+        <div className="library-window-controls">
+          <button type="button" aria-label="最小化" onClick={() => { postNativeCommand({ type: 'command', command: 'minimizeWindow' }) }}>
+            <i className="is-minimize" />
+          </button>
+          <button type="button" aria-label="最大化或还原" onClick={() => { postNativeCommand({ type: 'command', command: 'toggleMaximizeWindow' }) }}>
+            <i className="is-maximize" />
+          </button>
+          <button className="is-close" type="button" aria-label="关闭" onClick={() => { postNativeCommand({ type: 'command', command: 'closeWindow' }) }}>
+            <X size={15} />
+          </button>
+        </div>
+      </header> : null}
+
+      <div className={`library-shell ${useMainOnlyLayout ? 'is-library-home' : ''}`}>
       <aside className="library-sidebar">
         <div className="library-brand">
-          <Film size={30} />
+          <img src="./app-icon.png" alt="" aria-hidden="true" draggable={false} />
           <div>
             <strong>Anvil Library</strong>
             <span>Media Manager</span>
@@ -3673,9 +4981,9 @@ export default function LibraryApp(): JSX.Element {
         <nav className="library-nav">
           <div className="library-nav-group">
             <div className="library-nav-heading">
-              <span>媒体库</span>
+              <span>{language === 'zh' ? '媒体库' : 'Library'}</span>
             </div>
-            {primaryNav.map((item) => (
+            {localizedPrimaryNav.map((item) => (
               <SidebarButton
                 key={item.key}
                 item={item}
@@ -3688,9 +4996,9 @@ export default function LibraryApp(): JSX.Element {
 
           <div className="library-nav-group">
             <div className="library-nav-heading">
-              <span>智能分类</span>
+              <span>{language === 'zh' ? '智能分类' : 'Smart collections'}</span>
             </div>
-            {smartNav.map((item) => (
+            {localizedSmartNav.map((item) => (
               <SidebarButton
                 key={item.key}
                 item={item}
@@ -3703,18 +5011,18 @@ export default function LibraryApp(): JSX.Element {
 
           <div className="library-nav-group">
             <div className="library-nav-heading">
-              <span>媒体源</span>
-              <button type="button" title="添加媒体源" onClick={openSourcePicker}>
+              <span>{language === 'zh' ? '媒体源' : 'Sources'}</span>
+              <button type="button" title={language === 'zh' ? '添加媒体源' : 'Add source'} onClick={openSourcePicker}>
                 <Plus size={13} />
               </button>
             </div>
-            <div className="library-nav-subheading">文件系统</div>
+            <div className="library-nav-subheading">{language === 'zh' ? '文件系统' : 'File system'}</div>
             {fileSystemSources.length ? renderSourceRows(fileSystemSources) : (
-              <span className="library-nav-empty">尚未添加本地文件夹</span>
+              <span className="library-nav-empty">{language === 'zh' ? '尚未添加本地文件夹' : 'No local folders'}</span>
             )}
-            <div className="library-nav-subheading">媒体库服务</div>
+            <div className="library-nav-subheading">{language === 'zh' ? '媒体库服务' : 'Media services'}</div>
             {mediaServiceSources.length ? renderSourceRows(mediaServiceSources) : (
-              <span className="library-nav-empty">尚未连接 Emby</span>
+              <span className="library-nav-empty">{language === 'zh' ? '尚未连接 Emby' : 'Emby not connected'}</span>
             )}
           </div>
         </nav>
@@ -3730,44 +5038,84 @@ export default function LibraryApp(): JSX.Element {
           </button>
           <button className="library-back-button" type="button" onClick={() => { postNativeCommand({ type: 'command', command: 'focusPlayer' }) }}>
           <Play size={15} />
-          <span>播放器模块</span>
+          <span>{language === 'zh' ? '播放器模块' : 'Player'}</span>
           </button>
         </div>
       </aside>
 
       <main className="library-main">
-        <section className="library-toolbar">
+        <section className={`library-toolbar ${!isSourceSetup && !isActiveEmby ? 'has-management-tools' : ''}`}>
           <div className="library-title-block">
             <span>{pageEyebrow}</span>
             <h1>{pageTitle}</h1>
           </div>
           {!isSourceSetup ? (
             <>
-              <label className="library-search">
-                <Search size={16} />
-                <input
-                  value={query}
-                  onChange={(event) => {
-                    setPersonSearch(undefined)
-                    setQuery(event.target.value)
-                    setSelectedId('')
-                    setIsDetailOpen(false)
-                    setPlayIntent('')
-                  }}
-                  placeholder="搜索关键字"
-                />
-              </label>
-              {showSortControl ? (
-                <div className="library-toolbar-actions">
+              <div className="library-toolbar-primary-actions">
+                <label className="library-search">
+                  <Search size={16} />
+                  <input
+                    value={query}
+                    onChange={(event) => {
+                      setPersonSearch(undefined)
+                      setQuery(event.target.value)
+                      setSelectedId('')
+                      setIsDetailOpen(false)
+                      setPlayIntent('')
+                    }}
+                    placeholder={language === 'zh' ? '搜索关键字' : 'Search library'}
+                  />
+                </label>
+                {showSortControl ? (
                   <ToolbarSelect
                     value={sortKey}
                     options={sortOptions}
-                    ariaLabel="排序"
+                    ariaLabel={language === 'zh' ? '排序' : 'Sort'}
                     statusIcon={sortOrder === 'descending'
                       ? <ArrowDownWideNarrow size={15} />
                       : <ArrowUpNarrowWide size={15} />}
                     onChange={changeSortKey}
                   />
+                ) : null}
+              </div>
+              {!isActiveEmby ? (
+                <div className="library-toolbar-secondary-actions">
+                  <div className={`library-toolbar-popover-anchor ${mediaManagementOpen ? 'is-open' : ''}`}>
+                    <button className="library-task-button" type="button" aria-expanded={mediaManagementOpen} onClick={() => { setMediaManagementOpen((open) => !open); setTaskCenterOpen(false) }}>
+                      <Database size={16} />
+                      <span>{language === 'zh' ? '媒体管理' : 'Manage'}</span>
+                      {allItems.filter((item) => item.availability === 'missing' || (item.versions?.length ?? 0) > 0).length ? <b>{allItems.filter((item) => item.availability === 'missing' || (item.versions?.length ?? 0) > 0).length}</b> : null}
+                    </button>
+                    {mediaManagementOpen ? (
+                      <MediaManagementDialog
+                        language={language}
+                        items={allItems}
+                        sources={sources}
+                        onClose={() => setMediaManagementOpen(false)}
+                        onSelect={(item) => { setMediaManagementOpen(false); selectMediaItem(item.id) }}
+                        onRescan={(source) => { setMediaManagementOpen(false); rescanFileSystemSource(source) }}
+                        onRemoveMissing={(item) => { void removeMissingMediaItem(item) }}
+                      />
+                    ) : null}
+                  </div>
+                  <div className={`library-toolbar-popover-anchor ${taskCenterOpen ? 'is-open' : ''}`}>
+                    <button className={`library-task-button ${backgroundTasks.some((task) => task.status === 'running' || task.status === 'paused') ? 'is-active' : ''}`} type="button" aria-expanded={taskCenterOpen} onClick={() => { setTaskCenterOpen((open) => !open); setMediaManagementOpen(false) }}>
+                      <Activity size={16} />
+                      <span>{language === 'zh' ? '后台任务' : 'Tasks'}</span>
+                      {backgroundTasks.filter((task) => task.status === 'running' || task.status === 'paused').length ? <b>{backgroundTasks.filter((task) => task.status === 'running' || task.status === 'paused').length}</b> : null}
+                    </button>
+                    <TaskCenter
+                      open={taskCenterOpen}
+                      language={language}
+                      tasks={backgroundTasks}
+                      onClose={() => setTaskCenterOpen(false)}
+                      onPause={pauseTask}
+                      onResume={resumeTask}
+                      onRetry={retryTask}
+                      onCancel={cancelTask}
+                      onClearFinished={() => setBackgroundTasks((current) => current.filter((task) => !['completed', 'failed', 'cancelled'].includes(task.status)))}
+                    />
+                  </div>
                 </div>
               ) : null}
             </>
@@ -3789,12 +5137,18 @@ export default function LibraryApp(): JSX.Element {
         {sourceSetupMode === 'settings' ? (
           <LibrarySettingsPage
             language={language}
+            refreshRateSyncEnabled={refreshRateSyncEnabled}
+            refreshRateMaximumMultiple={refreshRateMaximumMultiple}
             tmdbSettings={tmdbSettings}
             tmdbStatus={tmdbStatus}
             isTestingTmdb={isTestingTmdb}
-            onLanguageChange={setLanguage}
+            trailerSettings={trailerSettings}
+            onLanguageChange={changeInterfaceLanguage}
+            onRefreshRateSyncChange={setRefreshRateSyncEnabled}
+            onRefreshRateMaximumMultipleChange={setRefreshRateMaximumMultiple}
             onTmdbSettingsChange={updateTmdbSettings}
             onTestTmdb={() => { void testTmdbSettingsConnection() }}
+            onTrailerSettingsChange={setTrailerSettings}
           />
         ) : sourceSetupMode === 'select' ? (
           <SourceTypePicker
@@ -4225,7 +5579,7 @@ export default function LibraryApp(): JSX.Element {
         ) : (
           <>
             {showLibraryViewTabs ? (
-            <section className="library-view-tabs" aria-label="媒体类型">
+            <section className="library-view-tabs" aria-label={language === 'zh' ? '媒体类型' : 'Media type'}>
               {viewTabs.map((tab) => (
                 <button
                   key={tab.key}
@@ -4242,7 +5596,7 @@ export default function LibraryApp(): JSX.Element {
             {showContinueSection ? (
             <section className="library-continue">
               <div className="library-section-heading">
-                <span>{activeSource ? `${activeSource.name} · 继续观看` : '继续观看'}</span>
+                <span>{activeSource ? `${activeSource.name} · ${language === 'zh' ? '继续观看' : 'Continue watching'}` : (language === 'zh' ? '继续观看' : 'Continue watching')}</span>
                 <button type="button" onClick={isActiveEmby ? openContinueListing : () => selectNavigation('continue')}>
                   <Clock3 size={13} />
                   <span>全部</span>
@@ -4274,7 +5628,7 @@ export default function LibraryApp(): JSX.Element {
                 onSelectView={openLibraryView}
               />
             ) : (
-            <section className="library-grid-section">
+            <section className="library-grid-section" ref={listingSectionRef}>
               <div className="library-section-heading">
                 <span>{listingTitle} · {visibleItems.length}</span>
                 <button type="button" onClick={resetCurrentListing}>
@@ -4283,17 +5637,45 @@ export default function LibraryApp(): JSX.Element {
                 </button>
               </div>
               {visibleItems.length ? (
-                <div className="library-poster-grid">
-                  {visibleItems.map((item) => (
-                    <MediaPoster
-                      key={item.id}
-                      item={item}
-                      source={sourceFor(item.sourceId)}
-                      selected={selectedItem?.id === item.id}
-                      onSelect={selectMediaItem}
-                    />
-                  ))}
-                </div>
+                <>
+                  <div className="library-poster-grid">
+                    {pagedVisibleItems.map((item) => (
+                      <MediaPoster
+                        key={item.id}
+                        item={item}
+                        source={sourceFor(item.sourceId)}
+                        selected={selectedItem?.id === item.id}
+                        onSelect={selectMediaItem}
+                      />
+                    ))}
+                  </div>
+                  {listingPageCount > 1 ? (
+                    <nav className="library-pagination" aria-label="媒体库分页">
+                      <button
+                        type="button"
+                        disabled={effectiveListingPage === 1}
+                        aria-label="上一页"
+                        onClick={() => changeListingPage(effectiveListingPage - 1)}
+                      >
+                        <ChevronLeft size={15} />
+                        <span>上一页</span>
+                      </button>
+                      <span className="library-pagination-status">
+                        {listingRangeStart}-{listingRangeEnd} / {visibleItems.length}
+                        <small>第 {effectiveListingPage} / {listingPageCount} 页</small>
+                      </span>
+                      <button
+                        type="button"
+                        disabled={effectiveListingPage === listingPageCount}
+                        aria-label="下一页"
+                        onClick={() => changeListingPage(effectiveListingPage + 1)}
+                      >
+                        <span>下一页</span>
+                        <ChevronRight size={15} />
+                      </button>
+                    </nav>
+                  ) : null}
+                </>
               ) : (
                 <EmptyState
                   icon={<Film size={24} />}
@@ -4311,8 +5693,14 @@ export default function LibraryApp(): JSX.Element {
 
       {showDetailPanel && selectedDetailItem ? (
         <DetailPanel
+          key={`${selectedDetailItem.id}:${trailerSettings.source}`}
           item={selectedDetailItem}
           source={sourceFor(selectedDetailItem.sourceId)}
+          language={language}
+          trailerSource={trailerSettings.source}
+          trailerSoundEnabled={trailerSettings.soundEnabled}
+          trailerAutoPlay={trailerSettings.autoPlayOnDetails}
+          trailerAutoPlayReady={sourceFor(selectedDetailItem.sourceId).kind !== 'Emby' || selectedDetailLoaded}
           playIntent={playIntent}
           isResolvingPlayback={Boolean(resolvingPlayItemId)}
           canScrapeMetadata={sourceFor(selectedDetailItem.sourceId).kind !== 'Emby'}
@@ -4325,10 +5713,15 @@ export default function LibraryApp(): JSX.Element {
             setSelectedId('')
             setPlayIntent('')
           }}
-          onPlayIntent={(item) => { void playMediaItem(item) }}
+          onPlayIntent={(item, audioTrackIndex, subtitleTrackIndex) => { void playMediaItem(item, audioTrackIndex, subtitleTrackIndex) }}
+          onTrailerIntent={resolveMediaTrailer}
+          onRemoveFromLibrary={(item) => { void removeMediaFromLibrary(item) }}
           onScrapeIntent={(item) => { void scrapeMediaMetadata(item) }}
+          onRematchIntent={(item) => { void scrapeMediaMetadata(item, true) }}
+          onSearchMatch={(item) => { void searchMetadataMatches(item) }}
+          onToggleMetadataLock={(item) => { void toggleMetadataLock(item) }}
           onEditMetadata={openMetadataEditor}
-          onClearMetadata={(item) => { void clearMediaMetadata(item) }}
+          onClearMetadata={setMetadataDeleteItem}
         />
       ) : !useMainOnlyLayout && !isSourceSetup ? (
         <EmptyDetail />
@@ -4342,6 +5735,39 @@ export default function LibraryApp(): JSX.Element {
           onSave={(item) => { void saveManualMetadata(item) }}
         />
       ) : null}
+
+      {metadataMatchItem ? (
+        <MetadataMatchDialog
+          item={metadataMatchItem}
+          language={language}
+          candidates={metadataCandidates}
+          searching={isSearchingMetadata}
+          applyingId={applyingMetadataCandidateId}
+          onSearch={(searchQuery) => { void searchMetadataMatches(metadataMatchItem, searchQuery) }}
+          onApply={(candidate) => { void applyMetadataCandidate(candidate) }}
+          onClose={() => { setMetadataMatchItem(undefined); setMetadataCandidates([]) }}
+        />
+      ) : null}
+
+      {metadataDeleteItem ? (
+        <MetadataDeleteDialog
+          item={metadataDeleteItem}
+          language={language}
+          onClose={() => setMetadataDeleteItem(undefined)}
+          onDeleteOnly={() => {
+            const item = metadataDeleteItem
+            setMetadataDeleteItem(undefined)
+            void clearMediaMetadata(item)
+          }}
+          onDeleteAndDissolve={() => {
+            const item = metadataDeleteItem
+            setMetadataDeleteItem(undefined)
+            void dissolveAndClearMediaCollection(item)
+          }}
+        />
+      ) : null}
+
+      </div>
     </div>
   )
 }

@@ -481,8 +481,9 @@ export async function resolveEmbyPlaybackTarget(
   ].join(',')
 
   if (item.type === 'movie') {
+    const providerItemId = item.providerItemId || item.id
     const detail = await fetchJson<EmbyItem>(
-      apiUrl(session.apiBaseUrl, `/Users/${session.userId}/Items/${item.id}`, {
+      apiUrl(session.apiBaseUrl, `/Users/${session.userId}/Items/${providerItemId}`, {
         Fields: fields,
         api_key: session.accessToken
       }),
@@ -490,8 +491,12 @@ export async function resolveEmbyPlaybackTarget(
       '读取 Emby 播放信息'
     )
     const playbackInfo = await fetchPlaybackInfo(session, detail.Id)
-    const source = playbackInfo.MediaSources?.[0]
-    const fallbackSource = detail.MediaSources?.[0]
+    const source = item.mediaSourceId
+      ? playbackInfo.MediaSources?.find((row) => row.Id === item.mediaSourceId)
+      : playbackInfo.MediaSources?.[0]
+    const fallbackSource = item.mediaSourceId
+      ? detail.MediaSources?.find((row) => row.Id === item.mediaSourceId)
+      : detail.MediaSources?.[0]
     const url = playbackStreamUrl(session, detail.Id, source ?? fallbackSource, playbackInfo.PlaySessionId)
     await assertPlayableHttpUrl(url)
     return {

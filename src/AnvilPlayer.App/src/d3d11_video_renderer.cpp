@@ -1081,6 +1081,8 @@ void D3D11VideoRenderer::OnResize() {
 
 void D3D11VideoRenderer::ResizeOnRenderThread(const UINT width, const UINT height) {
     if (!swapChain_) return;
+    cachedOutputFrameValid_ = false;
+    cachedOutputFrame_.Reset();
     backBuffer_.Reset();
     rtv_.Reset();
     // Composition swap chains do not use ALLOW_MODE_SWITCH; only set it for the
@@ -1333,12 +1335,15 @@ void D3D11VideoRenderer::RenderThreadMain() {
         UINT resizeHeight = 1;
         bool resetStats = false;
         bool clear = false;
+        bool repeatLastPresent = false;
 
         {
             std::unique_lock lock(commandMutex_);
-            commandCv_.wait(lock, [this]() {
-                return stopRequested_ || HasPendingWorkLocked();
-            });
+            if (!cachedOutputFrameValid_) {
+                commandCv_.wait(lock, [this]() {
+                    return stopRequested_ || HasPendingWorkLocked();
+                });
+            }
             if (stopRequested_) {
                 shutdownFrame = pendingFrame_;
                 pendingFrame_ = nullptr;
@@ -1361,6 +1366,7 @@ void D3D11VideoRenderer::RenderThreadMain() {
             pendingResetStats_ = false;
             clear = pendingClear_;
             pendingClear_ = false;
+            repeatLastPresent = !frame && !resize && !clear && cachedOutputFrameValid_;
         }
 
         if (colorPipeline) {
@@ -1385,6 +1391,8 @@ void D3D11VideoRenderer::RenderThreadMain() {
             RenderOnRenderThread(frame->frame);
             PublishRenderStats();
             RetireQueuedFrame(frame);
+        } else if (repeatLastPresent) {
+            RepeatLastPresentOnRenderThread();
         }
     }
 
@@ -1687,6 +1695,10 @@ void D3D11VideoRenderer::RenderOnRenderThread(const NativeVideoFrame& frame) {
         stageStart = now;
     }
 
+    if (cachedOutputFrame_ && backBuffer_) {
+        context_->CopyResource(cachedOutputFrame_.Get(), backBuffer_.Get());
+        cachedOutputFrameValid_ = true;
+    }
     PresentFrame(kVideoPresentSyncInterval, collectStats, stageStart);
     if (collectStats) {
         const auto now = std::chrono::steady_clock::now();
@@ -1699,6 +1711,15 @@ void D3D11VideoRenderer::RenderOnRenderThread(const NativeVideoFrame& frame) {
         renderStats_.totalRenderUs += totalUs;
         renderStats_.maxRenderUs = std::max(renderStats_.maxRenderUs, totalUs);
     }
+}
+
+void D3D11VideoRenderer::RepeatLastPresentOnRenderThread() {
+    if (!context_ || !swapChain_ || !backBuffer_ || !cachedOutputFrame_ || !cachedOutputFrameValid_) {
+        return;
+    }
+    WaitForFrameLatencyObject(false);
+    context_->CopyResource(backBuffer_.Get(), cachedOutputFrame_.Get());
+    PresentFrame(kVideoPresentSyncInterval, false, {});
 }
 
 void D3D11VideoRenderer::Clear() {
@@ -1723,6 +1744,7 @@ void D3D11VideoRenderer::ClearOnRenderThread() {
     subtitleTextureCache_.clear();
     hwSrvUV_.Reset();
     hwSrvY_.Reset();
+    cachedOutputFrameValid_ = false;
     float clearColor[4] = {0.02f, 0.03f, 0.04f, 1.0f};
     context_->OMSetRenderTargets(1, rtv_.GetAddressOf(), nullptr);
     context_->ClearRenderTargetView(rtv_.Get(), clearColor);
@@ -1749,8 +1771,22 @@ bool D3D11VideoRenderer::CreateRenderTarget() {
         return false;
     }
     if (IsStopRequested()) return false;
+    D3D11_TEXTURE2D_DESC cacheDesc{};
+    backBuffer->GetDesc(&cacheDesc);
+    cacheDesc.BindFlags = 0;
+    cacheDesc.CPUAccessFlags = 0;
+    cacheDesc.MiscFlags = 0;
+    cacheDesc.Usage = D3D11_USAGE_DEFAULT;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> cachedOutputFrame;
+    const HRESULT cacheHr = device_->CreateTexture2D(&cacheDesc, nullptr, &cachedOutputFrame);
+    if (FAILED(cacheHr)) {
+        LogHr(L"Create cached output frame", cacheHr);
+        return false;
+    }
     rtv_ = std::move(rtv);
     backBuffer_ = std::move(backBuffer);
+    cachedOutputFrame_ = std::move(cachedOutputFrame);
+    cachedOutputFrameValid_ = false;
     return true;
 }
 
@@ -3954,6 +3990,8 @@ void D3D11VideoRenderer::ReleaseAll() {
     vs_.Reset();
     rtv_.Reset();
     backBuffer_.Reset();
+    cachedOutputFrame_.Reset();
+    cachedOutputFrameValid_ = false;
     if (dcompTarget_) {
         dcompTarget_->SetRoot(nullptr);
     }

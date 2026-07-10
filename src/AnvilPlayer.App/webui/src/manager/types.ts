@@ -106,6 +106,19 @@ export interface MediaItem {
   }
   metadataProvider?: string
   metadataMatchedAt?: number
+  metadataLocked?: boolean
+  metadataMatchTitle?: string
+  fileSizeBytes?: number
+  fileModifiedAt?: number
+  fileFingerprint?: string
+  availability?: 'available' | 'missing'
+  missingSince?: number
+  mediaSourceId?: string
+  providerItemId?: string
+  versionLabel?: string
+  collectionDissolved?: boolean
+  trailerUrl?: string
+  trailerUrls?: string[]
 }
 
 export interface LibraryHomeCard {

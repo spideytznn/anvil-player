@@ -914,7 +914,126 @@ std::wstring WebDavCallFailure(const std::wstring& prefix,
     return prefix + WindowsErrorMessage(error);
 }
 
+std::wstring UrlEncodeQueryValue(const std::wstring& value) {
+    constexpr wchar_t hex[] = L"0123456789ABCDEF";
+    std::wstring encoded;
+    for (const unsigned char byte : WideToUtf8(value)) {
+        if ((byte >= 'a' && byte <= 'z') ||
+            (byte >= 'A' && byte <= 'Z') ||
+            (byte >= '0' && byte <= '9') ||
+            byte == '-' || byte == '_' || byte == '.' || byte == '~') {
+            encoded.push_back(static_cast<wchar_t>(byte));
+        } else {
+            encoded.push_back(L'%');
+            encoded.push_back(hex[(byte >> 4) & 0x0f]);
+            encoded.push_back(hex[byte & 0x0f]);
+        }
+    }
+    return encoded;
+}
+
+bool ReadHttpGet(const HINTERNET session,
+                 const std::wstring& url,
+                 const std::wstring& referer,
+                 std::string& response,
+                 std::wstring& errorMessage,
+                 const WebDavRequestOptions& options) {
+    const auto parts = CrackWebDavUrl(url);
+    if (!parts) {
+        errorMessage = L"请求地址无效。";
+        return false;
+    }
+    WinHttpHandle connection(WinHttpConnect(session, parts->host.c_str(), parts->port, 0));
+    if (!connection) {
+        errorMessage = L"网络连接失败：" + WindowsErrorMessage(GetLastError());
+        return false;
+    }
+    const DWORD flags = parts->secure ? WINHTTP_FLAG_SECURE : 0;
+    WinHttpHandle request(WinHttpOpenRequest(
+        connection.Get(),
+        L"GET",
+        parts->pathAndQuery.c_str(),
+        nullptr,
+        referer.empty() ? WINHTTP_NO_REFERER : referer.c_str(),
+        WINHTTP_DEFAULT_ACCEPT_TYPES,
+        flags));
+    if (!request || !ApplyWebDavTimeouts(request.Get(), options, errorMessage)) {
+        if (errorMessage.empty()) errorMessage = L"网络请求创建失败：" + WindowsErrorMessage(GetLastError());
+        return false;
+    }
+    DWORD decompression = WINHTTP_DECOMPRESSION_FLAG_GZIP | WINHTTP_DECOMPRESSION_FLAG_DEFLATE;
+    WinHttpSetOption(request.Get(), WINHTTP_OPTION_DECOMPRESSION, &decompression, sizeof(decompression));
+    constexpr wchar_t headers[] =
+        L"Accept: application/json,text/html;q=0.9,*/*;q=0.8\r\n"
+        L"Accept-Language: zh-CN,zh;q=0.9,en;q=0.7\r\n";
+    if (!WinHttpSendRequest(request.Get(), headers, ARRAYSIZE(headers) - 1,
+                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        !WinHttpReceiveResponse(request.Get(), nullptr)) {
+        errorMessage = L"网络请求失败：" + WindowsErrorMessage(GetLastError());
+        return false;
+    }
+    DWORD statusCode = 0;
+    DWORD statusSize = sizeof(statusCode);
+    WinHttpQueryHeaders(request.Get(), WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                        WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+    if (statusCode != 200) {
+        errorMessage = L"B 站搜索请求失败：HTTP " + std::to_wstring(statusCode);
+        return false;
+    }
+    response.clear();
+    for (;;) {
+        if (!CheckWebDavRequestActive(options, errorMessage)) return false;
+        DWORD available = 0;
+        if (!WinHttpQueryDataAvailable(request.Get(), &available)) {
+            errorMessage = L"读取 B 站搜索响应失败：" + WindowsErrorMessage(GetLastError());
+            return false;
+        }
+        if (available == 0) break;
+        if (response.size() + available > options.maxResponseBytes) {
+            errorMessage = L"B 站搜索响应过大。";
+            return false;
+        }
+        const std::size_t offset = response.size();
+        response.resize(offset + available);
+        DWORD read = 0;
+        if (!WinHttpReadData(request.Get(), response.data() + offset, available, &read)) {
+            errorMessage = L"读取 B 站搜索响应失败：" + WindowsErrorMessage(GetLastError());
+            return false;
+        }
+        response.resize(offset + read);
+        if (read == 0) break;
+    }
+    return true;
+}
+
 }  // namespace
+
+std::string SearchBilibiliVideos(const std::wstring& keyword,
+                                 std::wstring& errorMessage,
+                                 const WebDavRequestOptions& options) {
+    WinHttpHandle session(WinHttpOpen(
+        L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        L"Chrome/150.0.0.0 Safari/537.36",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS,
+        0));
+    if (!session || !ApplyWebDavTimeouts(session.Get(), options, errorMessage)) {
+        if (errorMessage.empty()) errorMessage = L"B 站搜索初始化失败。";
+        return {};
+    }
+
+    const std::wstring encodedKeyword = UrlEncodeQueryValue(keyword);
+    const std::wstring searchPage = L"https://search.bilibili.com/all?keyword=" + encodedKeyword;
+    std::string ignoredPage;
+    if (!ReadHttpGet(session.Get(), searchPage, L"", ignoredPage, errorMessage, options)) return {};
+
+    const std::wstring apiUrl =
+        L"https://api.bilibili.com/x/web-interface/search/type?search_type=video&page=1&keyword=" + encodedKeyword;
+    std::string response;
+    if (!ReadHttpGet(session.Get(), apiUrl, searchPage, response, errorMessage, options)) return {};
+    return response;
+}
 
 std::vector<WebDavEntry> WebDavPropFind(const std::wstring& url,
                                         const std::wstring& username,

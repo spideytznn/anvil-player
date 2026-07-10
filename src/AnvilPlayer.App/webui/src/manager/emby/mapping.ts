@@ -535,7 +535,7 @@ export function mapItem(
         item.Name ?? ''
       ].filter(Boolean).join(' - ')
     : undefined
-  return {
+  const mapped: MediaItem = {
     id: item.Id,
     title: episodeTitle ?? item.Name ?? '未命名',
     originalTitle: item.OriginalTitle ?? item.SortName ?? item.Name ?? '',
@@ -559,12 +559,38 @@ export function mapItem(
     backdrop: imageBackground(session, item, 'Backdrop'),
     tagline: item.Taglines?.[0] ?? '',
     overview: item.Overview ?? '',
+    trailerUrl: item.RemoteTrailers?.find((trailer) => trailer.Url)?.Url,
+    trailerUrls: item.RemoteTrailers?.flatMap((trailer) => trailer.Url ? [trailer.Url] : []),
     cast: mapCast(session, item),
     streamSpecs: mapStreamSpecs(item),
     studios: item.Studios?.map((studio) => studio.Name ?? '').filter(Boolean),
     tags: item.Tags ?? [],
-    path: item.Path
+    path: item.Path,
+    mediaSourceId: item.MediaSources?.[0]?.Id,
+    metadataProvider: 'emby',
+    metadataMatchTitle: episodeTitle ?? item.Name ?? ''
   }
+  const additionalSources = item.MediaSources?.slice(1) ?? []
+  if (additionalSources.length) {
+    mapped.versions = additionalSources.map((mediaSource, index) => {
+      const versionItem = { ...item, MediaSources: [mediaSource] }
+      const label = mediaSource.Name?.trim() || qualityLabel(versionItem) || `${mediaSource.Container?.toUpperCase() || 'Version'} ${index + 2}`
+      return {
+        ...mapped,
+        id: `${item.Id}:version:${mediaSource.Id || index + 1}`,
+        path: mediaSource.Path || item.Path,
+        mediaSourceId: mediaSource.Id,
+        providerItemId: item.Id,
+        versionLabel: label,
+        quality: qualityLabel(versionItem),
+        videoSpec: videoSpecLabel(versionItem),
+        audioSpec: audioSpecLabel(versionItem),
+        streamSpecs: mapStreamSpecs(versionItem),
+        versions: undefined
+      }
+    })
+  }
+  return mapped
 }
 
 export function episodeIndexLabel(item: EmbyItem): string {

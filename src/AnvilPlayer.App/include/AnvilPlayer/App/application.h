@@ -41,7 +41,10 @@ public:
     // to startPositionRatio. Safe to call from the library window's message
     // handler (same thread). If the player window does not exist yet it is
     // created and shown; otherwise it is brought to the foreground.
-    void OpenInPlayer(const std::filesystem::path& path, double startPositionRatio);
+    void OpenInPlayer(const std::filesystem::path& path,
+                      double startPositionRatio,
+                      int audioTrackIndex = -2,
+                      int subtitleTrackIndex = -2);
 
     // Brings the player window to the foreground, creating it if necessary.
     void FocusPlayer();
@@ -66,6 +69,7 @@ private:
     AppArguments arguments_{};
     std::unique_ptr<LibraryWindow> library_;
     std::unique_ptr<MainWindow> player_;
+    std::shared_ptr<anvil::playback::InMemoryLogSink> logSink_;
     std::shared_ptr<PlayerReaperState> playerReaperState_;
     // Emby report relay: buffered when it arrives before the player WebView is
     // ready, then redelivered on a timer until consumed once.
@@ -78,6 +82,8 @@ private:
     bool quitPosted_ = false;
     std::optional<std::filesystem::path> pendingPlayerOpenPath_;
     double pendingPlayerOpenRatio_ = 0.0;
+    int pendingPlayerAudioTrackIndex_ = -2;
+    int pendingPlayerSubtitleTrackIndex_ = -2;
     bool pendingPlayerFocus_ = false;
     bool playerReaperUnavailable_ = false;
 };

@@ -2,12 +2,15 @@
 
 #include "AnvilPlayer/App/app_arguments.h"
 #include "AnvilPlayer/App/app_messages.h"
+#include "AnvilPlayer/App/display_refresh_rate.h"
 #include "AnvilPlayer/App/library_commands.h"
 #include "AnvilPlayer/App/rect_util.h"
 #include "AnvilPlayer/App/single_instance.h"
 #include "AnvilPlayer/App/string_util.h"
+#include "AnvilPlayer/App/window_chrome.h"
 #include "AnvilPlayer/App/web_ui_json.h"
 #include "AnvilPlayer/App/webui_root.h"
+#include "AnvilPlayer/Playback/MediaProbe.h"
 
 #include <commdlg.h>
 #include <dwmapi.h>
@@ -24,10 +27,12 @@
 #include <cstdint>
 #include <deque>
 #include <filesystem>
+#include <iomanip>
 #include <list>
 #include <mutex>
 #include <new>
 #include <set>
+#include <sstream>
 #include <stop_token>
 #include <string>
 #include <system_error>
@@ -95,6 +100,8 @@ struct DeferredSmbPlayback {
     std::wstring normalizedConnectionPath;
     std::optional<std::filesystem::path> playbackPath;
     double startPositionRatio = 0.0;
+    int audioTrackIndex = -2;
+    int subtitleTrackIndex = -2;
 };
 
 struct LibraryWindowAsyncState {
@@ -335,6 +342,44 @@ LibraryOperationStart BeginLibraryOperation(
     return {LibraryAdmissionStatus::Accepted, std::move(operation)};
 }
 
+void CancelLibraryOperation(const std::shared_ptr<LibraryWindowAsyncState>& state,
+                            const std::wstring& key) noexcept {
+    if (!state || key.empty()) return;
+    LibraryRetiredPayload retired;
+    bool hasRetired = false;
+    {
+        std::lock_guard lock(state->mutex);
+        const auto current = state->operations.find(key);
+        if (current == state->operations.end()) return;
+        current->second->stopSource.request_stop();
+        if (const auto queued = state->queuedJobsByKey.find(key);
+            queued != state->queuedJobsByKey.end()) {
+            retired.job.emplace(std::move(*queued->second));
+            state->jobs.erase(queued->second);
+            state->queuedJobsByKey.erase(queued);
+        }
+        if (const auto pending = state->pendingResultsByKey.find(key);
+            pending != state->pendingResultsByKey.end()) {
+            const std::array ids{pending->second.progress, pending->second.final};
+            for (std::size_t index = 0; index < ids.size(); ++index) {
+                if (ids[index] == 0) continue;
+                if (const auto result = state->results.find(ids[index]); result != state->results.end()) {
+                    retired.results[index].emplace(std::move(result->second));
+                    state->results.erase(result);
+                }
+            }
+            state->pendingResultsByKey.erase(pending);
+        }
+        retired.operation = std::move(current->second);
+        state->operations.erase(current);
+        if (state->retired.size() < EffectiveLibraryRetiredLimit(*state)) {
+            state->retired.push_back(std::move(retired));
+            hasRetired = true;
+        }
+    }
+    if (hasRetired) state->workAvailable.notify_one();
+}
+
 LibraryAdmissionStatus QueueLibraryJob(
     const std::shared_ptr<LibraryWindowAsyncState>& state,
     const std::shared_ptr<LibraryAsyncOperation>& operation,
@@ -529,6 +574,53 @@ std::wstring MessageJson(const wchar_t* type, const std::wstring& message) {
            JsonEscape(message) + L"\"}";
 }
 
+std::wstring MediaDetailsProbedJson(const std::wstring& requestId,
+                                    const std::filesystem::path& path,
+                                    const anvil::playback::MediaDescriptor& descriptor) {
+    std::wostringstream json;
+    json << L"{\"type\":\"mediaDetailsProbed\",\"requestId\":\"" << JsonEscape(requestId)
+         << L"\",\"path\":\"" << JsonEscape(path.wstring()) << L"\",";
+    std::wstring videoSpec;
+    if (descriptor.hasVideo) {
+        videoSpec = descriptor.videoCodec;
+        if (descriptor.videoWidth > 0 && descriptor.videoHeight > 0) {
+            videoSpec += (videoSpec.empty() ? L"" : L" · ") +
+                         std::to_wstring(descriptor.videoWidth) + L"x" + std::to_wstring(descriptor.videoHeight);
+        }
+        if (descriptor.videoFrameRate > 0.0) {
+            std::wostringstream fps;
+            fps << std::fixed << std::setprecision(3) << descriptor.videoFrameRate << L" fps";
+            videoSpec += (videoSpec.empty() ? L"" : L" · ") + fps.str();
+        }
+    }
+    json << L"\"videoSpec\":\"" << JsonEscape(videoSpec)
+         << L"\",\"audioSpec\":\"" << JsonEscape(descriptor.audioCodec)
+         << L"\",\"streamSpecs\":[";
+    bool first = true;
+    for (const auto& stream : descriptor.streams) {
+        const std::wstring kind = LowerCopy(stream.kind);
+        const wchar_t* type = kind == L"video" ? L"video" : kind == L"audio" ? L"audio" : kind == L"subtitle" ? L"subtitle" : nullptr;
+        if (!type) continue;
+        if (!first) json << L",";
+        first = false;
+        json << L"{\"id\":\"probe-" << stream.index << L"\",\"type\":\"" << type
+             << L"\",\"title\":\"" << JsonEscape(stream.codec.empty() ? stream.kind : stream.codec)
+             << L"\",\"subtitle\":\"" << JsonEscape(stream.details)
+             << L"\",\"details\":["
+             << L"{\"label\":\"流索引\",\"value\":\"" << stream.index << L"\"},"
+             << L"{\"label\":\"编码\",\"value\":\"" << JsonEscape(stream.codec) << L"\"}";
+        if (!stream.language.empty()) {
+            json << L",{\"label\":\"语言\",\"value\":\"" << JsonEscape(stream.language) << L"\"}";
+        }
+        if (!stream.details.empty()) {
+            json << L",{\"label\":\"详细\",\"value\":\"" << JsonEscape(stream.details) << L"\"}";
+        }
+        json << L"]}";
+    }
+    json << L"]}";
+    return json.str();
+}
+
 std::wstring LocalScanOperationKey(const std::filesystem::path& folder) {
     return L"local-scan:" + LowerCopy(folder.lexically_normal().wstring());
 }
@@ -701,6 +793,14 @@ void LibraryWindow::SetPlaybackRequest(PlaybackRequest callback) {
     playbackRequest_ = std::move(callback);
 }
 
+void LibraryWindow::SetUiLanguageChangedRequest(std::function<void()> callback) {
+    uiLanguageChangedRequest_ = std::move(callback);
+}
+
+void LibraryWindow::SetRefreshRatePreferencesChangedRequest(std::function<void()> callback) {
+    refreshRatePreferencesChangedRequest_ = std::move(callback);
+}
+
 void LibraryWindow::SetAllowInsecureCertificatesRequest(std::function<void(bool)> callback) {
     allowInsecureCertificatesRequest_ = std::move(callback);
 }
@@ -721,6 +821,10 @@ void LibraryWindow::SetTimerHandler(std::function<void()> callback) {
     timerHandler_ = std::move(callback);
 }
 
+void LibraryWindow::SetDebugLogHandler(std::function<void(const std::wstring&)> callback) {
+    debugLogHandler_ = std::move(callback);
+}
+
 bool LibraryWindow::Create(HINSTANCE instance) {
     instance_ = instance;
     dpi_ = GetDpiForSystem();
@@ -736,8 +840,15 @@ bool LibraryWindow::Create(HINSTANCE instance) {
         return false;
     }
 
-    constexpr DWORD windowStyle = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
-    constexpr DWORD windowExStyle = 0;
+    // Forge-style borderless chrome: keep the native resize frame, shadow and
+    // taskbar behavior, but let the Web UI own the title bar and controls.
+    constexpr DWORD windowStyle = WS_POPUP |
+                                  WS_THICKFRAME |
+                                  WS_SYSMENU |
+                                  WS_MINIMIZEBOX |
+                                  WS_MAXIMIZEBOX |
+                                  WS_CLIPCHILDREN;
+    constexpr DWORD windowExStyle = WS_EX_APPWINDOW;
     const auto adjustedWindowRect = [this, windowStyle, windowExStyle](const int clientWidth, const int clientHeight) {
         RECT rect = MakeRect(0, 0, clientWidth, clientHeight);
         if (!AdjustWindowRectExForDpi(&rect, windowStyle, FALSE, windowExStyle, dpi_)) {
@@ -776,6 +887,16 @@ bool LibraryWindow::Create(HINSTANCE instance) {
     if (!hwnd_) {
         return false;
     }
+
+    // Do not rely solely on CreateWindowEx style normalization: explicitly
+    // remove any caption bits and recalculate the non-client frame. This keeps
+    // DWM's resize border/shadow without allowing a system title bar.
+    const LONG_PTR createdStyle = GetWindowLongPtrW(hwnd_, GWL_STYLE);
+    SetWindowLongPtrW(hwnd_, GWL_STYLE, createdStyle & ~static_cast<LONG_PTR>(WS_CAPTION));
+    SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
+                 SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE |
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+    ApplyWindowChrome();
 
     TryCreateWebUi();
     return true;
@@ -1112,6 +1233,95 @@ void LibraryWindow::StartWebDavDirectoryList(std::wstring requestId,
     }
 }
 
+void LibraryWindow::StartMediaDetailsProbe(std::wstring requestId, std::filesystem::path path) {
+    if (requestId.empty() || path.empty()) return;
+    auto start = BeginLibraryOperation(asyncIoState_, L"media-probe:" + requestId);
+    if (!start.operation) {
+        PostScanResult(L"{\"type\":\"mediaDetailsProbeFailed\",\"requestId\":\"" +
+                       JsonEscape(requestId) + L"\",\"message\":\"媒体信息探测队列繁忙\"}");
+        return;
+    }
+    const auto state = asyncIoState_;
+    const auto operation = std::move(start.operation);
+    const auto queueStatus = QueueLibraryJob(
+        state,
+        operation,
+        [state, operation, requestId = std::move(requestId), path = std::move(path)]() {
+            LibraryAsyncResult result;
+            try {
+                anvil::playback::MediaProbeOptions options;
+                options.stopToken = operation->stopSource.get_token();
+                options.timeout = std::chrono::seconds(20);
+                const auto probe = anvil::playback::MediaProbe::Probe(path, options);
+                if (operation->StopRequested()) return;
+                if (probe.failed || probe.cancelled || probe.timedOut || probe.fallbackUsed ||
+                    probe.descriptor.streams.empty()) {
+                    result.json = L"{\"type\":\"mediaDetailsProbeFailed\",\"requestId\":\"" +
+                                  JsonEscape(requestId) + L"\",\"message\":\"" +
+                                  JsonEscape(probe.diagnostic.empty() ? L"未探测到媒体流信息" : probe.diagnostic) + L"\"}";
+                } else {
+                    result.json = MediaDetailsProbedJson(requestId, path, probe.descriptor);
+                }
+            } catch (const std::exception& error) {
+                result.json = L"{\"type\":\"mediaDetailsProbeFailed\",\"requestId\":\"" +
+                              JsonEscape(requestId) + L"\",\"message\":\"" +
+                              JsonEscape(Utf8ToWide(error.what())) + L"\"}";
+            }
+            PublishLibraryResult(state, operation, std::move(result));
+        },
+        true);
+    if (queueStatus == LibraryAdmissionStatus::Overloaded) {
+        PostScanResult(L"{\"type\":\"mediaDetailsProbeFailed\",\"requestId\":\"" +
+                       JsonEscape(requestId) + L"\",\"message\":\"媒体信息探测队列繁忙\"}");
+    }
+}
+
+void LibraryWindow::StartBilibiliTrailerSearch(std::wstring requestId, std::wstring keyword) {
+    if (requestId.empty() || keyword.empty()) return;
+    auto start = BeginLibraryOperation(asyncIoState_, L"bilibili-trailer:" + requestId);
+    if (!start.operation) {
+        PostScanResult(L"{\"type\":\"bilibiliTrailerSearchFailed\",\"requestId\":\"" +
+                       JsonEscape(requestId) + L"\",\"message\":\"B 站搜索队列繁忙\"}");
+        return;
+    }
+    const auto state = asyncIoState_;
+    const auto operation = std::move(start.operation);
+    const auto queueStatus = QueueLibraryJob(
+        state,
+        operation,
+        [state, operation, requestId = std::move(requestId), keyword = std::move(keyword)]() {
+            LibraryAsyncResult result;
+            try {
+                WebDavRequestOptions options;
+                options.deadline = operation->deadline;
+                options.cancellationToken = operation->stopSource.get_token();
+                options.shutdownToken = operation->shutdownToken;
+                options.maxResponseBytes = 4 * 1024 * 1024;
+                std::wstring errorMessage;
+                const std::string response = SearchBilibiliVideos(keyword, errorMessage, options);
+                if (operation->StopRequested()) return;
+                if (!errorMessage.empty() || response.empty()) {
+                    result.json = L"{\"type\":\"bilibiliTrailerSearchFailed\",\"requestId\":\"" +
+                                  JsonEscape(requestId) + L"\",\"message\":\"" +
+                                  JsonEscape(errorMessage.empty() ? L"B 站没有返回搜索结果" : errorMessage) + L"\"}";
+                } else {
+                    result.json = L"{\"type\":\"bilibiliTrailerSearchCompleted\",\"requestId\":\"" +
+                                  JsonEscape(requestId) + L"\",\"response\":" + Utf8ToWide(response.c_str()) + L"}";
+                }
+            } catch (const std::exception& error) {
+                result.json = L"{\"type\":\"bilibiliTrailerSearchFailed\",\"requestId\":\"" +
+                              JsonEscape(requestId) + L"\",\"message\":\"" +
+                              JsonEscape(Utf8ToWide(error.what())) + L"\"}";
+            }
+            PublishLibraryResult(state, operation, std::move(result));
+        },
+        true);
+    if (queueStatus == LibraryAdmissionStatus::Overloaded) {
+        PostScanResult(L"{\"type\":\"bilibiliTrailerSearchFailed\",\"requestId\":\"" +
+                       JsonEscape(requestId) + L"\",\"message\":\"B 站搜索队列繁忙\"}");
+    }
+}
+
 void LibraryWindow::StartWebDavScan(std::wstring url,
                                     std::wstring username,
                                     std::wstring password) {
@@ -1210,7 +1420,9 @@ void LibraryWindow::CancelAsyncIo() noexcept {
 
 bool LibraryWindow::DeferPlaybackForPendingSmbConnection(
     const std::filesystem::path& path,
-    const double startPositionRatio) {
+    const double startPositionRatio,
+    const int audioTrackIndex,
+    const int subtitleTrackIndex) {
     if (!asyncIoState_) {
         return false;
     }
@@ -1223,6 +1435,8 @@ bool LibraryWindow::DeferPlaybackForPendingSmbConnection(
             asyncIoState_->deferredSmbPlayback->normalizedConnectionPath == normalizedPath) {
             asyncIoState_->deferredSmbPlayback->playbackPath = path;
             asyncIoState_->deferredSmbPlayback->startPositionRatio = startPositionRatio;
+            asyncIoState_->deferredSmbPlayback->audioTrackIndex = audioTrackIndex;
+            asyncIoState_->deferredSmbPlayback->subtitleTrackIndex = subtitleTrackIndex;
             deferred = true;
         }
     }
@@ -1235,6 +1449,8 @@ bool LibraryWindow::DeferPlaybackForPendingSmbConnection(
 void LibraryWindow::CompleteDeferredSmbPlayback() {
     std::optional<std::filesystem::path> path;
     double startPositionRatio = 0.0;
+    int audioTrackIndex = -2;
+    int subtitleTrackIndex = -2;
     {
         std::lock_guard lock(asyncIoState_->mutex);
         if (!asyncIoState_->deferredSmbPlayback) {
@@ -1242,13 +1458,15 @@ void LibraryWindow::CompleteDeferredSmbPlayback() {
         }
         path = std::move(asyncIoState_->deferredSmbPlayback->playbackPath);
         startPositionRatio = asyncIoState_->deferredSmbPlayback->startPositionRatio;
+        audioTrackIndex = asyncIoState_->deferredSmbPlayback->audioTrackIndex;
+        subtitleTrackIndex = asyncIoState_->deferredSmbPlayback->subtitleTrackIndex;
         asyncIoState_->deferredSmbPlayback.reset();
     }
     if (hwnd_) {
         KillTimer(hwnd_, kSmbConnectionFallbackTimer);
     }
     if (path && playbackRequest_) {
-        playbackRequest_(*path, startPositionRatio);
+        playbackRequest_(*path, startPositionRatio, audioTrackIndex, subtitleTrackIndex);
     }
 }
 
@@ -1293,23 +1511,13 @@ void LibraryWindow::OpenMediaFileDialog() {
     dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER | OFN_NOCHANGEDIR;
 
     if (GetOpenFileNameW(&dialog) && playbackRequest_) {
-        playbackRequest_(std::filesystem::path(filePath.data()), 0.0);
+        playbackRequest_(std::filesystem::path(filePath.data()), 0.0, -2, -2);
     }
 }
 
 void LibraryWindow::ApplyWindowChrome() const {
-    // Mirror MainWindow's dark chrome so the library window matches the
-    // player's dark title bar / borders instead of the default white frame.
-    const BOOL dark = TRUE;
-    const int corner = kDwmCornerRound;
-    const COLORREF border = RGB(38, 42, 50);
-    const COLORREF caption = RGB(8, 10, 13);
-    const COLORREF text = RGB(239, 241, 245);
-    DwmSetWindowAttribute(hwnd_, kDwmUseImmersiveDarkMode, &dark, sizeof(dark));
-    DwmSetWindowAttribute(hwnd_, kDwmWindowCornerPreference, &corner, sizeof(corner));
-    DwmSetWindowAttribute(hwnd_, kDwmBorderColor, &border, sizeof(border));
-    DwmSetWindowAttribute(hwnd_, kDwmCaptionColor, &caption, sizeof(caption));
-    DwmSetWindowAttribute(hwnd_, kDwmTextColor, &text, sizeof(text));
+    ApplyFramelessWindowChrome(hwnd_, RGB(1, 3, 6), RGB(239, 241, 245));
+    UpdateFramelessWindowRegion(hwnd_, dpi_);
 }
 
 void LibraryWindow::HandleWebUiMessage(const std::wstring_view message) {
@@ -1331,6 +1539,10 @@ void LibraryWindow::HandleWebUiMessage(const std::wstring_view message) {
         }
         if (allowInsecureCertificatesRequest_) {
             allowInsecureCertificatesRequest_(enabled);
+        }
+    } else if (MessageContains(message, L"\"command\":\"setLibraryWebViewMuted\"")) {
+        if (webUiHost_) {
+            webUiHost_->SetMuted(MessageContains(message, L"\"muted\":true"));
         }
     } else if (MessageContains(message, L"\"command\":\"open\"")) {
         OpenMediaFileDialog();
@@ -1373,22 +1585,72 @@ void LibraryWindow::HandleWebUiMessage(const std::wstring_view message) {
             ReadJsonString(message, L"url").value_or(L""),
             ReadJsonString(message, L"username").value_or(L""),
             ReadJsonString(message, L"password").value_or(L""));
+    } else if (MessageContains(message, L"\"command\":\"cancelLibraryScan\"")) {
+        const auto path = ReadJsonString(message, L"path").value_or(L"");
+        const bool webDav = MessageContains(message, L"\"webDav\":true");
+        CancelLibraryOperation(asyncIoState_, webDav
+            ? WebDavScanOperationKey(path)
+            : LocalScanOperationKey(std::filesystem::path(path)));
+    } else if (MessageContains(message, L"\"command\":\"cancelLibraryProbe\"")) {
+        const auto requestId = ReadJsonString(message, L"requestId").value_or(L"");
+        CancelLibraryOperation(asyncIoState_, L"media-probe:" + requestId);
     } else if (MessageContains(message, L"\"command\":\"debugLog\"")) {
         if (const auto text = ReadJsonString(message, L"message")) {
             OutputDebugStringW((L"[library] " + *text + L"\n").c_str());
+            if (debugLogHandler_) {
+                debugLogHandler_(*text);
+            }
         }
+    } else if (MessageContains(message, L"\"command\":\"searchBilibiliTrailers\"")) {
+        StartBilibiliTrailerSearch(
+            ReadJsonString(message, L"requestId").value_or(L""),
+            ReadJsonString(message, L"keyword").value_or(L""));
+    } else if (MessageContains(message, L"\"command\":\"probeMediaDetails\"")) {
+        StartMediaDetailsProbe(
+            ReadJsonString(message, L"requestId").value_or(L""),
+            std::filesystem::path(ReadJsonString(message, L"path").value_or(L"")));
     } else if (MessageContains(message, L"\"command\":\"requestPlayback\"")) {
         if (const auto path = ReadJsonString(message, L"path")) {
             const double startRatio = ReadJsonNumber(message, L"startPositionRatio").value_or(0.0);
+            const int audioTrackIndex = static_cast<int>(ReadJsonNumber(message, L"audioTrackIndex").value_or(-2.0));
+            const int subtitleTrackIndex = static_cast<int>(ReadJsonNumber(message, L"subtitleTrackIndex").value_or(-2.0));
             const std::filesystem::path playbackPath(*path);
-            if (!DeferPlaybackForPendingSmbConnection(playbackPath, startRatio) && playbackRequest_) {
-                playbackRequest_(playbackPath, startRatio);
+            if (!DeferPlaybackForPendingSmbConnection(playbackPath, startRatio, audioTrackIndex, subtitleTrackIndex) && playbackRequest_) {
+                playbackRequest_(playbackPath, startRatio, audioTrackIndex, subtitleTrackIndex);
             }
         }
+    } else if (MessageContains(message, L"\"command\":\"openExternalUrl\"")) {
+        if (const auto url = ReadJsonString(message, L"url")) {
+            if (StartsWithInsensitive(*url, L"https://") || StartsWithInsensitive(*url, L"http://")) {
+                ShellExecuteW(nullptr, L"open", url->c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            }
+        }
+    } else if (MessageContains(message, L"\"command\":\"setGlobalRefreshRateSync\"")) {
+        DisplayRefreshRateController::SaveGlobalEnabled(MessageContains(message, L"\"enabled\":true"));
+        if (refreshRatePreferencesChangedRequest_) refreshRatePreferencesChangedRequest_();
+    } else if (MessageContains(message, L"\"command\":\"setGlobalRefreshRateMaximumMultiple\"")) {
+        DisplayRefreshRateController::SaveMaximumMultipleEnabled(MessageContains(message, L"\"enabled\":true"));
+        if (refreshRatePreferencesChangedRequest_) refreshRatePreferencesChangedRequest_();
+    } else if (MessageContains(message, L"\"command\":\"setUiLanguage\"")) {
+        DisplayRefreshRateController::SaveUiLanguage(ReadJsonString(message, L"language").value_or(L"zh"));
+        if (uiLanguageChangedRequest_) uiLanguageChangedRequest_();
     } else if (MessageContains(message, L"\"command\":\"focusPlayer\"")) {
         if (focusPlayerRequest_) {
             focusPlayerRequest_();
         }
+    } else if (MessageContains(message, L"\"command\":\"requestWindowChrome\"")) {
+        PostScanResult(L"{\"type\":\"windowChrome\",\"customTitleBar\":true}");
+    } else if (MessageContains(message, L"\"command\":\"beginWindowDrag\"")) {
+        if (!IsZoomed(hwnd_)) {
+            ReleaseCapture();
+            SendMessageW(hwnd_, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+        }
+    } else if (MessageContains(message, L"\"command\":\"minimizeWindow\"")) {
+        ShowWindow(hwnd_, SW_MINIMIZE);
+    } else if (MessageContains(message, L"\"command\":\"toggleMaximizeWindow\"")) {
+        ShowWindow(hwnd_, IsZoomed(hwnd_) ? SW_RESTORE : SW_MAXIMIZE);
+    } else if (MessageContains(message, L"\"command\":\"closeWindow\"")) {
+        PostMessageW(hwnd_, WM_CLOSE, 0, 0);
     } else if (MessageContains(message, L"\"command\":\"deliverEmbyPlaybackReport\"")) {
         // Relay the full report object to the player window via Application so
         // the player's WebView (separate storage) can inject it.
@@ -1427,6 +1689,35 @@ LRESULT CALLBACK LibraryWindow::WindowProc(HWND hwnd, const UINT message, const 
 
 LRESULT LibraryWindow::HandleMessage(const UINT message, const WPARAM wParam, const LPARAM lParam) {
     switch (message) {
+    case WM_NCCALCSIZE:
+        if (wParam != FALSE && IsZoomed(hwnd_)) {
+            auto* params = reinterpret_cast<NCCALCSIZE_PARAMS*>(lParam);
+            MONITORINFO monitor{sizeof(monitor)};
+            if (GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &monitor)) {
+                params->rgrc[0] = monitor.rcWork;
+            }
+        }
+        return 0;
+    case WM_NCHITTEST:
+        if (!IsZoomed(hwnd_)) {
+            const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            RECT windowRect{};
+            GetWindowRect(hwnd_, &windowRect);
+            const int edge = ScaleForDpi(6, dpi_);
+            const bool left = point.x < windowRect.left + edge;
+            const bool right = point.x >= windowRect.right - edge;
+            const bool top = point.y < windowRect.top + edge;
+            const bool bottom = point.y >= windowRect.bottom - edge;
+            if (top && left) return HTTOPLEFT;
+            if (top && right) return HTTOPRIGHT;
+            if (bottom && left) return HTBOTTOMLEFT;
+            if (bottom && right) return HTBOTTOMRIGHT;
+            if (left) return HTLEFT;
+            if (right) return HTRIGHT;
+            if (top) return HTTOP;
+            if (bottom) return HTBOTTOM;
+        }
+        return HTCLIENT;
     case WM_CREATE:
         dpi_ = GetDpiForWindow(hwnd_);
         ActivateLibraryAsyncState(asyncIoState_, hwnd_);
@@ -1447,12 +1738,13 @@ LRESULT LibraryWindow::HandleMessage(const UINT message, const WPARAM wParam, co
             std::wstring forwarded(static_cast<const wchar_t*>(copyData->lpData), charCount);
             const auto args = ParseCommandLine(forwarded);
             if (!args.mediaPath.empty() && playbackRequest_) {
-                playbackRequest_(args.mediaPath, 0.0);
+                playbackRequest_(args.mediaPath, 0.0, -2, -2);
             }
         }
         return TRUE;
     }
     case WM_SIZE:
+        UpdateFramelessWindowRegion(hwnd_, dpi_);
         if (webUiHost_) {
             RECT client{};
             GetClientRect(hwnd_, &client);
@@ -1465,7 +1757,7 @@ LRESULT LibraryWindow::HandleMessage(const UINT message, const WPARAM wParam, co
         const UINT queried = DragQueryFileW(drop, 0, filePath, static_cast<UINT>(std::size(filePath)));
         DragFinish(drop);
         if (queried > 0 && playbackRequest_) {
-            playbackRequest_(std::filesystem::path(filePath), 0.0);
+            playbackRequest_(std::filesystem::path(filePath), 0.0, -2, -2);
         }
         return 0;
     }

@@ -40,6 +40,7 @@ export const EMBY_ITEM_FIELDS = [
   'People',
   'Studios',
   'Tags',
+  'RemoteTrailers',
   'Path'
 ].join(',')
 
@@ -149,6 +150,7 @@ export interface EmbyItem {
   People?: EmbyPerson[]
   Studios?: Array<{ Name?: string }>
   Tags?: string[]
+  RemoteTrailers?: Array<{ Name?: string; Url?: string }>
   Path?: string
   ChildCount?: number
   ParentId?: string

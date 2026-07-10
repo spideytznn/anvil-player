@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <array>
 #include <condition_variable>
 #include <cstdint>
 #include <cwctype>
@@ -36,6 +37,51 @@ std::wstring Lowercase(std::wstring value) {
     std::transform(value.begin(), value.end(), value.begin(), [](const wchar_t ch) {
         return static_cast<wchar_t>(std::towlower(ch));
     });
+    return value;
+}
+
+std::wstring RedactUrlCredentials(std::wstring value) {
+    std::size_t searchFrom = 0;
+    while (searchFrom < value.size()) {
+        const auto scheme = value.find(L"://", searchFrom);
+        if (scheme == std::wstring::npos) {
+            break;
+        }
+
+        const auto authorityBegin = scheme + 3;
+        const auto authorityEnd = value.find_first_of(L"/?# \t\r\n\"'", authorityBegin);
+        const auto end = authorityEnd == std::wstring::npos ? value.size() : authorityEnd;
+        const auto at = value.rfind(L'@', end);
+        if (at != std::wstring::npos && at >= authorityBegin && at < end) {
+            value.replace(authorityBegin, at - authorityBegin + 1, L"[credentials]@");
+            searchFrom = authorityBegin + std::wstring_view(L"[credentials]@").size();
+        } else {
+            searchFrom = end;
+        }
+    }
+
+    constexpr std::array<std::wstring_view, 5> sensitiveParameters{
+        L"api_key=", L"api-key=", L"access_token=", L"token=", L"password="};
+    for (const auto parameter : sensitiveParameters) {
+        searchFrom = 0;
+        while (searchFrom < value.size()) {
+            const auto lowercase = Lowercase(value);
+            const auto key = lowercase.find(parameter, searchFrom);
+            if (key == std::wstring::npos) {
+                break;
+            }
+            if (key > 0 && value[key - 1] != L'?' && value[key - 1] != L'&' &&
+                !std::iswspace(value[key - 1])) {
+                searchFrom = key + parameter.size();
+                continue;
+            }
+            const auto secretBegin = key + parameter.size();
+            const auto secretEnd = value.find_first_of(L"& \t\r\n\"'", secretBegin);
+            const auto end = secretEnd == std::wstring::npos ? value.size() : secretEnd;
+            value.replace(secretBegin, end - secretBegin, L"[redacted]");
+            searchFrom = secretBegin + std::wstring_view(L"[redacted]").size();
+        }
+    }
     return value;
 }
 
@@ -453,8 +499,8 @@ void InMemoryLogSink::Write(LogLevel level, std::wstring category, std::wstring 
         entry = LogEntry{
             std::chrono::system_clock::now(),
             level,
-            std::move(category),
-            std::move(message),
+            RedactUrlCredentials(std::move(category)),
+            RedactUrlCredentials(std::move(message)),
         };
         entries_.push_back(entry);
 

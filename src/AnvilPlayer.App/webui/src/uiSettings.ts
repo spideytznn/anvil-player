@@ -27,3 +27,7 @@ export function applyDocumentLanguage(language: UiLanguage): void {
 export function uiLanguageLabel(language: UiLanguage): string {
   return language === 'zh' ? '中文' : 'English'
 }
+
+export function tmdbLanguageForUi(language: UiLanguage): string {
+  return language === 'zh' ? 'zh-CN' : 'en-US'
+}

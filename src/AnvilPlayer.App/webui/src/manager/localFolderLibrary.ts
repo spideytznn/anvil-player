@@ -109,6 +109,12 @@ function daysSinceModified(file: LocalFolderPickItem, index: number): number {
   return index
 }
 
+function fileFingerprint(file: LocalFolderPickItem): string {
+  const modifiedAt = Number.isFinite(file.modifiedAt) ? Math.max(0, file.modifiedAt ?? 0) : 0
+  const sizeBytes = Number.isFinite(file.sizeBytes) ? Math.max(0, file.sizeBytes ?? 0) : 0
+  return `${sizeBytes}:${modifiedAt}`
+}
+
 function seasonFolderTitle(filePath: string): string {
   const segments = pathSegments(filePath)
   for (let index = segments.length - 2; index > 0; index -= 1) {
@@ -279,7 +285,11 @@ function buildFileMediaItem(
     tagline: '等待刮削',
     overview: `本地媒体文件：${file.path}`,
     path: file.path,
-    playbackPath: file.playbackPath
+    playbackPath: file.playbackPath,
+    fileSizeBytes: file.sizeBytes,
+    fileModifiedAt: file.modifiedAt,
+    fileFingerprint: fileFingerprint(file),
+    availability: 'available'
   }
 }
 
@@ -362,6 +372,10 @@ function buildSeriesItem(folderPath: string, sourceId: string, title: string, re
     tagline: '等待刮削',
     overview: `本地电视剧合集：${seriesTitle}`,
     path: firstEpisode?.path,
+    fileSizeBytes: sortedRecords.reduce((total, record) => total + (record.file.sizeBytes ?? 0), 0),
+    fileModifiedAt: Math.max(0, ...sortedRecords.map((record) => record.file.modifiedAt ?? 0)),
+    fileFingerprint: stableHash(sortedRecords.map((record) => fileFingerprint(record.file)).join('|')),
+    availability: 'available',
     seasons,
     episodes: seasons[0]?.episodes
   }

@@ -4,6 +4,7 @@
 #include "AnvilPlayer/App/rect_util.h"
 #include "AnvilPlayer/App/single_instance.h"
 #include "AnvilPlayer/App/string_util.h"
+#include "AnvilPlayer/App/window_chrome.h"
 #include "AnvilPlayer/App/ui_animation_math.h"
 #include "AnvilPlayer/App/web_ui_json.h"
 #include "AnvilPlayer/App/webui_root.h"
@@ -343,6 +344,10 @@ std::wstring HdrToneCurveJson(const anvil::playback::VideoSettings& settings) {
 
 }  // namespace
 
+MainWindow::MainWindow(std::shared_ptr<anvil::playback::InMemoryLogSink> logSink)
+    : controller_(std::move(logSink)) {
+}
+
 MainWindow::~MainWindow() {
     InvalidateBackgroundListWorkers();
     // Application retires MainWindow on a background reaper. Joining here is
@@ -357,6 +362,7 @@ void MainWindow::ReleaseUiThreadResourcesForBackgroundDestruction() noexcept {
         return;
     }
     uiThreadResourcesReleased_ = true;
+    refreshRateController_.Restore();
 
     // WebView2 controller/environment releases must stay on the apartment
     // that created them. Reset the host here as well as shutting it down so a
@@ -453,8 +459,13 @@ bool MainWindow::Create(HINSTANCE instance) {
         return false;
     }
 
-    constexpr DWORD windowStyle = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
-    constexpr DWORD windowExStyle = 0;
+    constexpr DWORD windowStyle = WS_POPUP |
+                                  WS_THICKFRAME |
+                                  WS_SYSMENU |
+                                  WS_MINIMIZEBOX |
+                                  WS_MAXIMIZEBOX |
+                                  WS_CLIPCHILDREN;
+    constexpr DWORD windowExStyle = WS_EX_APPWINDOW;
     const auto adjustedWindowRect = [this, windowStyle, windowExStyle](const int clientWidth, const int clientHeight) {
         RECT rect = MakeRect(0, 0, clientWidth, clientHeight);
         if (!AdjustWindowRectExForDpi(&rect, windowStyle, FALSE, windowExStyle, dpi_)) {
@@ -505,6 +516,13 @@ bool MainWindow::Create(HINSTANCE instance) {
         return false;
     }
 
+    const LONG_PTR createdStyle = GetWindowLongPtrW(hwnd_, GWL_STYLE);
+    SetWindowLongPtrW(hwnd_, GWL_STYLE, createdStyle & ~static_cast<LONG_PTR>(WS_CAPTION));
+    SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
+                 SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE |
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+    ApplyWindowChrome();
+
     playbackSupervisor_ = std::make_unique<PlaybackSupervisor>(controller_);
     if (!playbackSupervisor_->Start(
             hwnd_,
@@ -538,6 +556,17 @@ std::filesystem::path MainWindow::WebUiRoot() const {
         return std::filesystem::path(modulePath).parent_path() / L"webui";
     }
     return {};
+}
+
+void MainWindow::SetPendingMediaTrackSelections(const int audioTrackIndex,
+                                                const int subtitleTrackIndex) {
+    auto settings = controller_.Settings();
+    settings.audio.selectedTrackIndex = audioTrackIndex;
+    settings.subtitles.selectedTrackIndex = subtitleTrackIndex;
+    controller_.ApplySettings(settings);
+    LogApp(LogLevel::Info,
+           L"library track preselection audio=" + std::to_wstring(audioTrackIndex) +
+           L" subtitle=" + std::to_wstring(subtitleTrackIndex));
 }
 
 bool MainWindow::TryCreateWebUi() {
@@ -619,13 +648,14 @@ std::wstring MainWindow::BuildWebUiStateJson() const {
         }
         if (snapshot.media->videoFrameRate > 0.0) {
             std::wostringstream fps;
-            fps << std::fixed << std::setprecision(2) << snapshot.media->videoFrameRate << L" fps";
+            fps << std::fixed << std::setprecision(3) << snapshot.media->videoFrameRate << L" fps";
             frameRate = fps.str();
         }
     }
 
     std::wostringstream json;
     json << L"{\"type\":\"state\",\"state\":{";
+    json << L"\"uiLanguage\":\"" << DisplayRefreshRateController::LoadUiLanguage() << L"\",";
     json << L"\"playbackState\":\"" << JsonEscape(playbackState) << L"\",";
     json << L"\"lastError\":\"" << JsonEscape(snapshot.lastError) << L"\",";
     json << L"\"mediaName\":\"" << JsonEscape(mediaName) << L"\",";
@@ -643,6 +673,12 @@ std::wstring MainWindow::BuildWebUiStateJson() const {
     json << L"\"backendLabel\":\"" << JsonEscape(RuntimeLabel()) << L"\",";
     json << L"\"sidebarCollapsed\":" << (inspectorCollapsed_ ? L"true" : L"false") << L",";
     json << L"\"fullscreen\":" << (fullscreen_ ? L"true" : L"false") << L",";
+    json << L"\"customTitleBar\":true,";
+    json << L"\"refreshRateSyncEnabled\":" << (refreshRateSyncEnabled_ ? L"true" : L"false") << L",";
+    json << L"\"refreshRateMaximumMultiple\":" << (refreshRateMaximumMultiple_ ? L"true" : L"false") << L",";
+    json << L"\"refreshRateSyncUnavailable\":" << (refreshRateSyncUnavailable_ ? L"true" : L"false") << L",";
+    json << L"\"refreshRateSyncActive\":" << (refreshRateController_.Active() ? L"true" : L"false") << L",";
+    json << L"\"refreshRateSyncHz\":" << std::fixed << std::setprecision(3) << refreshRateController_.AppliedRefreshRate() << L",";
     json << L"\"fullscreenTransportVisible\":"
          << ((!fullscreen_ || fullscreenTransportTarget_ > 0.0 || draggingProgress_ || draggingVolume_) ? L"true" : L"false")
          << L",";
@@ -722,6 +758,17 @@ void MainWindow::HandleWebUiMessage(const std::wstring_view message) {
         // Legacy single-window route notification. MainWindow is always the
         // player window now, so the route never changes here. The standalone
         // LibraryWindow owns the library route.
+    } else if (MessageContains(message, L"\"command\":\"beginWindowDrag\"")) {
+        if (!fullscreen_ && !IsZoomed(hwnd_)) {
+            ReleaseCapture();
+            SendMessageW(hwnd_, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+        }
+    } else if (MessageContains(message, L"\"command\":\"minimizeWindow\"")) {
+        ShowWindow(hwnd_, SW_MINIMIZE);
+    } else if (MessageContains(message, L"\"command\":\"toggleMaximizeWindow\"")) {
+        ShowWindow(hwnd_, IsZoomed(hwnd_) ? SW_RESTORE : SW_MAXIMIZE);
+    } else if (MessageContains(message, L"\"command\":\"closeWindow\"")) {
+        PostMessageW(hwnd_, WM_CLOSE, 0, 0);
     } else if (MessageContains(message, L"\"command\":\"open\"")) {
         OpenFileDialog();
     } else if (MessageContains(message, L"\"command\":\"pickLocalFolder\"") ||
@@ -759,6 +806,15 @@ void MainWindow::HandleWebUiMessage(const std::wstring_view message) {
         ToggleSidebar();
     } else if (MessageContains(message, L"\"command\":\"toggleFullscreen\"")) {
         ToggleFullscreen();
+    } else if (MessageContains(message, L"\"command\":\"setRefreshRateSync\"")) {
+        SetRefreshRateSyncEnabled(MessageContains(message, L"\"enabled\":true"));
+    } else if (MessageContains(message, L"\"command\":\"setRefreshRateMaximumMultiple\"")) {
+        SetRefreshRateMaximumMultiple(MessageContains(message, L"\"enabled\":true"));
+    } else if (MessageContains(message, L"\"command\":\"dismissRefreshRateSyncUnavailable\"")) {
+        refreshRateSyncUnavailable_ = false;
+        MarkLayoutDirty();
+        EnsureLayout();
+        UpdateVideoHost();
     } else if (MessageContains(message, L"\"command\":\"showFullscreenTransport\"")) {
         ShowFullscreenTransport(L"web_ui_activation");
     } else if (MessageContains(message, L"\"command\":\"subtitleGeometry\"")) {
@@ -808,6 +864,27 @@ void MainWindow::HandleWebUiMessage(const std::wstring_view message) {
             const int h = std::max(1, scaled(height));
             webUiTransportBounds_ = MakeRect(x, y, x + w, y + h);
             webUiTransportGeometryValid_ = true;
+            MarkLayoutDirty();
+            EnsureLayout();
+            UpdateVideoHost();
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        }
+    } else if (MessageContains(message, L"\"command\":\"videoGeometry\"")) {
+        const double scale = std::clamp(ReadJsonNumber(message, L"scale").value_or(1.0), 0.25, 4.0);
+        const auto scaled = [scale](const std::optional<double>& value) {
+            return static_cast<int>(std::round(value.value_or(0.0) * scale));
+        };
+        const auto left = ReadJsonNumber(message, L"left");
+        const auto top = ReadJsonNumber(message, L"top");
+        const auto width = ReadJsonNumber(message, L"width");
+        const auto height = ReadJsonNumber(message, L"height");
+        if (left && top && width && height) {
+            const int x = scaled(left);
+            const int y = scaled(top);
+            const int w = std::max(1, scaled(width));
+            const int h = std::max(1, scaled(height));
+            webUiVideoBounds_ = MakeRect(x, y, x + w, y + h);
+            webUiVideoGeometryValid_ = true;
             MarkLayoutDirty();
             EnsureLayout();
             UpdateVideoHost();
@@ -1233,6 +1310,35 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
     }
 
     switch (message) {
+    case WM_NCCALCSIZE:
+        if (wParam != FALSE && IsZoomed(hwnd_)) {
+            auto* params = reinterpret_cast<NCCALCSIZE_PARAMS*>(lParam);
+            MONITORINFO monitor{sizeof(monitor)};
+            if (GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &monitor)) {
+                params->rgrc[0] = monitor.rcWork;
+            }
+        }
+        return 0;
+    case WM_NCHITTEST:
+        if (!fullscreen_ && !IsZoomed(hwnd_)) {
+            const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            RECT windowRect{};
+            GetWindowRect(hwnd_, &windowRect);
+            const int edge = Scale(6);
+            const bool left = point.x < windowRect.left + edge;
+            const bool right = point.x >= windowRect.right - edge;
+            const bool top = point.y < windowRect.top + edge;
+            const bool bottom = point.y >= windowRect.bottom - edge;
+            if (top && left) return HTTOPLEFT;
+            if (top && right) return HTTOPRIGHT;
+            if (bottom && left) return HTBOTTOMLEFT;
+            if (bottom && right) return HTBOTTOMRIGHT;
+            if (left) return HTLEFT;
+            if (right) return HTRIGHT;
+            if (top) return HTTOP;
+            if (bottom) return HTBOTTOM;
+        }
+        return HTCLIENT;
     case WM_CREATE:
         dpi_ = GetDpiForWindow(hwnd_);
         ApplyWindowChrome();
@@ -1464,6 +1570,7 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
         return 0;
     }
     case WM_SIZE:
+        UpdateFramelessWindowRegion(hwnd_, dpi_, fullscreen_);
         MarkLayoutDirty();
         EnsureLayout();
         if (webUiActive_ && webUiHost_) {
@@ -3084,16 +3191,8 @@ RECT MainWindow::PlaybackSurfaceBounds() const {
 }
 
 void MainWindow::ApplyWindowChrome() const {
-    const BOOL dark = TRUE;
-    const int corner = kDwmCornerRound;
-    const COLORREF border = palette_.border;
-    const COLORREF caption = palette_.background;
-    const COLORREF text = palette_.text;
-    DwmSetWindowAttribute(hwnd_, kDwmUseImmersiveDarkMode, &dark, sizeof(dark));
-    DwmSetWindowAttribute(hwnd_, kDwmWindowCornerPreference, &corner, sizeof(corner));
-    DwmSetWindowAttribute(hwnd_, kDwmBorderColor, &border, sizeof(border));
-    DwmSetWindowAttribute(hwnd_, kDwmCaptionColor, &caption, sizeof(caption));
-    DwmSetWindowAttribute(hwnd_, kDwmTextColor, &text, sizeof(text));
+    ApplyFramelessWindowChrome(hwnd_, RGB(1, 3, 6), palette_.text);
+    UpdateFramelessWindowRegion(hwnd_, dpi_, fullscreen_);
 }
 
 void MainWindow::OpenFileDialog() {
@@ -4287,6 +4386,12 @@ void MainWindow::OpenPath(const std::filesystem::path& path, const bool autoplay
         return;
     }
     LogApp(LogLevel::Info, L"open path=" + path.wstring());
+    refreshRateController_.Restore();
+    refreshRateSyncEnabled_ = DisplayRefreshRateController::LoadGlobalEnabled();
+    refreshRateMaximumMultiple_ = DisplayRefreshRateController::LoadMaximumMultipleEnabled();
+    refreshRateSyncOverridden_ = false;
+    refreshRateMaximumMultipleOverridden_ = false;
+    refreshRateSyncUnavailable_ = false;
     ClearDeferredRuntimeStart();
     deferredPausedFrameRefresh_ = false;
     deferredPausedFrameRefreshForceRestart_ = false;
@@ -4703,6 +4808,9 @@ void MainWindow::StartPlayback() {
 
     controller_.Play();
     const auto snapshot = controller_.Snapshot();
+    if (fullscreen_ && refreshRateSyncEnabled_ && snapshot.media.has_value() && snapshot.media->videoFrameRate > 0.0) {
+        refreshRateController_.ApplyForWindow(hwnd_, snapshot.media->videoFrameRate, refreshRateMaximumMultiple_);
+    }
     LogApp(LogLevel::Info, L"start playback state=" + ToDisplayString(snapshot.state) + L" hasMedia=" + (snapshot.media.has_value() ? L"true" : L"false"));
     if (snapshot.state == PlaybackState::Playing &&
         snapshot.media.has_value() &&
@@ -4828,6 +4936,7 @@ void MainWindow::TogglePlayback() {
 }
 
 void MainWindow::StopPlayback() {
+    refreshRateController_.Restore();
     ClearDeferredRuntimeStart();
     deferredPausedFrameRefresh_ = false;
     deferredPausedFrameRefreshForceRestart_ = false;
@@ -4911,6 +5020,17 @@ void MainWindow::SeekFromProgress(const int x) {
 
 void MainWindow::ToggleFullscreen() {
     if (!fullscreen_) {
+        refreshRateSyncUnavailable_ = false;
+        const auto snapshot = controller_.Snapshot();
+        if (refreshRateSyncEnabled_ && snapshot.media.has_value() && snapshot.media->videoFrameRate > 0.0) {
+            const bool matched = refreshRateController_.ApplyForWindow(hwnd_, snapshot.media->videoFrameRate, refreshRateMaximumMultiple_);
+            refreshRateSyncUnavailable_ = !matched;
+            LogApp(matched ? LogLevel::Info : LogLevel::Warning,
+                   matched
+                       ? L"refresh rate sync applied source_fps=" + std::to_wstring(snapshot.media->videoFrameRate) +
+                             L" target_hz=" + std::to_wstring(refreshRateController_.AppliedRefreshRate())
+                       : L"refresh rate sync exact mode unavailable source_fps=" + std::to_wstring(snapshot.media->videoFrameRate));
+        }
         previousStyle_ = GetWindowLongW(hwnd_, GWL_STYLE);
         previousExStyle_ = GetWindowLongW(hwnd_, GWL_EXSTYLE);
         previousPlacement_.length = sizeof(previousPlacement_);
@@ -4941,6 +5061,8 @@ void MainWindow::ToggleFullscreen() {
         }
         SetTimer(hwnd_, kFullscreenChromeHideTimer, 120, nullptr);
     } else {
+        refreshRateController_.Restore();
+        refreshRateSyncUnavailable_ = false;
         SetWindowLongW(hwnd_, GWL_STYLE, previousStyle_);
         SetWindowLongW(hwnd_, GWL_EXSTYLE, previousExStyle_);
         SetWindowPlacement(hwnd_, &previousPlacement_);
@@ -4966,6 +5088,59 @@ void MainWindow::ToggleFullscreen() {
     }
     InvalidateRect(hwnd_, nullptr, FALSE);
     PostWebUiState();
+}
+
+void MainWindow::SetRefreshRateSyncEnabled(const bool enabled) {
+    refreshRateSyncOverridden_ = true;
+    refreshRateSyncEnabled_ = enabled;
+    if (!enabled) {
+        refreshRateController_.Restore();
+        refreshRateSyncUnavailable_ = false;
+        MarkLayoutDirty();
+        EnsureLayout();
+        UpdateVideoHost();
+    } else if (fullscreen_) {
+        const auto snapshot = controller_.Snapshot();
+        if (snapshot.media.has_value() && snapshot.media->videoFrameRate > 0.0) {
+            refreshRateController_.ApplyForWindow(hwnd_, snapshot.media->videoFrameRate, refreshRateMaximumMultiple_);
+        }
+    }
+    PostWebUiState();
+}
+
+void MainWindow::SetRefreshRateMaximumMultiple(const bool enabled) {
+    refreshRateMaximumMultipleOverridden_ = true;
+    refreshRateMaximumMultiple_ = enabled;
+    if (fullscreen_ && refreshRateSyncEnabled_) {
+        refreshRateController_.Restore();
+        const auto snapshot = controller_.Snapshot();
+        if (snapshot.media.has_value() && snapshot.media->videoFrameRate > 0.0) {
+            refreshRateSyncUnavailable_ = !refreshRateController_.ApplyForWindow(hwnd_, snapshot.media->videoFrameRate, refreshRateMaximumMultiple_);
+        }
+    }
+    PostWebUiState();
+}
+
+void MainWindow::ApplyGlobalRefreshRatePreferences() {
+    const bool globalSyncEnabled = DisplayRefreshRateController::LoadGlobalEnabled();
+    const bool globalMaximumMultiple = DisplayRefreshRateController::LoadMaximumMultipleEnabled();
+    bool changed = false;
+    if (!refreshRateSyncOverridden_ && refreshRateSyncEnabled_ != globalSyncEnabled) {
+        refreshRateSyncEnabled_ = globalSyncEnabled;
+        changed = true;
+    }
+    if (!refreshRateMaximumMultipleOverridden_ && refreshRateMaximumMultiple_ != globalMaximumMultiple) {
+        refreshRateMaximumMultiple_ = globalMaximumMultiple;
+        changed = true;
+    }
+    if (changed && fullscreen_) {
+        refreshRateController_.Restore();
+        const auto snapshot = controller_.Snapshot();
+        if (refreshRateSyncEnabled_ && snapshot.media.has_value() && snapshot.media->videoFrameRate > 0.0) {
+            refreshRateSyncUnavailable_ = !refreshRateController_.ApplyForWindow(hwnd_, snapshot.media->videoFrameRate, refreshRateMaximumMultiple_);
+        }
+    }
+    PostWebUiState(true);
 }
 
 }  // namespace anvil::app

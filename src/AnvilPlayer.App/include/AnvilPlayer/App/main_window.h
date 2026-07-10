@@ -2,6 +2,7 @@
 
 #include "AnvilPlayer/App/app_messages.h"
 #include "AnvilPlayer/App/d3d11_video_renderer.h"
+#include "AnvilPlayer/App/display_refresh_rate.h"
 #include "AnvilPlayer/App/embedded_ffplay.h"
 #include "AnvilPlayer/App/external_video_decoder.h"
 #include "AnvilPlayer/App/ffmpeg_video_decoder.h"
@@ -47,6 +48,7 @@ public:
     // the process (e.g. closing the player window alone should NOT quit).
     using QuitHandler = std::function<void()>;
 
+    explicit MainWindow(std::shared_ptr<anvil::playback::InMemoryLogSink> logSink);
     ~MainWindow();
 
     void ConfigureLogging(anvil::playback::LogLevel minimumLevel);
@@ -60,6 +62,7 @@ public:
     void OpenInitialPath(const std::filesystem::path& path, bool autoplay);
     // Sets the 0..1 resume ratio consumed by the next OpenInitialPath/OpenPath.
     void SetPendingStartPositionRatio(double ratio) { pendingStartPositionRatio_ = ratio; }
+    void SetPendingMediaTrackSelections(int audioTrackIndex, int subtitleTrackIndex);
     HWND Handle() const { return hwnd_; }
     bool IsVisible() const;
     bool IsClosing() const { return closePending_; }
@@ -72,6 +75,8 @@ public:
     // storage from the library window). Returns true when the WebView was
     // ready and the message was actually posted.
     bool DeliverEmbyPlaybackReport(const std::wstring& reportJson) const;
+    void RefreshUiLanguage() const { PostWebUiState(true); }
+    void ApplyGlobalRefreshRatePreferences();
 
 private:
     static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
@@ -332,6 +337,8 @@ private:
     void ToggleDolbyVisionHdrOutput();
     void ToggleDolbyVisionCmv4Approx();
     void ToggleFullscreen();
+    void SetRefreshRateSyncEnabled(bool enabled);
+    void SetRefreshRateMaximumMultiple(bool enabled);
     void UpdateInspectorMediaLists(const std::filesystem::path& path);
 
     // main_window_paint.cpp
@@ -485,6 +492,12 @@ private:
     InspectorTab inspectorTab_ = InspectorTab::Recent;
     PlaybackBackend backend_ = PlaybackBackend::NativeFfmpegD3D11;
     bool fullscreen_ = false;
+    bool refreshRateSyncEnabled_ = false;
+    bool refreshRateMaximumMultiple_ = true;
+    bool refreshRateSyncOverridden_ = false;
+    bool refreshRateMaximumMultipleOverridden_ = false;
+    bool refreshRateSyncUnavailable_ = false;
+    DisplayRefreshRateController refreshRateController_;
     LONG previousStyle_ = 0;
     LONG previousExStyle_ = 0;
     WINDOWPLACEMENT previousPlacement_{sizeof(WINDOWPLACEMENT)};
@@ -509,6 +522,7 @@ private:
     RECT webUiSubtitleAnchor_{};
     RECT webUiSubtitlePopover_{};
     RECT webUiTransportBounds_{};
+    RECT webUiVideoBounds_{};
     RECT hdrToneCurvePlot_{};
     RECT hdrToneCurveExpandedEditor_{};
     RECT hdrToneCurveFloatingReset_{};
@@ -535,6 +549,7 @@ private:
     bool subtitleMenuOpen_ = false;
     bool webUiSubtitleGeometryValid_ = false;
     bool webUiTransportGeometryValid_ = false;
+    bool webUiVideoGeometryValid_ = false;
     bool progressHovered_ = false;
     bool volumeSliderHovered_ = false;
     bool volumeDragChanged_ = false;

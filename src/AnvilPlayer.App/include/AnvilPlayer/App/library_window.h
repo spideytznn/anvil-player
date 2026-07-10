@@ -28,7 +28,10 @@ struct LibraryWindowAsyncState;
 // the player window is alive.
 class LibraryWindow {
 public:
-    using PlaybackRequest = std::function<void(const std::filesystem::path& path, double startPositionRatio)>;
+    using PlaybackRequest = std::function<void(const std::filesystem::path& path,
+                                               double startPositionRatio,
+                                               int audioTrackIndex,
+                                               int subtitleTrackIndex)>;
     using QuitHandler = std::function<void()>;
 
     LibraryWindow();
@@ -40,12 +43,15 @@ public:
     void SetPlaybackRequest(PlaybackRequest callback);
     void SetAllowInsecureCertificatesRequest(std::function<void(bool)> callback);
     void SetFocusPlayerRequest(std::function<void()> callback);
+    void SetUiLanguageChangedRequest(std::function<void()> callback);
+    void SetRefreshRatePreferencesChangedRequest(std::function<void()> callback);
     // Relays a serialized Emby playback report (from the library WebView) to
     // the player window so it can report progress despite separate storage.
     void SetEmbyPlaybackReportRelay(std::function<void(const std::wstring&)> callback);
     void SetQuitHandler(QuitHandler handler);
     // Fired from the library window's WM_TIMER (used for the Emby report retry).
     void SetTimerHandler(std::function<void()> callback);
+    void SetDebugLogHandler(std::function<void(const std::wstring&)> callback);
 
     bool Create(HINSTANCE instance);
     void Show(int commandShow) const;
@@ -58,6 +64,8 @@ private:
     bool TryCreateWebUi();
     std::filesystem::path WebUiRoot() const;
     void HandleWebUiMessage(std::wstring_view message);
+    void StartMediaDetailsProbe(std::wstring requestId, std::filesystem::path path);
+    void StartBilibiliTrailerSearch(std::wstring requestId, std::wstring keyword);
     void PostScanResult(const std::wstring& json);
     void StartLocalFolderScan(std::filesystem::path folder,
                               std::wstring username,
@@ -81,7 +89,9 @@ private:
     void HandleAsyncIoResult(std::uintptr_t resultId);
     void CancelAsyncIo() noexcept;
     bool DeferPlaybackForPendingSmbConnection(const std::filesystem::path& path,
-                                              double startPositionRatio);
+                                              double startPositionRatio,
+                                              int audioTrackIndex,
+                                              int subtitleTrackIndex);
     void CompleteDeferredSmbPlayback();
     void OpenLocalFolderDialog();
     void OpenMediaFileDialog();
@@ -94,11 +104,14 @@ private:
     std::shared_ptr<LibraryWindowAsyncState> asyncIoState_;
     bool webUiActive_ = false;
     PlaybackRequest playbackRequest_;
+    std::function<void()> uiLanguageChangedRequest_;
+    std::function<void()> refreshRatePreferencesChangedRequest_;
     std::function<void(bool)> allowInsecureCertificatesRequest_;
     std::function<void()> focusPlayerRequest_;
     std::function<void(const std::wstring&)> embyPlaybackReportRelay_;
     QuitHandler quitHandler_;
     std::function<void()> timerHandler_;
+    std::function<void(const std::wstring&)> debugLogHandler_;
 };
 
 }  // namespace anvil::app

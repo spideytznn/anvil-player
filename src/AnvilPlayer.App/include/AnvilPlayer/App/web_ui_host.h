@@ -35,6 +35,7 @@ public:
     void Resize(RECT bounds) const;
     void PostJson(const std::wstring& json) const;
     void SetAllowInsecureCertificates(bool allow) const;
+    void SetMuted(bool muted) const;
     bool Ready() const;
     HRESULT LastCreateResult() const;
     bool UsedDefaultOptionsFallback() const;

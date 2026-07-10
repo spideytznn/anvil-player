@@ -93,11 +93,30 @@ bool Application::Initialize(HINSTANCE instance, int commandShow, const AppArgum
     instance_ = instance;
     arguments_ = arguments;
 
+    logSink_ = std::make_shared<anvil::playback::InMemoryLogSink>(arguments_.logLevel);
+    logSink_->SetFilePath(std::filesystem::temp_directory_path() / L"anvil-player" / L"anvil-player.log");
+#if defined(_DEBUG)
+    logSink_->EnableDebuggerOutput(true);
+#endif
+    logSink_->Write(anvil::playback::LogLevel::Info, L"library", L"library logging initialized");
+
     library_ = std::make_unique<LibraryWindow>();
-    library_->SetPlaybackRequest([this](const std::filesystem::path& path, double startRatio) {
-        OpenInPlayer(path, startRatio);
+    library_->SetDebugLogHandler([this](const std::wstring& message) {
+        if (logSink_) logSink_->Write(anvil::playback::LogLevel::Debug, L"library", message);
+    });
+    library_->SetPlaybackRequest([this](const std::filesystem::path& path,
+                                       double startRatio,
+                                       int audioTrackIndex,
+                                       int subtitleTrackIndex) {
+        OpenInPlayer(path, startRatio, audioTrackIndex, subtitleTrackIndex);
     });
     library_->SetFocusPlayerRequest([this] { FocusPlayer(); });
+    library_->SetUiLanguageChangedRequest([this] {
+        if (player_) player_->RefreshUiLanguage();
+    });
+    library_->SetRefreshRatePreferencesChangedRequest([this] {
+        if (player_) player_->ApplyGlobalRefreshRatePreferences();
+    });
     library_->SetEmbyPlaybackReportRelay([this](const std::wstring& reportJson) {
         RelayEmbyPlaybackReport(reportJson);
     });
@@ -136,7 +155,7 @@ void Application::EnsurePlayerWindow() {
         return;
     }
 
-    player_ = std::make_unique<MainWindow>();
+    player_ = std::make_unique<MainWindow>(logSink_);
     player_->ConfigureLogging(arguments_.logLevel);
     player_->SetBackend(arguments_.backend);
     player_->SetInitialVideoTrackSelection(arguments_.selectedVideoTrackIndex);
@@ -147,15 +166,21 @@ void Application::EnsurePlayerWindow() {
         player_.reset();
         return;
     }
+    player_->ApplyGlobalRefreshRatePreferences();
     player_->Show(SW_SHOWNORMAL);
     // Note: a buffered Emby report (if any) is delivered/retried by the timer
     // started in RelayEmbyPlaybackReport; nothing extra needed here.
 }
 
-void Application::OpenInPlayer(const std::filesystem::path& path, double startPositionRatio) {
+void Application::OpenInPlayer(const std::filesystem::path& path,
+                               const double startPositionRatio,
+                               const int audioTrackIndex,
+                               const int subtitleTrackIndex) {
     if ((player_ && player_->IsClosing()) || PlayerReaperPreventsCreation()) {
         pendingPlayerOpenPath_ = path;
         pendingPlayerOpenRatio_ = startPositionRatio;
+        pendingPlayerAudioTrackIndex_ = audioTrackIndex;
+        pendingPlayerSubtitleTrackIndex_ = subtitleTrackIndex;
         ArmPlayerReaperPollIfNeeded();
         return;
     }
@@ -167,6 +192,7 @@ void Application::OpenInPlayer(const std::filesystem::path& path, double startPo
     // OpenInitialPath consumes pendingStartPositionRatio_ during playback start
     // to resume from a saved position.
     player_->SetPendingStartPositionRatio(startPositionRatio);
+    player_->SetPendingMediaTrackSelections(audioTrackIndex, subtitleTrackIndex);
     player_->OpenInitialPath(path, true);
 }
 
@@ -299,10 +325,14 @@ void Application::ReplayPendingPlayerRequest() {
     if (pendingPlayerOpenPath_) {
         const auto path = std::move(*pendingPlayerOpenPath_);
         const double ratio = pendingPlayerOpenRatio_;
+        const int audioTrackIndex = pendingPlayerAudioTrackIndex_;
+        const int subtitleTrackIndex = pendingPlayerSubtitleTrackIndex_;
         pendingPlayerOpenPath_.reset();
         pendingPlayerOpenRatio_ = 0.0;
+        pendingPlayerAudioTrackIndex_ = -2;
+        pendingPlayerSubtitleTrackIndex_ = -2;
         pendingPlayerFocus_ = false;
-        OpenInPlayer(path, ratio);
+        OpenInPlayer(path, ratio, audioTrackIndex, subtitleTrackIndex);
     } else if (pendingPlayerFocus_) {
         pendingPlayerFocus_ = false;
         FocusPlayer();

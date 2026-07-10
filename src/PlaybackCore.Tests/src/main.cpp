@@ -360,6 +360,28 @@ void TestInMemoryLogRetentionIsBounded() {
     assert(latest.back().message == L"entry=699");
 }
 
+void TestLogRedactsUrlCredentials() {
+    InMemoryLogSink sink(LogLevel::Debug);
+    sink.Write(LogLevel::Info,
+               L"network",
+               L"open path=http://media-user:secret-password@example.test/library/movie.mkv");
+
+    const auto entries = sink.Entries();
+    assert(entries.size() == 1);
+    assert(entries[0].message ==
+           L"open path=http://[credentials]@example.test/library/movie.mkv");
+    assert(entries[0].message.find(L"media-user") == std::wstring::npos);
+    assert(entries[0].message.find(L"secret-password") == std::wstring::npos);
+
+    sink.Write(LogLevel::Info,
+               L"network",
+               L"open path=https://example.test/stream.mkv?UserId=42&api_key=token-value&Static=true");
+    const auto tokenEntries = sink.Entries();
+    assert(tokenEntries.size() == 2);
+    assert(tokenEntries[1].message.find(L"api_key=[redacted]") != std::wstring::npos);
+    assert(tokenEntries[1].message.find(L"token-value") == std::wstring::npos);
+}
+
 void TestInvalidMediaFallsBackToExtensionProbe() {
     PlayerController controller;
     const auto path = MakeTempMediaFile();
@@ -488,6 +510,7 @@ int main() {
     TestLogFilteringAndFileOutput();
     TestConcurrentLogWritesAreBufferedAndFlushed();
     TestInMemoryLogRetentionIsBounded();
+    TestLogRedactsUrlCredentials();
     TestInvalidMediaFallsBackToExtensionProbe();
     TestRealAvformatProbeWhenFfmpegToolIsAvailable();
     TestCapabilityReportHasD3DShape();

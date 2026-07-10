@@ -157,6 +157,7 @@ private:
     void ResetRenderStatsOnRenderThread();
     void PublishRenderStats();
     void RenderOnRenderThread(const NativeVideoFrame& frame);
+    void RepeatLastPresentOnRenderThread();
     void ClearOnRenderThread();
 
     void EnableMultithreadProtection();
@@ -266,6 +267,8 @@ private:
     Microsoft::WRL::ComPtr<IDCompositionTarget> dcompTarget_;
     Microsoft::WRL::ComPtr<IDCompositionVisual> dcompVisual_;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> backBuffer_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> cachedOutputFrame_;
+    bool cachedOutputFrameValid_ = false;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> rtv_;
     Microsoft::WRL::ComPtr<ID3D11VertexShader> vs_;
     Microsoft::WRL::ComPtr<ID3D11PixelShader> ps_;
