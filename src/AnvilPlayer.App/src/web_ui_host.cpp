@@ -257,6 +257,13 @@ struct WebUiHost::Impl {
         controller->put_Bounds(current->pendingBounds);
         controller->put_IsVisible(TRUE);
 
+        // Let the native player window own Explorer file drops. The media
+        // library deliberately does not accept dropped files.
+        ComPtr<ICoreWebView2Controller4> controller4;
+        if (SUCCEEDED(controller.As(&controller4)) && controller4) {
+            controller4->put_AllowExternalDrop(FALSE);
+        }
+
         ComPtr<ICoreWebView2Settings> settings;
         if (SUCCEEDED(webview->get_Settings(&settings)) && settings) {
             settings->put_AreDefaultContextMenusEnabled(FALSE);

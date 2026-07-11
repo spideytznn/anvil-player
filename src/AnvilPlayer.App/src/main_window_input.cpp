@@ -5,11 +5,13 @@
 #include <windowsx.h>
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <cstddef>
 #include <cmath>
 #include <iterator>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -18,6 +20,131 @@ namespace anvil::app {
 using anvil::playback::PlaybackState;
 
 namespace {
+
+class MediaFileDropTarget final : public IDropTarget {
+public:
+    MediaFileDropTarget(std::function<void(const std::filesystem::path&)> onDrop,
+                        std::function<void(const std::wstring&)> trace,
+                        const HWND targetWindow)
+        : onDrop_(std::move(onDrop)), trace_(std::move(trace)), targetWindow_(targetWindow) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
+        if (!object) return E_POINTER;
+        *object = nullptr;
+        if (iid == IID_IUnknown || iid == IID_IDropTarget) {
+            *object = static_cast<IDropTarget*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return ++references_;
+    }
+
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG remaining = --references_;
+        if (remaining == 0) delete this;
+        return remaining;
+    }
+
+    HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* dataObject,
+                                        DWORD,
+                                        POINTL,
+                                        DWORD* effect) override {
+        const HRESULT result = UpdateEffect(dataObject, effect);
+        Trace(L"DragEnter accepts=" + std::wstring(acceptsCurrentDrag_ ? L"true" : L"false"));
+        return result;
+    }
+
+    HRESULT STDMETHODCALLTYPE DragOver(DWORD, POINTL, DWORD* effect) override {
+        if (effect) *effect = acceptsCurrentDrag_ ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE DragLeave() override {
+        Trace(L"DragLeave");
+        acceptsCurrentDrag_ = false;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE Drop(IDataObject* dataObject,
+                                   DWORD,
+                                   POINTL,
+                                   DWORD* effect) override {
+        acceptsCurrentDrag_ = false;
+        if (effect) *effect = DROPEFFECT_NONE;
+        Trace(L"Drop received");
+        if (!dataObject) {
+            Trace(L"Drop rejected reason=null_data_object");
+            return E_INVALIDARG;
+        }
+
+        FORMATETC format{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+        STGMEDIUM medium{};
+        const HRESULT getDataResult = dataObject->GetData(&format, &medium);
+        if (FAILED(getDataResult)) {
+            Trace(L"Drop rejected reason=get_data_failed hr=" + HrText(getDataResult));
+            return S_FALSE;
+        }
+
+        const auto drop = static_cast<HDROP>(GlobalLock(medium.hGlobal));
+        if (!drop) {
+            Trace(L"Drop rejected reason=global_lock_failed");
+            ReleaseStgMedium(&medium);
+            return E_FAIL;
+        }
+
+        std::filesystem::path path;
+        const UINT length = DragQueryFileW(drop, 0, nullptr, 0);
+        if (length > 0) {
+            std::vector<wchar_t> value(static_cast<std::size_t>(length) + 1);
+            if (DragQueryFileW(drop, 0, value.data(), static_cast<UINT>(value.size())) > 0) {
+                path = value.data();
+            }
+        }
+        GlobalUnlock(medium.hGlobal);
+        ReleaseStgMedium(&medium);
+
+        if (path.empty()) {
+            Trace(L"Drop rejected reason=empty_path");
+            return S_FALSE;
+        }
+        Trace(L"Drop path=" + path.wstring());
+        if (effect) *effect = DROPEFFECT_COPY;
+        if (onDrop_) onDrop_(path);
+        return S_OK;
+    }
+
+private:
+    static std::wstring HrText(const HRESULT result) {
+        std::wostringstream value;
+        value << L"0x" << std::hex << std::uppercase << static_cast<unsigned long>(result);
+        return value.str();
+    }
+
+    void Trace(const std::wstring& message) const {
+        if (!trace_) return;
+        std::wostringstream value;
+        value << L"media drop hwnd=0x" << std::hex << std::uppercase
+              << reinterpret_cast<std::uintptr_t>(targetWindow_) << L" " << message;
+        trace_(value.str());
+    }
+
+    HRESULT UpdateEffect(IDataObject* dataObject, DWORD* effect) {
+        FORMATETC format{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+        acceptsCurrentDrag_ = dataObject && SUCCEEDED(dataObject->QueryGetData(&format));
+        if (effect) *effect = acceptsCurrentDrag_ ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+        return S_OK;
+    }
+
+    std::atomic<ULONG> references_{1};
+    std::function<void(const std::filesystem::path&)> onDrop_;
+    std::function<void(const std::wstring&)> trace_;
+    HWND targetWindow_ = nullptr;
+    bool acceptsCurrentDrag_ = false;
+};
 
 void SavePassthroughSetting(const wchar_t* name, const bool enabled) {
     HKEY key = nullptr;
@@ -2011,14 +2138,64 @@ void MainWindow::ShowSubtitleMenu() {
 }
 
 void MainWindow::OnDropFiles(HDROP drop) {
+    LogApp(anvil::playback::LogLevel::Info, L"media drop WM_DROPFILES received");
     const UINT length = DragQueryFileW(drop, 0, nullptr, 0);
     if (length > 0) {
         std::vector<wchar_t> path(static_cast<std::size_t>(length) + 1);
         if (DragQueryFileW(drop, 0, path.data(), static_cast<UINT>(path.size())) > 0) {
+            LogApp(anvil::playback::LogLevel::Info, L"media drop WM_DROPFILES path=" + std::wstring(path.data()));
             OpenPath(path.data());
         }
     }
     DragFinish(drop);
+}
+
+void MainWindow::RegisterMediaDropTarget() {
+    if (!hwnd_) return;
+
+    std::vector<HWND> windows{hwnd_};
+    EnumChildWindows(hwnd_, [](HWND child, LPARAM context) -> BOOL {
+        reinterpret_cast<std::vector<HWND>*>(context)->push_back(child);
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&windows));
+
+    for (const HWND window : windows) {
+        const auto existing = std::find_if(mediaDropTargets_.begin(), mediaDropTargets_.end(),
+                                           [window](const auto& item) { return item.first == window; });
+        if (existing != mediaDropTargets_.end()) continue;
+
+        wchar_t className[256]{};
+        GetClassNameW(window, className, static_cast<int>(std::size(className)));
+        auto* target = new MediaFileDropTarget(
+            [this](const std::filesystem::path& path) {
+                LogApp(anvil::playback::LogLevel::Info, L"media drop dispatch OpenPath path=" + path.wstring());
+                OpenPath(path, true);
+            },
+            [this](const std::wstring& message) {
+                LogApp(anvil::playback::LogLevel::Info, message);
+            },
+            window);
+        const HRESULT result = RegisterDragDrop(window, target);
+        std::wostringstream detail;
+        detail << L"media drop target hwnd=0x" << std::hex << std::uppercase
+               << reinterpret_cast<std::uintptr_t>(window) << L" class=" << className
+               << L" hr=0x" << static_cast<unsigned long>(result);
+        if (SUCCEEDED(result)) {
+            mediaDropTargets_.emplace_back(window, target);
+            LogApp(anvil::playback::LogLevel::Info, detail.str() + L" registered=true");
+        } else {
+            target->Release();
+            LogApp(anvil::playback::LogLevel::Warning, detail.str() + L" registered=false");
+        }
+    }
+}
+
+void MainWindow::RevokeMediaDropTarget() noexcept {
+    for (const auto& [window, target] : mediaDropTargets_) {
+        if (IsWindow(window)) RevokeDragDrop(window);
+        target->Release();
+    }
+    mediaDropTargets_.clear();
 }
 
 void MainWindow::OpenInspectorPathItem(const int itemIndex) {

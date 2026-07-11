@@ -20,6 +20,7 @@
 
 #include <shellapi.h>
 #include <windows.h>
+#include <oleidl.h>
 
 #include <array>
 #include <atomic>
@@ -282,6 +283,8 @@ private:
     void HideHdrToneCurveWindow();
     void OnKeyDown(WPARAM key);
     void OnDropFiles(HDROP drop);
+    void RegisterMediaDropTarget();
+    void RevokeMediaDropTarget() noexcept;
     void Execute(Command command);
     void OpenInspectorPathItem(int itemIndex);
     void OpenFileDialog();
@@ -642,6 +645,7 @@ private:
     mutable std::shared_ptr<RecentMediaWriterState> recentMediaWriter_;
     std::vector<InspectorPathItem> inspectorPathItems_;
     std::vector<UiButton> buttons_;
+    std::vector<std::pair<HWND, IDropTarget*>> mediaDropTargets_;
     bool automaticDisplayLeaseActive_ = false;
     bool automaticDisplayOriginalHdrEnabled_ = false;
     bool automaticDisplayChanged_ = false;

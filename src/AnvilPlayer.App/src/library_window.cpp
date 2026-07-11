@@ -1815,7 +1815,6 @@ LRESULT LibraryWindow::HandleMessage(const UINT message, const WPARAM wParam, co
         dpi_ = GetDpiForWindow(hwnd_);
         ActivateLibraryAsyncState(asyncIoState_, hwnd_);
         ApplyWindowChrome();
-        DragAcceptFiles(hwnd_, TRUE);
         return 0;
     case WM_COPYDATA: {
         // Single-instance command-line forwarding from a second launch. Parse
@@ -1844,16 +1843,6 @@ LRESULT LibraryWindow::HandleMessage(const UINT message, const WPARAM wParam, co
             webUiHost_->Resize(client);
         }
         return 0;
-    case WM_DROPFILES: {
-        HDROP drop = reinterpret_cast<HDROP>(wParam);
-        wchar_t filePath[MAX_PATH]{};
-        const UINT queried = DragQueryFileW(drop, 0, filePath, static_cast<UINT>(std::size(filePath)));
-        DragFinish(drop);
-        if (queried > 0 && playbackRequest_) {
-            playbackRequest_(std::filesystem::path(filePath), 0.0, -2, -2);
-        }
-        return 0;
-    }
     case kLocalFolderScanResultMessage: {
         if (wParam != 0) {
             // A stale message can target a recycled HWND. Only the cookie for

@@ -485,6 +485,7 @@ void MainWindow::ReleaseUiThreadResourcesForBackgroundDestruction() noexcept {
         return;
     }
     uiThreadResourcesReleased_ = true;
+    RevokeMediaDropTarget();
     RestoreAutomaticDisplayFormat();
     refreshRateController_.Restore();
 
@@ -1564,6 +1565,7 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
         dpi_ = GetDpiForWindow(hwnd_);
         ApplyWindowChrome();
         DragAcceptFiles(hwnd_, TRUE);
+        RegisterMediaDropTarget();
         SetPlaybackTimer(false);
         MarkLayoutDirty();
         EnsureLayout();
@@ -1939,6 +1941,7 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
         KillTimer(hwnd_, kVideoPressTimer);
         KillTimer(hwnd_, kScrollbarAutoHideTimer);
         KillTimer(hwnd_, kAsyncCompletionPollTimer);
+        RevokeMediaDropTarget();
         DragAcceptFiles(hwnd_, FALSE);
         if (hdrToneCurveWindow_) {
             DestroyWindow(hdrToneCurveWindow_);
@@ -3062,6 +3065,10 @@ void MainWindow::SetPlaybackTimer(const bool playing) {
 }
 
 void MainWindow::OnPlaybackTimerTick() {
+    // WebView2 creates its input child windows asynchronously. Keep the native
+    // file-drop target attached to newly-created player descendants as well as
+    // the top-level window.
+    RegisterMediaDropTarget();
     PollPlaybackSupervisorCompletion();
     {
         auto settings = controller_.Settings();
