@@ -38,7 +38,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <AdditionalLibraryDirectories>$(SolutionDir)third_party\ffmpeg\lib;$(SolutionDir)third_party\webview2\lib\win-$(Platform);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>avformat.lib;avcodec.lib;avutil.lib;avfilter.lib;swscale.lib;swresample.lib;WebView2LoaderStatic.lib;advapi32.lib;comdlg32.lib;d3d11.lib;d3dcompiler.lib;dxgi.lib;dxguid.lib;dwmapi.lib;dcomp.lib;gdiplus.lib;shell32.lib;shlwapi.lib;ole32.lib;version.lib;mpr.lib;netapi32.lib;winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>avformat.lib;avcodec.lib;avutil.lib;avfilter.lib;swscale.lib;swresample.lib;WebView2LoaderStatic.lib;advapi32.lib;comdlg32.lib;d3d11.lib;d3dcompiler.lib;dxgi.lib;dxguid.lib;dwmapi.lib;dcomp.lib;gdiplus.lib;shell32.lib;shlwapi.lib;ole32.lib;oleaut32.lib;runtimeobject.lib;mf.lib;mfplat.lib;mfuuid.lib;version.lib;mpr.lib;netapi32.lib;winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Manifest>
       <AdditionalManifestFiles>app.manifest;%(AdditionalManifestFiles)</AdditionalManifestFiles>
@@ -77,8 +77,10 @@ if exist "$(SolutionDir)third_party\webview2-runtime\Microsoft.WebView2.FixedVer
     <ClCompile Include="src\main_window_input.cpp" />
     <ClCompile Include="src\main_window_layout.cpp" />
     <ClCompile Include="src\main_window_paint.cpp" />
+    <ClCompile Include="src\nvidia_hdr_output.cpp" />
     <ClCompile Include="src\playback_supervisor.cpp" />
     <ClCompile Include="src\single_instance.cpp" />
+    <ClCompile Include="src\system_dolby_vision_player.cpp" />
     <ClCompile Include="src\string_util.cpp" />
     <ClCompile Include="src\color_metadata_util.cpp" />
     <ClCompile Include="src\subtitle_util.cpp" />
@@ -106,11 +108,13 @@ if exist "$(SolutionDir)third_party\webview2-runtime\Microsoft.WebView2.FixedVer
     <ClInclude Include="include\AnvilPlayer\App\libass_subtitle_renderer.h" />
     <ClInclude Include="include\AnvilPlayer\App\log_sink_ptr.h" />
     <ClInclude Include="include\AnvilPlayer\App\main_window.h" />
+    <ClInclude Include="include\AnvilPlayer\App\nvidia_hdr_output.h" />
     <ClInclude Include="include\AnvilPlayer\App\playback_supervisor.h" />
     <ClInclude Include="include\AnvilPlayer\App\rect_util.h" />
     <ClInclude Include="include\AnvilPlayer\App\single_instance.h" />
     <ClInclude Include="include\AnvilPlayer\App\string_util.h" />
     <ClInclude Include="include\AnvilPlayer\App\subtitle_util.h" />
+    <ClInclude Include="include\AnvilPlayer\App\system_dolby_vision_player.h" />
     <ClInclude Include="include\AnvilPlayer\App\ui_animation_math.h" />
     <ClInclude Include="include\AnvilPlayer\App\ui_draw.h" />
     <ClInclude Include="include\AnvilPlayer\App\ui_types.h" />

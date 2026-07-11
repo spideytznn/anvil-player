@@ -139,7 +139,9 @@ bool HdrFormatLooksHdr(const std::wstring& value) {
 }
 
 bool MediaIsDolbyVision(const std::optional<anvil::playback::MediaDescriptor>& media) {
-    return media.has_value() && media->hasVideo && media->dolbyVisionDetected;
+    return media.has_value() &&
+           media->hasVideo &&
+           (media->dolbyVisionDetected || ContainsInsensitive(media->hdrFormat, L"Dolby Vision"));
 }
 
 bool MediaHasDolbyVisionEnhancementStream(const std::optional<anvil::playback::MediaDescriptor>& media) {
@@ -342,10 +344,131 @@ std::wstring HdrToneCurveJson(const anvil::playback::VideoSettings& settings) {
     return json.str();
 }
 
+constexpr wchar_t kVideoSettingsRegistryPath[] = L"Software\\AnvilPlayer\\Video";
+
+std::optional<bool> LoadVideoBooleanSetting(const wchar_t* name) {
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    if (RegGetValueW(HKEY_CURRENT_USER,
+                     kVideoSettingsRegistryPath,
+                     name,
+                     RRF_RT_REG_DWORD,
+                     nullptr,
+                     &value,
+                     &size) != ERROR_SUCCESS) {
+        return std::nullopt;
+    }
+    return value != 0;
+}
+
+void SaveVideoBooleanSetting(const wchar_t* name, const bool enabled) {
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER,
+                        kVideoSettingsRegistryPath,
+                        0,
+                        nullptr,
+                        REG_OPTION_NON_VOLATILE,
+                        KEY_SET_VALUE,
+                        nullptr,
+                        &key,
+                        nullptr) != ERROR_SUCCESS) {
+        return;
+    }
+    const DWORD value = enabled ? 1u : 0u;
+    RegSetValueExW(key,
+                   name,
+                   0,
+                   REG_DWORD,
+                   reinterpret_cast<const BYTE*>(&value),
+                   sizeof(value));
+    RegCloseKey(key);
+}
+
+bool ResolveWindowDisplayTarget(HWND window,
+                                LUID& adapterId,
+                                UINT32& targetId,
+                                bool& hdrSupported,
+                                bool& hdrEnabled) {
+    MONITORINFOEXW monitor{};
+    monitor.cbSize = sizeof(monitor);
+    if (!window || !GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &monitor)) {
+        return false;
+    }
+
+    UINT32 pathCount = 0;
+    UINT32 modeCount = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS) {
+        return false;
+    }
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS,
+                           &pathCount,
+                           paths.data(),
+                           &modeCount,
+                           modes.data(),
+                           nullptr) != ERROR_SUCCESS) {
+        return false;
+    }
+
+    for (UINT32 index = 0; index < pathCount; ++index) {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
+        source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        source.header.size = sizeof(source);
+        source.header.adapterId = paths[index].sourceInfo.adapterId;
+        source.header.id = paths[index].sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS ||
+            _wcsicmp(source.viewGdiDeviceName, monitor.szDevice) != 0) {
+            continue;
+        }
+
+        DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO color{};
+        color.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+        color.header.size = sizeof(color);
+        color.header.adapterId = paths[index].targetInfo.adapterId;
+        color.header.id = paths[index].targetInfo.id;
+        if (DisplayConfigGetDeviceInfo(&color.header) != ERROR_SUCCESS) {
+            return false;
+        }
+        adapterId = color.header.adapterId;
+        targetId = color.header.id;
+        hdrSupported = color.advancedColorSupported != 0;
+        hdrEnabled = color.advancedColorEnabled != 0;
+        return true;
+    }
+    return false;
+}
+
+bool SetDisplayHdrState(const LUID adapterId, const UINT32 targetId, const bool enabled) {
+    DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE state{};
+    state.header.type = DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE;
+    state.header.size = sizeof(state);
+    state.header.adapterId = adapterId;
+    state.header.id = targetId;
+    state.enableAdvancedColor = enabled ? 1u : 0u;
+    return DisplayConfigSetDeviceInfo(&state.header) == ERROR_SUCCESS;
+}
+
 }  // namespace
 
 MainWindow::MainWindow(std::shared_ptr<anvil::playback::InMemoryLogSink> logSink)
     : controller_(std::move(logSink)) {
+    auto settings = controller_.Settings();
+    if (const auto value = LoadVideoBooleanSetting(L"DisplayMetadataPassthrough")) {
+        settings.video.displayMetadataPassthrough = *value;
+    }
+    if (const auto value = LoadVideoBooleanSetting(L"AutoDisplayFormat")) {
+        settings.video.autoDisplayFormat = *value;
+        if (*value) {
+            settings.video.displayMetadataPassthrough = true;
+            settings.video.dolbyVisionSystemPipelineExperimental = true;
+        }
+    }
+    if (const auto value = LoadVideoBooleanSetting(L"DolbyVisionSystemPipelineExperimental")) {
+        settings.video.dolbyVisionSystemPipelineExperimental =
+            *value && anvil::playback::CapabilityDetector::IsHdrEnabledNow();
+    }
+    controller_.ApplySettings(settings);
 }
 
 MainWindow::~MainWindow() {
@@ -362,6 +485,7 @@ void MainWindow::ReleaseUiThreadResourcesForBackgroundDestruction() noexcept {
         return;
     }
     uiThreadResourcesReleased_ = true;
+    RestoreAutomaticDisplayFormat();
     refreshRateController_.Restore();
 
     // WebView2 controller/environment releases must stay on the apartment
@@ -558,6 +682,33 @@ std::filesystem::path MainWindow::WebUiRoot() const {
     return {};
 }
 
+void MainWindow::MoveToMonitorOf(const HWND sourceWindow) {
+    if (!hwnd_ || !sourceWindow || fullscreen_ || IsZoomed(hwnd_) || IsIconic(hwnd_)) {
+        return;
+    }
+
+    const HMONITOR targetMonitor = MonitorFromWindow(sourceWindow, MONITOR_DEFAULTTONEAREST);
+    const HMONITOR currentMonitor = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
+    if (!targetMonitor || targetMonitor == currentMonitor) {
+        return;
+    }
+
+    MONITORINFO targetInfo{};
+    targetInfo.cbSize = sizeof(targetInfo);
+    RECT playerBounds{};
+    if (!GetMonitorInfoW(targetMonitor, &targetInfo) || !GetWindowRect(hwnd_, &playerBounds)) {
+        return;
+    }
+
+    const int width = std::min(RectWidth(playerBounds), RectWidth(targetInfo.rcWork));
+    const int height = std::min(RectHeight(playerBounds), RectHeight(targetInfo.rcWork));
+    const int x = targetInfo.rcWork.left + std::max(0, RectWidth(targetInfo.rcWork) - width) / 2;
+    const int y = targetInfo.rcWork.top + std::max(0, RectHeight(targetInfo.rcWork) - height) / 2;
+    SetWindowPos(hwnd_, nullptr, x, y, width, height,
+                 SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER);
+    LogApp(LogLevel::Info, L"player moved to library monitor");
+}
+
 void MainWindow::SetPendingMediaTrackSelections(const int audioTrackIndex,
                                                 const int subtitleTrackIndex) {
     auto settings = controller_.Settings();
@@ -600,6 +751,7 @@ bool MainWindow::TryCreateWebUi() {
 std::wstring MainWindow::BuildWebUiStateJson() const {
     const auto snapshot = controller_.Snapshot();
     const auto settings = controller_.Settings();
+    const auto capabilities = anvil::playback::CapabilityDetector::CollectBasic();
 
     std::wstring playbackState = ToDisplayString(snapshot.state);
     if (!snapshot.media.has_value()) {
@@ -627,7 +779,9 @@ std::wstring MainWindow::BuildWebUiStateJson() const {
             bufferedEndMs = std::clamp<long long>(stats.bufferedEnd.count(), positionMs, durationMs);
         }
     }
+    const bool windowsHdrEnabled = anvil::playback::CapabilityDetector::IsHdrEnabledNow();
     const bool hdrAvailable = CurrentMediaHasHdrControls();
+    const bool dolbyVisionMedia = MediaIsDolbyVision(snapshot.media);
     const bool cmv4Available = CurrentMediaHasCmv4Control();
     const bool cmv4Enabled = CurrentCmv4ControlEnabled(settings) && settings.video.dolbyVisionCmv4Approx;
     const bool hdrToneCurveAvailable = HdrToneCurveAvailable(settings);
@@ -686,6 +840,23 @@ std::wstring MainWindow::BuildWebUiStateJson() const {
     json << L"\"inspectorTab\":\"" << InspectorTabName(inspectorTab_) << L"\",";
     json << L"\"hdrAvailable\":" << (hdrAvailable ? L"true" : L"false") << L",";
     json << L"\"hdrOutput\":" << (settings.video.dolbyVisionHdrOutput ? L"true" : L"false") << L",";
+    json << L"\"hdrOutputLocked\":"
+         << ((settings.video.autoDisplayFormat ||
+              (windowsHdrEnabled && (settings.video.displayMetadataPassthrough ||
+                                    settings.video.dolbyVisionSystemPipelineExperimental))
+             )
+                 ? L"true"
+                 : L"false")
+         << L",";
+    json << L"\"windowsHdrEnabled\":" << (windowsHdrEnabled ? L"true" : L"false") << L",";
+    json << L"\"autoDisplayFormat\":" << (settings.video.autoDisplayFormat ? L"true" : L"false") << L",";
+    json << L"\"displayMetadataPassthrough\":" << (settings.video.displayMetadataPassthrough ? L"true" : L"false") << L",";
+    json << L"\"dolbyVisionSystemPipelineExperimental\":"
+         << (settings.video.dolbyVisionSystemPipelineExperimental ? L"true" : L"false") << L",";
+    json << L"\"dolbyVisionSystemPipelineAvailable\":"
+         << ((windowsHdrEnabled && cachedCapabilities_.codecs.dolbyVisionExtensionDetected) ? L"true" : L"false")
+         << L",";
+    json << L"\"dolbyVisionMedia\":" << (dolbyVisionMedia ? L"true" : L"false") << L",";
     json << L"\"cmv4Available\":" << (cmv4Available ? L"true" : L"false") << L",";
     json << L"\"cmv4Enabled\":" << (cmv4Enabled ? L"true" : L"false") << L",";
     json << L"\"audioSelectedTrack\":" << settings.audio.selectedTrackIndex << L",";
@@ -738,6 +909,10 @@ void MainWindow::PostWebUiState(const bool force) const {
 }
 
 void MainWindow::HandleWebUiMessage(const std::wstring_view message) {
+    if (MessageContains(message, L"\"command\":\"localPlaybackProgress\"")) {
+        if (localPlaybackProgressRelay_) localPlaybackProgressRelay_(std::wstring(message));
+        return;
+    }
     if (MessageContains(message, L"\"type\":\"requestState\"")) {
         PostWebUiState();
         return;
@@ -910,6 +1085,12 @@ void MainWindow::HandleWebUiMessage(const std::wstring_view message) {
         Execute(Command::ToggleDolbyVisionHdr);
     } else if (MessageContains(message, L"\"command\":\"toggleCmv4\"")) {
         Execute(Command::ToggleDolbyVisionCmv4Approx);
+    } else if (MessageContains(message, L"\"command\":\"setAutoDisplayFormat\"")) {
+        SetAutomaticDisplayFormat(MessageContains(message, L"\"enabled\":true"));
+    } else if (MessageContains(message, L"\"command\":\"setDisplayMetadataPassthrough\"")) {
+        SetDisplayMetadataPassthrough(MessageContains(message, L"\"enabled\":true"));
+    } else if (MessageContains(message, L"\"command\":\"setDolbyVisionSystemPipelineExperimental\"")) {
+        SetDolbyVisionSystemPipelineExperimental(MessageContains(message, L"\"enabled\":true"));
     } else if (MessageContains(message, L"\"command\":\"setAudioTrack\"")) {
         if (const auto index = ReadJsonNumber(message, L"index")) {
             ApplyAudioSelection(static_cast<int>(std::round(*index)));
@@ -1043,13 +1224,53 @@ LRESULT CALLBACK MainWindow::VideoHostProc(HWND hwnd, UINT message, WPARAM wPara
         window = reinterpret_cast<MainWindow*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     }
 
-    if (window && (message == WM_MOUSEMOVE || message == WM_LBUTTONDOWN || message == WM_LBUTTONUP)) {
+    if (window && message == WM_MOUSEMOVE && !window->videoHostTrackingMouseLeave_) {
+        TRACKMOUSEEVENT event{};
+        event.cbSize = sizeof(event);
+        event.dwFlags = TME_LEAVE;
+        event.hwndTrack = hwnd;
+        window->videoHostTrackingMouseLeave_ = TrackMouseEvent(&event) != FALSE;
+    }
+    if (window && message == WM_MOUSEMOVE) {
         POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         MapWindowPoints(hwnd, window->hwnd_, &point, 1);
-        return SendMessageW(window->hwnd_, message, wParam, MAKELPARAM(point.x, point.y));
+        window->OnMouseMove(point.x, point.y);
+        return 0;
     }
-    if (window && (message == WM_KEYDOWN || message == WM_SYSKEYDOWN) && wParam == VK_ESCAPE) {
-        return SendMessageW(window->hwnd_, message, wParam, lParam);
+    if (window && message == WM_LBUTTONDOWN) {
+        POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        MapWindowPoints(hwnd, window->hwnd_, &point, 1);
+        window->OnLeftButtonDown(point.x, point.y);
+        return 0;
+    }
+    if (window && message == WM_LBUTTONUP) {
+        POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        MapWindowPoints(hwnd, window->hwnd_, &point, 1);
+        window->OnLeftButtonUp(point.x, point.y);
+        return 0;
+    }
+    if (window && message == WM_MOUSELEAVE) {
+        window->videoHostTrackingMouseLeave_ = false;
+        window->OnMouseLeave();
+        return 0;
+    }
+    if (window && message == WM_MOUSEWHEEL) {
+        POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+        window->OnMouseWheel(GET_WHEEL_DELTA_WPARAM(wParam), point);
+        return 0;
+    }
+    if (window && message == WM_SETCURSOR && LOWORD(lParam) == HTCLIENT) {
+        POINT point{};
+        GetCursorPos(&point);
+        ScreenToClient(window->hwnd_, &point);
+        SetCursor(LoadCursorW(nullptr, window->IsPointInteractive(point) ? IDC_HAND : IDC_ARROW));
+        return TRUE;
+    }
+    if (window &&
+        (message == WM_KEYDOWN || message == WM_SYSKEYDOWN) &&
+        (wParam == VK_ESCAPE || wParam == VK_SPACE || wParam == VK_LEFT || wParam == VK_RIGHT)) {
+        window->OnKeyDown(wParam);
+        return 0;
     }
 
     if (message == WM_ERASEBKGND) {
@@ -1585,18 +1806,18 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
         UpdateFullscreenOverlay();
         return 0;
     case WM_MOUSEMOVE:
+        if (!trackingMouseLeave_) {
+            TRACKMOUSEEVENT event{};
+            event.cbSize = sizeof(event);
+            event.dwFlags = TME_LEAVE;
+            event.hwndTrack = hwnd_;
+            trackingMouseLeave_ = TrackMouseEvent(&event) != FALSE;
+        }
         OnMouseMove(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
         return 0;
     case WM_MOUSELEAVE:
         trackingMouseLeave_ = false;
-        ClearButtonHoverTargets();
-        hoveredButton_ = -1;
-        hoveredInspectorPathItem_ = -1;
-        hoveredHdrToneCurvePoint_ = -1;
-        SetVolumeSliderHover(false);
-        SetProgressHover(false);
-        InvalidateFullscreenOverlay();
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        OnMouseLeave();
         return 0;
     case WM_SETCURSOR:
         if (LOWORD(lParam) == HTCLIENT) {
@@ -2134,6 +2355,14 @@ void MainWindow::SetButtonHoverTarget(const int buttonIndex, const bool hovered)
         return;
     }
 
+    if (UsesGpuFullscreenUiOverlay()) {
+        animation.amount = target;
+        animation.startAmount = target;
+        animation.target = target;
+        InvalidateTransportArea();
+        return;
+    }
+
     animation.startAmount = animation.amount;
     animation.target = target;
     animation.startedAt = std::chrono::steady_clock::now();
@@ -2144,6 +2373,20 @@ void MainWindow::SetButtonHoverTarget(const int buttonIndex, const bool hovered)
 }
 
 void MainWindow::ClearButtonHoverTargets() {
+    if (UsesGpuFullscreenUiOverlay()) {
+        bool changed = false;
+        for (auto& animation : buttonHoverAnimations_) {
+            changed = changed || animation.amount > 0.001 || animation.target > 0.001;
+            animation.amount = 0.0;
+            animation.startAmount = 0.0;
+            animation.target = 0.0;
+        }
+        if (changed) {
+            InvalidateTransportArea();
+        }
+        return;
+    }
+
     bool changed = false;
     const auto now = std::chrono::steady_clock::now();
     for (auto& animation : buttonHoverAnimations_) {
@@ -2176,6 +2419,10 @@ void MainWindow::TriggerButtonPress(const int buttonIndex) {
     }
 
     UiMotionValue& animation = buttonPressAnimations_[slot];
+    if (UsesGpuFullscreenUiOverlay()) {
+        animation = {};
+        return;
+    }
     animation.amount = 1.0;
     animation.startAmount = 1.0;
     animation.target = 0.0;
@@ -2208,6 +2455,13 @@ void MainWindow::SetVolumeSliderHover(const bool hovered) {
     }
 
     volumeSliderHovered_ = hovered;
+    if (UsesGpuFullscreenUiOverlay()) {
+        volumeHoverAmount_ = hovered ? 1.0 : 0.0;
+        volumeHoverStartAmount_ = volumeHoverAmount_;
+        volumeHoverTarget_ = volumeHoverAmount_;
+        InvalidateTransportArea();
+        return;
+    }
     volumeHoverStartAmount_ = volumeHoverAmount_;
     volumeHoverTarget_ = hovered ? 1.0 : 0.0;
     volumeHoverAnimationStartedAt_ = std::chrono::steady_clock::now();
@@ -2351,11 +2605,9 @@ void MainWindow::UpdateUiAnimations() {
         InvalidateRect(hwnd_, nullptr, FALSE);
     }
     if (fullscreenTransportValueChanged) {
-        UpdateVideoHost();
         InvalidateFullscreenOverlay();
     }
     if (subtitleMenuValueChanged) {
-        UpdateVideoHost();
         UpdateSubtitleMenuOverlay();
         InvalidateTransportArea();
         InvalidateFullscreenOverlay();
@@ -2423,6 +2675,24 @@ void MainWindow::SetSubtitleMenuTarget(const bool visible) {
     }
 
     subtitleMenuOpen_ = visible || subtitleMenuAmount_ > 0.001;
+    if (UsesGpuFullscreenUiOverlay()) {
+        subtitleMenuOpen_ = visible;
+        subtitleMenuAmount_ = target;
+        subtitleMenuStartAmount_ = target;
+        subtitleMenuTarget_ = target;
+        if (!visible) {
+            hoveredSubtitleMenuItem_ = -1;
+        }
+        MarkLayoutDirty();
+        EnsureLayout();
+        UpdateVideoHost();
+        UpdateSubtitleMenuOverlay();
+        InvalidateTransportArea();
+        InvalidateFullscreenOverlay();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        PostWebUiState();
+        return;
+    }
     subtitleMenuStartAmount_ = subtitleMenuAmount_;
     subtitleMenuTarget_ = target;
     subtitleMenuAnimationStartedAt_ = std::chrono::steady_clock::now();
@@ -2485,6 +2755,13 @@ void MainWindow::SetProgressHover(const bool hovered) {
     }
 
     progressHovered_ = hovered;
+    if (UsesGpuFullscreenUiOverlay()) {
+        progressHoverAmount_ = hovered ? 1.0 : 0.0;
+        progressHoverStartAmount_ = progressHoverAmount_;
+        progressHoverTarget_ = progressHoverAmount_;
+        InvalidateTransportArea();
+        return;
+    }
     progressHoverStartAmount_ = progressHoverAmount_;
     progressHoverTarget_ = hovered ? 1.0 : 0.0;
     progressHoverAnimationStartedAt_ = std::chrono::steady_clock::now();
@@ -2669,7 +2946,24 @@ void MainWindow::HideFullscreenTransportIfIdle() {
 void MainWindow::SetFullscreenTransportTarget(const bool visible) {
     fullscreenTransportVisible_ = visible;
     const double target = visible ? 1.0 : 0.0;
-    if (std::abs(fullscreenTransportTarget_ - target) < 0.001) {
+    if (std::abs(fullscreenTransportTarget_ - target) < 0.001 &&
+        (!UsesGpuFullscreenUiOverlay() || std::abs(fullscreenTransportAmount_ - target) < 0.001)) {
+        return;
+    }
+
+    if (UsesGpuFullscreenUiOverlay()) {
+        fullscreenTransportAmount_ = target;
+        fullscreenTransportStartAmount_ = target;
+        fullscreenTransportTarget_ = target;
+        MarkLayoutDirty();
+        EnsureLayout();
+        UpdateVideoHost();
+        // Visibility transitions must not wait for the next decoded frame. A
+        // stalled stream or a just-paused decoder may not produce one.
+        QueueGpuFullscreenUiOverlay(true);
+        InvalidateFullscreenOverlay();
+        InvalidateRect(hwnd_, nullptr, FALSE);
+        PostWebUiState();
         return;
     }
 
@@ -2711,6 +3005,7 @@ void MainWindow::SetTemporaryPlaybackRate(const double rate) {
     const auto snapshot = controller_.Snapshot();
     if (!snapshot.media.has_value()) {
         audioPlayer_.SetPlaybackRate(1.0);
+        systemDolbyVisionPlayer_.SetPlaybackRate(1.0);
         temporaryRateActive_ = false;
         return;
     }
@@ -2719,16 +3014,21 @@ void MainWindow::SetTemporaryPlaybackRate(const double rate) {
     if (std::abs(snapshot.playbackRate - clamped) < 0.001) {
         temporaryRateActive_ = clamped > 1.01;
         audioPlayer_.SetPlaybackRate(clamped);
+        systemDolbyVisionPlayer_.SetPlaybackRate(clamped);
         return;
     }
 
     controller_.SetPlaybackRate(clamped);
     audioPlayer_.SetPlaybackRate(clamped);
+    systemDolbyVisionPlayer_.SetPlaybackRate(clamped);
     temporaryRateActive_ = clamped > 1.01;
     InvalidateTransportArea();
 }
 
 std::wstring MainWindow::RuntimeLabel() const {
+    if (systemDolbyVisionPlayer_.IsActive()) {
+        return L"Windows Media Foundation / Dolby Vision";
+    }
     switch (backend_) {
     case PlaybackBackend::NativeFfmpegD3D11: return kNativeFfmpegD3D11RuntimeLabel;
     case PlaybackBackend::EmbeddedFfplay: return kExternalPlaybackRuntimeLabel;
@@ -2738,6 +3038,9 @@ std::wstring MainWindow::RuntimeLabel() const {
 }
 
 std::wstring MainWindow::RuntimeShortLabel() const {
+    if (systemDolbyVisionPlayer_.IsActive()) {
+        return L"System Dolby Vision";
+    }
     switch (backend_) {
     case PlaybackBackend::NativeFfmpegD3D11: return L"Native FFmpeg";
     case PlaybackBackend::EmbeddedFfplay: return L"External FFplay";
@@ -2760,6 +3063,20 @@ void MainWindow::SetPlaybackTimer(const bool playing) {
 
 void MainWindow::OnPlaybackTimerTick() {
     PollPlaybackSupervisorCompletion();
+    {
+        auto settings = controller_.Settings();
+        if (settings.video.displayMetadataPassthrough &&
+            anvil::playback::CapabilityDetector::IsHdrEnabledNow() &&
+            !settings.video.dolbyVisionHdrOutput) {
+            settings.video.dolbyVisionHdrOutput = true;
+            controller_.ApplySettings(settings);
+            const auto current = controller_.Snapshot();
+            if (current.media.has_value() && current.media->hasVideo) {
+                ApplyNativeColorSettingsLive(current);
+            }
+            LogApp(LogLevel::Info, L"hdr output forced on by display metadata passthrough");
+        }
+    }
     if (d3dRenderer_ && !videoHostReady_) {
         const auto rendererState = d3dRenderer_->State();
         if (rendererState == D3D11RendererState::Ready ||
@@ -2770,7 +3087,43 @@ void MainWindow::OnPlaybackTimerTick() {
     bool nativeBuffering = false;
     bool nativeDecoderClockActive = false;
     const bool runtimeTransition = RuntimeStopInProgress() || deferredRuntimeStart_;
+    const bool systemDolbyVisionActive = systemDolbyVisionPlayer_.IsActive();
+    if (systemDolbyVisionActive && !runtimeTransition) {
+        if (systemDolbyVisionPlayer_.HasFailed()) {
+            systemDolbyVisionFallbackForCurrentMedia_ = true;
+            LogApp(LogLevel::Warning,
+                   L"system dolby vision playback failed; fallback=ffmpeg_hdr10 reason=" +
+                       systemDolbyVisionPlayer_.LastError());
+            QueueDeferredRuntimeStart(true, false);
+            StopRuntimeAsync(true);
+            return;
+        }
+        const auto systemSnapshot = controller_.Snapshot();
+        if (systemDolbyVisionPlayer_.IsPlaying() && !systemDolbyVisionPlayingLogged_) {
+            systemDolbyVisionPlayingLogged_ = true;
+            LogApp(LogLevel::Info,
+                   L"system dolby vision media engine event=playing position=" +
+                       FormatTimecode(systemDolbyVisionPlayer_.Position()));
+        } else if (systemSnapshot.state == PlaybackState::Playing &&
+                   !systemDolbyVisionPlayer_.IsPlaying() &&
+                   systemDolbyVisionStartedAt_.time_since_epoch().count() != 0 &&
+                   std::chrono::steady_clock::now() - systemDolbyVisionStartedAt_ >
+                       std::chrono::seconds{10}) {
+            systemDolbyVisionFallbackForCurrentMedia_ = true;
+            LogApp(LogLevel::Warning,
+                   L"system dolby vision media engine startup timeout; fallback=ffmpeg_hdr10");
+            QueueDeferredRuntimeStart(true, false);
+            StopRuntimeAsync(true);
+            return;
+        }
+        controller_.SyncClock(systemDolbyVisionPlayer_.Position());
+        if (systemDolbyVisionPlayer_.HasEnded()) {
+            controller_.UpdateClock();
+        }
+        nativeDecoderClockActive = true;
+    }
     if (backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+        !systemDolbyVisionActive &&
         nativeVideoDecoder_) {
         const auto current = controller_.Snapshot();
         if (current.state == PlaybackState::Playing &&
@@ -2835,6 +3188,13 @@ void MainWindow::OnPlaybackTimerTick() {
         }
         SetTemporaryPlaybackRate(1.0);
         if (snapshot.state == PlaybackState::Paused &&
+            systemDolbyVisionPlayer_.IsActive()) {
+            InvalidateRect(hwnd_, &transportBar_, FALSE);
+            InvalidateFullscreenOverlay();
+            PostWebUiState(false);
+            return;
+        }
+        if (snapshot.state == PlaybackState::Paused &&
             backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
             nativeVideoDecoder_ &&
             nativeVideoDecoder_->IsRunning()) {
@@ -2845,6 +3205,7 @@ void MainWindow::OnPlaybackTimerTick() {
             PostWebUiState(false);
             return;
         }
+        RestoreAutomaticDisplayFormat();
         // Paused keeps the freeze frame captured by PausePlayback; other
         // stopped states clear the runtime frame as before.
         const bool keepFrame = (snapshot.state == PlaybackState::Paused);
@@ -2889,6 +3250,7 @@ void MainWindow::OnPlaybackTimerTick() {
                     snapshot.media->hasAudio &&
                     IsNetworkMediaPath(snapshot.media->path);
                 if (audioRequired &&
+                    !systemDolbyVisionPlayer_.IsActive() &&
                     backend_ != PlaybackBackend::EmbeddedFfplay &&
                     !audioPlayer_.IsRunning() &&
                     (!audioOwnedByNativeVideoDemuxer || audioPlayer_.HasStartFailed())) {
@@ -2924,7 +3286,8 @@ void MainWindow::InvalidateVideoSurface() const {
     InvalidateRect(hwnd_, &videoSurface_, FALSE);
 }
 
-void MainWindow::InvalidateTransportArea() const {
+void MainWindow::InvalidateTransportArea() {
+    QueueGpuFullscreenUiOverlay();
     if (subtitleMenuOverlay_ && IsWindowVisible(subtitleMenuOverlay_)) {
         InvalidateRect(subtitleMenuOverlay_, nullptr, FALSE);
     }
@@ -2941,7 +3304,7 @@ void MainWindow::InvalidateTransportArea() const {
     }
 }
 
-void MainWindow::InvalidateFullscreenOverlay() const {
+void MainWindow::InvalidateFullscreenOverlay() {
     if (subtitleMenuOverlay_ && IsWindowVisible(subtitleMenuOverlay_)) {
         InvalidateRect(subtitleMenuOverlay_, nullptr, FALSE);
     }
@@ -2966,32 +3329,46 @@ const CapabilityReport& MainWindow::CachedCapabilities() {
         capabilitiesCached_ = true;
         LogApp(LogLevel::Debug, L"capability report pending async media preparation");
     }
+    // The cached report is collected asynchronously and can predate a Windows
+    // HDR/Dolby Vision desktop-mode transition. Output configuration needs the
+    // current Advanced Color state, not the media-open snapshot.
+    cachedCapabilities_.display.hdrEnabled =
+        anvil::playback::CapabilityDetector::IsHdrEnabledNow();
     return cachedCapabilities_;
 }
 
 bool MainWindow::CurrentMediaHasHdrControls() const {
-    return MediaHasHdrSignal(controller_.Snapshot().media);
+    return anvil::playback::CapabilityDetector::IsHdrEnabledNow() &&
+           MediaHasHdrSignal(controller_.Snapshot().media);
 }
 
 bool MainWindow::CurrentMediaHasCmv4Control() const {
-    return MediaIsDolbyVision(controller_.Snapshot().media);
+    const auto settings = controller_.Settings();
+    return !settings.video.dolbyVisionSystemPipelineExperimental &&
+           MediaIsDolbyVision(controller_.Snapshot().media) &&
+           !systemDolbyVisionPlayer_.IsActive();
 }
 
-bool MainWindow::CurrentCmv4ControlEnabled(const anvil::playback::PlayerSettings& settings) const {
-    (void)settings;
+bool MainWindow::CurrentCmv4ControlEnabled(const anvil::playback::PlayerSettings&) const {
     return CurrentMediaHasCmv4Control();
 }
 
 bool MainWindow::HdrToneCurveAvailable(const anvil::playback::PlayerSettings& settings) const {
-    if (!CurrentMediaHasHdrControls() || !settings.video.dolbyVisionHdrOutput) {
+    if (settings.video.autoDisplayFormat ||
+        settings.video.displayMetadataPassthrough ||
+        !CurrentMediaHasHdrControls() ||
+        !settings.video.dolbyVisionHdrOutput ||
+        MediaIsDolbyVision(controller_.Snapshot().media)) {
         return false;
     }
-    return !CurrentMediaHasCmv4Control() || !WantsCmv4Approx(settings.video);
+    return true;
 }
 
 bool MainWindow::Cmv4ApproxActiveForPlayback(const PlaybackSessionSnapshot& snapshot,
                                              const anvil::playback::VideoSettings& settings) const {
     return MediaIsDolbyVision(snapshot.media) &&
+           !settings.dolbyVisionSystemPipelineExperimental &&
+           !systemDolbyVisionPlayer_.IsActive() &&
            WantsCmv4Approx(settings);
 }
 
@@ -3106,7 +3483,7 @@ bool MainWindow::NativeCmv4ToggleNeedsDecoderRefresh(const PlaybackSessionSnapsh
 }
 
 int MainWindow::SettingsVideoFieldCount() const {
-    int count = 6;
+    int count = 8;
     if (CurrentMediaHasHdrControls()) {
         ++count;
     }
@@ -3123,10 +3500,13 @@ void MainWindow::ApplyDefaultHdrControlsForCurrentMedia() {
     }
 
     auto settings = controller_.Settings();
-    const bool windowsHdrEnabled = CachedCapabilities().display.hdrEnabled;
-    const bool hdrControlVisible = MediaHasHdrSignal(snapshot.media);
-    const bool defaultHdrOutput = hdrControlVisible && windowsHdrEnabled;
-    const bool defaultEnhanced = MediaIsDolbyVision(snapshot.media);
+    const bool windowsHdrEnabled = anvil::playback::CapabilityDetector::IsHdrEnabledNow();
+    const bool hdrSignalPresent = MediaHasHdrSignal(snapshot.media);
+    const bool hdrControlVisible = windowsHdrEnabled && hdrSignalPresent;
+    const bool defaultHdrOutput = hdrControlVisible &&
+                                  (settings.video.displayMetadataPassthrough || hdrSignalPresent);
+    const bool defaultEnhanced = MediaIsDolbyVision(snapshot.media) &&
+                                 !settings.video.dolbyVisionSystemPipelineExperimental;
     bool changed = false;
 
     if (settings.video.dolbyVisionHdrOutput != defaultHdrOutput) {
@@ -3193,6 +3573,118 @@ RECT MainWindow::PlaybackSurfaceBounds() const {
 void MainWindow::ApplyWindowChrome() const {
     ApplyFramelessWindowChrome(hwnd_, RGB(1, 3, 6), palette_.text);
     UpdateFramelessWindowRegion(hwnd_, dpi_, fullscreen_);
+}
+
+bool MainWindow::ApplyAutomaticDisplayFormatForCurrentMedia() {
+    auto settings = controller_.Settings();
+    const auto snapshot = controller_.Snapshot();
+    if (!settings.video.autoDisplayFormat || !snapshot.media.has_value() || !snapshot.media->hasVideo) {
+        return true;
+    }
+
+    LUID adapterId{};
+    UINT32 targetId = 0;
+    bool hdrSupported = false;
+    bool hdrEnabled = false;
+    if (!ResolveWindowDisplayTarget(hwnd_, adapterId, targetId, hdrSupported, hdrEnabled)) {
+        LogApp(LogLevel::Warning, L"auto display format unavailable reason=display_target_not_found");
+        return false;
+    }
+
+    const bool sameTarget = automaticDisplayLeaseActive_ &&
+                            automaticDisplayAdapterId_.HighPart == adapterId.HighPart &&
+                            automaticDisplayAdapterId_.LowPart == adapterId.LowPart &&
+                            automaticDisplayTargetId_ == targetId;
+    if (automaticDisplayLeaseActive_ && !sameTarget) {
+        RestoreAutomaticDisplayFormat();
+    }
+    if (!automaticDisplayLeaseActive_) {
+        automaticDisplayLeaseActive_ = true;
+        automaticDisplayAdapterId_ = adapterId;
+        automaticDisplayTargetId_ = targetId;
+        automaticDisplayOriginalHdrEnabled_ = hdrEnabled;
+        automaticDisplayChanged_ = false;
+    }
+
+    const bool wantsHdr = MediaHasHdrSignal(snapshot.media) && hdrSupported;
+    if (hdrEnabled != wantsHdr) {
+        if (!SetDisplayHdrState(adapterId, targetId, wantsHdr)) {
+            LogApp(LogLevel::Warning,
+                   L"auto display format switch failed target=" + std::wstring(wantsHdr ? L"hdr" : L"sdr"));
+            return false;
+        }
+        automaticDisplayChanged_ = true;
+        for (int attempt = 0; attempt < 20; ++attempt) {
+            Sleep(100);
+            bool currentSupported = false;
+            bool currentEnabled = false;
+            LUID currentAdapter{};
+            UINT32 currentTarget = 0;
+            if (ResolveWindowDisplayTarget(hwnd_, currentAdapter, currentTarget, currentSupported, currentEnabled) &&
+                currentEnabled == wantsHdr) {
+                hdrEnabled = currentEnabled;
+                break;
+            }
+        }
+    }
+
+    cachedCapabilities_.display.hdrEnabled = wantsHdr;
+    LogApp(LogLevel::Info,
+           L"auto display format media=" + snapshot.media->hdrFormat +
+               L" windows_hdr=" + std::wstring(wantsHdr ? L"on" : L"off") +
+               (MediaIsDolbyVision(snapshot.media) && !cachedCapabilities_.display.dolbyVisionSignalAvailable
+                    ? L" dolby_vision=fallback_hdr10"
+                    : L""));
+    return true;
+}
+
+void MainWindow::RestoreAutomaticDisplayFormat() {
+    if (!automaticDisplayLeaseActive_) {
+        return;
+    }
+    if (automaticDisplayChanged_) {
+        SetDisplayHdrState(automaticDisplayAdapterId_,
+                           automaticDisplayTargetId_,
+                           automaticDisplayOriginalHdrEnabled_);
+        LogApp(LogLevel::Info,
+               L"auto display format restored windows_hdr=" +
+                   std::wstring(automaticDisplayOriginalHdrEnabled_ ? L"on" : L"off"));
+    }
+    automaticDisplayLeaseActive_ = false;
+    automaticDisplayChanged_ = false;
+}
+
+void MainWindow::SetAutomaticDisplayFormat(const bool enabled) {
+    auto settings = controller_.Settings();
+    if (settings.video.autoDisplayFormat == enabled) {
+        return;
+    }
+    if (!enabled) {
+        RestoreAutomaticDisplayFormat();
+    }
+    settings.video.autoDisplayFormat = enabled;
+    if (enabled) {
+        settings.video.displayMetadataPassthrough = true;
+        settings.video.dolbyVisionSystemPipelineExperimental = true;
+    } else {
+        settings.video.displayMetadataPassthrough =
+            LoadVideoBooleanSetting(L"DisplayMetadataPassthrough").value_or(true);
+        settings.video.dolbyVisionSystemPipelineExperimental =
+            LoadVideoBooleanSetting(L"DolbyVisionSystemPipelineExperimental").value_or(false);
+    }
+    controller_.ApplySettings(settings);
+    SaveVideoBooleanSetting(L"AutoDisplayFormat", enabled);
+    if (enabled && controller_.Snapshot().media.has_value()) {
+        ApplyAutomaticDisplayFormatForCurrentMedia();
+        ApplyDefaultHdrControlsForCurrentMedia();
+    }
+    const auto snapshot = controller_.Snapshot();
+    if (snapshot.media.has_value() && snapshot.media->hasVideo) {
+        ScheduleNativeColorSettingsRefresh(true);
+    }
+    MarkLayoutDirty();
+    EnsureLayout();
+    PostWebUiState();
 }
 
 void MainWindow::OpenFileDialog() {
@@ -3346,6 +3838,7 @@ void MainWindow::StopRuntimeAsync(const bool clearVideoFrame) {
     // component. This wakes FFmpeg/WASAPI/pipe I/O as one coordinated phase.
     playbackPlayer_.RequestStop();
     videoDecoder_.RequestStop();
+    systemDolbyVisionPlayer_.RequestStop();
     if (nativeVideoDecoder_) {
         nativeVideoDecoder_->RequestStop();
     }
@@ -3403,6 +3896,7 @@ void MainWindow::RetireAfterRuntimeStopSchedulingFailure() {
 void MainWindow::StopRuntimeBackends() {
     playbackPlayer_.Stop();
     videoDecoder_.Stop();
+    systemDolbyVisionPlayer_.Stop();
     if (nativeVideoDecoder_) {
         nativeVideoDecoder_->Stop();
     }
@@ -3521,6 +4015,12 @@ void MainWindow::CompleteRendererInitialization(const D3D11RendererState state) 
     }
     videoHostInitializationFailureHandled_ = true;
     videoHostReady_ = false;
+    if (systemDolbyVisionPlayer_.IsActive()) {
+        LogApp(LogLevel::Warning,
+               L"native d3d renderer initialization failed while system dolby vision remains active");
+        UpdateVideoHost();
+        return;
+    }
     if (videoHost_) {
         ShowWindow(videoHost_, SW_HIDE);
     }
@@ -3636,6 +4136,7 @@ bool MainWindow::RuntimeBackendsRunning() const {
     return runtimeCleanupPending_.load(std::memory_order_acquire) ||
            playbackPlayer_.IsRunning() ||
            videoDecoder_.IsRunning() ||
+           systemDolbyVisionPlayer_.IsActive() ||
            audioPlayer_.IsRunning() ||
            (nativeVideoDecoder_ && nativeVideoDecoder_->IsRunning());
 }
@@ -3981,6 +4482,71 @@ bool MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
     bool preferDolbyVisionHdrOutput = false;
     bool enableDolbyVisionEnhancementDecode = false;
     const auto runtimeSettings = controller_.Settings();
+    const auto capabilities = CachedCapabilities();
+    // Dolby Vision owns a separate Windows Media Foundation presentation
+    // pipeline. The system HEVC decoder and the registered Dolby renderer
+    // extension stay inside MediaEngine; the FFmpeg/D3D renderer is used only
+    // as a one-shot compatibility fallback when that pipeline is unavailable.
+    const bool requestSystemDolbyVision =
+        snapshot.media->hasVideo &&
+        snapshot.media->dolbyVisionDetected &&
+        (runtimeSettings.video.autoDisplayFormat ||
+         runtimeSettings.video.dolbyVisionSystemPipelineExperimental) &&
+        runtimeSettings.video.dolbyVision != anvil::playback::DolbyVisionMode::Off &&
+        anvil::playback::CapabilityDetector::IsHdrEnabledNow() &&
+        capabilities.codecs.dolbyVisionExtensionDetected &&
+        capabilities.display.dolbyVisionSignalAvailable &&
+        !systemDolbyVisionFallbackForCurrentMedia_;
+    if (snapshot.media->dolbyVisionDetected) {
+        LogApp(LogLevel::Info,
+               L"dolby vision system pipeline requested=" +
+                   std::wstring(requestSystemDolbyVision ? L"true" : L"false") +
+                   L" profile=" + snapshot.media->hdrFormat +
+                   L" experimental=" +
+                   std::wstring(runtimeSettings.video.dolbyVisionSystemPipelineExperimental ? L"on" : L"off") +
+                   L" extension_reported=" +
+                   std::wstring(capabilities.codecs.dolbyVisionExtensionDetected ? L"true" : L"false") +
+                   L" edid_lldv=" +
+                   std::wstring(capabilities.display.dolbyVisionSignalAvailable ? L"true" : L"false") +
+                   L" session_fallback=" +
+                   std::wstring(systemDolbyVisionFallbackForCurrentMedia_ ? L"true" : L"false"));
+    }
+    if (requestSystemDolbyVision) {
+        MarkLayoutDirty();
+        EnsureLayout();
+        EnsureVideoHost();
+        if (videoHost_ && systemDolbyVisionPlayer_.Start(videoHost_,
+                                                         snapshot.media->path,
+                                                         snapshot.position,
+                                                         snapshot.volume)) {
+            systemDolbyVisionPlayer_.SetPlaybackRate(snapshot.playbackRate);
+            runtimeCleanupPending_.store(true, std::memory_order_release);
+            systemDolbyVisionPlayingLogged_ = false;
+            systemDolbyVisionStartedAt_ = std::chrono::steady_clock::now();
+            ShowWindow(videoHost_, SW_SHOWNA);
+            UpdateVideoHost();
+            LogApp(restart ? LogLevel::Debug : LogLevel::Info,
+                   L"system dolby vision playback start=true pipeline=media_engine+dolby_renderer_extension profile=" +
+                       snapshot.media->hdrFormat +
+                       L" source=" + snapshot.media->container);
+            return true;
+        }
+        systemDolbyVisionFallbackForCurrentMedia_ = true;
+        LogApp(LogLevel::Warning,
+               L"system dolby vision playback start=false fallback=ffmpeg_hdr10 reason=" +
+                   systemDolbyVisionPlayer_.LastError());
+    } else if (snapshot.media->dolbyVisionDetected &&
+               runtimeSettings.video.dolbyVisionSystemPipelineExperimental &&
+               runtimeSettings.video.dolbyVision != anvil::playback::DolbyVisionMode::Off &&
+               !systemDolbyVisionFallbackForCurrentMedia_) {
+        systemDolbyVisionFallbackForCurrentMedia_ = true;
+        LogApp(LogLevel::Warning,
+               L"system dolby vision playback unavailable reason=" +
+                   std::wstring(!anvil::playback::CapabilityDetector::IsHdrEnabledNow()
+                                    ? L"windows_hdr_off"
+                                    : L"renderer_extension_not_registered") +
+                   L" fallback=ffmpeg_hdr10");
+    }
     if (snapshot.media->hasVideo) {
         MarkLayoutDirty();
         EnsureLayout();
@@ -4066,9 +4632,9 @@ bool MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
                                                   std::chrono::milliseconds{settings.subtitles.subtitleDelayMs},
                                                   settings.subtitles.externalSubtitleAutoLoad,
                                                   settings.subtitles.externalSubtitlePath,
-                                                  false,
-                                                  preferDolbyVisionHdrOutput,
-                                                  enableDolbyVisionEnhancementDecode,
+                                                   false,
+                                                   preferDolbyVisionHdrOutput,
+                                                   enableDolbyVisionEnhancementDecode,
                                                   std::move(audioPacketSink),
                                                   windowLifetimeCookie_);
         if (videoStarted) {
@@ -4116,8 +4682,8 @@ bool MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
             const bool cmv4Intermediate = Cmv4ApproxActiveForPlayback(snapshot, runtimeSettings.video);
             const bool finalHdrOutput = WantsDolbyVisionHdrOutput(runtimeSettings.video, CachedCapabilities().display);
             LogApp(LogLevel::Info,
-                   L"dolby vision libplacebo intermediate=hdr_bt2020_pq final=" +
-                       std::wstring(finalHdrOutput ? L"hdr10" : L"sdr") +
+                   L"dolby vision fallback path=ffmpeg_libplacebo final=" +
+                       std::wstring(finalHdrOutput ? L"windows_hdr10" : L"sdr") +
                        (cmv4Intermediate ? L" cmv4=on" : L" cmv4=off") +
                        (enableDolbyVisionEnhancementDecode ? L" el_decode=on" : L" el_decode=off"));
         }
@@ -4137,6 +4703,10 @@ bool MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
 bool MainWindow::SeekNativeRuntime(const PlaybackSessionSnapshot& snapshot) {
     if (closePending_) {
         return false;
+    }
+    if (snapshot.state == PlaybackState::Playing &&
+        systemDolbyVisionPlayer_.IsActive()) {
+        return systemDolbyVisionPlayer_.Seek(snapshot.position);
     }
     if (backend_ != PlaybackBackend::NativeFfmpegD3D11 ||
         snapshot.state != PlaybackState::Playing ||
@@ -4364,9 +4934,9 @@ void MainWindow::RefreshPausedNativeFrame(const PlaybackSessionSnapshot& snapsho
                                                     std::chrono::milliseconds{settings.subtitles.subtitleDelayMs},
                                                     settings.subtitles.externalSubtitleAutoLoad,
                                                     settings.subtitles.externalSubtitlePath,
-                                                    true,
-                                                    preferDolbyVisionHdrOutput,
-                                                    enableDolbyVisionEnhancementDecode,
+                                                     true,
+                                                     preferDolbyVisionHdrOutput,
+                                                     enableDolbyVisionEnhancementDecode,
                                                     NativeAudioPacketSink{},
                                                     windowLifetimeCookie_);
     if (started) {
@@ -4430,6 +5000,7 @@ void MainWindow::CompleteOpenPath(PlaybackSupervisor::OpenCompletion completion)
                L" generation=" + std::to_wstring(completion.generation) +
                L" autoplay=" + (completion.autoplay ? L"true" : L"false"));
     if (opened) {
+        systemDolbyVisionFallbackForCurrentMedia_ = false;
         auto settings = controller_.Settings();
         bool settingsChanged = false;
         if (!settings.subtitles.externalSubtitlePath.empty()) {
@@ -4445,6 +5016,7 @@ void MainWindow::CompleteOpenPath(PlaybackSupervisor::OpenCompletion completion)
             controller_.ApplySettings(settings);
         }
         UpdateInspectorMediaLists(path);
+        ApplyAutomaticDisplayFormatForCurrentMedia();
         ApplyDefaultHdrControlsForCurrentMedia();
         MarkLayoutDirty();
         EnsureLayout();
@@ -4809,7 +5381,8 @@ void MainWindow::StartPlayback() {
     controller_.Play();
     const auto snapshot = controller_.Snapshot();
     if (fullscreen_ && refreshRateSyncEnabled_ && snapshot.media.has_value() && snapshot.media->videoFrameRate > 0.0) {
-        refreshRateController_.ApplyForWindow(hwnd_, snapshot.media->videoFrameRate, refreshRateMaximumMultiple_);
+        refreshRateSyncUnavailable_ =
+            !refreshRateController_.ApplyForWindow(hwnd_, snapshot.media->videoFrameRate, refreshRateMaximumMultiple_);
     }
     LogApp(LogLevel::Info, L"start playback state=" + ToDisplayString(snapshot.state) + L" hasMedia=" + (snapshot.media.has_value() ? L"true" : L"false"));
     if (snapshot.state == PlaybackState::Playing &&
@@ -4817,6 +5390,10 @@ void MainWindow::StartPlayback() {
         (snapshot.media->hasVideo || snapshot.media->hasAudio)) {
         const auto settings = controller_.Settings();
         const bool enhancedPlaybackNeedsRestart = NativeCmv4ToggleNeedsDecoderRefresh(snapshot, settings.video);
+        const bool resumedSystemDolbyVision =
+            before.state == PlaybackState::Paused &&
+            !RuntimeStopInProgress() &&
+            systemDolbyVisionPlayer_.IsActive();
         const bool resumedNativeRuntime =
             before.state == PlaybackState::Paused &&
             backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
@@ -4826,7 +5403,14 @@ void MainWindow::StartPlayback() {
             !nativeVideoDecoder_->OneShotFrame() &&
             !audioPlayer_.IsStopping() &&
             !enhancedPlaybackNeedsRestart;
-        if (resumedNativeRuntime) {
+        if (resumedSystemDolbyVision) {
+            systemDolbyVisionPlayer_.SetVolume(snapshot.volume);
+            systemDolbyVisionPlayer_.SetPlaybackRate(snapshot.playbackRate);
+            if (!systemDolbyVisionPlayer_.Play()) {
+                systemDolbyVisionFallbackForCurrentMedia_ = true;
+                RequestRuntimeStart(true, false);
+            }
+        } else if (resumedNativeRuntime) {
             if (d3dRenderer_) {
                 d3dRenderer_->ConfigureColorPipeline(settings.video, CachedCapabilities().display, snapshot.media->videoColor);
                 d3dRenderer_->ConfigureSubtitleSettings(settings.subtitles);
@@ -4872,6 +5456,9 @@ void MainWindow::StartPlayback() {
     }
     MarkLayoutDirty();
     EnsureLayout();
+    if (fullscreen_ && before.state == PlaybackState::Paused) {
+        ShowFullscreenTransport(L"resume");
+    }
     InvalidateTransportArea();
     InvalidateFullscreenOverlay();
     InvalidateRect(hwnd_, nullptr, FALSE);
@@ -4891,6 +5478,8 @@ void MainWindow::PausePlayback() {
     const auto snapshot = controller_.Snapshot();
     if (RuntimeStopInProgress()) {
         SetPlaybackTimer(false);
+    } else if (systemDolbyVisionPlayer_.IsActive()) {
+        systemDolbyVisionPlayer_.Pause();
     } else if (backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
         nativeVideoDecoder_ &&
         nativeVideoDecoder_->IsRunning() &&
@@ -4920,10 +5509,20 @@ void MainWindow::PausePlayback() {
     SetPlaybackTimer(false);
     MarkLayoutDirty();
     EnsureLayout();
+    if (fullscreen_) {
+        ShowFullscreenTransport(L"pause");
+    }
     InvalidateTransportArea();
     InvalidateFullscreenOverlay();
     InvalidateRect(hwnd_, nullptr, FALSE);
     PostWebUiState();
+    if (fullscreen_ && heldNativeFrame_.has_value() && heldNativeFrame_->HasContent()) {
+        // Pausing stops decoder-driven presents. Submit the retained frame once
+        // after queuing the new UI bitmap so the transport is composited even
+        // when the renderer's cached output was invalidated by a recent resize.
+        RenderHeldNativeFrame(false);
+        LogApp(LogLevel::Debug, L"fullscreen_transport paused frame submitted with ui overlay");
+    }
 }
 
 void MainWindow::TogglePlayback() {
@@ -4936,6 +5535,7 @@ void MainWindow::TogglePlayback() {
 }
 
 void MainWindow::StopPlayback() {
+    RestoreAutomaticDisplayFormat();
     refreshRateController_.Restore();
     ClearDeferredRuntimeStart();
     deferredPausedFrameRefresh_ = false;
@@ -4970,7 +5570,9 @@ void MainWindow::SeekRelative(const std::chrono::milliseconds delta) {
     const auto before = controller_.Snapshot();
     controller_.SeekRelative(delta);
     const auto after = controller_.Snapshot();
-    if (after.state == PlaybackState::Paused &&
+    if (systemDolbyVisionPlayer_.IsActive()) {
+        systemDolbyVisionPlayer_.Seek(after.position);
+    } else if (after.state == PlaybackState::Paused &&
         after.media.has_value() &&
         after.media->hasVideo &&
         backend_ == PlaybackBackend::NativeFfmpegD3D11) {
@@ -4989,7 +5591,9 @@ void MainWindow::SeekToPosition(const std::chrono::milliseconds position) {
     const auto before = controller_.Snapshot();
     controller_.Seek(position);
     const auto after = controller_.Snapshot();
-    if (after.state == PlaybackState::Paused &&
+    if (systemDolbyVisionPlayer_.IsActive()) {
+        systemDolbyVisionPlayer_.Seek(after.position);
+    } else if (after.state == PlaybackState::Paused &&
         after.media.has_value() &&
         after.media->hasVideo &&
         backend_ == PlaybackBackend::NativeFfmpegD3D11) {
@@ -5039,7 +5643,13 @@ void MainWindow::ToggleFullscreen() {
         MONITORINFO monitorInfo{};
         monitorInfo.cbSize = sizeof(monitorInfo);
         GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST), &monitorInfo);
-        SetWindowLongW(hwnd_, GWL_STYLE, previousStyle_ & ~WS_OVERLAPPEDWINDOW);
+        // A maximized window keeps WS_MAXIMIZE even after the overlapped-window
+        // chrome is removed. Clear the show-state bits so fullscreen always has
+        // the same monitor-sized client area, regardless of how it was entered.
+        const LONG fullscreenStyle =
+            (previousStyle_ & ~(WS_OVERLAPPEDWINDOW | WS_MAXIMIZE | WS_MINIMIZE)) | WS_POPUP;
+        fullscreen_ = true;
+        SetWindowLongW(hwnd_, GWL_STYLE, fullscreenStyle);
         SetWindowLongW(hwnd_, GWL_EXSTYLE, previousExStyle_ & ~WS_EX_WINDOWEDGE);
         SetWindowPos(hwnd_,
                      HWND_TOP,
@@ -5048,7 +5658,6 @@ void MainWindow::ToggleFullscreen() {
                      RectWidth(monitorInfo.rcMonitor),
                      RectHeight(monitorInfo.rcMonitor),
                      SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
-        fullscreen_ = true;
         fullscreenTransportVisible_ = false;
         fullscreenTransportAmount_ = 0.0;
         fullscreenTransportStartAmount_ = fullscreenTransportAmount_;
@@ -5061,6 +5670,9 @@ void MainWindow::ToggleFullscreen() {
         }
         SetTimer(hwnd_, kFullscreenChromeHideTimer, 120, nullptr);
     } else {
+        // Refresh-rate matching belongs to exclusive player fullscreen only.
+        // Restore the desktop mode before returning to a windowed/maximized
+        // presentation so playback cannot leave the desktop at the media rate.
         refreshRateController_.Restore();
         refreshRateSyncUnavailable_ = false;
         SetWindowLongW(hwnd_, GWL_STYLE, previousStyle_);
@@ -5081,9 +5693,23 @@ void MainWindow::ToggleFullscreen() {
     ApplyWindowChrome();
     MarkLayoutDirty();
     EnsureLayout();
-    if (fullscreen_ &&
-        hasLastFullscreenCursorClient_ &&
-        IsFullscreenTransportActivationPoint(lastFullscreenCursorClient_)) {
+    const auto fullscreenSnapshot = controller_.Snapshot();
+    if (fullscreen_ && fullscreenSnapshot.state == PlaybackState::Paused) {
+        ShowFullscreenTransport(L"enter_fullscreen_paused");
+        if (heldNativeFrame_.has_value() && heldNativeFrame_->HasContent()) {
+            // ResizeBuffers invalidates the renderer's cached output. A paused
+            // decoder will not produce another frame, so explicitly rebuild it.
+            RenderHeldNativeFrame(false);
+        } else {
+            // Windowed pause can race runtime retirement and leave no retained
+            // frame. ResizeBuffers has already invalidated the renderer cache,
+            // so request a one-shot paused frame instead of waiting forever.
+            LogApp(LogLevel::Debug, L"fullscreen_transport paused resize requires frame refresh");
+            RefreshPausedNativeFrame(fullscreenSnapshot);
+        }
+    } else if (fullscreen_ &&
+               hasLastFullscreenCursorClient_ &&
+               IsFullscreenTransportActivationPoint(lastFullscreenCursorClient_)) {
         ShowFullscreenTransport(L"enter_fullscreen_activation");
     }
     InvalidateRect(hwnd_, nullptr, FALSE);
@@ -5102,8 +5728,13 @@ void MainWindow::SetRefreshRateSyncEnabled(const bool enabled) {
     } else if (fullscreen_) {
         const auto snapshot = controller_.Snapshot();
         if (snapshot.media.has_value() && snapshot.media->videoFrameRate > 0.0) {
-            refreshRateController_.ApplyForWindow(hwnd_, snapshot.media->videoFrameRate, refreshRateMaximumMultiple_);
+            refreshRateSyncUnavailable_ =
+                !refreshRateController_.ApplyForWindow(hwnd_, snapshot.media->videoFrameRate, refreshRateMaximumMultiple_);
+        } else {
+            refreshRateSyncUnavailable_ = false;
         }
+    } else {
+        refreshRateSyncUnavailable_ = false;
     }
     PostWebUiState();
 }
@@ -5111,12 +5742,17 @@ void MainWindow::SetRefreshRateSyncEnabled(const bool enabled) {
 void MainWindow::SetRefreshRateMaximumMultiple(const bool enabled) {
     refreshRateMaximumMultipleOverridden_ = true;
     refreshRateMaximumMultiple_ = enabled;
-    if (fullscreen_ && refreshRateSyncEnabled_) {
+    if (refreshRateSyncEnabled_ && fullscreen_) {
         refreshRateController_.Restore();
         const auto snapshot = controller_.Snapshot();
         if (snapshot.media.has_value() && snapshot.media->videoFrameRate > 0.0) {
             refreshRateSyncUnavailable_ = !refreshRateController_.ApplyForWindow(hwnd_, snapshot.media->videoFrameRate, refreshRateMaximumMultiple_);
+        } else {
+            refreshRateSyncUnavailable_ = false;
         }
+    } else if (!fullscreen_) {
+        refreshRateController_.Restore();
+        refreshRateSyncUnavailable_ = false;
     }
     PostWebUiState();
 }
@@ -5133,14 +5769,28 @@ void MainWindow::ApplyGlobalRefreshRatePreferences() {
         refreshRateMaximumMultiple_ = globalMaximumMultiple;
         changed = true;
     }
-    if (changed && fullscreen_) {
+    if (changed) {
         refreshRateController_.Restore();
         const auto snapshot = controller_.Snapshot();
-        if (refreshRateSyncEnabled_ && snapshot.media.has_value() && snapshot.media->videoFrameRate > 0.0) {
+        if (fullscreen_ && refreshRateSyncEnabled_ && snapshot.media.has_value() && snapshot.media->videoFrameRate > 0.0) {
             refreshRateSyncUnavailable_ = !refreshRateController_.ApplyForWindow(hwnd_, snapshot.media->videoFrameRate, refreshRateMaximumMultiple_);
+        } else {
+            refreshRateSyncUnavailable_ = false;
         }
     }
     PostWebUiState(true);
+}
+
+void MainWindow::ApplyGlobalVideoPassthroughPreferences() {
+    const bool autoDisplayFormat = LoadVideoBooleanSetting(L"AutoDisplayFormat").value_or(false);
+    const bool displayMetadata = LoadVideoBooleanSetting(L"DisplayMetadataPassthrough").value_or(true);
+    const bool dolbySystemPipeline =
+        LoadVideoBooleanSetting(L"DolbyVisionSystemPipelineExperimental").value_or(false);
+    SetAutomaticDisplayFormat(autoDisplayFormat);
+    if (!autoDisplayFormat) {
+        SetDisplayMetadataPassthrough(displayMetadata);
+        SetDolbyVisionSystemPipelineExperimental(dolbySystemPipeline);
+    }
 }
 
 }  // namespace anvil::app

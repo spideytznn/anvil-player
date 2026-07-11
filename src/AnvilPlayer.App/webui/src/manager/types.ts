@@ -84,6 +84,8 @@ export interface MediaItem {
   continueWatching?: boolean
   watched: boolean
   favorite: boolean
+  inPlaylist?: boolean
+  playlistIds?: string[]
   addedDaysAgo: number
   poster: string
   backdrop: string

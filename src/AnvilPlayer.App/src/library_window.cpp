@@ -47,6 +47,45 @@ constexpr std::size_t kMaxLibraryOperations = 16;
 constexpr std::size_t kMaxLibraryJobs = 16;
 constexpr std::size_t kMaxLibraryResults = kMaxLibraryOperations * 2;
 constexpr std::size_t kMaxLibraryRetiredPayloads = 32;
+constexpr wchar_t kVideoSettingsRegistryPath[] = L"Software\\AnvilPlayer\\Video";
+
+bool LoadVideoPassthroughSetting(const wchar_t* name, const bool fallback) {
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    if (RegGetValueW(HKEY_CURRENT_USER,
+                     kVideoSettingsRegistryPath,
+                     name,
+                     RRF_RT_REG_DWORD,
+                     nullptr,
+                     &value,
+                     &size) != ERROR_SUCCESS) {
+        return fallback;
+    }
+    return value != 0;
+}
+
+void SaveVideoPassthroughSetting(const wchar_t* name, const bool enabled) {
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER,
+                        kVideoSettingsRegistryPath,
+                        0,
+                        nullptr,
+                        REG_OPTION_NON_VOLATILE,
+                        KEY_SET_VALUE,
+                        nullptr,
+                        &key,
+                        nullptr) != ERROR_SUCCESS) {
+        return;
+    }
+    const DWORD value = enabled ? 1u : 0u;
+    RegSetValueExW(key,
+                   name,
+                   0,
+                   REG_DWORD,
+                   reinterpret_cast<const BYTE*>(&value),
+                   sizeof(value));
+    RegCloseKey(key);
+}
 
 enum class LibraryAsyncResultKind {
     Json,
@@ -592,6 +631,10 @@ std::wstring MediaDetailsProbedJson(const std::wstring& requestId,
             fps << std::fixed << std::setprecision(3) << descriptor.videoFrameRate << L" fps";
             videoSpec += (videoSpec.empty() ? L"" : L" · ") + fps.str();
         }
+        if (!descriptor.hdrFormat.empty() && descriptor.hdrFormat != L"SDR / unknown" &&
+            descriptor.hdrFormat != L"Probe pending") {
+            videoSpec += (videoSpec.empty() ? L"" : L" · ") + descriptor.hdrFormat;
+        }
     }
     json << L"\"videoSpec\":\"" << JsonEscape(videoSpec)
          << L"\",\"audioSpec\":\"" << JsonEscape(descriptor.audioCodec)
@@ -801,6 +844,10 @@ void LibraryWindow::SetRefreshRatePreferencesChangedRequest(std::function<void()
     refreshRatePreferencesChangedRequest_ = std::move(callback);
 }
 
+void LibraryWindow::SetVideoPassthroughPreferencesChangedRequest(std::function<void()> callback) {
+    videoPassthroughPreferencesChangedRequest_ = std::move(callback);
+}
+
 void LibraryWindow::SetAllowInsecureCertificatesRequest(std::function<void(bool)> callback) {
     allowInsecureCertificatesRequest_ = std::move(callback);
 }
@@ -905,6 +952,12 @@ bool LibraryWindow::Create(HINSTANCE instance) {
 void LibraryWindow::Show(const int commandShow) const {
     ShowWindow(hwnd_, commandShow);
     UpdateWindow(hwnd_);
+}
+
+bool LibraryWindow::DeliverLocalPlaybackProgress(const std::wstring& progressJson) const {
+    if (!webUiActive_ || !webUiHost_ || !webUiHost_->Ready()) return false;
+    webUiHost_->PostJson(progressJson);
+    return true;
 }
 
 std::filesystem::path LibraryWindow::WebUiRoot() const {
@@ -1631,6 +1684,46 @@ void LibraryWindow::HandleWebUiMessage(const std::wstring_view message) {
     } else if (MessageContains(message, L"\"command\":\"setGlobalRefreshRateMaximumMultiple\"")) {
         DisplayRefreshRateController::SaveMaximumMultipleEnabled(MessageContains(message, L"\"enabled\":true"));
         if (refreshRatePreferencesChangedRequest_) refreshRatePreferencesChangedRequest_();
+    } else if (MessageContains(message, L"\"command\":\"requestGlobalVideoPassthroughSettings\"")) {
+        const bool displayMetadata = LoadVideoPassthroughSetting(L"DisplayMetadataPassthrough", true);
+        const bool autoDisplayFormat = LoadVideoPassthroughSetting(L"AutoDisplayFormat", false);
+        const bool windowsHdrEnabled = anvil::playback::CapabilityDetector::IsHdrEnabledNow();
+        const bool dolbySystemPipeline =
+            windowsHdrEnabled &&
+            LoadVideoPassthroughSetting(L"DolbyVisionSystemPipelineExperimental", false);
+        PostScanResult(L"{\"type\":\"globalVideoPassthroughSettings\",\"autoDisplayFormat\":" +
+                       std::wstring(autoDisplayFormat ? L"true" : L"false") +
+                       L",\"displayMetadataPassthrough\":" +
+                       std::wstring((autoDisplayFormat || displayMetadata) ? L"true" : L"false") +
+                       L",\"dolbyVisionSystemPipelineExperimental\":" +
+                       std::wstring((autoDisplayFormat || dolbySystemPipeline) ? L"true" : L"false") +
+                       L",\"windowsHdrEnabled\":" +
+                       std::wstring(windowsHdrEnabled ? L"true" : L"false") +
+                       L"}");
+    } else if (MessageContains(message, L"\"command\":\"setGlobalAutoDisplayFormat\"")) {
+        SaveVideoPassthroughSetting(L"AutoDisplayFormat",
+                                    MessageContains(message, L"\"enabled\":true"));
+        if (videoPassthroughPreferencesChangedRequest_) videoPassthroughPreferencesChangedRequest_();
+    } else if (MessageContains(message, L"\"command\":\"setGlobalDisplayMetadataPassthrough\"")) {
+        if (LoadVideoPassthroughSetting(L"AutoDisplayFormat", false)) {
+            return;
+        }
+        if (!anvil::playback::CapabilityDetector::IsHdrEnabledNow()) {
+            return;
+        }
+        SaveVideoPassthroughSetting(L"DisplayMetadataPassthrough",
+                                    MessageContains(message, L"\"enabled\":true"));
+        if (videoPassthroughPreferencesChangedRequest_) videoPassthroughPreferencesChangedRequest_();
+    } else if (MessageContains(message, L"\"command\":\"setGlobalDolbyVisionSystemPipelineExperimental\"")) {
+        if (LoadVideoPassthroughSetting(L"AutoDisplayFormat", false)) {
+            return;
+        }
+        const bool enabled = MessageContains(message, L"\"enabled\":true");
+        if (enabled && !anvil::playback::CapabilityDetector::IsHdrEnabledNow()) {
+            return;
+        }
+        SaveVideoPassthroughSetting(L"DolbyVisionSystemPipelineExperimental", enabled);
+        if (videoPassthroughPreferencesChangedRequest_) videoPassthroughPreferencesChangedRequest_();
     } else if (MessageContains(message, L"\"command\":\"setUiLanguage\"")) {
         DisplayRefreshRateController::SaveUiLanguage(ReadJsonString(message, L"language").value_or(L"zh"));
         if (uiLanguageChangedRequest_) uiLanguageChangedRequest_();

@@ -16,14 +16,14 @@ import {
   RotateCcw,
   ScrollText,
   Settings,
-  SkipBack,
-  SkipForward,
   SlidersHorizontal,
   Square,
   Volume2,
   X
 } from 'lucide-react'
 import { applyAppearanceSettings } from './appearance'
+import back10IconUrl from '../../assets/icons/back10.png'
+import forward10IconUrl from '../../assets/icons/forward10.png'
 import {
   clearPendingEmbyPlaybackReport,
   EMBY_PLAYBACK_REPORT_PENDING_EVENT,
@@ -100,6 +100,13 @@ const en = {
   hdr: 'HDR',
   hdrControls: 'HDR controls',
   hdrOutput: 'HDR output',
+  autoDisplayFormat: 'Automatically match display format',
+  autoDisplayFormatHint: 'Switch Windows and player HDR output for the current video, then restore the original display state.',
+  displayMetadataPassthrough: 'Display metadata passthrough',
+  displayMetadataPassthroughHint: 'Pass HDR mastering display, MaxCLL, and MaxFALL metadata to the display.',
+  dolbyVisionSystemPipelineExperimental: 'Dolby Vision passthrough (experimental)',
+  dolbyVisionSystemPipelineExperimentalHint: 'Force Dolby Vision sources through Windows MediaEngine and Dolby Vision Extensions. Disable to use FFmpeg/libplacebo.',
+  dolbyVisionSystemPipelineUnavailable: 'Windows HDR or Dolby Vision Extensions is unavailable; the FFmpeg/libplacebo path will be used.',
   dolbyVision: 'Dolby Vision',
   streams: 'Streams',
   available: 'Available',
@@ -201,6 +208,13 @@ const zh: Record<keyof typeof en, string> = {
   hdr: 'HDR',
   hdrControls: 'HDR 控制',
   hdrOutput: 'HDR 输出',
+  autoDisplayFormat: '自动匹配显示格式',
+  autoDisplayFormatHint: '根据当前视频切换 Windows 和播放器 HDR 输出，播放结束后恢复原始显示状态。',
+  displayMetadataPassthrough: '显示元数据直通',
+  displayMetadataPassthroughHint: '向显示设备传递 HDR 母版色域、MaxCLL 与 MaxFALL 元数据。',
+  dolbyVisionSystemPipelineExperimental: '杜比视界直通（实验性）',
+  dolbyVisionSystemPipelineExperimentalHint: '强制杜比视界片源使用 Windows MediaEngine 与 Dolby Vision Extensions；关闭时使用 FFmpeg/libplacebo。',
+  dolbyVisionSystemPipelineUnavailable: 'Windows HDR 或 Dolby Vision Extensions 不可用，将使用 FFmpeg/libplacebo。',
   dolbyVision: '杜比视界',
   streams: '流',
   available: '可用',
@@ -587,6 +601,27 @@ function rectSnapshotFromElement(element: HTMLElement | null): RectSnapshot {
   }
 }
 
+function useLocalPlaybackReporting(state: PlayerState): void {
+  const lastPostedRef = useRef({ path: '', at: 0, positionMs: -1, playbackState: '' })
+  useEffect(() => {
+    if (!state.hasMedia || !state.mediaPath || state.durationMs <= 0) return
+    const now = Date.now()
+    const last = lastPostedRef.current
+    const stateChanged = last.path !== state.mediaPath || last.playbackState !== state.playbackState
+    const movedEnough = Math.abs(state.positionMs - last.positionMs) >= 5000
+    if (!stateChanged && !movedEnough && now - last.at < 5000) return
+    lastPostedRef.current = { path: state.mediaPath, at: now, positionMs: state.positionMs, playbackState: state.playbackState }
+    postNativeCommand({
+      type: 'command',
+      command: 'localPlaybackProgress',
+      path: state.mediaPath,
+      positionMs: state.positionMs,
+      durationMs: state.durationMs,
+      playbackState: state.playbackState
+    })
+  }, [state.durationMs, state.hasMedia, state.mediaPath, state.playbackState, state.positionMs])
+}
+
 function layoutSnapshotFromElement(element: HTMLElement | null): RectSnapshot {
   if (!element) return DEFAULT_SUBTITLE_ANCHOR
   if (element.offsetWidth > 0 && element.offsetHeight > 0) {
@@ -733,7 +768,7 @@ interface HdrCurveRangeSelection {
   currentX: number
 }
 
-function HdrCurveEditor({ state, t }: { state: PlayerState; t: Copy }): JSX.Element {
+function HdrCurveEditor({ state, t }: { state: PlayerState; t: Copy }): JSX.Element | null {
   const svgRef = useRef<SVGSVGElement | null>(null)
   const [dragging, setDragging] = useState<HdrCurveDrag | null>(null)
   const [selectedPointIndexes, setSelectedPointIndexes] = useState<number[]>([])
@@ -748,12 +783,7 @@ function HdrCurveEditor({ state, t }: { state: PlayerState; t: Copy }): JSX.Elem
   }, [points])
 
   if (!state.hdrToneCurveAvailable || points.length === 0) {
-    return (
-      <div className="control-group">
-        <div className="control-title">{t.hdrCurve}</div>
-        <div className="empty-list">{t.unavailable}</div>
-      </div>
-    )
+    return null
   }
 
   const viewWidth = 320
@@ -1067,6 +1097,48 @@ function HdrCurveEditor({ state, t }: { state: PlayerState; t: Copy }): JSX.Elem
   )
 }
 
+function PassthroughSetting({
+  label,
+  hint,
+  enabled,
+  available = true,
+  unavailableHint,
+  onChange,
+  t
+}: {
+  label: string
+  hint: string
+  enabled: boolean
+  available?: boolean
+  unavailableHint?: string
+  onChange: (enabled: boolean) => void
+  t: Copy
+}): JSX.Element {
+  return (
+    <div className={`refresh-rate-setting ${available ? '' : 'is-unavailable'}`}>
+      <div>
+        <strong>{label}</strong>
+        <small>{available ? hint : (unavailableHint || hint)}</small>
+      </div>
+      <button
+        className={`refresh-rate-toggle ${enabled ? 'is-active' : ''}`}
+        type="button"
+        role="switch"
+        aria-checked={enabled}
+        aria-label={label}
+        disabled={!available}
+        aria-disabled={!available}
+        onClick={() => onChange(!enabled)}
+      >
+        <span className="refresh-rate-toggle-track" aria-hidden="true">
+          <span className="refresh-rate-toggle-thumb" />
+        </span>
+        <span className="refresh-rate-toggle-label">{enabled ? t.on : t.off}</span>
+      </button>
+    </div>
+  )
+}
+
 function TopBar({ state, t }: { state: PlayerState; t: Copy }): JSX.Element {
   return (
     <header className="topbar line-panel">
@@ -1223,7 +1295,34 @@ function InspectorContent({
           <SlidersHorizontal size={15} />
           <span>{t.settings}</span>
         </div>
+        <PassthroughSetting
+          label={t.autoDisplayFormat}
+          hint={t.autoDisplayFormatHint}
+          enabled={state.autoDisplayFormat}
+          available
+          onChange={(enabled) => postNativeCommand({ type: 'command', command: 'setAutoDisplayFormat', enabled })}
+          t={t}
+        />
         <HdrCurveEditor state={state} t={t} />
+        {!state.dolbyVisionMedia && (
+          <PassthroughSetting
+            label={t.displayMetadataPassthrough}
+            hint={t.displayMetadataPassthroughHint}
+            enabled={state.displayMetadataPassthrough}
+            available={state.windowsHdrEnabled && !state.autoDisplayFormat}
+            onChange={(enabled) => postNativeCommand({ type: 'command', command: 'setDisplayMetadataPassthrough', enabled })}
+            t={t}
+          />
+        )}
+        <PassthroughSetting
+          label={t.dolbyVisionSystemPipelineExperimental}
+          hint={t.dolbyVisionSystemPipelineExperimentalHint}
+          enabled={state.dolbyVisionSystemPipelineExperimental}
+          available={state.dolbyVisionSystemPipelineAvailable && !state.autoDisplayFormat}
+          unavailableHint={t.dolbyVisionSystemPipelineUnavailable}
+          onChange={(enabled) => postNativeCommand({ type: 'command', command: 'setDolbyVisionSystemPipelineExperimental', enabled })}
+          t={t}
+        />
         <div className="refresh-rate-setting">
           <div>
             <strong>{t.refreshRateSync}</strong>
@@ -1301,7 +1400,7 @@ function InspectorContent({
         <InfoRow label={t.backend} value={state.backendLabel} emptyLabel={t.none} />
         <InfoRow label={t.hdrControls} value={state.hdrAvailable ? t.available : t.unavailable} emptyLabel={t.none} />
         <InfoRow label={t.hdrOutput} value={state.hdrOutput ? t.on : t.off} emptyLabel={t.none} />
-        <InfoRow label={t.dolbyVision} value={state.cmv4Available ? t.available : t.unavailable} emptyLabel={t.none} />
+        <InfoRow label={t.dolbyVision} value={state.dolbyVisionMedia ? t.available : t.unavailable} emptyLabel={t.none} />
       </div>
     )
   }
@@ -1684,7 +1783,7 @@ function Transport({
     ? Math.round((state.durationMs * displayProgress) / 1000)
     : state.positionMs
   const playing = state.playbackState === 'Playing'
-  const hdrButtonLabel = state.cmv4Available ? t.dolbyVision : t.hdr
+  const hdrButtonLabel = state.dolbyVisionMedia ? t.dolbyVision : t.hdr
   const volumePercent = Math.round(state.volume * 100)
   const showVolumePercent = volumeHover || volumeDragging
   const progressStyle = {
@@ -1769,13 +1868,13 @@ function Transport({
       <div className="transport-row">
         <div className="transport-left">
           <IconButton label={t.back10} disabled={!state.hasMedia} onClick={() => postNativeCommand({ type: 'command', command: 'back' })}>
-            <SkipBack size={18} />
+            <img className="seek-ten-icon" src={back10IconUrl} alt="" draggable={false} />
           </IconButton>
           <IconButton label={playing ? t.pause : t.play} primary disabled={!state.hasMedia} onClick={() => postNativeCommand({ type: 'command', command: 'playPause' })}>
             {playing ? <Pause size={22} fill="currentColor" /> : <Play size={22} fill="currentColor" />}
           </IconButton>
           <IconButton label={t.forward10} disabled={!state.hasMedia} onClick={() => postNativeCommand({ type: 'command', command: 'forward' })}>
-            <SkipForward size={18} />
+            <img className="seek-ten-icon" src={forward10IconUrl} alt="" draggable={false} />
           </IconButton>
           <IconButton label={t.stop} disabled={!state.hasMedia} onClick={() => postNativeCommand({ type: 'command', command: 'stop' })}>
             <Square size={17} fill="currentColor" />
@@ -1811,13 +1910,14 @@ function Transport({
 
         <div className="transport-right">
           {state.hdrAvailable && (
-            <button className={`line-button label-button ${state.hdrOutput ? 'is-active' : ''}`} type="button" onClick={() => postNativeCommand({ type: 'command', command: 'toggleHdr' })}>
+            <button
+              className={`line-button label-button ${state.hdrOutput ? 'is-active' : ''}`}
+              type="button"
+              disabled={state.hdrOutputLocked}
+              aria-disabled={state.hdrOutputLocked}
+              onClick={() => postNativeCommand({ type: 'command', command: 'toggleHdr' })}
+            >
               {hdrButtonLabel}
-            </button>
-          )}
-          {state.cmv4Available && (
-            <button className={`line-button label-button ${state.cmv4Enabled ? 'is-active' : ''}`} type="button" onClick={() => postNativeCommand({ type: 'command', command: 'toggleCmv4' })}>
-              {t.enhanced}
             </button>
           )}
           <IconButton label={t.subtitles} subtitleToggle buttonRef={subtitleButtonRef} onClick={onSubtitleMenu}>
@@ -1849,6 +1949,7 @@ export default function App(): JSX.Element {
   const t = copy[language]
   const subtitleVisualActive = subtitlePopoverMounted || subtitlePopoverOpen || state.subtitleMenuOpen
   useEmbyPlaybackReporting(state)
+  useLocalPlaybackReporting(state)
 
   const captureSubtitleAnchor = (): RectSnapshot => {
     const element = subtitleButtonRef.current
@@ -1883,9 +1984,16 @@ export default function App(): JSX.Element {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent): void => {
-      if (!state.fullscreen || event.key !== 'Escape') return
+      if (state.fullscreen && event.key === 'Escape') {
+        event.preventDefault()
+        postNativeCommand({ type: 'command', command: 'toggleFullscreen' })
+        return
+      }
+      if (event.code !== 'Space' || event.repeat) return
+      const target = event.target instanceof Element ? event.target : null
+      if (target?.closest('button, input, select, textarea, [contenteditable="true"]')) return
       event.preventDefault()
-      postNativeCommand({ type: 'command', command: 'toggleFullscreen' })
+      postNativeCommand({ type: 'command', command: 'playPause' })
     }
     window.addEventListener('keydown', onKeyDown, true)
     return () => window.removeEventListener('keydown', onKeyDown, true)

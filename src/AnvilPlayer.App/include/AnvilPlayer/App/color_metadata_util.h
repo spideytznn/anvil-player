@@ -6,7 +6,9 @@
 // content-light side data into VideoColorMetadata, plus the fixed SDR/HDR
 // presets used by the software-frame publish paths.
 
+#include <cstdint>
 #include <memory>
+#include <vector>
 
 extern "C" {
 #include <libavutil/pixfmt.h>  // AVColorPrimaries, AVColorSpace, etc.
@@ -37,6 +39,9 @@ anvil::playback::VideoColorMetadata BuildColorMetadata(const AVCodecParameters* 
 anvil::playback::VideoColorMetadata MergeFrameColorMetadata(
     const AVFrame* frame,
     const anvil::playback::VideoColorMetadata& defaults);
+
+std::shared_ptr<const std::vector<std::uint8_t>> ExtractHdr10PlusPayload(const AVFrame* frame);
+std::shared_ptr<const std::vector<std::uint8_t>> ExtractDolbyVisionRpu(const AVFrame* frame);
 
 // Fixed presets for software-rendered frames.
 anvil::playback::VideoColorMetadata SdrBt709ColorMetadata();

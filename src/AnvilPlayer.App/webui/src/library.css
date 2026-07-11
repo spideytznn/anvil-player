@@ -2719,6 +2719,21 @@
   transform: translateY(2%);
 }
 
+.library-classification-group + .library-classification-group {
+  margin-top: 30px;
+}
+
+.library-classification-group > .library-section-heading small {
+  color: var(--library-text-muted);
+  font-size: 12px;
+}
+
+.library-settings-field > small {
+  color: var(--library-dim);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
 .library-trailer-keyword-field {
   max-width: 620px;
   margin-top: 2px;
@@ -3562,6 +3577,14 @@
   color: var(--library-text);
 }
 
+.library-favorite-action.is-favorite {
+  color: inherit;
+}
+
+.library-favorite-action.is-favorite > svg {
+  color: #ff6b80;
+}
+
 .library-tool-action.is-danger:hover {
   color: var(--danger);
 }
@@ -3786,6 +3809,143 @@
   font-size: 12px;
   line-height: 1.62;
   transition: max-height 460ms var(--motion-fluid);
+}
+
+@keyframes library-playlist-dialog-enter {
+  from { opacity: 0; transform: translateY(12px) scale(0.94); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes library-playlist-backdrop-enter {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.library-playlist-dialog-backdrop {
+  position: fixed;
+  z-index: 100;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(1, 4, 8, 0.72);
+  backdrop-filter: blur(7px);
+  padding: 24px;
+  animation: library-playlist-backdrop-enter 160ms ease-out both;
+}
+
+.library-playlist-dialog {
+  display: grid;
+  width: min(400px, 100%);
+  grid-template-columns: 40px minmax(0, 1fr);
+  gap: 16px 12px;
+  border: 1px solid var(--library-line-strong);
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(8, 13, 20, 0.995), rgba(2, 5, 9, 0.995));
+  box-shadow: 0 30px 90px rgba(0, 0, 0, 0.58);
+  padding: 20px;
+  animation: library-playlist-dialog-enter 220ms cubic-bezier(0.2, 0.85, 0.25, 1.15) both;
+}
+
+.library-playlist-dialog-icon {
+  display: grid;
+  width: 40px;
+  height: 40px;
+  place-items: center;
+  border: 1px solid var(--library-line-strong);
+  border-radius: 12px;
+  color: var(--library-accent);
+  background: var(--library-panel-soft);
+}
+
+.library-playlist-dialog label > span {
+  color: var(--library-muted);
+  font-size: 11px;
+  font-weight: 760;
+}
+
+.library-playlist-dialog-copy h2 {
+  margin: 0 0 4px;
+  color: var(--library-text);
+  font-size: 18px;
+  font-weight: 760;
+  letter-spacing: -0.02em;
+}
+
+.library-playlist-dialog-copy p {
+  margin: 0;
+  color: var(--library-muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.library-playlist-dialog label,
+.library-playlist-dialog-actions {
+  grid-column: 1 / -1;
+}
+
+.library-playlist-dialog label {
+  display: grid;
+  gap: 7px;
+}
+
+.library-playlist-dialog input {
+  width: 100%;
+  height: 40px;
+  border: 1px solid var(--library-line-strong);
+  border-radius: 9px;
+  outline: 0;
+  background: rgba(2, 6, 11, 0.82);
+  color: var(--library-text);
+  padding: 0 12px;
+  font-size: 14px;
+}
+
+.library-playlist-dialog input:focus {
+  border-color: var(--library-accent);
+  box-shadow: 0 0 0 3px rgba(225, 105, 84, 0.14);
+}
+
+.library-playlist-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 9px;
+}
+
+.library-playlist-dialog-actions button {
+  min-height: 34px;
+  border: 1px solid var(--library-line-strong);
+  border-radius: 8px;
+  background: var(--library-panel-soft);
+  color: var(--library-text);
+  padding: 0 15px;
+  font-size: 12px;
+  font-weight: 720;
+}
+
+.library-playlist-dialog-actions button.is-primary {
+  border-color: transparent;
+  background: var(--library-accent);
+  color: #fff;
+}
+
+.library-playlist-dialog-actions button:disabled {
+  opacity: 0.42;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .library-playlist-dialog-backdrop,
+  .library-playlist-dialog { animation: none; }
+}
+
+.library-playlist-menu-panel button {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: center;
+  column-gap: 8px;
+}
+
+.library-playlist-menu-panel button > span:first-child {
+  text-align: center;
 }
 
 .library-overview.is-collapsed {

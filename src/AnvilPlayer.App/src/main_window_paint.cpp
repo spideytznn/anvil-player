@@ -427,6 +427,151 @@ void MainWindow::PaintTransportOverlay(HWND overlay) {
     PaintFullscreenOverlay(overlay);
 }
 
+bool MainWindow::UsesGpuFullscreenUiOverlay() const {
+    return fullscreen_ &&
+           webUiActive_ &&
+           backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+           d3dRenderer_.has_value() &&
+           d3dRenderer_->IsReady() &&
+           videoHost_;
+}
+
+void MainWindow::QueueGpuFullscreenUiOverlay(const bool forceImmediatePresent) {
+    if (!d3dRenderer_) {
+        gpuFullscreenUiOverlayActive_ = false;
+        return;
+    }
+    const auto snapshot = controller_.Snapshot();
+    const bool videoFramesAdvancing =
+        snapshot.state == PlaybackState::Playing &&
+        nativeVideoDecoder_ &&
+        nativeVideoDecoder_->IsRunning() &&
+        !nativeVideoDecoder_->Stats().buffering;
+    const bool requestImmediatePresent = forceImmediatePresent || !videoFramesAdvancing;
+    const double transportOpacity = std::clamp(fullscreenTransportAmount_, 0.0, 1.0);
+    const double menuOpacity = std::clamp(subtitleMenuAmount_, 0.0, 1.0);
+    const bool hasMenuSurface = menuOpacity > 0.0 &&
+                                RectWidth(subtitleMenu_) > 0 &&
+                                RectHeight(subtitleMenu_) > 0;
+    if (!UsesGpuFullscreenUiOverlay() ||
+        fullscreenTransportAmount_ <= 0.01 ||
+        RectWidth(transportBar_) <= 0 ||
+        RectHeight(transportBar_) <= 0) {
+        if (gpuFullscreenUiOverlayActive_) {
+            d3dRenderer_->ConfigureUiOverlay(nullptr, requestImmediatePresent);
+            gpuFullscreenUiOverlayActive_ = false;
+        }
+        return;
+    }
+
+    RECT client{};
+    GetClientRect(hwnd_, &client);
+    RECT overlayBounds = transportBar_;
+    if (hasMenuSurface) {
+        RECT menuBounds = subtitleMenu_;
+        InflateRect(&menuBounds, Scale(4), Scale(4));
+        UnionRect(&overlayBounds, &overlayBounds, &menuBounds);
+    }
+    RECT clippedBounds{};
+    if (!IntersectRect(&clippedBounds, &overlayBounds, &client)) {
+        return;
+    }
+
+    const int width = RectWidth(clippedBounds);
+    const int height = RectHeight(clippedBounds);
+    HDC windowDc = GetDC(hwnd_);
+    HDC memoryDc = windowDc ? CreateCompatibleDC(windowDc) : nullptr;
+    if (!windowDc || !memoryDc) {
+        if (memoryDc) DeleteDC(memoryDc);
+        if (windowDc) ReleaseDC(hwnd_, windowDc);
+        return;
+    }
+
+    BITMAPINFO bitmapInfo{};
+    bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bitmapInfo.bmiHeader.biWidth = width;
+    bitmapInfo.bmiHeader.biHeight = -height;
+    bitmapInfo.bmiHeader.biPlanes = 1;
+    bitmapInfo.bmiHeader.biBitCount = 32;
+    bitmapInfo.bmiHeader.biCompression = BI_RGB;
+    void* dibPixels = nullptr;
+    HBITMAP bitmap = CreateDIBSection(windowDc, &bitmapInfo, DIB_RGB_COLORS, &dibPixels, nullptr, 0);
+    if (!bitmap || !dibPixels) {
+        if (bitmap) DeleteObject(bitmap);
+        DeleteDC(memoryDc);
+        ReleaseDC(hwnd_, windowDc);
+        return;
+    }
+
+    std::memset(dibPixels, 0, static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
+    HGDIOBJ oldBitmap = SelectObject(memoryDc, bitmap);
+    SetBkMode(memoryDc, TRANSPARENT);
+    POINT oldOrigin{};
+    SetViewportOrgEx(memoryDc, -clippedBounds.left, -clippedBounds.top, &oldOrigin);
+
+    fullscreenTransportAmount_ = 1.0;
+    if (menuOpacity > 0.0) {
+        subtitleMenuAmount_ = 1.0;
+    }
+    DrawTransport(memoryDc, snapshot);
+    DrawButtons(memoryDc, snapshot);
+    if (hasMenuSurface) {
+        DrawSubtitleMenu(memoryDc, snapshot);
+    }
+    fullscreenTransportAmount_ = transportOpacity;
+    subtitleMenuAmount_ = menuOpacity;
+    SetViewportOrgEx(memoryDc, oldOrigin.x, oldOrigin.y, nullptr);
+
+    auto pixels = std::make_shared<std::vector<uint8_t>>(
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
+    std::memcpy(pixels->data(), dibPixels, pixels->size());
+    if (hasMenuSurface) {
+        for (int y = 0; y < height; ++y) {
+            const int clientY = clippedBounds.top + y;
+            for (int x = 0; x < width; ++x) {
+                const int clientX = clippedBounds.left + x;
+                uint8_t* pixel = pixels->data() +
+                                 (static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
+                                  static_cast<std::size_t>(x)) * 4;
+                if ((pixel[0] | pixel[1] | pixel[2]) == 0) {
+                    pixel[3] = 0;
+                    continue;
+                }
+                const bool inMenu = clientX >= subtitleMenu_.left && clientX < subtitleMenu_.right &&
+                                    clientY >= subtitleMenu_.top && clientY < subtitleMenu_.bottom;
+                const double opacity = transportOpacity * (inMenu ? menuOpacity : 1.0);
+                const uint8_t alpha = static_cast<uint8_t>(std::clamp(std::lround(opacity * 255.0), 0L, 255L));
+                pixel[0] = static_cast<uint8_t>((static_cast<unsigned>(pixel[0]) * alpha + 127u) / 255u);
+                pixel[1] = static_cast<uint8_t>((static_cast<unsigned>(pixel[1]) * alpha + 127u) / 255u);
+                pixel[2] = static_cast<uint8_t>((static_cast<unsigned>(pixel[2]) * alpha + 127u) / 255u);
+                pixel[3] = alpha;
+            }
+        }
+    }
+
+    SelectObject(memoryDc, oldBitmap);
+    DeleteObject(bitmap);
+    DeleteDC(memoryDc);
+    ReleaseDC(hwnd_, windowDc);
+
+    const RECT hostBounds = PlaybackSurfaceBounds();
+    auto overlay = std::make_shared<D3D11UiOverlayBitmap>();
+    overlay->width = width;
+    overlay->height = height;
+    overlay->destinationX = clippedBounds.left - hostBounds.left;
+    overlay->destinationY = clippedBounds.top - hostBounds.top;
+    overlay->alphaFromRgb = !hasMenuSurface;
+    overlay->opacity = static_cast<float>(transportOpacity);
+    overlay->bgraPremultiplied = std::move(pixels);
+    d3dRenderer_->ConfigureUiOverlay(std::move(overlay), requestImmediatePresent);
+    gpuFullscreenUiOverlayActive_ = true;
+    if (!gpuFullscreenUiOverlayLogged_) {
+        gpuFullscreenUiOverlayLogged_ = true;
+        LogApp(anvil::playback::LogLevel::Info,
+               L"fullscreen ui overlay gpu=active surface=video_backbuffer webview_cutout=false");
+    }
+}
+
 void MainWindow::RenderBufferingHudOverlay(const NativeVideoQueueStats& stats) {
     if (!bufferingHudOverlay_) {
         return;
@@ -787,17 +932,16 @@ void MainWindow::DrawButtons(HDC hdc, const PlaybackSessionSnapshot& snapshot) c
         const RECT bounds = visualButtonBounds(button.bounds, hoverMotion, pressMotion);
 
         if (button.kind == ButtonKind::TransportIcon || button.kind == ButtonKind::TransportLabel) {
-            const int radius = std::max(Scale(8), std::min(RectWidth(bounds), RectHeight(bounds)) / 2);
-            if (visuallyHovered || button.selected) {
-                const COLORREF fill = button.selected
-                                          ? BlendColor(palette_.accentSoft, palette_.surfaceRaised, 0.12)
-                                          : BlendColor(palette_.surfaceRaised, palette_.text, 0.025 + 0.055 * hoverMotion);
-                FillRoundRect(hdc, bounds, fade(fill), radius);
-                StrokeRoundRect(hdc,
-                                bounds,
-                                fade(BlendColor(palette_.border, palette_.text, 0.04 + 0.16 * hoverMotion)),
-                                radius);
-            }
+            const int radius = Scale(7);
+            const COLORREF fill = button.selected
+                                      ? BlendColor(palette_.accentSoft, palette_.surfaceRaised, 0.12)
+                                      : BlendColor(RGB(11, 13, 17), palette_.surfaceRaised,
+                                                   visuallyHovered ? 0.42 + 0.18 * hoverMotion : 0.0);
+            FillRoundRect(hdc, bounds, fade(fill), radius);
+            StrokeRoundRect(hdc,
+                            bounds,
+                            fade(BlendColor(palette_.border, palette_.text, 0.04 + 0.16 * hoverMotion)),
+                            radius);
 
             COLORREF contentColor = !button.enabled
                                         ? palette_.dim
@@ -897,9 +1041,7 @@ void MainWindow::DrawButtons(HDC hdc, const PlaybackSessionSnapshot& snapshot) c
             }
         }
 
-        const int radius = button.kind == ButtonKind::TransportPrimary
-                               ? std::max(Scale(12), std::min(RectWidth(bounds), RectHeight(bounds)) / 2)
-                               : Scale(8);
+        const int radius = button.kind == ButtonKind::TransportPrimary ? Scale(7) : Scale(8);
         FillRoundRect(hdc, bounds, fade(fill), radius);
         StrokeRoundRect(hdc,
                         bounds,
@@ -919,7 +1061,7 @@ void MainWindow::DrawButtons(HDC hdc, const PlaybackSessionSnapshot& snapshot) c
         const bool wideTextIcon = button.icon == IconKind::HdrColor || button.icon == IconKind::DolbyVisionColor;
         const int iconInset = wideTextIcon
                                   ? Scale(3)
-                                  : (button.kind == ButtonKind::TransportPrimary ? Scale(10) : Scale(8));
+                                  : (button.kind == ButtonKind::TransportPrimary ? Scale(7) : Scale(8));
         RECT iconRect = DeflateRectCopy(bounds, iconInset, iconInset);
         IconKind icon = button.icon;
         if (button.command == Command::PlayPause) {
@@ -2091,6 +2233,10 @@ void MainWindow::DrawLogContent(HDC hdc, RECT cursor) const {
 }
 
 void MainWindow::DrawSettingsContent(HDC hdc, const PlayerSettings& settings, RECT cursor) const {
+    const auto snapshot = controller_.Snapshot();
+    const bool dolbyVisionMedia = snapshot.media.has_value() &&
+                                  snapshot.media->hasVideo &&
+                                  snapshot.media->dolbyVisionDetected;
     const RECT viewport = RectWidth(settingsContentViewport_) > 0 ? settingsContentViewport_ : cursor;
     HRGN clip = CreateRectRgn(viewport.left, viewport.top, viewport.right + 1, viewport.bottom + 1);
     SelectClipRgn(hdc, clip);
@@ -2106,9 +2252,19 @@ void MainWindow::DrawSettingsContent(HDC hdc, const PlayerSettings& settings, RE
     DrawField(hdc, L"HDR mode", ToDisplayString(settings.video.hdrOutput), cursor);
     DrawField(hdc, L"Tone map", ToDisplayString(settings.video.toneMapping), cursor);
     DrawField(hdc, L"Dolby Vision", ToDisplayString(settings.video.dolbyVision), cursor);
+    if (!dolbyVisionMedia) {
+        DrawField(hdc,
+                  L"Display metadata passthrough",
+                  settings.video.displayMetadataPassthrough ? L"On" : L"Off",
+                  cursor);
+    }
+    DrawField(hdc,
+              L"Dolby Vision system pipeline (experimental)",
+              settings.video.dolbyVisionSystemPipelineExperimental ? L"On" : L"Off",
+              cursor);
     if (CurrentMediaHasHdrControls()) {
         DrawField(hdc,
-                  CurrentMediaHasCmv4Control() ? L"Dolby Vision" : L"HDR Output",
+                  dolbyVisionMedia ? L"Dolby Vision" : L"HDR Output",
                   settings.video.dolbyVisionHdrOutput ? L"On" : L"Off",
                   cursor);
     }

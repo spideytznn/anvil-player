@@ -32,9 +32,9 @@ function filterByNav(items: MediaItem[], navKey: NavKey): MediaItem[] {
     case 'unwatched': return items.filter((item) => !item.watched)
     case 'watched': return items.filter((item) => item.watched)
     case 'favorites': return items.filter((item) => item.favorite)
-    case 'playlist': return items.filter((item) => item.favorite || item.progress > 0)
+    case 'playlist': return items.filter((item) => item.inPlaylist || Boolean(item.playlistIds?.length))
     case 'genre': return [...items].sort((a, b) => a.genres[0].localeCompare(b.genres[0], 'zh-Hans-CN'))
-    case 'rating': return items.filter((item) => item.rating >= 8)
+    case 'rating': return [...items].sort((a, b) => b.rating - a.rating)
     case 'release': return [...items].sort((a, b) => b.year - a.year)
     default: return items
   }
@@ -253,6 +253,8 @@ function tinyNestedItemForCache(item: MediaItem): MediaItem {
     continueWatching: item.continueWatching,
     watched: item.watched,
     favorite: item.favorite,
+    inPlaylist: item.inPlaylist,
+    playlistIds: item.playlistIds,
     addedDaysAgo: item.addedDaysAgo,
     poster: item.poster,
     backdrop: '',
@@ -506,7 +508,10 @@ export function createEmptyLibraryClient(): MediaLibraryClient {
     },
 
     async upsertSourceItems(source, sourceItems, sourceHomeSections = []) {
-      sources = [source, ...sources.filter((candidate) => candidate.id !== source.id)]
+      const existingIndex = sources.findIndex((candidate) => candidate.id === source.id)
+      sources = existingIndex >= 0
+        ? sources.map((candidate, index) => index === existingIndex ? source : candidate)
+        : [source, ...sources]
       items = [
         ...items.filter((item) => item.sourceId !== source.id),
         ...sourceItems.map((item) => ({ ...item, sourceId: source.id })).filter((item) => !isHidden(item))

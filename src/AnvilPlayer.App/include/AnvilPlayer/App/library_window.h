@@ -45,6 +45,7 @@ public:
     void SetFocusPlayerRequest(std::function<void()> callback);
     void SetUiLanguageChangedRequest(std::function<void()> callback);
     void SetRefreshRatePreferencesChangedRequest(std::function<void()> callback);
+    void SetVideoPassthroughPreferencesChangedRequest(std::function<void()> callback);
     // Relays a serialized Emby playback report (from the library WebView) to
     // the player window so it can report progress despite separate storage.
     void SetEmbyPlaybackReportRelay(std::function<void(const std::wstring&)> callback);
@@ -56,6 +57,7 @@ public:
     bool Create(HINSTANCE instance);
     void Show(int commandShow) const;
     HWND Handle() const { return hwnd_; }
+    bool DeliverLocalPlaybackProgress(const std::wstring& progressJson) const;
 
 private:
     static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
@@ -106,6 +108,7 @@ private:
     PlaybackRequest playbackRequest_;
     std::function<void()> uiLanguageChangedRequest_;
     std::function<void()> refreshRatePreferencesChangedRequest_;
+    std::function<void()> videoPassthroughPreferencesChangedRequest_;
     std::function<void(bool)> allowInsecureCertificatesRequest_;
     std::function<void()> focusPlayerRequest_;
     std::function<void(const std::wstring&)> embyPlaybackReportRelay_;

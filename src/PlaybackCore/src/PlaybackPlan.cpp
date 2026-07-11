@@ -64,8 +64,9 @@ std::wstring ChooseVideoMode(const MediaDescriptor& media, const VideoSettings& 
             // when explicitly opting out).
             return L"dolby_vision_disabled_tone_map";
         }
-        if (settings.dolbyVision == DolbyVisionMode::ExperimentalPassthrough && capabilities.display.dolbyVisionSignalAvailable) {
-            return L"dolby_vision_experimental_passthrough";
+        if (settings.dolbyVisionSystemPipelineExperimental &&
+            capabilities.codecs.dolbyVisionExtensionDetected) {
+            return L"dolby_vision_system_extensions";
         }
         // Software-extracted RPU reshaping on the GPU, output as HDR10 PQ
         // (HDR display) or tone-mapped SDR.

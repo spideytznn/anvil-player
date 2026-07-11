@@ -5,7 +5,9 @@
 extern "C" {
 #include <libavcodec/codec_par.h>
 #include <libavutil/frame.h>
+#include <libavutil/hdr_dynamic_metadata.h>
 #include <libavutil/mastering_display_metadata.h>
+#include <libavutil/mem.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/rational.h>
 }
@@ -182,6 +184,36 @@ VideoColorMetadata MergeFrameColorMetadata(const AVFrame* frame, const VideoColo
     }
 
     return metadata;
+}
+
+std::shared_ptr<const std::vector<std::uint8_t>> ExtractHdr10PlusPayload(const AVFrame* frame) {
+    const AVFrameSideData* sideData = frame
+                                          ? av_frame_get_side_data(frame, AV_FRAME_DATA_DYNAMIC_HDR_PLUS)
+                                          : nullptr;
+    if (!sideData || sideData->size < sizeof(AVDynamicHDRPlus)) return {};
+
+    const auto* metadata = reinterpret_cast<const AVDynamicHDRPlus*>(sideData->data);
+    std::uint8_t* payload = nullptr;
+    std::size_t payloadSize = 0;
+    if (av_dynamic_hdr_plus_to_t35(metadata, &payload, &payloadSize) < 0 || !payload || payloadSize == 0) {
+        av_free(payload);
+        return {};
+    }
+    auto result = std::make_shared<std::vector<std::uint8_t>>(payload, payload + payloadSize);
+    av_free(payload);
+    return result;
+}
+
+std::shared_ptr<const std::vector<std::uint8_t>> ExtractDolbyVisionRpu(const AVFrame* frame) {
+    const AVFrameSideData* sideData = frame
+                                          ? av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_RPU_BUFFER)
+                                          : nullptr;
+    if (!sideData || !sideData->data || sideData->size == 0) {
+        return {};
+    }
+    return std::make_shared<std::vector<std::uint8_t>>(
+        sideData->data,
+        sideData->data + sideData->size);
 }
 
 VideoColorMetadata SdrBt709ColorMetadata() {

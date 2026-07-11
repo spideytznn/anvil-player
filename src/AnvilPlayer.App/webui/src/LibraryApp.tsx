@@ -20,7 +20,9 @@ import {
   Languages,
   LockKeyhole,
   ListFilter,
+  ListPlus,
   MoreHorizontal,
+  MonitorCog,
   Play,
   Plus,
   Search,
@@ -40,6 +42,7 @@ import { applyAppearanceSettings } from './appearance'
 import { loadSavedEmbyConnections, removeSavedEmbyConnection, saveSavedEmbyConnection, type SavedEmbyConnection } from './manager/connectionStorage'
 import { createEmptyLibraryClient } from './manager/mediaLibraryClient'
 import {
+  listEmbyLibraryView,
   loadEmbyItemDetails,
   loadEmbyLibrary,
   notifyPendingEmbyPlaybackReport,
@@ -135,6 +138,29 @@ import { TaskCenter, type BackgroundTask } from './library/TaskCenter'
 
 const LIBRARY_LISTING_PAGE_SIZE = 60
 const DISSOLVED_COLLECTION_PATHS_KEY = 'anvil-player.library.dissolved-paths.v1'
+const PLAYLISTS_KEY = 'anvil-player.library.playlists.v1'
+const WATCH_LATER_PLAYLIST_ID = 'watch-later'
+
+interface MediaPlaylist {
+  id: string
+  name: string
+}
+
+function loadMediaPlaylists(): MediaPlaylist[] {
+  try {
+    const parsed: unknown = JSON.parse(localStorage.getItem(PLAYLISTS_KEY) || '[]')
+    const custom = Array.isArray(parsed)
+      ? parsed.filter((row): row is MediaPlaylist => Boolean(row && typeof row === 'object' && typeof (row as MediaPlaylist).id === 'string' && typeof (row as MediaPlaylist).name === 'string'))
+      : []
+    return [{ id: WATCH_LATER_PLAYLIST_ID, name: '稍后观看' }, ...custom.filter((row) => row.id !== WATCH_LATER_PLAYLIST_ID)]
+  } catch {
+    return [{ id: WATCH_LATER_PLAYLIST_ID, name: '稍后观看' }]
+  }
+}
+
+function saveMediaPlaylists(playlists: MediaPlaylist[]): void {
+  localStorage.setItem(PLAYLISTS_KEY, JSON.stringify(playlists.filter((row) => row.id !== WATCH_LATER_PLAYLIST_ID)))
+}
 
 function loadDissolvedCollectionPaths(): Set<string> {
   try {
@@ -173,7 +199,7 @@ const smartNav: NavItem[] = [
   { key: 'unwatched', label: 'unwatched', icon: <Clock3 size={16} /> },
   { key: 'watched', label: 'watched', icon: <Check size={16} /> },
   { key: 'favorites', label: 'favorites', icon: <Heart size={16} /> },
-  { key: 'playlist', label: 'playlist', icon: <Wand2 size={16} /> },
+  { key: 'playlist', label: 'playlist', icon: <ListPlus size={16} /> },
   { key: 'genre', label: 'genre', icon: <ListFilter size={16} /> },
   { key: 'rating', label: 'rating', icon: <Star size={16} /> },
   { key: 'release', label: 'release', icon: <Database size={16} /> }
@@ -194,6 +220,49 @@ const navTranslations: Record<string, Record<UiLanguage, string>> = {
 }
 
 let currentLibraryLanguage: UiLanguage = 'zh'
+
+function playbackLocationKey(value: string): string {
+  try {
+    const url = new URL(value)
+    url.username = ''
+    url.password = ''
+    return locationKey(url.toString())
+  } catch {
+    return locationKey(value)
+  }
+}
+
+function applyPlaybackProgress(item: MediaItem, path: string, ratio: number, ended: boolean): { item: MediaItem; changed: boolean } {
+  const matches = [item.path, item.playbackPath].some((value) => value && playbackLocationKey(value) === playbackLocationKey(path))
+  let nestedChanged = false
+  const updateNested = (nested: MediaItem | undefined): MediaItem | undefined => {
+    if (!nested) return nested
+    const updated = applyPlaybackProgress(nested, path, ratio, ended)
+    nestedChanged ||= updated.changed
+    return updated.item
+  }
+  const seasons = item.seasons?.map((season) => ({
+    ...season,
+    episodes: season.episodes.map((episode) => ({ ...episode, item: updateNested(episode.item) }))
+  }))
+  const episodes = item.episodes?.map((episode) => ({ ...episode, item: updateNested(episode.item) }))
+  const versions = item.versions?.map((version) => updateNested(version) ?? version)
+  if (!matches && !nestedChanged) return { item, changed: false }
+  const watched = ended || ratio >= 0.9
+  const progress = watched ? 1 : ratio
+  return {
+    changed: true,
+    item: {
+      ...item,
+      seasons,
+      episodes,
+      versions,
+      progress,
+      watched,
+      continueWatching: !watched && progress >= 0.005
+    }
+  }
+}
 
 function localizedNav(items: NavItem[], language: UiLanguage): NavItem[] {
   return items.map((item) => ({ ...item, label: navTranslations[item.label]?.[language] ?? item.label }))
@@ -1009,6 +1078,10 @@ function DetailPanel(props: {
   onPlayIntent: (item: MediaItem, audioTrackIndex: number, subtitleTrackIndex: number) => void
   onTrailerIntent: (item: MediaItem) => Promise<string[]>
   onRemoveFromLibrary: (item: MediaItem) => void
+  onToggleFavorite: (item: MediaItem) => void
+  playlists: MediaPlaylist[]
+  onTogglePlaylist: (item: MediaItem, playlistId: string) => void
+  onCreatePlaylist: (item: MediaItem) => void
   onScrapeIntent: (item: MediaItem) => void
   onRematchIntent: (item: MediaItem) => void
   onSearchMatch: (item: MediaItem) => void
@@ -1031,6 +1104,7 @@ function DetailPanel(props: {
   const [selectedAudioStreamId, setSelectedAudioStreamId] = useState('')
   const [selectedSubtitleStreamId, setSelectedSubtitleStreamId] = useState('subtitle-auto')
   const [metadataMenuOpen, setMetadataMenuOpen] = useState(false)
+  const [playlistMenuOpen, setPlaylistMenuOpen] = useState(false)
   const [trailerPlaying, setTrailerPlaying] = useState(false)
   const [trailerPlaybackStarted, setTrailerPlaybackStarted] = useState(false)
   const initialTrailerUrls = (): string[] => [...new Set([
@@ -1392,10 +1466,39 @@ function DetailPanel(props: {
           </button>
         </div>
         <div className="library-utility-actions">
-          <button className={`library-tool-action ${props.item.favorite ? 'is-active' : ''}`} type="button" title="收藏">
-            <Heart size={18} />
-            <span>{props.language === 'zh' ? '收藏' : 'Favorite'}</span>
+          <button
+            className={`library-tool-action library-favorite-action ${props.item.favorite ? 'is-favorite' : ''}`}
+            type="button"
+            title={props.item.favorite ? (props.language === 'zh' ? '已收藏' : 'Favorited') : (props.language === 'zh' ? '收藏' : 'Favorite')}
+            aria-pressed={props.item.favorite}
+            onClick={() => props.onToggleFavorite(props.item)}
+          >
+            <Heart size={18} fill={props.item.favorite ? 'currentColor' : 'none'} />
+            <span>{props.item.favorite ? (props.language === 'zh' ? '已收藏' : 'Favorited') : (props.language === 'zh' ? '收藏' : 'Favorite')}</span>
           </button>
+          <div className="library-detail-menu">
+            <button
+              className="library-tool-action"
+              type="button"
+              title={props.language === 'zh' ? '管理片单' : 'Manage playlists'}
+              aria-expanded={playlistMenuOpen}
+              onClick={() => setPlaylistMenuOpen((open) => !open)}
+            >
+              <ListPlus size={18} />
+              <span>{props.language === 'zh' ? '片单' : 'Playlists'}</span>
+            </button>
+            {playlistMenuOpen ? (
+              <div className="library-detail-menu-panel library-playlist-menu-panel">
+                {props.playlists.map((playlist) => {
+                  const selected = props.item.playlistIds?.includes(playlist.id) || (props.item.inPlaylist && playlist.id === WATCH_LATER_PLAYLIST_ID)
+                  return <button className={selected ? 'is-active' : ''} type="button" key={playlist.id} onClick={() => props.onTogglePlaylist(props.item, playlist.id)}>
+                    <span>{selected ? '✓' : '+'}</span><span>{playlist.name}</span>
+                  </button>
+                })}
+                <button type="button" onClick={() => props.onCreatePlaylist(props.item)}><span>+</span><span>{props.language === 'zh' ? '新建片单' : 'New playlist'}</span></button>
+              </div>
+            ) : null}
+          </div>
           {props.canScrapeMetadata ? (
             <button
               className="library-tool-action"
@@ -1408,7 +1511,13 @@ function DetailPanel(props: {
               <span>{props.language === 'zh' ? '刮削' : 'Scrape'}</span>
             </button>
           ) : null}
-          <button className="library-tool-action is-danger" type="button" title={props.language === 'zh' ? '从媒体库移除' : 'Remove from library'} onClick={() => props.onRemoveFromLibrary(props.item)}>
+          <button
+            className="library-tool-action is-danger"
+            type="button"
+            title={props.language === 'zh' ? '从媒体库移除' : 'Remove from library'}
+            disabled={props.source.kind === 'Emby'}
+            onClick={() => props.onRemoveFromLibrary(props.item)}
+          >
             <Trash2 size={18} />
             <span>{props.language === 'zh' ? '删除' : 'Remove'}</span>
           </button>
@@ -1432,7 +1541,7 @@ function DetailPanel(props: {
               ) : null}
             </div>
           ) : (
-            <button className="library-tool-action" type="button" title="更多">
+            <button className="library-tool-action" type="button" title="更多" disabled={props.source.kind === 'Emby'}>
               <MoreHorizontal size={18} />
               <span>{props.language === 'zh' ? '更多' : 'More'}</span>
             </button>
@@ -1914,6 +2023,14 @@ const settingsCopy: Record<UiLanguage, {
   tone: string
   playerTone: string
   playbackHint: string
+  displayPassthrough: string
+  displayPassthroughCaption: string
+  autoDisplayFormat: string
+  autoDisplayFormatCaption: string
+  displayMetadataPassthrough: string
+  displayMetadataPassthroughCaption: string
+  dolbyVisionSystemPipelineExperimental: string
+  dolbyVisionSystemPipelineExperimentalCaption: string
   refreshRateSync: string
   refreshRateSyncCaption: string
   refreshRateSyncRequirement: string
@@ -1955,6 +2072,14 @@ const settingsCopy: Record<UiLanguage, {
     tone: '色调',
     playerTone: '跟随播放器',
     playbackHint: '播放相关设置仍在播放器侧边栏中调整。',
+    displayPassthrough: '显示直通',
+    displayPassthroughCaption: '全局默认。播放器会根据片源规格选择显示输出，并在停止播放时恢复。',
+    autoDisplayFormat: '自动匹配显示格式',
+    autoDisplayFormatCaption: '根据片源自动切换 Windows 与播放器 HDR，播放结束后恢复原始显示状态。',
+    displayMetadataPassthrough: '显示元数据直通',
+    displayMetadataPassthroughCaption: '向电视传递 HDR 母版色域、MaxCLL 和 MaxFALL 元数据。',
+    dolbyVisionSystemPipelineExperimental: '杜比视界直通（实验性）',
+    dolbyVisionSystemPipelineExperimentalCaption: '强制杜比视界片源使用 Windows MediaEngine 与 Dolby Vision Extensions；默认关闭。',
     refreshRateSync: '智能刷新率同步',
     refreshRateSyncCaption: '全局默认。播放视频进入全屏时，自动选择与帧率整数倍匹配的最高刷新率。',
     refreshRateSyncRequirement: '请先在显卡控制面板创建片源所需的精确刷新率，例如 23.976 Hz 或 119.880 Hz。',
@@ -1996,6 +2121,14 @@ const settingsCopy: Record<UiLanguage, {
     tone: 'Tone',
     playerTone: 'Follow player',
     playbackHint: 'Playback-specific settings remain in the player sidebar.',
+    displayPassthrough: 'Display passthrough',
+    displayPassthroughCaption: 'Global default. Match the display output to the source and restore it when playback stops.',
+    autoDisplayFormat: 'Automatically match display format',
+    autoDisplayFormatCaption: 'Switch Windows and player HDR for the current media, then restore the original display state.',
+    displayMetadataPassthrough: 'Display metadata passthrough',
+    displayMetadataPassthroughCaption: 'Pass HDR mastering primaries, MaxCLL, and MaxFALL metadata to the TV.',
+    dolbyVisionSystemPipelineExperimental: 'Dolby Vision passthrough (experimental)',
+    dolbyVisionSystemPipelineExperimentalCaption: 'Force Dolby Vision sources through Windows MediaEngine and Dolby Vision Extensions. Disabled by default.',
     refreshRateSync: 'Smart refresh-rate sync',
     refreshRateSyncCaption: 'Global default. In fullscreen, select the highest refresh rate that is an integer multiple of the video frame rate.',
     refreshRateSyncRequirement: 'Create the exact required mode in the GPU control panel first, such as 23.976 Hz or 119.880 Hz.',
@@ -2044,6 +2177,13 @@ function LibrarySettingsPage(props: {
   onRefreshRateSyncChange: (enabled: boolean) => void
   refreshRateMaximumMultiple: boolean
   onRefreshRateMaximumMultipleChange: (enabled: boolean) => void
+  displayMetadataPassthrough: boolean
+  autoDisplayFormat: boolean
+  dolbyVisionSystemPipelineExperimental: boolean
+  windowsHdrEnabled: boolean
+  onDisplayMetadataPassthroughChange: (enabled: boolean) => void
+  onAutoDisplayFormatChange: (enabled: boolean) => void
+  onDolbyVisionSystemPipelineExperimentalChange: (enabled: boolean) => void
 }): JSX.Element {
   const t = settingsCopy[props.language]
   const languageOptions: Array<{ key: UiLanguage; label: string }> = [
@@ -2174,6 +2314,52 @@ function LibrarySettingsPage(props: {
 
       <section className="library-settings-panel">
         <div className="library-settings-panel-title">
+          <MonitorCog size={16} />
+          <span>{t.displayPassthrough}</span>
+        </div>
+        <p>{t.displayPassthroughCaption}</p>
+        <div className="library-settings-form-grid">
+          <label className="library-settings-field">
+            <span>{t.autoDisplayFormat}</span>
+            <small>{t.autoDisplayFormatCaption}</small>
+            <div className="library-setting-options" role="group" aria-label={t.autoDisplayFormat}>
+              <button className={props.autoDisplayFormat ? 'is-selected' : ''} type="button" onClick={() => props.onAutoDisplayFormatChange(true)}>
+                <span>{t.enabled}</span>
+              </button>
+              <button className={!props.autoDisplayFormat ? 'is-selected' : ''} type="button" onClick={() => props.onAutoDisplayFormatChange(false)}>
+                <span>{t.disabled}</span>
+              </button>
+            </div>
+          </label>
+          <label className="library-settings-field">
+            <span>{t.displayMetadataPassthrough}</span>
+            <small>{t.displayMetadataPassthroughCaption}</small>
+            <div className="library-setting-options" role="group" aria-label={t.displayMetadataPassthrough}>
+              <button className={(props.autoDisplayFormat || props.displayMetadataPassthrough) ? 'is-selected' : ''} type="button" disabled={props.autoDisplayFormat || !props.windowsHdrEnabled} onClick={() => props.onDisplayMetadataPassthroughChange(true)}>
+                <span>{t.enabled}</span>
+              </button>
+              <button className={!props.autoDisplayFormat && !props.displayMetadataPassthrough ? 'is-selected' : ''} type="button" disabled={props.autoDisplayFormat || !props.windowsHdrEnabled} onClick={() => props.onDisplayMetadataPassthroughChange(false)}>
+                <span>{t.disabled}</span>
+              </button>
+            </div>
+          </label>
+          <label className="library-settings-field">
+            <span>{t.dolbyVisionSystemPipelineExperimental}</span>
+            <small>{t.dolbyVisionSystemPipelineExperimentalCaption}</small>
+            <div className="library-setting-options" role="group" aria-label={t.dolbyVisionSystemPipelineExperimental}>
+              <button className={(props.autoDisplayFormat || props.dolbyVisionSystemPipelineExperimental) ? 'is-selected' : ''} type="button" disabled={props.autoDisplayFormat || !props.windowsHdrEnabled} onClick={() => props.onDolbyVisionSystemPipelineExperimentalChange(true)}>
+                <span>{t.enabled}</span>
+              </button>
+              <button className={!props.autoDisplayFormat && !props.dolbyVisionSystemPipelineExperimental ? 'is-selected' : ''} type="button" disabled={props.autoDisplayFormat || !props.windowsHdrEnabled} onClick={() => props.onDolbyVisionSystemPipelineExperimentalChange(false)}>
+                <span>{t.disabled}</span>
+              </button>
+            </div>
+          </label>
+        </div>
+      </section>
+
+      <section className="library-settings-panel">
+        <div className="library-settings-panel-title">
           <Tv size={16} />
           <span>{t.refreshRateSync}</span>
         </div>
@@ -2287,8 +2473,16 @@ export default function LibraryApp(): JSX.Element {
   )
   const client = useMemo(() => createEmptyLibraryClient(), [])
   const [language, setLanguage] = useState<UiLanguage>(() => getInitialLanguage())
+  const [playlists, setPlaylists] = useState<MediaPlaylist[]>(() => loadMediaPlaylists())
+  const [newPlaylistItem, setNewPlaylistItem] = useState<MediaItem | undefined>()
+  const [newPlaylistName, setNewPlaylistName] = useState('')
   const [customTitleBarEnabled, setCustomTitleBarEnabled] = useState(false)
   currentLibraryLanguage = language
+  const [displayMetadataPassthrough, setDisplayMetadataPassthrough] = useState(true)
+  const [autoDisplayFormat, setAutoDisplayFormat] = useState(false)
+  const [dolbyVisionSystemPipelineExperimental, setDolbyVisionSystemPipelineExperimental] = useState(false)
+  const [windowsHdrEnabled, setWindowsHdrEnabled] = useState(false)
+  const [videoPassthroughSettingsLoaded, setVideoPassthroughSettingsLoaded] = useState(false)
   const [refreshRateSyncEnabled, setRefreshRateSyncEnabled] = useState(() => localStorage.getItem('anvil-player.refresh-rate-sync') === 'true')
   const [refreshRateMaximumMultiple, setRefreshRateMaximumMultiple] = useState(() => localStorage.getItem('anvil-player.refresh-rate-maximum-multiple') !== 'false')
   const { settings: tmdbSettings, status: tmdbStatus, isTesting: isTestingTmdb, updateSettings: updateTmdbSettings, testConnection: testTmdbSettingsConnection } = useTmdbSettings()
@@ -2614,6 +2808,21 @@ export default function LibraryApp(): JSX.Element {
   }, [refreshRateMaximumMultiple])
 
   useEffect(() => {
+    if (!videoPassthroughSettingsLoaded) return
+    postNativeCommand({ type: 'command', command: 'setGlobalAutoDisplayFormat', enabled: autoDisplayFormat })
+  }, [autoDisplayFormat, videoPassthroughSettingsLoaded])
+
+  useEffect(() => {
+    if (!videoPassthroughSettingsLoaded || autoDisplayFormat) return
+    postNativeCommand({ type: 'command', command: 'setGlobalDisplayMetadataPassthrough', enabled: displayMetadataPassthrough })
+  }, [displayMetadataPassthrough, videoPassthroughSettingsLoaded, autoDisplayFormat])
+
+  useEffect(() => {
+    if (!videoPassthroughSettingsLoaded || autoDisplayFormat) return
+    postNativeCommand({ type: 'command', command: 'setGlobalDolbyVisionSystemPipelineExperimental', enabled: dolbyVisionSystemPipelineExperimental })
+  }, [dolbyVisionSystemPipelineExperimental, videoPassthroughSettingsLoaded, autoDisplayFormat])
+
+  useEffect(() => {
     saveTrailerSettings(trailerSettings)
   }, [trailerSettings])
 
@@ -2926,8 +3135,35 @@ export default function LibraryApp(): JSX.Element {
     }
 
     const unsubscribe = subscribeNativeMessages((message) => {
-      if (message.type === 'windowChrome') {
+      if (message.type === 'command' && message.command === 'localPlaybackProgress') {
+        const ratio = message.durationMs > 0 ? Math.max(0, Math.min(1, message.positionMs / message.durationMs)) : 0
+        const ended = message.playbackState === 'Ended'
+        const changed: MediaItem[] = []
+        const nextItems = allItemsRef.current.map((candidate) => {
+          if (sources.find((source) => source.id === candidate.sourceId)?.kind === 'Emby') return candidate
+          const updated = applyPlaybackProgress(candidate, message.path, ratio, ended)
+          if (updated.changed) changed.push(updated.item)
+          return updated.item
+        })
+        if (!changed.length) return
+        allItemsRef.current = nextItems
+        setAllItems(nextItems)
+        setVisibleItems((current) => current.map((candidate) => changed.find((item) => item.id === candidate.id) ?? candidate))
+        setContinueItems(nextItems.filter((item) => item.continueWatching || (item.progress > 0 && item.progress < 1)))
+        setDetailItemsById((current) => {
+          const next = new Map(current)
+          changed.forEach((item) => next.set(item.id, item))
+          return next
+        })
+        changed.forEach((item) => { void client.updateItem(item) })
+      } else if (message.type === 'windowChrome') {
         setCustomTitleBarEnabled(message.customTitleBar)
+      } else if (message.type === 'globalVideoPassthroughSettings') {
+        setAutoDisplayFormat(message.autoDisplayFormat)
+        setDisplayMetadataPassthrough(message.displayMetadataPassthrough)
+        setDolbyVisionSystemPipelineExperimental(message.dolbyVisionSystemPipelineExperimental)
+        setWindowsHdrEnabled(message.windowsHdrEnabled)
+        setVideoPassthroughSettingsLoaded(true)
       } else if (message.type === 'localFolderPicked') {
         void importLocalFolder(message)
       } else if (message.type === 'localFolderScanCompleted') {
@@ -3004,6 +3240,7 @@ export default function LibraryApp(): JSX.Element {
       }
     })
     postNativeCommand({ type: 'command', command: 'requestWindowChrome' })
+    postNativeCommand({ type: 'command', command: 'requestGlobalVideoPassthroughSettings' })
     return unsubscribe
   }, [activeLibraryViewId, activeNav, activeView, client, debouncedQuery, mediaFilter, selectedId, sortKey, sortOrder, sources])
 
@@ -3094,6 +3331,22 @@ export default function LibraryApp(): JSX.Element {
     const activeSession = activeSourceId ? embySessionsBySourceId.get(activeSourceId) : undefined
 
     async function loadVisibleItems(): Promise<void> {
+      if (activeSourceKind === 'Emby' && activeSession && activeLibraryViewId && !debouncedQuery.trim()) {
+        try {
+          const rows = await listEmbyLibraryView(activeSession, {
+            libraryViewId: activeLibraryViewId,
+            view: activeView,
+            filterKey: mediaFilter,
+            sortKey,
+            sortOrder
+          })
+          if (!cancelled) setVisibleItems(rows)
+          return
+        } catch (error) {
+          debugLibraryPlayback(`emby view load failed source=${activeSourceId} view=${activeLibraryViewId} error=${errorText(error)}`)
+        }
+      }
+
       if (activeSourceKind === 'Emby' && activeSession && debouncedQuery.trim()) {
         try {
           const rows = personSearch && personSearch.sourceId === activeSourceId && personSearch.name === debouncedQuery.trim()
@@ -3170,6 +3423,24 @@ export default function LibraryApp(): JSX.Element {
     effectiveListingPage * LIBRARY_LISTING_PAGE_SIZE,
     visibleItems.length
   )
+  const classificationGroups = useMemo(() => {
+    if (!['playlist', 'genre', 'rating', 'release'].includes(activeNav)) return [] as Array<{ label: string; items: MediaItem[] }>
+    const groups = new Map<string, MediaItem[]>()
+    visibleItems.forEach((item) => {
+      const labels = activeNav === 'playlist'
+        ? playlists.filter((playlist) => item.playlistIds?.includes(playlist.id) || (item.inPlaylist && playlist.id === WATCH_LATER_PLAYLIST_ID)).map((playlist) => playlist.name)
+        : activeNav === 'genre'
+        ? (item.genres.length ? item.genres : ['未分类'])
+        : activeNav === 'rating'
+          ? [item.rating > 0 ? `${Math.floor(item.rating)}.0–${Math.floor(item.rating)}.9` : '暂无评分']
+          : [item.year > 0 ? String(item.year) : '未知年份']
+      labels.forEach((label) => groups.set(label, [...(groups.get(label) ?? []), item]))
+    })
+    const rows = [...groups].map(([label, items]) => ({ label, items }))
+    return activeNav === 'genre' || activeNav === 'playlist'
+      ? rows.sort((a, b) => a.label.localeCompare(b.label, 'zh-Hans-CN'))
+      : rows.sort((a, b) => (Number.parseFloat(b.label) || -1) - (Number.parseFloat(a.label) || -1))
+  }, [activeNav, playlists, visibleItems])
 
   useEffect(() => {
     if (listingPage > listingPageCount) setListingPage(listingPageCount)
@@ -3719,6 +3990,40 @@ export default function LibraryApp(): JSX.Element {
     updateTask(taskId, failed
       ? { status: 'failed', error: `${failed} ${language === 'zh' ? '张图片下载失败' : 'images failed'}` }
       : { status: 'completed', completed: urls.length })
+  }
+
+  async function updateLibraryFlags(item: MediaItem, flags: Pick<Partial<MediaItem>, 'favorite' | 'inPlaylist'>): Promise<void> {
+    await applyUpdatedMediaItem({ ...item, ...flags })
+  }
+
+  async function toggleItemPlaylist(item: MediaItem, playlistId: string): Promise<void> {
+    const current = new Set(item.playlistIds ?? (item.inPlaylist ? [WATCH_LATER_PLAYLIST_ID] : []))
+    if (current.has(playlistId)) current.delete(playlistId)
+    else current.add(playlistId)
+    await applyUpdatedMediaItem({
+      ...item,
+      inPlaylist: false,
+      playlistIds: [...current]
+    })
+  }
+
+  function createPlaylistForItem(item: MediaItem): void {
+    setNewPlaylistItem(item)
+    setNewPlaylistName('')
+  }
+
+  function confirmCreatePlaylist(): void {
+    const item = newPlaylistItem
+    const name = newPlaylistName.trim()
+    if (!item || !name) return
+    if (!name) return
+    const id = `playlist-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
+    const next = [...playlists, { id, name }]
+    setPlaylists(next)
+    saveMediaPlaylists(next)
+    setNewPlaylistItem(undefined)
+    setNewPlaylistName('')
+    void toggleItemPlaylist(item, id)
   }
 
   async function scrapeMediaMetadata(item: MediaItem, ignoreSavedMatch = false): Promise<void> {
@@ -5137,6 +5442,10 @@ export default function LibraryApp(): JSX.Element {
         {sourceSetupMode === 'settings' ? (
           <LibrarySettingsPage
             language={language}
+            displayMetadataPassthrough={displayMetadataPassthrough}
+            autoDisplayFormat={autoDisplayFormat}
+            dolbyVisionSystemPipelineExperimental={dolbyVisionSystemPipelineExperimental}
+            windowsHdrEnabled={windowsHdrEnabled}
             refreshRateSyncEnabled={refreshRateSyncEnabled}
             refreshRateMaximumMultiple={refreshRateMaximumMultiple}
             tmdbSettings={tmdbSettings}
@@ -5144,6 +5453,9 @@ export default function LibraryApp(): JSX.Element {
             isTestingTmdb={isTestingTmdb}
             trailerSettings={trailerSettings}
             onLanguageChange={changeInterfaceLanguage}
+            onDisplayMetadataPassthroughChange={setDisplayMetadataPassthrough}
+            onAutoDisplayFormatChange={setAutoDisplayFormat}
+            onDolbyVisionSystemPipelineExperimentalChange={setDolbyVisionSystemPipelineExperimental}
             onRefreshRateSyncChange={setRefreshRateSyncEnabled}
             onRefreshRateMaximumMultipleChange={setRefreshRateMaximumMultiple}
             onTmdbSettingsChange={updateTmdbSettings}
@@ -5638,18 +5950,29 @@ export default function LibraryApp(): JSX.Element {
               </div>
               {visibleItems.length ? (
                 <>
-                  <div className="library-poster-grid">
-                    {pagedVisibleItems.map((item) => (
-                      <MediaPoster
-                        key={item.id}
-                        item={item}
-                        source={sourceFor(item.sourceId)}
-                        selected={selectedItem?.id === item.id}
-                        onSelect={selectMediaItem}
-                      />
-                    ))}
-                  </div>
-                  {listingPageCount > 1 ? (
+                  {classificationGroups.length ? classificationGroups.map((group) => (
+                    <section className="library-classification-group" key={group.label}>
+                      <div className="library-section-heading"><span>{group.label}</span><small>{group.items.length}</small></div>
+                      <div className="library-poster-grid">
+                        {group.items.map((item) => (
+                          <MediaPoster key={`${group.label}:${item.id}`} item={item} source={sourceFor(item.sourceId)} selected={selectedItem?.id === item.id} onSelect={selectMediaItem} />
+                        ))}
+                      </div>
+                    </section>
+                  )) : (
+                    <div className="library-poster-grid">
+                      {pagedVisibleItems.map((item) => (
+                        <MediaPoster
+                          key={item.id}
+                          item={item}
+                          source={sourceFor(item.sourceId)}
+                          selected={selectedItem?.id === item.id}
+                          onSelect={selectMediaItem}
+                        />
+                      ))}
+                    </div>
+                  )}
+                  {!classificationGroups.length && listingPageCount > 1 ? (
                     <nav className="library-pagination" aria-label="媒体库分页">
                       <button
                         type="button"
@@ -5716,6 +6039,10 @@ export default function LibraryApp(): JSX.Element {
           onPlayIntent={(item, audioTrackIndex, subtitleTrackIndex) => { void playMediaItem(item, audioTrackIndex, subtitleTrackIndex) }}
           onTrailerIntent={resolveMediaTrailer}
           onRemoveFromLibrary={(item) => { void removeMediaFromLibrary(item) }}
+          onToggleFavorite={(item) => { void updateLibraryFlags(item, { favorite: !item.favorite }) }}
+          playlists={playlists}
+          onTogglePlaylist={(item, playlistId) => { void toggleItemPlaylist(item, playlistId) }}
+          onCreatePlaylist={createPlaylistForItem}
           onScrapeIntent={(item) => { void scrapeMediaMetadata(item) }}
           onRematchIntent={(item) => { void scrapeMediaMetadata(item, true) }}
           onSearchMatch={(item) => { void searchMetadataMatches(item) }}
@@ -5725,6 +6052,28 @@ export default function LibraryApp(): JSX.Element {
         />
       ) : !useMainOnlyLayout && !isSourceSetup ? (
         <EmptyDetail />
+      ) : null}
+
+      {newPlaylistItem ? (
+        <div className="library-playlist-dialog-backdrop" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget) setNewPlaylistItem(undefined)
+        }}>
+          <form className="library-playlist-dialog" onSubmit={(event) => { event.preventDefault(); confirmCreatePlaylist() }}>
+            <div className="library-playlist-dialog-icon"><ListPlus size={19} /></div>
+            <div className="library-playlist-dialog-copy">
+              <h2>{language === 'zh' ? '新建片单' : 'New playlist'}</h2>
+              <p>{language === 'zh' ? `将《${newPlaylistItem.title}》加入新片单` : `Add ${newPlaylistItem.title} to a new playlist.`}</p>
+            </div>
+            <label>
+              <span>{language === 'zh' ? '名称' : 'Name'}</span>
+              <input autoFocus value={newPlaylistName} maxLength={40} onChange={(event) => setNewPlaylistName(event.target.value)} placeholder={language === 'zh' ? '周末电影' : 'Weekend movies'} />
+            </label>
+            <div className="library-playlist-dialog-actions">
+              <button type="button" onClick={() => setNewPlaylistItem(undefined)}>{language === 'zh' ? '取消' : 'Cancel'}</button>
+              <button className="is-primary" type="submit" disabled={!newPlaylistName.trim()}>{language === 'zh' ? '创建' : 'Create'}</button>
+            </div>
+          </form>
+        </div>
       ) : null}
 
       {activeMetadataEditorItem ? (

@@ -38,6 +38,7 @@ export function mediaKind(type?: string): MediaItem['type'] {
   switch (type) {
     case 'BoxSet': return 'folder'
     case 'Movie': return 'movie'
+    case 'Video': return 'movie'
     case 'Episode': return 'movie'
     case 'Series': return 'series'
     default: return 'folder'
@@ -404,18 +405,27 @@ export function itemCardSubtitle(item: EmbyItem): string {
 
 export function latestItemTypesForView(view: EmbyView): string {
   switch (view.CollectionType) {
-    case 'movies': return 'Movie'
+    case 'movies': return 'Movie,Video'
     case 'tvshows': return 'Series'
-    default: return 'Movie,Series'
+    default: return 'Movie,Series,Video'
   }
 }
 
 export function itemTypesForLibraryView(view: LibraryView | undefined): string {
   switch (view) {
-    case 'movies': return 'BoxSet,Movie,Episode'
+    case 'movies': return 'BoxSet,Movie,Video'
+    case 'series': return 'Series'
+    case 'folders': return 'Folder'
+    default: return 'BoxSet,Movie,Series,Video'
+  }
+}
+
+export function itemTypesForSearch(view: LibraryView | undefined): string {
+  switch (view) {
+    case 'movies': return 'BoxSet,Movie,Video,Episode'
     case 'series': return 'Series,Episode'
     case 'folders': return 'Folder'
-    default: return 'BoxSet,Movie,Series,Episode'
+    default: return 'BoxSet,Movie,Series,Video,Episode'
   }
 }
 
@@ -423,8 +433,9 @@ export function searchResultPriority(item: EmbyItem): number {
   switch (item.Type) {
     case 'BoxSet': return 0
     case 'Movie': return 1
-    case 'Series': return 2
-    case 'Episode': return 3
+    case 'Video': return 2
+    case 'Series': return 3
+    case 'Episode': return 4
     default: return 4
   }
 }

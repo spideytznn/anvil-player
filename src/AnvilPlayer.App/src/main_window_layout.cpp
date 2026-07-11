@@ -242,11 +242,11 @@ void MainWindow::UpdateLayout() {
     const int margin = compact ? Scale(10) : Scale(16);
     const int gap = compact ? Scale(8) : Scale(12);
     const int topHeight = compact ? Scale(48) : Scale(56);
-    const int bottomHeight = compact ? Scale(88) : Scale(96);
+    const int bottomHeight = compact ? Scale(82) : Scale(90);
     const int topButtonSize = compact ? Scale(30) : Scale(32);
     const int transportButtonSize = compact ? Scale(30) : Scale(32);
-    const int playButtonSize = compact ? Scale(38) : Scale(42);
-    const int buttonGap = compact ? Scale(8) : Scale(12);
+    const int playButtonSize = compact ? Scale(34) : Scale(36);
+    const int buttonGap = compact ? Scale(8) : Scale(10);
     const int rightButtonSize = compact ? Scale(28) : Scale(30);
     const int rightButtonGap = compact ? Scale(8) : Scale(12);
     const int volumeSliderWidth = compact ? Scale(158) : Scale(202);
@@ -289,33 +289,48 @@ void MainWindow::UpdateLayout() {
     settingsContentHeight_ = 0;
     settingsScrollMax_ = 0;
     const bool showHdrButton = CurrentMediaHasHdrControls();
-    const bool showCmv4Button = CurrentMediaHasCmv4Control();
+    // CMv4 enhancement is automatic for Dolby Vision software playback. Keep
+    // its runtime status internal instead of exposing a transport toggle.
+    const bool showCmv4Button = false;
     const bool cmv4ButtonEnabled = CurrentCmv4ControlEnabled(settings);
-    const bool dolbyVisionButton = showCmv4Button;
-    const int hdrButtonWidth = showHdrButton ? (dolbyVisionButton ? Scale(104) : Scale(48)) : 0;
-    const int cmv4ButtonWidth = showCmv4Button ? Scale(86) : 0;
+    const bool dolbyVisionButton = snapshot.media.has_value() &&
+                                   snapshot.media->hasVideo &&
+                                   snapshot.media->dolbyVisionDetected;
+    const bool chineseUi = DisplayRefreshRateController::LoadUiLanguage() == L"zh";
+    const int hdrButtonWidth = showHdrButton
+                                   ? (dolbyVisionButton
+                                          ? Scale(chineseUi ? 82 : 104)
+                                          : Scale(48))
+                                   : 0;
+    const int cmv4ButtonWidth = showCmv4Button ? Scale(chineseUi ? 62 : 86) : 0;
     const std::wstring hdrOutputTooltip =
         dolbyVisionButton
-            ? (settings.video.dolbyVisionHdrOutput ? L"Disable Dolby Vision HDR output"
-                                                    : L"Enable Dolby Vision HDR output")
-            : (settings.video.dolbyVisionHdrOutput ? L"Disable HDR output" : L"Enable HDR output");
+            ? (settings.video.dolbyVisionHdrOutput
+                   ? (chineseUi ? L"关闭杜比视界 HDR 输出" : L"Disable Dolby Vision HDR output")
+                   : (chineseUi ? L"开启杜比视界 HDR 输出" : L"Enable Dolby Vision HDR output"))
+            : (settings.video.dolbyVisionHdrOutput
+                   ? (chineseUi ? L"关闭 HDR 输出" : L"Disable HDR output")
+                   : (chineseUi ? L"开启 HDR 输出" : L"Enable HDR output"));
     const std::wstring cmv4Tooltip = settings.video.dolbyVisionCmv4Approx
-                                         ? L"Disable Dolby Vision Enhanced"
-                                         : L"Enable Dolby Vision Enhanced";
+                                         ? (chineseUi ? L"关闭杜比视界增强" : L"Disable Dolby Vision Enhanced")
+                                         : (chineseUi ? L"开启杜比视界增强" : L"Enable Dolby Vision Enhanced");
     const auto addDolbyVisionHdrButton = [&](const int left, const int top) {
         buttons_.push_back(UiButton{Command::ToggleDolbyVisionHdr,
                                     MakeRect(left, top, left + hdrButtonWidth, top + rightButtonSize),
-                                    dolbyVisionButton ? L"Dolby Vision" : L"HDR",
+                                    dolbyVisionButton
+                                        ? (chineseUi ? L"杜比视界" : L"Dolby Vision")
+                                        : L"HDR",
                                     hdrOutputTooltip,
                                     IconKind::None,
                                     ButtonKind::TransportLabel,
                                     false,
-                                    settings.video.dolbyVisionHdrOutput});
+                                    settings.video.dolbyVisionHdrOutput,
+                                    !settings.video.autoDisplayFormat});
     };
     const auto addDolbyVisionCmv4Button = [&](const int left, const int top) {
         buttons_.push_back(UiButton{Command::ToggleDolbyVisionCmv4Approx,
                                     MakeRect(left, top, left + cmv4ButtonWidth, top + rightButtonSize),
-                                    L"Enhanced",
+                                    chineseUi ? L"增强" : L"Enhanced",
                                     cmv4Tooltip,
                                     IconKind::None,
                                     ButtonKind::TransportLabel,
@@ -333,7 +348,7 @@ void MainWindow::UpdateLayout() {
 
         const bool showTransport = ShouldShowFullscreenTransport(snapshot);
         const int fullscreenInset = Scale(18);
-        const int fullscreenBottomHeight = compact ? Scale(112) : Scale(128);
+        const int fullscreenBottomHeight = compact ? Scale(92) : Scale(100);
         transportBar_ = showTransport
                             ? MakeRect(client.left + fullscreenInset,
                                        client.bottom - fullscreenInset - fullscreenBottomHeight,
@@ -343,13 +358,13 @@ void MainWindow::UpdateLayout() {
         const int progressInset = compact ? Scale(18) : Scale(24);
         progress_ = showTransport
                         ? MakeRect(transportBar_.left + progressInset,
-                                   transportBar_.top + (compact ? Scale(36) : Scale(42)),
+                                    transportBar_.top + (compact ? Scale(30) : Scale(34)),
                                    transportBar_.right - progressInset,
-                                   transportBar_.top + (compact ? Scale(42) : Scale(48)))
+                                    transportBar_.top + (compact ? Scale(36) : Scale(40)))
                         : RECT{};
 
         if (showTransport) {
-            const int controlCenterY = transportBar_.bottom - (compact ? Scale(36) : Scale(42));
+            const int controlCenterY = transportBar_.bottom - (compact ? Scale(28) : Scale(32));
             const int controlLeft = static_cast<int>(transportBar_.left) + (compact ? Scale(18) : Scale(24));
             int x = controlLeft;
             transportControlsLeft_ = x;
@@ -406,14 +421,6 @@ void MainWindow::UpdateLayout() {
             int rightX = transportBar_.right - Scale(22) - fullscreenRightClusterWidth();
             if (rightX < x + Scale(12) && showFullscreenSubtitleButton) {
                 showFullscreenSubtitleButton = false;
-                rightX = transportBar_.right - Scale(22) - fullscreenRightClusterWidth();
-            }
-            if (rightX < x + Scale(12) && showFullscreenCmv4Button) {
-                showFullscreenCmv4Button = false;
-                rightX = transportBar_.right - Scale(22) - fullscreenRightClusterWidth();
-            }
-            if (rightX < x + Scale(12) && showFullscreenHdrButton) {
-                showFullscreenHdrButton = false;
                 rightX = transportBar_.right - Scale(22) - fullscreenRightClusterWidth();
             }
             if (showFullscreenVolumeSlider) {
@@ -793,7 +800,7 @@ void MainWindow::UpdateLayout() {
 }
 
 void MainWindow::UpdateVideoHost() {
-    if (!videoHostReady_ || !videoHost_) {
+    if ((!videoHostReady_ && !systemDolbyVisionPlayer_.IsActive()) || !videoHost_) {
         return;
     }
     if (webUiActive_ && !webUiPlayerRouteActive_) {
@@ -804,6 +811,7 @@ void MainWindow::UpdateVideoHost() {
         if (!RectEquals(lastVideoHostBounds_, empty)) {
             lastVideoHostBounds_ = empty;
         }
+        QueueGpuFullscreenUiOverlay();
         UpdateBufferingOverlay();
         return;
     }
@@ -828,7 +836,8 @@ void MainWindow::UpdateVideoHost() {
     const bool nativeHeldFrame = backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
                                  nativeFrameHoldVisible_ &&
                                  heldNativeFrame_.has_value();
-    const bool nativeVideoVisible = nativeActive || nativePausedFrame || nativeHeldFrame;
+    const bool nativeVideoVisible = systemDolbyVisionPlayer_.IsActive() ||
+                                    nativeActive || nativePausedFrame || nativeHeldFrame;
     const int w = RectWidth(bounds);
     const int h = RectHeight(bounds);
     if (nativeVideoVisible && w > 0 && h > 0) {
@@ -849,6 +858,7 @@ void MainWindow::UpdateVideoHost() {
             }
         }
         if (webUiActive_) {
+            const bool gpuFullscreenUiOverlay = UsesGpuFullscreenUiOverlay();
             HRGN region = fullscreen_
                               ? CreateRectRgn(0, 0, w + 1, h + 1)
                               : CreateRoundRectRgn(0, 0, w + 1, h + 1, Scale(8), Scale(8));
@@ -872,7 +882,8 @@ void MainWindow::UpdateVideoHost() {
                     DeleteObject(cutoutRegion);
                 }
             };
-            if ((subtitleMenuTarget_ > 0.0 || subtitleMenuAmount_ > 0.01) &&
+            if (!gpuFullscreenUiOverlay &&
+                (subtitleMenuTarget_ > 0.0 || subtitleMenuAmount_ > 0.01) &&
                 RectWidth(subtitleMenu_) > 0 &&
                 RectHeight(subtitleMenu_) > 0) {
                 RECT subtitleAnchor = webUiSubtitleGeometryValid_ ? webUiSubtitleAnchor_ : RECT{};
@@ -896,7 +907,8 @@ void MainWindow::UpdateVideoHost() {
                 InflateRect(&cutout, 1, 1);
                 subtractCutout(cutout, Scale(8));
             }
-            if (fullscreen_ &&
+            if (!gpuFullscreenUiOverlay &&
+                fullscreen_ &&
                 (fullscreenTransportTarget_ > 0.0 || fullscreenTransportAmount_ > 0.01)) {
                 RECT transportCutout = webUiTransportGeometryValid_ ? webUiTransportBounds_ : transportBar_;
                 if (RectWidth(transportCutout) > 0 && RectHeight(transportCutout) > 0) {
@@ -911,7 +923,12 @@ void MainWindow::UpdateVideoHost() {
             if (fullscreen_ && refreshRateSyncUnavailable_) {
                 subtractCutout(bounds, 0);
             }
-            if (!SetWindowRgn(videoHost_, region, TRUE)) {
+            const bool applyRegion = !gpuFullscreenUiOverlay || boundsChanged || !wasVisible;
+            if (applyRegion) {
+                if (!SetWindowRgn(videoHost_, region, TRUE)) {
+                    DeleteObject(region);
+                }
+            } else {
                 DeleteObject(region);
             }
         } else {
@@ -934,6 +951,7 @@ void MainWindow::UpdateVideoHost() {
             lastVideoHostBounds_ = empty;
         }
     }
+    QueueGpuFullscreenUiOverlay();
     UpdateBufferingOverlay();
 }
 

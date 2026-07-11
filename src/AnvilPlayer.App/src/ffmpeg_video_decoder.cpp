@@ -1896,6 +1896,17 @@ void FfmpegVideoDecoder::DecodeLoop() {
             break;
         }
         streamTimeBase = formatCtx->streams[videoStreamIndex]->time_base;
+        const AVRational sourceFrameRate =
+            formatCtx->streams[videoStreamIndex]->avg_frame_rate.num > 0 &&
+                    formatCtx->streams[videoStreamIndex]->avg_frame_rate.den > 0
+                ? formatCtx->streams[videoStreamIndex]->avg_frame_rate
+                : formatCtx->streams[videoStreamIndex]->r_frame_rate;
+        videoFrameRateNumerator_ = sourceFrameRate.num > 0
+                                       ? static_cast<UINT32>(sourceFrameRate.num)
+                                       : 24000u;
+        videoFrameRateDenominator_ = sourceFrameRate.den > 0
+                                         ? static_cast<UINT32>(sourceFrameRate.den)
+                                         : 1001u;
         AVCodecParameters* codecpar = formatCtx->streams[videoStreamIndex]->codecpar;
         if (audioPacketSink_.Enabled()) {
             const int requestedAudioStream = audioPacketSink_.selectedTrackIndex;
@@ -4229,6 +4240,8 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
         queued.width = srcW;
         queued.height = srcH;
         queued.color = MergeFrameColorMetadata(frame, streamColorMetadata_);
+        queued.hdr10PlusPayload = ExtractHdr10PlusPayload(frame);
+        queued.dolbyVisionRpu = ExtractDolbyVisionRpu(frame);
         queued.dovi = dolbyVisionStream_ ? ExtractFrameDolbyVisionMetadata(frame) : nullptr;
         if (queued.dovi && queued.dovi->valid) {
             queued.dynamicMetadataPath = L"dolby_vision_shader";
@@ -4337,6 +4350,8 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
     queued.stride = stride;
     queued.bgra = std::move(pixels);
     queued.color = MergeFrameColorMetadata(frame, streamColorMetadata_);
+    queued.hdr10PlusPayload = ExtractHdr10PlusPayload(frame);
+    queued.dolbyVisionRpu = ExtractDolbyVisionRpu(frame);
     if (dolbyVisionStream_) {
         queued.dovi = ExtractFrameDolbyVisionMetadata(frame);
         if (queued.dovi && queued.dovi->valid) {
@@ -4432,6 +4447,8 @@ bool FfmpegVideoDecoder::TryBuildD3DTextureFrame(AVFrame* frame, std::chrono::mi
     out.sourceUvRect = samplingRegion.uvRect;
     out.softwareFormat = HardwareFrameSoftwareFormat(frame);
     out.color = MergeFrameColorMetadata(frame, streamColorMetadata_);
+    out.hdr10PlusPayload = ExtractHdr10PlusPayload(frame);
+    out.dolbyVisionRpu = ExtractDolbyVisionRpu(frame);
     if (dolbyVisionStream_) {
         out.dovi = ExtractFrameDolbyVisionMetadata(frame);
         if (out.dovi && out.dovi->valid) {
@@ -4460,6 +4477,8 @@ bool FfmpegVideoDecoder::TryBuildD3DTextureFrame(AVFrame* frame, std::chrono::mi
 }
 
 bool FfmpegVideoDecoder::PublishImmediateFrame(NativeVideoFrame&& frame) {
+    frame.frameRateNumerator = videoFrameRateNumerator_;
+    frame.frameRateDenominator = videoFrameRateDenominator_;
     RefreshFrameSubtitles(frame);
     {
         std::scoped_lock lock(mutex_);
@@ -5074,10 +5093,31 @@ std::shared_ptr<const DolbyVisionFrameMetadata> FfmpegVideoDecoder::ExtractDolby
     for (int i = 0; i < 9; ++i) {
         out->yccToRgb[i] = static_cast<float>(RationalToDouble(color->ycc_to_rgb_matrix[i]));
         out->rgbToLms[i] = static_cast<float>(RationalToDouble(color->rgb_to_lms_matrix[i]));
+        out->yccToRgbCode[i] = static_cast<int16_t>(std::clamp(
+            std::llround(RationalToDouble(color->ycc_to_rgb_matrix[i]) * static_cast<double>(1 << 13)),
+            static_cast<long long>(std::numeric_limits<int16_t>::min()),
+            static_cast<long long>(std::numeric_limits<int16_t>::max())));
+        out->rgbToLmsCode[i] = static_cast<int16_t>(std::clamp(
+            std::llround(RationalToDouble(color->rgb_to_lms_matrix[i]) * static_cast<double>(1 << 14)),
+            static_cast<long long>(std::numeric_limits<int16_t>::min()),
+            static_cast<long long>(std::numeric_limits<int16_t>::max())));
     }
     for (int i = 0; i < 3; ++i) {
         out->yccOffset[i] = static_cast<float>(RationalToDouble(color->ycc_to_rgb_offset[i]));
+        out->yccOffsetCode[i] = static_cast<uint32_t>(std::clamp(
+            std::llround(RationalToDouble(color->ycc_to_rgb_offset[i]) * static_cast<double>(uint64_t{1} << 28)),
+            0ll,
+            static_cast<long long>(std::numeric_limits<uint32_t>::max())));
     }
+    out->signalEotf = color->signal_eotf;
+    out->signalEotfParam0 = color->signal_eotf_param0;
+    out->signalEotfParam1 = color->signal_eotf_param1;
+    out->signalEotfParam2 = color->signal_eotf_param2;
+    out->signalBitDepth = color->signal_bit_depth;
+    out->signalColorSpace = color->signal_color_space;
+    out->signalChromaFormat = color->signal_chroma_format;
+    out->signalFullRangeFlag = color->signal_full_range_flag;
+    out->sourceDiagonal = color->source_diagonal;
     out->sourceMinPq = color->source_min_pq;
     out->sourceMaxPq = color->source_max_pq;
     out->sourceMinNits = Pq12CodeToNits(out->sourceMinPq);
@@ -5448,6 +5488,8 @@ bool FfmpegVideoDecoder::SeekPrerollReadyLocked() const {
 }
 
 bool FfmpegVideoDecoder::EnqueueFrame(NativeVideoFrame&& frame) {
+    frame.frameRateNumerator = videoFrameRateNumerator_;
+    frame.frameRateDenominator = videoFrameRateDenominator_;
     if (!frame.subtitlesPrepared) {
         RefreshFrameSubtitles(frame);
     }

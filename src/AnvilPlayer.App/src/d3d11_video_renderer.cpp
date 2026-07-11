@@ -26,6 +26,9 @@
 
 namespace anvil::app {
 
+D3D11VideoRenderer::D3D11VideoRenderer(LogSinkPtr logSink)
+    : logSink_(std::move(logSink)) {}
+
 struct D3D11QueuedVideoFrame {
     explicit D3D11QueuedVideoFrame(const NativeVideoFrame& source) : frame(source) {}
     explicit D3D11QueuedVideoFrame(NativeVideoFrame&& source) noexcept : frame(std::move(source)) {}
@@ -245,6 +248,8 @@ struct VideoColorConstants {
     float doviTrimClip = 0.0f;
     float doviTrimReserved0 = 0.0f;
     float doviTrimReserved1 = 0.0f;
+    int hlgOutputRangeType = 0;
+    float hlgReserved[3] = {};
     float doviActiveArea[4] = {0.0f, 0.0f, 1.0f, 1.0f};  // x0,y0,x1,y1 in source UV.
     float hdrToneCurve[anvil::playback::kHdrToneCurvePointCount][4] = {};
     float sourceUvRect[4] = {0.0f, 0.0f, 1.0f, 1.0f};
@@ -258,6 +263,13 @@ constexpr UINT kVideoPresentSyncInterval = 1;
 
 struct SubtitleShaderConstants {
     float uvRect[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+    float hdrUi = 0.0f;
+    float sdrWhiteNits = 203.0f;
+    float hlgUi = 0.0f;
+    float hlgFullRange = 0.0f;
+    float alphaFromRgb = 0.0f;
+    float overlayOpacity = 1.0f;
+    float overlayReserved[2] = {};
 };
 
 static_assert(sizeof(SubtitleShaderConstants) % 16 == 0);
@@ -718,7 +730,7 @@ bool WantsHdrOutput(const VideoColorMetadata& color,
     if (settings.hdrOutput == anvil::playback::HdrOutputMode::ForceHdr) {
         return display.hdrEnabled || display.hdrSupported;
     }
-    return settings.dolbyVisionHdrOutput && color.IsHdr();
+    return display.hdrEnabled && color.IsHdr();
 }
 
 UINT16 ChromaticityToDxgi(double value) {
@@ -745,6 +757,10 @@ std::wstring ColorSpaceName(const DXGI_COLOR_SPACE_TYPE colorSpace) {
         return L"rgb_full_pq_bt2020";
     case DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709:
         return L"rgb_full_g22_bt709";
+    case DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020:
+        return L"ycbcr_studio_hlg_bt2020";
+    case DXGI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020:
+        return L"ycbcr_full_hlg_bt2020";
     default:
         return L"dxgi_color_space_" + std::to_wstring(static_cast<int>(colorSpace));
     }
@@ -787,6 +803,11 @@ D3D11VideoRenderer::~D3D11VideoRenderer() {
     // destroys the renderer on a non-window reaper. The public stop path never
     // joins; this only reaps the already-finished worker during destruction.
     StopRenderThread();
+}
+
+bool IsHlgColorSpace(const DXGI_COLOR_SPACE_TYPE colorSpace) {
+    return colorSpace == DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020 ||
+           colorSpace == DXGI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020;
 }
 
 bool D3D11VideoRenderer::BeginInitialize(const HWND host,
@@ -938,59 +959,67 @@ bool D3D11VideoRenderer::InitializeGpuOnRenderThread(const UINT width, const UIN
     desc.BufferCount = 2;
     desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     desc.Scaling = DXGI_SCALING_STRETCH;
-    // Prefer a composition swap chain: DWM composites the video surface so GDI
-    // sibling overlay windows (subtitle menu popup) render on top of it. A
-    // HWND-bound flip-model swap chain would occlude those overlays. Composition
-    // swap chains do not support ALLOW_MODE_SWITCH, but can use the frame
-    // latency waitable flag on systems/drivers that expose it.
-    desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
-    hr = factory_->CreateSwapChainForComposition(device_.Get(), &desc, nullptr, &swapChain_);
-    if (IsStopRequested()) return false;
-    const bool createdWaitableComposition = SUCCEEDED(hr) && swapChain_ && CreateComposition();
-    if (IsStopRequested()) return false;
-    if (createdWaitableComposition) {
-        useComposition_ = true;
-        LogInfo(L"swap chain created via CreateSwapChainForComposition + DirectComposition waitable=true");
-    } else {
+    // Prefer the existing RGB composition path for SDR/HDR10 and all drawing.
+    // Native HLG gets a separate media/YUV composition surface below.
+    const auto resetCompositionAttempt = [this]() {
         swapChain_.Reset();
         dcompVisual_.Reset();
         dcompTarget_.Reset();
         dcompDevice_.Reset();
         useComposition_ = false;
+    };
+    const auto tryCompositionSwapChain = [&](const UINT flags,
+                                             const std::wstring_view label) {
+        desc.Flags = flags;
+        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        const HRESULT createHr =
+            factory_->CreateSwapChainForComposition(device_.Get(), &desc, nullptr, &swapChain_);
+        if (FAILED(createHr) || !swapChain_ || IsStopRequested()) {
+            resetCompositionAttempt();
+            return false;
+        }
 
-        desc.Flags = 0;
-        hr = factory_->CreateSwapChainForComposition(device_.Get(), &desc, nullptr, &swapChain_);
+        if (!CreateComposition() || IsStopRequested()) {
+            resetCompositionAttempt();
+            return false;
+        }
+        useComposition_ = true;
+        LogInfo(L"swap chain created via CreateSwapChainForComposition + DirectComposition " +
+                std::wstring(label));
+        return true;
+    };
+
+    const UINT waitable = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    bool createdComposition =
+        tryCompositionSwapChain(waitable, L"waitable=true yuv_video=false");
+    if (!createdComposition) {
+        createdComposition =
+            tryCompositionSwapChain(0, L"waitable=false yuv_video=false");
+    }
+
+
+    if (!createdComposition) {
+        // Fallback to a HWND-bound flip-model swap chain on systems/drivers
+        // without composition support. Native HLG remains disabled here.
+        resetCompositionAttempt();
+        hlgStudioColorSpaceSupported_ = false;
+        hlgFullColorSpaceSupported_ = false;
+        desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        desc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH |
+                     DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        const HWND swapChainHost = host_.load(std::memory_order_acquire);
+        if (IsStopRequested() || !swapChainHost || !IsWindow(swapChainHost)) return false;
+        hr = factory_->CreateSwapChainForHwnd(
+            device_.Get(), swapChainHost, &desc, nullptr, nullptr, &swapChain_);
         if (IsStopRequested()) return false;
-        const bool createdComposition = SUCCEEDED(hr) && swapChain_ && CreateComposition();
-        if (IsStopRequested()) return false;
-        if (createdComposition) {
-            useComposition_ = true;
-            LogInfo(L"swap chain created via CreateSwapChainForComposition + DirectComposition waitable=false");
+        if (SUCCEEDED(hr)) {
+            LogInfo(L"swap chain created via CreateSwapChainForHwnd (composition fallback) waitable=true");
         } else {
-            // Fallback to a HWND-bound flip-model swap chain on systems/drivers
-            // without composition support. Behavior reverts to the previous one
-            // (overlay occlusion may recur on such systems).
-            swapChain_.Reset();
-            dcompVisual_.Reset();
-            dcompTarget_.Reset();
-            dcompDevice_.Reset();
-            useComposition_ = false;
-
-            desc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
-            const HWND swapChainHost = host_.load(std::memory_order_acquire);
-            if (IsStopRequested() || !swapChainHost || !IsWindow(swapChainHost)) return false;
-            hr = factory_->CreateSwapChainForHwnd(device_.Get(), swapChainHost, &desc, nullptr, nullptr, &swapChain_);
-            if (IsStopRequested()) return false;
-            if (SUCCEEDED(hr)) {
-                LogInfo(L"swap chain created via CreateSwapChainForHwnd (composition fallback) waitable=true");
-            } else {
-                desc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
-                if (IsStopRequested()) return false;
-                hr = factory_->CreateSwapChainForHwnd(device_.Get(), swapChainHost, &desc, nullptr, nullptr, &swapChain_);
-                if (FAILED(hr)) { LogHr(L"CreateSwapChainForHwnd", hr); return false; }
-                if (IsStopRequested()) return false;
-                LogInfo(L"swap chain created via CreateSwapChainForHwnd (composition fallback) waitable=false");
-            }
+            desc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+            hr = factory_->CreateSwapChainForHwnd(
+                device_.Get(), swapChainHost, &desc, nullptr, nullptr, &swapChain_);
+            if (FAILED(hr)) { LogHr(L"CreateSwapChainForHwnd", hr); return false; }
+            LogInfo(L"swap chain created via CreateSwapChainForHwnd (composition fallback) waitable=false");
         }
     }
 
@@ -1007,7 +1036,7 @@ bool D3D11VideoRenderer::InitializeGpuOnRenderThread(const UINT width, const UIN
     viewport_.Height = static_cast<float>(height);
     viewport_.MinDepth = 0.0f;
     viewport_.MaxDepth = 1.0f;
-    if (!ApplySwapChainColorSpace(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, mediaColor_)) {
+    if (!ApplySwapChainColorSpace(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, mediaColor_, false)) {
         // Color-space support is best-effort and was not fatal in the previous
         // synchronous initialization path.
     }
@@ -1032,13 +1061,47 @@ void D3D11VideoRenderer::ApplyColorPipelineConfiguration(const PendingColorPipel
     activePipelineLabel_.clear();
     activePipelineSignature_ = 0;
     hdrMetadataApplied_ = false;
+    activeHdrMetadataSignature_ = 0;
     hdrColorSpaceFailureLogged_ = false;
+    hlgColorSpaceFailureLogged_ = false;
+    hdr10PlusMetadataLogged_ = false;
+
+    const bool wantsNativeHlgResources =
+        useComposition_ &&
+        videoSettings_.displayMetadataPassthrough &&
+        videoSettings_.hdrOutput != anvil::playback::HdrOutputMode::ForceSdr &&
+        mediaColor_.transfer == VideoTransferCharacteristic::Hlg &&
+        mediaColor_.primaries == VideoColorPrimaries::Bt2020;
+    if (wantsNativeHlgResources && !hlgSwapChain_ && backBuffer_) {
+        D3D11_TEXTURE2D_DESC backBufferDesc{};
+        backBuffer_->GetDesc(&backBufferDesc);
+        CreateHlgPresentationResources(backBufferDesc.Width, backBufferDesc.Height);
+    }
 }
 
 void D3D11VideoRenderer::ConfigureSubtitleSettings(const anvil::playback::SubtitleSettings& settings) {
     {
         std::lock_guard lock(commandMutex_);
         pendingSubtitleSettings_ = settings;
+    }
+    commandCv_.notify_one();
+}
+
+void D3D11VideoRenderer::ConfigureUiOverlay(std::shared_ptr<const D3D11UiOverlayBitmap> overlay,
+                                            const bool requestImmediatePresent) {
+    {
+        std::lock_guard lock(commandMutex_);
+        if (!acceptingCommands_) {
+            return;
+        }
+        // UI updates share a latest-value mailbox, but presentation urgency is
+        // edge-triggered state. A hover/geometry update arriving after a reveal
+        // must not downgrade the reveal's immediate-present request before the
+        // render thread consumes the batch.
+        const bool mergedImmediatePresent =
+            requestImmediatePresent ||
+            (pendingUiOverlay_.has_value() && pendingUiOverlay_->requestImmediatePresent);
+        pendingUiOverlay_ = PendingUiOverlay{std::move(overlay), mergedImmediatePresent};
     }
     commandCv_.notify_one();
 }
@@ -1083,6 +1146,13 @@ void D3D11VideoRenderer::ResizeOnRenderThread(const UINT width, const UINT heigh
     if (!swapChain_) return;
     cachedOutputFrameValid_ = false;
     cachedOutputFrame_.Reset();
+    // These views retain the old RGB/P010 back buffers. Release them before
+    // either swap chain is resized, then rebuild the complete conversion path.
+    hlgVideoOutputView_.Reset();
+    hlgVideoInputView_.Reset();
+    hlgVideoProcessor_.Reset();
+    hlgVideoProcessorEnumerator_.Reset();
+    hlgBackBuffer_.Reset();
     backBuffer_.Reset();
     rtv_.Reset();
     // Composition swap chains do not use ALLOW_MODE_SWITCH; only set it for the
@@ -1101,8 +1171,44 @@ void D3D11VideoRenderer::ResizeOnRenderThread(const UINT width, const UINT heigh
     }
     if (FAILED(hr)) { LogHr(L"ResizeBuffers", hr); return; }
     CreateRenderTarget();
+    if (hlgSwapChain_ && !ResizeHlgPresentationResources(width, height)) {
+        SelectCompositionSwapChain(false);
+        hlgSwapChain_.Reset();
+        hlgCompositionSurface_.Reset();
+        if (hlgCompositionSurfaceHandle_) {
+            CloseHandle(hlgCompositionSurfaceHandle_);
+            hlgCompositionSurfaceHandle_ = nullptr;
+        }
+        hlgStudioColorSpaceSupported_ = false;
+        hlgFullColorSpaceSupported_ = false;
+        LogInfo(L"hlg native disabled after resize failure fallback=hdr10");
+    }
     viewport_.Width = static_cast<float>(width);
     viewport_.Height = static_cast<float>(height);
+    // ResizeBuffers can make the driver's active Advanced Color state and HDR
+    // metadata stale even when IDXGISwapChain3 still reports success. Force the
+    // media-derived signal back onto the resized chain so window/fullscreen
+    // transitions cannot silently inherit the desktop color mode.
+    activeColorSpace_ = static_cast<DXGI_COLOR_SPACE_TYPE>(-1);
+    hdrMetadataApplied_ = false;
+    activeHdrMetadataSignature_ = 0;
+    const bool hdrOutput = WantsHdrOutput(mediaColor_, videoSettings_, displayCapabilities_);
+    const bool nativeHlg = hdrOutput &&
+                           videoSettings_.displayMetadataPassthrough &&
+                           mediaColor_.transfer == VideoTransferCharacteristic::Hlg &&
+                           (hlgStudioColorSpaceSupported_ || hlgFullColorSpaceSupported_);
+    const DXGI_COLOR_SPACE_TYPE resizeColorSpace = nativeHlg
+        ? ((mediaColor_.range == VideoColorRange::Full && hlgFullColorSpaceSupported_) ||
+                   !hlgStudioColorSpaceSupported_
+               ? DXGI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020
+               : DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020)
+        : (hdrOutput
+               ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+               : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+    ApplySwapChainColorSpace(resizeColorSpace,
+                             mediaColor_,
+                             false,
+                             false);
     // For composition swap chains, the visual content tracks the new buffer
     // size automatically once content is presented, but committing here ensures
     // the surface is kept in sync on resize.
@@ -1161,6 +1267,7 @@ bool D3D11VideoRenderer::HasPendingWorkLocked() const {
            pendingResize_ ||
            pendingColorPipeline_.has_value() ||
            pendingSubtitleSettings_.has_value() ||
+           pendingUiOverlay_.has_value() ||
            pendingDiagnosticsEnabled_.has_value() ||
            pendingResetStats_ ||
            pendingClear_;
@@ -1255,6 +1362,7 @@ void D3D11VideoRenderer::RenderThreadMain() {
     }
 
     if (ready) {
+        LogInfo(L"present scheduler=event_driven osd_texture=persistent");
         PostInitializationCompletion(
             D3D11RendererState::Ready,
             initializationCompletionWindow,
@@ -1270,6 +1378,7 @@ void D3D11VideoRenderer::RenderThreadMain() {
             pendingResize_ = false;
             pendingColorPipeline_.reset();
             pendingSubtitleSettings_.reset();
+            pendingUiOverlay_.reset();
             pendingDiagnosticsEnabled_.reset();
             pendingResetStats_ = false;
             pendingClear_ = false;
@@ -1329,21 +1438,19 @@ void D3D11VideoRenderer::RenderThreadMain() {
         D3D11QueuedVideoFrame* frame = nullptr;
         std::optional<PendingColorPipeline> colorPipeline;
         std::optional<anvil::playback::SubtitleSettings> subtitleSettings;
+        std::optional<PendingUiOverlay> uiOverlay;
         std::optional<bool> diagnosticsEnabled;
         bool resize = false;
         UINT resizeWidth = 1;
         UINT resizeHeight = 1;
         bool resetStats = false;
         bool clear = false;
-        bool repeatLastPresent = false;
 
         {
             std::unique_lock lock(commandMutex_);
-            if (!cachedOutputFrameValid_) {
-                commandCv_.wait(lock, [this]() {
-                    return stopRequested_ || HasPendingWorkLocked();
-                });
-            }
+            commandCv_.wait(lock, [this]() {
+                return stopRequested_ || HasPendingWorkLocked();
+            });
             if (stopRequested_) {
                 shutdownFrame = pendingFrame_;
                 pendingFrame_ = nullptr;
@@ -1356,6 +1463,8 @@ void D3D11VideoRenderer::RenderThreadMain() {
             pendingColorPipeline_.reset();
             subtitleSettings = std::move(pendingSubtitleSettings_);
             pendingSubtitleSettings_.reset();
+            uiOverlay = std::move(pendingUiOverlay_);
+            pendingUiOverlay_.reset();
             diagnosticsEnabled = pendingDiagnosticsEnabled_;
             pendingDiagnosticsEnabled_.reset();
             resize = pendingResize_;
@@ -1366,7 +1475,6 @@ void D3D11VideoRenderer::RenderThreadMain() {
             pendingResetStats_ = false;
             clear = pendingClear_;
             pendingClear_ = false;
-            repeatLastPresent = !frame && !resize && !clear && cachedOutputFrameValid_;
         }
 
         if (colorPipeline) {
@@ -1374,6 +1482,10 @@ void D3D11VideoRenderer::RenderThreadMain() {
         }
         if (subtitleSettings) {
             ApplySubtitleConfiguration(*subtitleSettings);
+        }
+        if (uiOverlay) {
+            activeUiOverlay_ = std::move(uiOverlay->overlay);
+            uiPresentRequired_ = uiPresentRequired_ || uiOverlay->requestImmediatePresent;
         }
         if (diagnosticsEnabled) {
             SetDiagnosticsEnabledOnRenderThread(*diagnosticsEnabled);
@@ -1388,11 +1500,20 @@ void D3D11VideoRenderer::RenderThreadMain() {
             ClearOnRenderThread();
         }
         if (frame) {
-            RenderOnRenderThread(frame->frame);
+            const bool presented = RenderOnRenderThread(frame->frame);
+            // A decoded frame can still be rejected while its texture is being
+            // retired or rebuilt. Only an actual Present may complete the UI
+            // transaction; otherwise keep it armed for the next valid frame.
+            if (presented) {
+                uiPresentRequired_ = false;
+            }
             PublishRenderStats();
             RetireQueuedFrame(frame);
-        } else if (repeatLastPresent) {
-            RepeatLastPresentOnRenderThread();
+        } else if (!clear && uiPresentRequired_ && cachedOutputFrameValid_) {
+            if (RepeatLastPresentOnRenderThread()) {
+                LogInfo(L"ui_overlay present=immediate source=cached_output");
+                uiPresentRequired_ = false;
+            }
         }
     }
 
@@ -1488,20 +1609,33 @@ void D3D11VideoRenderer::WaitForFrameLatencyObject(const bool collectStats) {
     }
 }
 
-void D3D11VideoRenderer::PresentFrame(const UINT syncInterval,
+bool D3D11VideoRenderer::PresentFrame(const UINT syncInterval,
                                       const bool collectStats,
                                       const std::chrono::steady_clock::time_point stageStart) {
     if (!swapChain_) {
-        return;
+        return false;
     }
 
-    const HRESULT presentHr = swapChain_->Present(syncInterval, 0);
+    IDXGISwapChain1* presentSwapChain = swapChain_.Get();
+    if (IsHlgColorSpace(activeColorSpace_)) {
+        if (!BlitHlgFrame() || !hlgSwapChain_) {
+            LogInfo(L"hlg native blit failed fallback_pending=hdr10");
+            hlgStudioColorSpaceSupported_ = false;
+            hlgFullColorSpaceSupported_ = false;
+            hlgColorSpaceFailureLogged_ = true;
+            SelectCompositionSwapChain(false);
+            activeColorSpace_ = static_cast<DXGI_COLOR_SPACE_TYPE>(-1);
+            return false;
+        }
+        presentSwapChain = hlgSwapChain_.Get();
+    }
+    const HRESULT presentHr = presentSwapChain->Present(syncInterval, 0);
     if (FAILED(presentHr)) {
         LogHr(L"Present", presentHr);
     }
 
     if (!collectStats) {
-        return;
+        return SUCCEEDED(presentHr);
     }
 
     const auto now = std::chrono::steady_clock::now();
@@ -1513,12 +1647,13 @@ void D3D11VideoRenderer::PresentFrame(const UINT syncInterval,
     }
 
     DXGI_FRAME_STATISTICS frameStatistics{};
-    const HRESULT statisticsHr = swapChain_->GetFrameStatistics(&frameStatistics);
+    const HRESULT statisticsHr = presentSwapChain->GetFrameStatistics(&frameStatistics);
     if (SUCCEEDED(statisticsHr)) {
         ++renderStats_.frameStatsSamples;
     } else if (statisticsHr == DXGI_ERROR_FRAME_STATISTICS_DISJOINT) {
         ++renderStats_.frameStatsDisjoint;
     }
+    return SUCCEEDED(presentHr);
 }
 
 void D3D11VideoRenderer::Render(const NativeVideoFrame& frame) {
@@ -1576,8 +1711,8 @@ bool D3D11VideoRenderer::RetireFrame(NativeVideoFrame&& frame) noexcept {
     return true;
 }
 
-void D3D11VideoRenderer::RenderOnRenderThread(const NativeVideoFrame& frame) {
-    if (!device_ || !context_ || !swapChain_) return;
+bool D3D11VideoRenderer::RenderOnRenderThread(const NativeVideoFrame& frame) {
+    if (!device_ || !context_ || !swapChain_) return false;
     if (((frame.dovi && frame.dovi->valid) ||
          (frame.enhancementDovi && frame.enhancementDovi->valid) ||
          !frame.dynamicMetadataPath.empty()) &&
@@ -1598,6 +1733,18 @@ void D3D11VideoRenderer::RenderOnRenderThread(const NativeVideoFrame& frame) {
     auto stageStart = renderStart;
 
     UpdateColorPipeline(frame);
+    if (frame.hdr10PlusPayload && !frame.hdr10PlusPayload->empty() && !hdr10PlusMetadataLogged_) {
+        hdr10PlusMetadataLogged_ = true;
+        LogInfo(L"hdr10plus metadata detected bytes=" + std::to_wstring(frame.hdr10PlusPayload->size()) +
+                L" sink_supported=" +
+                std::wstring(nvidiaHdrOutput_.Hdr10PlusSinkSupported() ? L"true" : L"false") +
+                L" gaming_sink_supported=" +
+                std::wstring(nvidiaHdrOutput_.Hdr10PlusGamingSinkSupported() ? L"true" : L"false") +
+                L" output=" +
+                std::wstring(nvidiaHdrOutput_.Hdr10PlusGamingActive()
+                                 ? L"hdr10plus_gaming_sstm"
+                                 : L"hdr10_fallback"));
+    }
     if (collectStats) {
         const auto now = std::chrono::steady_clock::now();
         renderStats_.colorPipelineUs += ElapsedMicroseconds(stageStart, now);
@@ -1642,12 +1789,15 @@ void D3D11VideoRenderer::RenderOnRenderThread(const NativeVideoFrame& frame) {
     }
 
     if (!hasHardwareTexture && !hasBgraTexture && !hasYuvTexture) {
-        return;
+        return false;
     }
 
     float clearColor[4] = {0.02f, 0.03f, 0.04f, 1.0f};
-    context_->OMSetRenderTargets(1, rtv_.GetAddressOf(), nullptr);
-    context_->ClearRenderTargetView(rtv_.Get(), clearColor);
+    // Native HLG is rendered into an RGB BT.2020/G22 intermediate surface;
+    // the video processor performs the final RGB-to-P010 conversion.
+    ID3D11RenderTargetView* activeRenderTarget = ActiveRgbRenderTarget();
+    context_->OMSetRenderTargets(1, &activeRenderTarget, nullptr);
+    context_->ClearRenderTargetView(activeRenderTarget, clearColor);
     const D3D11_VIEWPORT drawViewport = LetterboxedViewport(frame.width, frame.height);
     context_->RSSetViewports(1, &drawViewport);
 
@@ -1695,11 +1845,12 @@ void D3D11VideoRenderer::RenderOnRenderThread(const NativeVideoFrame& frame) {
         stageStart = now;
     }
 
-    if (cachedOutputFrame_ && backBuffer_) {
-        context_->CopyResource(cachedOutputFrame_.Get(), backBuffer_.Get());
+    if (cachedOutputFrame_ && ActiveRgbRenderTexture()) {
+        context_->CopyResource(cachedOutputFrame_.Get(), ActiveRgbRenderTexture());
         cachedOutputFrameValid_ = true;
     }
-    PresentFrame(kVideoPresentSyncInterval, collectStats, stageStart);
+    const bool uiPassComplete = DrawUiOverlay();
+    const bool presented = PresentFrame(kVideoPresentSyncInterval, collectStats, stageStart);
     if (collectStats) {
         const auto now = std::chrono::steady_clock::now();
         const uint64_t totalUs = ElapsedMicroseconds(renderStart, now);
@@ -1711,15 +1862,22 @@ void D3D11VideoRenderer::RenderOnRenderThread(const NativeVideoFrame& frame) {
         renderStats_.totalRenderUs += totalUs;
         renderStats_.maxRenderUs = std::max(renderStats_.maxRenderUs, totalUs);
     }
+    return presented && uiPassComplete;
 }
 
-void D3D11VideoRenderer::RepeatLastPresentOnRenderThread() {
+bool D3D11VideoRenderer::RepeatLastPresentOnRenderThread() {
     if (!context_ || !swapChain_ || !backBuffer_ || !cachedOutputFrame_ || !cachedOutputFrameValid_) {
-        return;
+        return false;
     }
     WaitForFrameLatencyObject(false);
-    context_->CopyResource(backBuffer_.Get(), cachedOutputFrame_.Get());
-    PresentFrame(kVideoPresentSyncInterval, false, {});
+    ID3D11Texture2D* activeRenderTexture = ActiveRgbRenderTexture();
+    if (!activeRenderTexture) {
+        return false;
+    }
+    context_->CopyResource(activeRenderTexture, cachedOutputFrame_.Get());
+    const bool uiPassComplete = DrawUiOverlay();
+    const bool presented = PresentFrame(kVideoPresentSyncInterval, false, {});
+    return presented && uiPassComplete;
 }
 
 void D3D11VideoRenderer::Clear() {
@@ -1738,7 +1896,9 @@ void D3D11VideoRenderer::Clear() {
 }
 
 void D3D11VideoRenderer::ClearOnRenderThread() {
+    nvidiaHdrOutput_.Restore();
     if (!device_ || !context_ || !swapChain_ || !rtv_) return;
+    ApplySwapChainColorSpace(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, mediaColor_, false);
     ResetRenderStatsOnRenderThread();
     hardwareSrvCache_.clear();
     subtitleTextureCache_.clear();
@@ -1746,8 +1906,10 @@ void D3D11VideoRenderer::ClearOnRenderThread() {
     hwSrvY_.Reset();
     cachedOutputFrameValid_ = false;
     float clearColor[4] = {0.02f, 0.03f, 0.04f, 1.0f};
-    context_->OMSetRenderTargets(1, rtv_.GetAddressOf(), nullptr);
-    context_->ClearRenderTargetView(rtv_.Get(), clearColor);
+    // Keep the R10 intermediate RGB black for native HLG as well.
+    ID3D11RenderTargetView* activeRenderTarget = ActiveRgbRenderTarget();
+    context_->OMSetRenderTargets(1, &activeRenderTarget, nullptr);
+    context_->ClearRenderTargetView(activeRenderTarget, clearColor);
     swapChain_->Present(0, 0);
 }
 
@@ -1771,8 +1933,9 @@ bool D3D11VideoRenderer::CreateRenderTarget() {
         return false;
     }
     if (IsStopRequested()) return false;
-    D3D11_TEXTURE2D_DESC cacheDesc{};
-    backBuffer->GetDesc(&cacheDesc);
+    D3D11_TEXTURE2D_DESC backBufferDesc{};
+    backBuffer->GetDesc(&backBufferDesc);
+    D3D11_TEXTURE2D_DESC cacheDesc = backBufferDesc;
     cacheDesc.BindFlags = 0;
     cacheDesc.CPUAccessFlags = 0;
     cacheDesc.MiscFlags = 0;
@@ -1822,6 +1985,370 @@ bool D3D11VideoRenderer::CreateComposition() {
     return true;
 }
 
+ID3D11RenderTargetView* D3D11VideoRenderer::ActiveRgbRenderTarget() const noexcept {
+    return rtv_.Get();
+}
+
+ID3D11Texture2D* D3D11VideoRenderer::ActiveRgbRenderTexture() const noexcept {
+    return backBuffer_.Get();
+}
+
+bool D3D11VideoRenderer::CreateHlgPresentationResources(const UINT width, const UINT height) {
+    hlgVideoOutputView_.Reset();
+    hlgVideoInputView_.Reset();
+    hlgVideoProcessor_.Reset();
+    hlgVideoProcessorEnumerator_.Reset();
+    hlgBackBuffer_.Reset();
+    hlgSwapChain_.Reset();
+    hlgCompositionSurface_.Reset();
+    if (hlgCompositionSurfaceHandle_) {
+        CloseHandle(hlgCompositionSurfaceHandle_);
+        hlgCompositionSurfaceHandle_ = nullptr;
+    }
+    videoContext1_.Reset();
+    videoDevice_.Reset();
+    hlgStudioColorSpaceSupported_ = false;
+    hlgFullColorSpaceSupported_ = false;
+    hlgCompositionSelected_ = false;
+
+    if (!useComposition_ || !factory_ || !device_ || !context_ || !dcompDevice_ ||
+        width == 0 || height == 0) {
+        return false;
+    }
+    if (FAILED(device_.As(&videoDevice_)) || !videoDevice_ ||
+        FAILED(context_.As(&videoContext1_)) || !videoContext1_) {
+        LogInfo(L"hlg native unavailable reason=d3d11_video_interfaces");
+        return false;
+    }
+
+    // 4:2:0 presentation surfaces require even dimensions. The RGB render
+    // target remains the exact client size; the video processor scales by at
+    // most one pixel into this padded media surface and the HWND clips it.
+    const UINT hlgWidth = (width + 1u) & ~1u;
+    const UINT hlgHeight = (height + 1u) & ~1u;
+    DXGI_SWAP_CHAIN_DESC1 hlgDesc{};
+    hlgDesc.Width = hlgWidth;
+    hlgDesc.Height = hlgHeight;
+    hlgDesc.Format = DXGI_FORMAT_P010;
+    hlgDesc.SampleDesc.Count = 1;
+    hlgDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    hlgDesc.BufferCount = 2;
+    hlgDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+    hlgDesc.Scaling = DXGI_SCALING_STRETCH;
+    hlgDesc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+    hlgDesc.Flags = DXGI_SWAP_CHAIN_FLAG_YUV_VIDEO |
+                    DXGI_SWAP_CHAIN_FLAG_FULLSCREEN_VIDEO;
+
+    Microsoft::WRL::ComPtr<IDXGIFactoryMedia> factoryMedia;
+    HRESULT createHr = adapter_
+                           ? adapter_->GetParent(IID_PPV_ARGS(&factoryMedia))
+                           : E_NOINTERFACE;
+    if (FAILED(createHr) || !factoryMedia) {
+        LogHr(L"Get IDXGIFactoryMedia for HLG", createHr);
+        return false;
+    }
+    createHr = DCompositionCreateSurfaceHandle(
+        COMPOSITIONOBJECT_ALL_ACCESS, nullptr, &hlgCompositionSurfaceHandle_);
+    if (FAILED(createHr) || !hlgCompositionSurfaceHandle_) {
+        LogHr(L"Create HLG composition surface handle", createHr);
+        hlgCompositionSurfaceHandle_ = nullptr;
+        return false;
+    }
+
+    const auto tryCreateMediaSwapChain = [&]() {
+        hlgSwapChain_.Reset();
+        createHr = factoryMedia->CreateSwapChainForCompositionSurfaceHandle(
+            device_.Get(), hlgCompositionSurfaceHandle_, &hlgDesc, nullptr, &hlgSwapChain_);
+        std::wostringstream message;
+        message << L"hlg media swap_chain create size=" << hlgDesc.Width << L"x"
+                << hlgDesc.Height << L" flags=" << hlgDesc.Flags << L" hr=0x"
+                << std::hex << static_cast<unsigned long>(createHr);
+        LogInfo(message.str());
+        return SUCCEEDED(createHr) && hlgSwapChain_;
+    };
+    bool createdMediaSwapChain = tryCreateMediaSwapChain();
+    if (!createdMediaSwapChain) {
+        // FULLSCREEN_VIDEO is an optimization hint rather than a semantic
+        // requirement; retain YUV_VIDEO on the compatibility retry.
+        hlgDesc.Flags = DXGI_SWAP_CHAIN_FLAG_YUV_VIDEO;
+        createdMediaSwapChain = tryCreateMediaSwapChain();
+    }
+    if (!createdMediaSwapChain) {
+        LogHr(L"Create HLG P010 media swap chain", createHr);
+        hlgSwapChain_.Reset();
+        CloseHandle(hlgCompositionSurfaceHandle_);
+        hlgCompositionSurfaceHandle_ = nullptr;
+        return false;
+    }
+
+    createHr = dcompDevice_->CreateSurfaceFromHandle(
+        hlgCompositionSurfaceHandle_, &hlgCompositionSurface_);
+    if (FAILED(createHr) || !hlgCompositionSurface_) {
+        LogHr(L"Create HLG composition surface", createHr);
+        hlgSwapChain_.Reset();
+        CloseHandle(hlgCompositionSurfaceHandle_);
+        hlgCompositionSurfaceHandle_ = nullptr;
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<IDXGISwapChain3> hlgSwapChain3;
+    if (FAILED(hlgSwapChain_.As(&hlgSwapChain3)) || !hlgSwapChain3) {
+        hlgCompositionSurface_.Reset();
+        hlgSwapChain_.Reset();
+        CloseHandle(hlgCompositionSurfaceHandle_);
+        hlgCompositionSurfaceHandle_ = nullptr;
+        return false;
+    }
+    const auto colorSpaceSupport = [&](const DXGI_COLOR_SPACE_TYPE colorSpace) {
+        UINT support = 0;
+        const HRESULT supportHr = hlgSwapChain3->CheckColorSpaceSupport(colorSpace, &support);
+        return std::pair{supportHr, support};
+    };
+    const auto [studioSupportHr, studioSupport] =
+        colorSpaceSupport(DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020);
+    const auto [fullSupportHr, fullSupport] =
+        colorSpaceSupport(DXGI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020);
+
+    Microsoft::WRL::ComPtr<IDXGIOutput> targetOutput;
+    const HWND host = host_.load(std::memory_order_acquire);
+    const HMONITOR targetMonitor = host ? MonitorFromWindow(host, MONITOR_DEFAULTTONEAREST) : nullptr;
+    if (adapter_) {
+        for (UINT outputIndex = 0;; ++outputIndex) {
+            Microsoft::WRL::ComPtr<IDXGIOutput> candidate;
+            if (adapter_->EnumOutputs(outputIndex, &candidate) == DXGI_ERROR_NOT_FOUND) {
+                break;
+            }
+            if (!candidate) {
+                continue;
+            }
+            DXGI_OUTPUT_DESC outputDesc{};
+            if (SUCCEEDED(candidate->GetDesc(&outputDesc)) &&
+                (!targetMonitor || outputDesc.Monitor == targetMonitor)) {
+                targetOutput = std::move(candidate);
+                break;
+            }
+        }
+    }
+    Microsoft::WRL::ComPtr<IDXGIOutput4> targetOutput4;
+    if (targetOutput) {
+        targetOutput.As(&targetOutput4);
+    }
+    const auto overlayColorSpaceSupport = [&](const DXGI_COLOR_SPACE_TYPE colorSpace) {
+        UINT support = 0;
+        const HRESULT supportHr = targetOutput4
+                                      ? targetOutput4->CheckOverlayColorSpaceSupport(
+                                            DXGI_FORMAT_P010, colorSpace, device_.Get(), &support)
+                                      : E_NOINTERFACE;
+        return std::pair{supportHr, support};
+    };
+    const auto [studioOverlayHr, studioOverlaySupport] =
+        overlayColorSpaceSupport(DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020);
+    const auto [fullOverlayHr, fullOverlaySupport] =
+        overlayColorSpaceSupport(DXGI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020);
+    constexpr UINT kMediaPresentSupport =
+        DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT |
+        DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_OVERLAY_PRESENT;
+    hlgStudioColorSpaceSupported_ =
+        (SUCCEEDED(studioSupportHr) && (studioSupport & kMediaPresentSupport) != 0) ||
+        (SUCCEEDED(studioOverlayHr) &&
+         (studioOverlaySupport & DXGI_OVERLAY_COLOR_SPACE_SUPPORT_FLAG_PRESENT) != 0);
+    hlgFullColorSpaceSupported_ =
+        (SUCCEEDED(fullSupportHr) && (fullSupport & kMediaPresentSupport) != 0) ||
+        (SUCCEEDED(fullOverlayHr) &&
+         (fullOverlaySupport & DXGI_OVERLAY_COLOR_SPACE_SUPPORT_FLAG_PRESENT) != 0);
+    {
+        std::wostringstream message;
+        message << L"hlg color_space support swap_studio=0x" << std::hex << studioSupport
+                << L" swap_studio_hr=0x" << static_cast<unsigned long>(studioSupportHr)
+                << L" swap_full=0x" << fullSupport
+                << L" swap_full_hr=0x" << static_cast<unsigned long>(fullSupportHr)
+                << L" overlay_studio=0x" << studioOverlaySupport
+                << L" overlay_studio_hr=0x" << static_cast<unsigned long>(studioOverlayHr)
+                << L" overlay_full=0x" << fullOverlaySupport
+                << L" overlay_full_hr=0x" << static_cast<unsigned long>(fullOverlayHr);
+        LogInfo(message.str());
+    }
+    if (!hlgStudioColorSpaceSupported_ && !hlgFullColorSpaceSupported_) {
+        LogInfo(L"hlg native unavailable reason=p010_color_space_support");
+        hlgCompositionSurface_.Reset();
+        hlgSwapChain_.Reset();
+        CloseHandle(hlgCompositionSurfaceHandle_);
+        hlgCompositionSurfaceHandle_ = nullptr;
+        return false;
+    }
+
+    if (!ResizeHlgPresentationResources(width, height)) {
+        hlgCompositionSurface_.Reset();
+        hlgSwapChain_.Reset();
+        CloseHandle(hlgCompositionSurfaceHandle_);
+        hlgCompositionSurfaceHandle_ = nullptr;
+        hlgStudioColorSpaceSupported_ = false;
+        hlgFullColorSpaceSupported_ = false;
+        return false;
+    }
+    LogInfo(L"hlg native ready path=r10_bt2020_g22_to_p010_hlg_video_processor studio=" +
+            std::wstring(hlgStudioColorSpaceSupported_ ? L"true" : L"false") +
+            L" full=" + std::wstring(hlgFullColorSpaceSupported_ ? L"true" : L"false"));
+    return true;
+}
+
+bool D3D11VideoRenderer::ResizeHlgPresentationResources(const UINT width, const UINT height) {
+    if (!hlgSwapChain_ || !videoDevice_ || width == 0 || height == 0) {
+        return false;
+    }
+    hlgVideoOutputView_.Reset();
+    hlgVideoInputView_.Reset();
+    hlgVideoProcessor_.Reset();
+    hlgVideoProcessorEnumerator_.Reset();
+    hlgBackBuffer_.Reset();
+
+    DXGI_SWAP_CHAIN_DESC1 swapChainDesc{};
+    const HRESULT descHr = hlgSwapChain_->GetDesc1(&swapChainDesc);
+    if (FAILED(descHr)) {
+        LogHr(L"Get HLG P010 swap chain description", descHr);
+        return false;
+    }
+    const UINT hlgWidth = (width + 1u) & ~1u;
+    const UINT hlgHeight = (height + 1u) & ~1u;
+    const HRESULT resizeHr = hlgSwapChain_->ResizeBuffers(
+        0, hlgWidth, hlgHeight, DXGI_FORMAT_P010, swapChainDesc.Flags);
+    if (FAILED(resizeHr)) {
+        LogHr(L"Resize HLG P010 swap chain", resizeHr);
+        return false;
+    }
+    const HRESULT bufferHr = hlgSwapChain_->GetBuffer(0, IID_PPV_ARGS(&hlgBackBuffer_));
+    if (FAILED(bufferHr) || !hlgBackBuffer_) {
+        LogHr(L"Get HLG P010 back buffer", bufferHr);
+        return false;
+    }
+
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC content{};
+    content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+    content.InputFrameRate.Numerator = 60;
+    content.InputFrameRate.Denominator = 1;
+    content.InputWidth = width;
+    content.InputHeight = height;
+    content.OutputFrameRate.Numerator = 60;
+    content.OutputFrameRate.Denominator = 1;
+    content.OutputWidth = hlgWidth;
+    content.OutputHeight = hlgHeight;
+    content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+    HRESULT hr = videoDevice_->CreateVideoProcessorEnumerator(
+        &content, &hlgVideoProcessorEnumerator_);
+    if (FAILED(hr) || !hlgVideoProcessorEnumerator_) {
+        LogHr(L"Create HLG video processor enumerator", hr);
+        return false;
+    }
+    UINT inputFormatSupport = 0;
+    UINT outputFormatSupport = 0;
+    const HRESULT inputFormatHr = hlgVideoProcessorEnumerator_->CheckVideoProcessorFormat(
+        DXGI_FORMAT_R10G10B10A2_UNORM, &inputFormatSupport);
+    const HRESULT outputFormatHr = hlgVideoProcessorEnumerator_->CheckVideoProcessorFormat(
+        DXGI_FORMAT_P010, &outputFormatSupport);
+    if (FAILED(inputFormatHr) || FAILED(outputFormatHr) ||
+        (inputFormatSupport & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT) == 0 ||
+        (outputFormatSupport & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT) == 0) {
+        LogInfo(L"hlg native unavailable reason=video_processor_format input_r10=" +
+                std::wstring((inputFormatSupport & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT) != 0
+                                 ? L"true"
+                                 : L"false") +
+                L" output_p010=" +
+                std::wstring((outputFormatSupport & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT) != 0
+                                 ? L"true"
+                                 : L"false"));
+        return false;
+    }
+    hr = videoDevice_->CreateVideoProcessor(
+        hlgVideoProcessorEnumerator_.Get(), 0, &hlgVideoProcessor_);
+    if (FAILED(hr) || !hlgVideoProcessor_) {
+        LogHr(L"Create HLG video processor", hr);
+        return false;
+    }
+
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inputDesc{};
+    inputDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+    inputDesc.Texture2D.MipSlice = 0;
+    inputDesc.Texture2D.ArraySlice = 0;
+    hr = videoDevice_->CreateVideoProcessorInputView(
+        backBuffer_.Get(), hlgVideoProcessorEnumerator_.Get(), &inputDesc, &hlgVideoInputView_);
+    if (FAILED(hr) || !hlgVideoInputView_) {
+        LogHr(L"Create HLG R10 video input view", hr);
+        return false;
+    }
+
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC outputDesc{};
+    outputDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+    outputDesc.Texture2D.MipSlice = 0;
+    hr = videoDevice_->CreateVideoProcessorOutputView(
+        hlgBackBuffer_.Get(), hlgVideoProcessorEnumerator_.Get(), &outputDesc, &hlgVideoOutputView_);
+    if (FAILED(hr) || !hlgVideoOutputView_) {
+        LogHr(L"Create HLG P010 video output view", hr);
+        return false;
+    }
+    return true;
+}
+
+bool D3D11VideoRenderer::BlitHlgFrame() {
+    if (!videoContext1_ || !hlgVideoProcessor_ || !hlgVideoInputView_ ||
+        !hlgVideoOutputView_ || !hlgBackBuffer_ || !backBuffer_ ||
+        !IsHlgColorSpace(activeColorSpace_)) {
+        return false;
+    }
+    D3D11_TEXTURE2D_DESC sourceDesc{};
+    D3D11_TEXTURE2D_DESC outputDesc{};
+    backBuffer_->GetDesc(&sourceDesc);
+    hlgBackBuffer_->GetDesc(&outputDesc);
+    RECT sourceRect{0, 0, static_cast<LONG>(sourceDesc.Width), static_cast<LONG>(sourceDesc.Height)};
+    RECT outputRect{0, 0, static_cast<LONG>(outputDesc.Width), static_cast<LONG>(outputDesc.Height)};
+    videoContext1_->VideoProcessorSetStreamFrameFormat(
+        hlgVideoProcessor_.Get(), 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+    videoContext1_->VideoProcessorSetStreamSourceRect(
+        hlgVideoProcessor_.Get(), 0, TRUE, &sourceRect);
+    videoContext1_->VideoProcessorSetStreamDestRect(
+        hlgVideoProcessor_.Get(), 0, TRUE, &outputRect);
+    videoContext1_->VideoProcessorSetOutputTargetRect(
+        hlgVideoProcessor_.Get(), TRUE, &outputRect);
+    videoContext1_->VideoProcessorSetStreamAutoProcessingMode(
+        hlgVideoProcessor_.Get(), 0, FALSE);
+    videoContext1_->VideoProcessorSetStreamColorSpace1(
+        hlgVideoProcessor_.Get(), 0, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020);
+    videoContext1_->VideoProcessorSetOutputColorSpace1(
+        hlgVideoProcessor_.Get(), activeColorSpace_);
+
+    D3D11_VIDEO_PROCESSOR_STREAM stream{};
+    stream.Enable = TRUE;
+    stream.pInputSurface = hlgVideoInputView_.Get();
+    const HRESULT hr = videoContext1_->VideoProcessorBlt(
+        hlgVideoProcessor_.Get(), hlgVideoOutputView_.Get(), 0, 1, &stream);
+    if (FAILED(hr)) {
+        LogHr(L"HLG VideoProcessorBlt", hr);
+        return false;
+    }
+    return true;
+}
+
+void D3D11VideoRenderer::SelectCompositionSwapChain(const bool hlg) {
+    if (!useComposition_ || !dcompVisual_ || !dcompDevice_ || hlgCompositionSelected_ == hlg) {
+        return;
+    }
+    IUnknown* const selected = hlg ? hlgCompositionSurface_.Get() : swapChain_.Get();
+    if (!selected) {
+        return;
+    }
+    const HRESULT contentHr = dcompVisual_->SetContent(selected);
+    if (FAILED(contentHr)) {
+        LogHr(L"Select composition swap chain", contentHr);
+        return;
+    }
+    const HRESULT commitHr = dcompDevice_->Commit();
+    if (FAILED(commitHr)) {
+        LogHr(L"Commit composition swap chain", commitHr);
+        return;
+    }
+    hlgCompositionSelected_ = hlg;
+    LogInfo(L"composition content=" + std::wstring(hlg ? L"hlg_p010" : L"rgb_r10"));
+}
+
 bool D3D11VideoRenderer::CreatePipeline() {
     const char* vsSrc =
         "struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };\n"
@@ -1860,6 +2387,8 @@ bool D3D11VideoRenderer::CreatePipeline() {
         "  float doviTrimClip;\n"
         "  float doviTrimReserved0;\n"
         "  float doviTrimReserved1;\n"
+        "  int hlgOutputRangeType;\n"
+        "  float3 hlgReserved;\n"
         "  float4 doviActiveArea;\n"
         "  float4 hdrToneCurve[9];\n"
         "  float4 sourceUvRect;\n"
@@ -2029,11 +2558,22 @@ bool D3D11VideoRenderer::CreatePipeline() {
         "  float3 linear709 = bt2020_to_bt709(linear2020);\n"
         "  return apply_sdr_contrast_recovery(encode_sdr_g22(compress_gamut_preserve_luma(linear709)));\n"
         "}\n"
+        "float3 hlg_to_g22_bt2020(float3 v) {\n"
+        "  const float a = 0.17883277;\n"
+        "  const float b = 0.28466892;\n"
+        "  const float c = 0.55991073;\n"
+        "  v = saturate(v);\n"
+        "  float3 low = (v * v) / 3.0;\n"
+        "  float3 high = (exp((v - c) / a) + b) / 12.0;\n"
+        "  float3 scene = lerp(high, low, step(v, float3(0.5, 0.5, 0.5)));\n"
+        "  return pow(saturate(scene), 1.0 / 2.2);\n"
+        "}\n"
         "float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_Target {\n"
         "  float2 displayUv = saturate(uv);\n"
         "  if (outside_dovi_active_area(displayUv)) return float4(0.0, 0.0, 0.0, 1.0);\n"
         "  float2 sampleUv = lerp(sourceUvRect.xy, sourceUvRect.zw, displayUv);\n"
         "  float4 c = tex.Sample(samp, sampleUv);\n"
+        "  if (outputMode == 2) return float4(hlg_to_g22_bt2020(c.rgb), c.a);\n"
         "  if (outputMode == 1) return float4(apply_hdr_tone_curve_pq(c.rgb), c.a);\n"
         "  if (transferType == 2 && primariesType == 2) return float4(bt2020_pq_to_sdr(c.rgb), c.a);\n"
         "  return float4(apply_dovi_trim_sdr_g22(c.rgb), c.a);\n"
@@ -2069,6 +2609,8 @@ bool D3D11VideoRenderer::CreatePipeline() {
         "  float doviTrimClip;\n"
         "  float doviTrimReserved0;\n"
         "  float doviTrimReserved1;\n"
+        "  int hlgOutputRangeType;\n"
+        "  float3 hlgReserved;\n"
         "  float4 doviActiveArea;\n"
         "  float4 hdrToneCurve[9];\n"
         "  float4 sourceUvRect;\n"
@@ -2182,6 +2724,9 @@ bool D3D11VideoRenderer::CreatePipeline() {
         "  float3 high = (exp((v - c) / a) + b) / 12.0;\n"
         "  float3 scene = lerp(high, low, step(v, float3(0.5, 0.5, 0.5)));\n"
         "  return max(scene, 0.0) * max(sourcePeakNits, 100.0);\n"
+        "}\n"
+        "float3 hlg_to_g22_bt2020(float3 v) {\n"
+        "  return pow(saturate(hlg_to_nits(v) / max(sourcePeakNits, 100.0)), 1.0 / 2.2);\n"
         "}\n"
         "float3 bt2020_to_bt709(float3 c) {\n"
         "  return float3(dot(float3(1.6605, -0.5876, -0.0728), c),\n"
@@ -2572,6 +3117,9 @@ bool D3D11VideoRenderer::CreatePipeline() {
         "  float2 sampleUv = lerp(sourceUvRect.xy, sourceUvRect.zw, displayUv);\n"
         "  float y = texY.Sample(samp, sampleUv);\n"
         "  float2 cbcr = texUV.Sample(samp, sampleUv);\n"
+        "  if (outputMode == 2) {\n"
+        "    return float4(hlg_to_g22_bt2020(ycbcr_to_rgb(y, cbcr)), 1.0);\n"
+        "  }\n"
         "  if (doviEnabled == 2) {\n"
         "    float3 hdrYcc = dovi_compose_p7_fel(y, cbcr, displayUv);\n"
         "    float3 rgb = ycbcr_to_rgb(hdrYcc.x, hdrYcc.yz);\n"
@@ -2582,6 +3130,12 @@ bool D3D11VideoRenderer::CreatePipeline() {
         "    float3 nits = encoded_to_nits(rgb);\n"
         "    if (primariesType == 2) return float4(bt2020_nits_to_sdr(nits), 1.0);\n"
         "    return float4(bt709_nits_to_sdr(nits), 1.0);\n"
+        "  }\n"
+        "  // Native Dolby tunnel: preserve the RPU-reshaped 12-bit opponent\n"
+        "  // signal. The final pass embeds DM metadata and packs it into RGB8.\n"
+        "  if (doviEnabled == 3) {\n"
+        "    float3 opponent = saturate(float3(y, cbcr.x, cbcr.y) * doviSampleScale);\n"
+        "    return float4(dovi_apply_mapping(opponent, 1), 1.0);\n"
         "  }\n"
         "  // Dolby Vision path: the input YUV is IPT-PQ encoded (not standard\n"
         "  // YCbCr). Apply per-frame RPU reshaping to recover BT.2020 PQ RGB,\n"
@@ -2616,12 +3170,43 @@ bool D3D11VideoRenderer::CreatePipeline() {
     const char* psSubtitleSrc =
         "Texture2D<float4> tex : register(t0);\n"
         "SamplerState samp : register(s0);\n"
-        "cbuffer SubtitleConstants : register(b0) { float4 uvRect; };\n"
+        "cbuffer SubtitleConstants : register(b0) { float4 uvRect; float hdrUi; float sdrWhiteNits; float hlgUi; float hlgFullRange; float alphaFromRgb; float overlayOpacity; float2 overlayReserved; };\n"
+        "float3 srgb_to_linear(float3 c) {\n"
+        "  float3 low = c / 12.92;\n"
+        "  float3 high = pow((c + 0.055) / 1.055, 2.4);\n"
+        "  return lerp(high, low, step(c, float3(0.04045, 0.04045, 0.04045)));\n"
+        "}\n"
+        "float3 bt709_to_bt2020(float3 c) {\n"
+        "  return float3(dot(float3(0.6274, 0.3293, 0.0433), c),\n"
+        "                dot(float3(0.0691, 0.9195, 0.0114), c),\n"
+        "                dot(float3(0.0164, 0.0880, 0.8956), c));\n"
+        "}\n"
+        "float3 nits_to_pq(float3 nits) {\n"
+        "  const float m1 = 2610.0 / 16384.0;\n"
+        "  const float m2 = 2523.0 / 32.0;\n"
+        "  const float c1 = 3424.0 / 4096.0;\n"
+        "  const float c2 = 2413.0 / 128.0;\n"
+        "  const float c3 = 2392.0 / 128.0;\n"
+        "  float3 y = pow(max(nits / 10000.0, 0.0), m1);\n"
+        "  return pow((c1 + c2 * y) / (1.0 + c3 * y), m2);\n"
+        "}\n"
         "float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_Target {\n"
         "  float2 sourceUv = lerp(uvRect.xy, uvRect.zw, saturate(uv));\n"
-        "  return tex.Sample(samp, sourceUv);\n"
+        "  float4 sample = tex.Sample(samp, sourceUv);\n"
+        "  if (alphaFromRgb > 0.5) {\n"
+        "    sample.a = max(sample.r, max(sample.g, sample.b)) > (0.5 / 255.0) ? saturate(overlayOpacity) : 0.0;\n"
+        "    sample.rgb *= sample.a;\n"
+        "  }\n"
+        "  if (hdrUi < 0.5 || sample.a <= 0.0001) return sample;\n"
+        "  float3 straight = saturate(sample.rgb / sample.a);\n"
+        "  if (hlgUi > 0.5) {\n"
+        "    float3 linear2020 = bt709_to_bt2020(srgb_to_linear(straight));\n"
+        "    float3 g22 = pow(saturate(linear2020 * max(sdrWhiteNits, 1.0) / 1000.0), 1.0 / 2.2);\n"
+        "    return float4(g22 * sample.a, sample.a);\n"
+        "  }\n"
+        "  float3 pq = nits_to_pq(bt709_to_bt2020(srgb_to_linear(straight)) * max(sdrWhiteNits, 1.0));\n"
+        "  return float4(pq * sample.a, sample.a);\n"
         "}\n";
-
     Microsoft::WRL::ComPtr<ID3DBlob> vsBlob;
     Microsoft::WRL::ComPtr<ID3DBlob> psBlob;
     Microsoft::WRL::ComPtr<ID3DBlob> psNv12Blob;
@@ -2721,6 +3306,9 @@ bool D3D11VideoRenderer::UpdateColorPipeline(const NativeVideoFrame& frame) {
     const bool hasEnhancementDolbyVisionMetadata = frame.enhancementDovi && frame.enhancementDovi->valid;
     const bool libplaceboProcessedDolbyVision =
         frame.dynamicMetadataPath.find(L"dolby_vision_libplacebo") != std::wstring::npos;
+    suppressHdrMetadataForDolbyVision_ = hasDolbyVisionMetadata ||
+                                         hasEnhancementDolbyVisionMetadata ||
+                                         libplaceboProcessedDolbyVision;
     const bool rawDolbyVisionInput = hasDolbyVisionMetadata && !libplaceboProcessedDolbyVision;
     const bool felComposerInput = enhancementYuvEnabled && hasEnhancementDolbyVisionMetadata;
     const bool felOverlayInput = enhancementYuvEnabled && !felComposerInput;
@@ -2744,13 +3332,77 @@ bool D3D11VideoRenderer::UpdateColorPipeline(const NativeVideoFrame& frame) {
         color.primaries == VideoColorPrimaries::Bt2020 &&
         color.transfer == VideoTransferCharacteristic::Pq;
     bool hdrOutput = WantsHdrOutput(color, videoSettings_, displayCapabilities_);
-    DXGI_COLOR_SPACE_TYPE colorSpace = hdrOutput
-                                           ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
-                                           : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
-    if (!ApplySwapChainColorSpace(colorSpace, color) && hdrOutput) {
-        hdrOutput = false;
-        colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
-        ApplySwapChainColorSpace(colorSpace, color);
+    // The cached desktop capability snapshot can report HDR disabled while
+    // Static HDR10 already contains display-referred BT.2020/PQ samples. Keep
+    // those samples untouched and let the HDR display use MaxCLL/mastering
+    // metadata, matching the native passthrough path. The editable curve is
+    // reserved for Dolby Vision reshaping paths that genuinely need mapping.
+    const bool hdrToneCurveEnabled =
+        hdrOutput &&
+        videoSettings_.dolbyVisionHdrOutput &&
+        !videoSettings_.displayMetadataPassthrough &&
+        (hasDolbyVisionMetadata || hasEnhancementDolbyVisionMetadata || libplaceboProcessedDolbyVision) &&
+        !cmv4ApproxEnabled;
+    bool nativeHlgOutput = false;
+    DXGI_COLOR_SPACE_TYPE colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    const bool nativeHlgColorSpaceAvailable =
+        videoSettings_.displayMetadataPassthrough &&
+        videoSettings_.hdrOutput != anvil::playback::HdrOutputMode::ForceSdr &&
+        color.transfer == VideoTransferCharacteristic::Hlg &&
+        color.primaries == VideoColorPrimaries::Bt2020 &&
+        (hlgStudioColorSpaceSupported_ || hlgFullColorSpaceSupported_);
+    // The capability report is an asynchronous desktop snapshot and can lag a
+    // Dolby Vision/HDR output transition. A live HLG presentation-space result
+    // from the actual media swap chain is the stronger signal. It is absent
+    // when Advanced Color is genuinely disabled, as verified by the driver.
+    if (!hdrOutput && nativeHlgColorSpaceAvailable) {
+        hdrOutput = true;
+        LogInfo(L"hlg native using live swap_chain capability cached_windows_hdr=false");
+    }
+    const bool nativeHlgRequested = hdrOutput && nativeHlgColorSpaceAvailable;
+    if (hdrOutput &&
+        videoSettings_.displayMetadataPassthrough &&
+        color.transfer == VideoTransferCharacteristic::Hlg &&
+        !nativeHlgRequested &&
+        !hlgColorSpaceFailureLogged_) {
+        hlgColorSpaceFailureLogged_ = true;
+        LogInfo(L"hlg native passthrough unavailable reason=swap_chain_color_space fallback=hdr10");
+    }
+    if (nativeHlgRequested) {
+        colorSpace =
+            ((color.range == VideoColorRange::Full && hlgFullColorSpaceSupported_) ||
+             !hlgStudioColorSpaceSupported_)
+                ? DXGI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020
+                : DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020;
+        nativeHlgOutput = ApplySwapChainColorSpace(colorSpace, color, false);
+        if (!nativeHlgOutput && !hlgColorSpaceFailureLogged_) {
+            hlgColorSpaceFailureLogged_ = true;
+            LogInfo(L"hlg native passthrough activation failed fallback=hdr10");
+        }
+    }
+
+    if (hdrOutput && !nativeHlgOutput) {
+        nvidiaHdrOutput_.SetLogHandler([this](const std::wstring& message) { LogInfo(message); });
+        const HWND host = host_.load(std::memory_order_acquire);
+        const bool hdr10PlusFrame = videoSettings_.displayMetadataPassthrough &&
+                                    frame.hdr10PlusPayload &&
+                                    !frame.hdr10PlusPayload->empty();
+        const bool hdr10PlusApplied = hdr10PlusFrame &&
+                                      nvidiaHdrOutput_.ApplyHdr10PlusGaming(host, color);
+        if (!hdr10PlusApplied) {
+            nvidiaHdrOutput_.ApplyHdr10(host, color);
+        }
+        colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+        if (!ApplySwapChainColorSpace(colorSpace,
+                                      color,
+                                      hdrToneCurveEnabled,
+                                      false)) {
+            hdrOutput = false;
+            colorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+            ApplySwapChainColorSpace(colorSpace, color, false);
+        }
+    } else if (!hdrOutput) {
+        ApplySwapChainColorSpace(colorSpace, color, false);
     }
 
     VideoColorConstants constants;
@@ -2761,11 +3413,12 @@ bool D3D11VideoRenderer::UpdateColorPipeline(const NativeVideoFrame& frame) {
     constants.matrixType = MatrixType(color);
     constants.rangeType = color.range == VideoColorRange::Full ? 1 : 0;
     constants.transferType = TransferType(color.transfer);
-    constants.outputMode = hdrOutput ? 1 : 0;
+    constants.outputMode = nativeHlgOutput ? 2 : (hdrOutput ? 1 : 0);
+    constants.hlgOutputRangeType =
+        colorSpace == DXGI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020 ? 1 : 0;
     constants.primariesType = PrimariesType(color.primaries);
     constants.toneMapMode = ToneMapType(videoSettings_.toneMapping);
     constants.sourcePeakNits = SourcePeakNits(color, videoSettings_, doviForDisplay);
-    const bool hdrToneCurveEnabled = hdrOutput && videoSettings_.dolbyVisionHdrOutput && !cmv4LibplaceboIntermediate;
     constants.targetPeakNits = hdrOutput
                                     ? (hdrToneCurveEnabled
                                            ? HdrToneCurveOutputPeakNits(videoSettings_)
@@ -2899,9 +3552,11 @@ bool D3D11VideoRenderer::UpdateColorPipeline(const NativeVideoFrame& frame) {
                       std::to_wstring(doviForActiveArea->dmLevel5TopOffset) + L"," +
                       std::to_wstring(doviForActiveArea->dmLevel5BottomOffset)
                 : L"";
+        const std::wstring outputLabel =
+            nativeHlgOutput ? std::wstring(L"hlg_passthrough") : OutputModeName(hdrOutput);
         const std::wstring label =
             std::wstring(L"input=") + (frame.HasD3DTexture() ? L"d3d11_texture" : (frame.HasYuv() ? L"p010_yuv" : L"bgra")) +
-            L" output=" + OutputModeName(hdrOutput) +
+            L" output=" + outputLabel +
             L" color_space=" + ColorSpaceName(colorSpace) +
             L" primaries=" + anvil::playback::ToDisplayString(color.primaries) +
             L" transfer=" + anvil::playback::ToDisplayString(color.transfer) +
@@ -2913,7 +3568,11 @@ bool D3D11VideoRenderer::UpdateColorPipeline(const NativeVideoFrame& frame) {
             activeAreaDetail +
             (!hdrOutput && doviTrim.enabled ? L" cmv4_sdr=vivid_reinhard_200nits" : L"") +
             (doviTrim.includesLevel3 ? L" l3=applied" : L"") +
-            (hdrOutput ? L" hdr_curve_peak=" + std::to_wstring(static_cast<int>(std::round(constants.targetPeakNits))) : L"") +
+            (hdrOutput && !nativeHlgOutput
+                 ? (hdrToneCurveEnabled
+                        ? L" hdr_curve_peak=" + std::to_wstring(static_cast<int>(std::round(constants.targetPeakNits)))
+                        : L" hdr_curve=passthrough")
+                 : L"") +
             (hdrOutput && videoSettings_.dolbyVisionHdrOutput && cmv4LibplaceboIntermediate ? L" hdr_curve=bypassed_for_cmv4" : L"") +
             L" dolby_vision=" + (libplaceboProcessedDolbyVision
                                       ? L"processed"
@@ -3105,68 +3764,132 @@ void D3D11VideoRenderer::UpdateDoviConstants(const NativeVideoFrame& frame) {
     doviEnabledLastFrame_ = true;
 }
 
-bool D3D11VideoRenderer::ApplySwapChainColorSpace(const DXGI_COLOR_SPACE_TYPE colorSpace, const VideoColorMetadata& color) {
-    if (!swapChain_) {
+bool D3D11VideoRenderer::ApplySwapChainColorSpace(const DXGI_COLOR_SPACE_TYPE colorSpace,
+                                                  const VideoColorMetadata& color,
+                                                  const bool hdrToneCurveActive,
+                                                  const bool suppressHdr10Metadata) {
+    const bool hlgColorSpace = IsHlgColorSpace(colorSpace);
+    IDXGISwapChain1* const targetSwapChain =
+        hlgColorSpace ? hlgSwapChain_.Get() : swapChain_.Get();
+    if (!targetSwapChain) {
         return false;
     }
     if (activeColorSpace_ == colorSpace) {
-        if (colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 && !hdrMetadataApplied_) {
-            ApplyHdrMetadata(color);
+        if (colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 &&
+            !suppressHdr10Metadata) {
+            ApplyHdrMetadata(color, hdrToneCurveActive);
+        } else if (colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 &&
+                   suppressHdr10Metadata && hdrMetadataApplied_) {
+            Microsoft::WRL::ComPtr<IDXGISwapChain4> swapChain4;
+            if (SUCCEEDED(swapChain_.As(&swapChain4)) && swapChain4) {
+                swapChain4->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_NONE, 0, nullptr);
+            }
+            hdrMetadataApplied_ = false;
+            activeHdrMetadataSignature_ = 0;
         }
         return true;
     }
 
+    const bool pqColorSpace = colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+    const auto shouldLogFailure = [this, hlgColorSpace, pqColorSpace]() {
+        if (hlgColorSpace) return !hlgColorSpaceFailureLogged_;
+        if (pqColorSpace) return !hdrColorSpaceFailureLogged_;
+        return true;
+    };
+    const auto markFailureLogged = [this, hlgColorSpace, pqColorSpace]() {
+        if (hlgColorSpace) hlgColorSpaceFailureLogged_ = true;
+        if (pqColorSpace) hdrColorSpaceFailureLogged_ = true;
+    };
+
     Microsoft::WRL::ComPtr<IDXGISwapChain3> swapChain3;
-    if (FAILED(swapChain_.As(&swapChain3)) || !swapChain3) {
-        if (colorSpace != DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 || !hdrColorSpaceFailureLogged_) {
+    if (FAILED(targetSwapChain->QueryInterface(IID_PPV_ARGS(&swapChain3))) || !swapChain3) {
+        if (shouldLogFailure()) {
             LogInfo(L"color_space unsupported reason=swapchain3_unavailable");
         }
-        if (colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) {
-            hdrColorSpaceFailureLogged_ = true;
-        }
+        markFailureLogged();
         return false;
     }
 
     UINT support = 0;
     HRESULT hr = swapChain3->CheckColorSpaceSupport(colorSpace, &support);
-    if (FAILED(hr) || (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) == 0) {
-        if (colorSpace != DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 || !hdrColorSpaceFailureLogged_) {
-            LogInfo(L"color_space unsupported target=" + ColorSpaceName(colorSpace));
+    const UINT requiredSupport = hlgColorSpace
+                                     ? (DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT |
+                                        DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_OVERLAY_PRESENT)
+                                     : DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT;
+    const bool outputOverlaySupport =
+        hlgColorSpace &&
+        ((colorSpace == DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020 &&
+          hlgStudioColorSpaceSupported_) ||
+         (colorSpace == DXGI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020 &&
+          hlgFullColorSpaceSupported_));
+    if (FAILED(hr) || ((support & requiredSupport) == 0 && !outputOverlaySupport)) {
+        if (shouldLogFailure()) {
+            std::wostringstream message;
+            message << L"color_space unsupported target=" << ColorSpaceName(colorSpace)
+                    << L" support=0x" << std::hex << support
+                    << L" hr=0x" << static_cast<unsigned long>(hr);
+            LogInfo(message.str());
         }
-        if (colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) {
-            hdrColorSpaceFailureLogged_ = true;
-        }
+        markFailureLogged();
         return false;
     }
 
     hr = swapChain3->SetColorSpace1(colorSpace);
     if (FAILED(hr)) {
-        if (colorSpace != DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 || !hdrColorSpaceFailureLogged_) {
+        if (shouldLogFailure()) {
             LogHr(L"SetColorSpace1 " + ColorSpaceName(colorSpace), hr);
         }
-        if (colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) {
-            hdrColorSpaceFailureLogged_ = true;
-        }
+        markFailureLogged();
         return false;
     }
 
     activeColorSpace_ = colorSpace;
     hdrMetadataApplied_ = false;
-    if (colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) {
-        ApplyHdrMetadata(color);
+    activeHdrMetadataSignature_ = 0;
+    if (colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 &&
+        !suppressHdr10Metadata) {
+        ApplyHdrMetadata(color, hdrToneCurveActive);
     } else {
+        // A Dolby renderer/tunnel path deliberately owns the display signal.
+        // Clearing DXGI HDR10 metadata must not tear down that NVAPI session.
+        if (!suppressHdr10Metadata) {
+            nvidiaHdrOutput_.Restore();
+        }
         Microsoft::WRL::ComPtr<IDXGISwapChain4> swapChain4;
         if (SUCCEEDED(swapChain_.As(&swapChain4)) && swapChain4) {
             swapChain4->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_NONE, 0, nullptr);
         }
     }
+    SelectCompositionSwapChain(hlgColorSpace);
     LogInfo(L"color_space active=" + ColorSpaceName(colorSpace));
     return true;
 }
 
-void D3D11VideoRenderer::ApplyHdrMetadata(const VideoColorMetadata& color) {
+void D3D11VideoRenderer::ApplyHdrMetadata(
+    const VideoColorMetadata& color,
+    const bool hdrToneCurveActive) {
     Microsoft::WRL::ComPtr<IDXGISwapChain4> swapChain4;
     if (!swapChain_ || FAILED(swapChain_.As(&swapChain4)) || !swapChain4) {
+        return;
+    }
+
+    if (!videoSettings_.displayMetadataPassthrough || suppressHdrMetadataForDolbyVision_) {
+        constexpr uint64_t kClearedMetadataSignature = 0x434c454152454455ull;
+        if (hdrMetadataApplied_ && activeHdrMetadataSignature_ == kClearedMetadataSignature) {
+            return;
+        }
+        const HRESULT clearHr = swapChain4->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_NONE, 0, nullptr);
+        if (SUCCEEDED(clearHr)) {
+            // Mark the requested metadata state as applied so the render loop
+            // does not issue the same clear operation for every frame.
+            hdrMetadataApplied_ = true;
+            activeHdrMetadataSignature_ = kClearedMetadataSignature;
+            LogInfo(suppressHdrMetadataForDolbyVision_
+                        ? L"hdr metadata passthrough=off reason=dolby_vision metadata=cleared"
+                        : L"hdr metadata passthrough=off metadata=cleared");
+        } else {
+            LogHr(L"Clear HDR metadata", clearHr);
+        }
         return;
     }
 
@@ -3194,7 +3917,7 @@ void D3D11VideoRenderer::ApplyHdrMetadata(const VideoColorMetadata& color) {
     }
 
     const bool cmv4ApproxEnabled = videoSettings_.dolbyVisionCmv4Approx || ExperimentalDoviTrimEnabled();
-    const bool curveActive = videoSettings_.dolbyVisionHdrOutput && !cmv4ApproxEnabled;
+    const bool curveActive = hdrToneCurveActive && !cmv4ApproxEnabled;
     const double curvePeak = curveActive
                                  ? static_cast<double>(HdrToneCurveOutputPeakNits(videoSettings_))
                                  : 10000.0;
@@ -3218,9 +3941,26 @@ void D3D11VideoRenderer::ApplyHdrMetadata(const VideoColorMetadata& color) {
             ? std::min(static_cast<double>(color.contentLight.maxFrameAverageLightLevelNits), curvePeak)
             : maxMastering / 2.0)));
 
+    uint64_t metadataSignature = 1469598103934665603ull;
+    const auto* metadataBytes = reinterpret_cast<const uint8_t*>(&metadata);
+    for (std::size_t index = 0; index < sizeof(metadata); ++index) {
+        metadataSignature ^= metadataBytes[index];
+        metadataSignature *= 1099511628211ull;
+    }
+    if (hdrMetadataApplied_ && activeHdrMetadataSignature_ == metadataSignature) {
+        return;
+    }
+
     const HRESULT hr = swapChain4->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_HDR10, sizeof(metadata), &metadata);
     if (SUCCEEDED(hr)) {
         hdrMetadataApplied_ = true;
+        activeHdrMetadataSignature_ = metadataSignature;
+        LogInfo(L"hdr metadata passthrough=on type=hdr10 max_mastering=" +
+                std::to_wstring(metadata.MaxMasteringLuminance) +
+                L" max_cll=" + std::to_wstring(metadata.MaxContentLightLevel) +
+                L" max_fall=" + std::to_wstring(metadata.MaxFrameAverageLightLevel));
+    } else {
+        LogHr(L"Set HDR10 metadata", hr);
     }
 }
 
@@ -3736,6 +4476,14 @@ bool D3D11VideoRenderer::DrawSubtitleBitmapOverlays(const NativeVideoFrame& fram
         }
 
         SubtitleShaderConstants constants{};
+        const bool hlgUi = IsHlgColorSpace(activeColorSpace_);
+        constants.hdrUi =
+            activeColorSpace_ == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 || hlgUi
+                ? 1.0f
+                : 0.0f;
+        constants.hlgUi = hlgUi ? 1.0f : 0.0f;
+        constants.hlgFullRange =
+            activeColorSpace_ == DXGI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020 ? 1.0f : 0.0f;
         constants.uvRect[0] = static_cast<float>((clippedLeft - destLeft) / destWidth);
         constants.uvRect[1] = static_cast<float>((clippedTop - destTop) / destHeight);
         constants.uvRect[2] = static_cast<float>((clippedRight - destLeft) / destWidth);
@@ -3934,6 +4682,14 @@ void D3D11VideoRenderer::DrawSubtitleOverlay() {
     }
 
     SubtitleShaderConstants constants{};
+    const bool hlgUi = IsHlgColorSpace(activeColorSpace_);
+    constants.hdrUi =
+        activeColorSpace_ == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 || hlgUi
+            ? 1.0f
+            : 0.0f;
+    constants.hlgUi = hlgUi ? 1.0f : 0.0f;
+    constants.hlgFullRange =
+        activeColorSpace_ == DXGI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020 ? 1.0f : 0.0f;
     context_->UpdateSubresource(subtitleConstants_.Get(), 0, nullptr, &constants, 0, 0);
     ID3D11Buffer* constantBuffers[1] = {subtitleConstants_.Get()};
     context_->PSSetConstantBuffers(0, 1, constantBuffers);
@@ -3954,7 +4710,140 @@ void D3D11VideoRenderer::DrawSubtitleOverlay() {
     context_->PSSetConstantBuffers(0, 1, nullConstants);
 }
 
+bool D3D11VideoRenderer::UpdateUiOverlayTexture() {
+    if (!device_ || !context_ || !activeUiOverlay_ ||
+        activeUiOverlay_->width <= 0 || activeUiOverlay_->height <= 0 ||
+        !activeUiOverlay_->bgraPremultiplied ||
+        activeUiOverlay_->bgraPremultiplied->size() <
+            static_cast<std::size_t>(activeUiOverlay_->width) *
+                static_cast<std::size_t>(activeUiOverlay_->height) * 4) {
+        return false;
+    }
+    if (uploadedUiOverlay_ == activeUiOverlay_ && uiOverlaySrv_) {
+        return true;
+    }
+
+    const bool sizeChanged = !uiOverlayTexture_ || !uiOverlaySrv_ ||
+                             !uploadedUiOverlay_ ||
+                             uploadedUiOverlay_->width != activeUiOverlay_->width ||
+                             uploadedUiOverlay_->height != activeUiOverlay_->height;
+    if (sizeChanged) {
+        uiOverlaySrv_.Reset();
+        uiOverlayTexture_.Reset();
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = static_cast<UINT>(activeUiOverlay_->width);
+        desc.Height = static_cast<UINT>(activeUiOverlay_->height);
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DYNAMIC;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(device_->CreateTexture2D(&desc, nullptr, &uiOverlayTexture_)) ||
+            FAILED(device_->CreateShaderResourceView(uiOverlayTexture_.Get(), nullptr, &uiOverlaySrv_))) {
+            uiOverlayTexture_.Reset();
+            uiOverlaySrv_.Reset();
+            return false;
+        }
+    }
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(context_->Map(uiOverlayTexture_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+        return false;
+    }
+    const int sourcePitch = activeUiOverlay_->width * 4;
+    for (int y = 0; y < activeUiOverlay_->height; ++y) {
+        std::memcpy(static_cast<uint8_t*>(mapped.pData) + static_cast<std::size_t>(mapped.RowPitch) * y,
+                    activeUiOverlay_->bgraPremultiplied->data() + static_cast<std::size_t>(sourcePitch) * y,
+                    static_cast<std::size_t>(sourcePitch));
+    }
+    context_->Unmap(uiOverlayTexture_.Get(), 0);
+    uploadedUiOverlay_ = activeUiOverlay_;
+    return true;
+}
+
+bool D3D11VideoRenderer::DrawUiOverlay() {
+    // A null overlay is a valid UI transaction: presenting the cached video
+    // frame removes the previously composited controls.
+    if (!activeUiOverlay_) {
+        return true;
+    }
+    if (!UpdateUiOverlayTexture() || !context_ || !uiOverlaySrv_ ||
+        !ActiveRgbRenderTarget() || !subtitleBlend_ || !vs_ || !psSubtitle_ || !subtitleConstants_) {
+        return false;
+    }
+
+    // DXGI flip-model Present unbinds back buffer 0 from the output-merger.
+    // Video-frame rendering happens to bind it earlier in the same pass, but
+    // paused playback redraws the cached frame after a previous Present. Make
+    // the UI pass self-contained so both paths target the same back buffer.
+    ID3D11RenderTargetView* activeRenderTarget = ActiveRgbRenderTarget();
+    context_->OMSetRenderTargets(1, &activeRenderTarget, nullptr);
+
+    const float left = std::clamp(static_cast<float>(activeUiOverlay_->destinationX),
+                                  0.0f,
+                                  viewport_.Width);
+    const float top = std::clamp(static_cast<float>(activeUiOverlay_->destinationY),
+                                 0.0f,
+                                 viewport_.Height);
+    const float right = std::clamp(left + static_cast<float>(activeUiOverlay_->width),
+                                   left,
+                                   viewport_.Width);
+    const float bottom = std::clamp(top + static_cast<float>(activeUiOverlay_->height),
+                                    top,
+                                    viewport_.Height);
+    if (right <= left || bottom <= top) {
+        return false;
+    }
+
+    SubtitleShaderConstants constants{};
+    const bool hlgUi = IsHlgColorSpace(activeColorSpace_);
+    constants.hdrUi =
+        activeColorSpace_ == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 || hlgUi
+            ? 1.0f
+            : 0.0f;
+    constants.hlgUi = hlgUi ? 1.0f : 0.0f;
+    constants.hlgFullRange =
+        activeColorSpace_ == DXGI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020 ? 1.0f : 0.0f;
+    constants.alphaFromRgb = activeUiOverlay_->alphaFromRgb ? 1.0f : 0.0f;
+    constants.overlayOpacity = activeUiOverlay_->opacity;
+    context_->UpdateSubresource(subtitleConstants_.Get(), 0, nullptr, &constants, 0, 0);
+    ID3D11Buffer* constantBuffers[1] = {subtitleConstants_.Get()};
+    context_->PSSetConstantBuffers(0, 1, constantBuffers);
+
+    D3D11_VIEWPORT overlayViewport{};
+    overlayViewport.TopLeftX = left;
+    overlayViewport.TopLeftY = top;
+    overlayViewport.Width = right - left;
+    overlayViewport.Height = bottom - top;
+    overlayViewport.MinDepth = 0.0f;
+    overlayViewport.MaxDepth = 1.0f;
+    context_->RSSetViewports(1, &overlayViewport);
+    context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context_->VSSetShader(vs_.Get(), nullptr, 0);
+    context_->PSSetShader(psSubtitle_.Get(), nullptr, 0);
+    context_->PSSetShaderResources(0, 1, uiOverlaySrv_.GetAddressOf());
+    context_->PSSetSamplers(0, 1, sampler_.GetAddressOf());
+    float blendFactor[4] = {};
+    context_->OMSetBlendState(subtitleBlend_.Get(), blendFactor, 0xffffffff);
+    context_->Draw(3, 0);
+    context_->OMSetBlendState(nullptr, blendFactor, 0xffffffff);
+    ID3D11ShaderResourceView* nullView[1] = {};
+    context_->PSSetShaderResources(0, 1, nullView);
+    ID3D11Buffer* nullConstants[1] = {};
+    context_->PSSetConstantBuffers(0, 1, nullConstants);
+    if (!uiOverlayLogged_) {
+        uiOverlayLogged_ = true;
+        LogInfo(L"ui_overlay composited=true target=video_backbuffer size=" +
+                std::to_wstring(activeUiOverlay_->width) + L"x" +
+                std::to_wstring(activeUiOverlay_->height));
+    }
+    return true;
+}
+
 void D3D11VideoRenderer::ReleaseAll() {
+    nvidiaHdrOutput_.Restore();
     publishedDevice_.store(nullptr, std::memory_order_release);
     host_.store(nullptr, std::memory_order_release);
     ResetRenderStatsOnRenderThread();
@@ -3962,6 +4851,11 @@ void D3D11VideoRenderer::ReleaseAll() {
     subtitleTextureCache_.clear();
     subtitleSrv_.Reset();
     subtitleTexture_.Reset();
+    uiOverlaySrv_.Reset();
+    uiOverlayTexture_.Reset();
+    activeUiOverlay_.reset();
+    uploadedUiOverlay_.reset();
+    uiPresentRequired_ = false;
     hwSrvUV_.Reset();
     hwSrvY_.Reset();
     yuvSrvUV_.Reset();
@@ -3988,6 +4882,13 @@ void D3D11VideoRenderer::ReleaseAll() {
     psNv12_.Reset();
     ps_.Reset();
     vs_.Reset();
+    hlgVideoOutputView_.Reset();
+    hlgVideoInputView_.Reset();
+    hlgVideoProcessor_.Reset();
+    hlgVideoProcessorEnumerator_.Reset();
+    videoContext1_.Reset();
+    videoDevice_.Reset();
+    hlgBackBuffer_.Reset();
     rtv_.Reset();
     backBuffer_.Reset();
     cachedOutputFrame_.Reset();
@@ -3997,6 +4898,7 @@ void D3D11VideoRenderer::ReleaseAll() {
     }
     dcompVisual_.Reset();
     dcompTarget_.Reset();
+    hlgCompositionSurface_.Reset();
     dcompDevice_.Reset();
     useComposition_ = false;
     if (frameLatencyWaitable_) {
@@ -4004,6 +4906,11 @@ void D3D11VideoRenderer::ReleaseAll() {
         frameLatencyWaitable_ = nullptr;
     }
     framePacingLogged_ = false;
+    hlgSwapChain_.Reset();
+    if (hlgCompositionSurfaceHandle_) {
+        CloseHandle(hlgCompositionSurfaceHandle_);
+        hlgCompositionSurfaceHandle_ = nullptr;
+    }
     swapChain_.Reset();
     context_.Reset();
     adapter_.Reset();
@@ -4022,7 +4929,12 @@ void D3D11VideoRenderer::ReleaseAll() {
     activeSubtitleOffsetYPx_ = 0;
     activeColorSpace_ = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
     hdrMetadataApplied_ = false;
+    activeHdrMetadataSignature_ = 0;
     hdrColorSpaceFailureLogged_ = false;
+    hlgColorSpaceFailureLogged_ = false;
+    hlgStudioColorSpaceSupported_ = false;
+    hlgFullColorSpaceSupported_ = false;
+    hlgCompositionSelected_ = false;
     felOverlayLogged_ = false;
     activePipelineLabel_.clear();
     activePipelineSignature_ = 0;

@@ -2,13 +2,17 @@
 
 #include "AnvilPlayer/App/ffmpeg_video_decoder.h"
 #include "AnvilPlayer/App/log_sink_ptr.h"
+#include "AnvilPlayer/App/nvidia_hdr_output.h"
 #include "AnvilPlayer/Playback/CapabilityReport.h"
 #include "AnvilPlayer/Playback/Settings.h"
 
 #include <d3d11.h>
+#include <d3d11_1.h>
 #include <d3d10.h>
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
+#include <dxgi1_3.h>
+#include <dxgi1_4.h>
 #include <dxgi1_3.h>
 #include <dcomp.h>
 #include <windows.h>
@@ -30,6 +34,16 @@
 namespace anvil::app {
 
 struct D3D11QueuedVideoFrame;
+
+struct D3D11UiOverlayBitmap {
+    int width = 0;
+    int height = 0;
+    int destinationX = 0;
+    int destinationY = 0;
+    bool alphaFromRgb = false;
+    float opacity = 1.0f;
+    std::shared_ptr<const std::vector<uint8_t>> bgraPremultiplied;
+};
 
 // Initialization and rendering are owned by the render worker. Failed is a
 // terminal state for the current renderer instance (the worker has exited and
@@ -77,7 +91,7 @@ struct D3D11RenderStats {
 // D3D11VA hardware decode (zero-copy path).
 class D3D11VideoRenderer {
 public:
-    explicit D3D11VideoRenderer(LogSinkPtr logSink = nullptr) : logSink_(std::move(logSink)) {}
+    explicit D3D11VideoRenderer(LogSinkPtr logSink = nullptr);
     ~D3D11VideoRenderer();
     D3D11VideoRenderer(const D3D11VideoRenderer&) = delete;
     D3D11VideoRenderer& operator=(const D3D11VideoRenderer&) = delete;
@@ -113,13 +127,14 @@ public:
                                 const anvil::playback::DisplayCapabilities& display,
                                 const anvil::playback::VideoColorMetadata& mediaColor);
     void ConfigureSubtitleSettings(const anvil::playback::SubtitleSettings& settings);
+    void ConfigureUiOverlay(std::shared_ptr<const D3D11UiOverlayBitmap> overlay,
+                            bool requestImmediatePresent);
 
     void OnResize();
 
     void SetDiagnosticsEnabled(bool enabled);
     void ResetRenderStats();
     D3D11RenderStats TakeRenderStats();
-
     void Render(const NativeVideoFrame& frame);
 
     // Transfers a frame to the bounded, process-lifetime retirement worker.
@@ -141,6 +156,11 @@ private:
         anvil::playback::VideoColorMetadata mediaColor;
     };
 
+    struct PendingUiOverlay {
+        std::shared_ptr<const D3D11UiOverlayBitmap> overlay;
+        bool requestImmediatePresent = false;
+    };
+
     void RenderThreadMain();
     void StopRenderThread();
     bool InitializeGpuOnRenderThread(UINT width, UINT height);
@@ -156,21 +176,31 @@ private:
     void SetDiagnosticsEnabledOnRenderThread(bool enabled);
     void ResetRenderStatsOnRenderThread();
     void PublishRenderStats();
-    void RenderOnRenderThread(const NativeVideoFrame& frame);
-    void RepeatLastPresentOnRenderThread();
+    bool RenderOnRenderThread(const NativeVideoFrame& frame);
+    bool RepeatLastPresentOnRenderThread();
     void ClearOnRenderThread();
 
     void EnableMultithreadProtection();
     bool CreateRenderTarget();
+    ID3D11RenderTargetView* ActiveRgbRenderTarget() const noexcept;
+    ID3D11Texture2D* ActiveRgbRenderTexture() const noexcept;
     bool CreatePipeline();
     bool CreateComposition();
+    bool CreateHlgPresentationResources(UINT width, UINT height);
+    bool ResizeHlgPresentationResources(UINT width, UINT height);
+    bool BlitHlgFrame();
+    void SelectCompositionSwapChain(bool hlg);
     bool UpdateColorPipeline(const NativeVideoFrame& frame);
     void UpdateDoviConstants(const NativeVideoFrame& frame);
-    bool ApplySwapChainColorSpace(DXGI_COLOR_SPACE_TYPE colorSpace, const anvil::playback::VideoColorMetadata& color);
-    void ApplyHdrMetadata(const anvil::playback::VideoColorMetadata& color);
+    bool ApplySwapChainColorSpace(DXGI_COLOR_SPACE_TYPE colorSpace,
+                                  const anvil::playback::VideoColorMetadata& color,
+                                  bool hdrToneCurveActive,
+                                  bool suppressHdr10Metadata = false);
+    void ApplyHdrMetadata(const anvil::playback::VideoColorMetadata& color,
+                          bool hdrToneCurveActive);
     bool ConfigureFramePacing();
     void WaitForFrameLatencyObject(bool collectStats);
-    void PresentFrame(UINT syncInterval, bool collectStats, std::chrono::steady_clock::time_point stageStart);
+    bool PresentFrame(UINT syncInterval, bool collectStats, std::chrono::steady_clock::time_point stageStart);
     bool UpdateHardwareTexture(const NativeVideoFrame& frame);
     void UpdateTexture(const NativeVideoFrame& frame);
     bool UpdateYuvTexture(const NativeVideoFrame& frame);
@@ -178,6 +208,8 @@ private:
     bool UpdateSubtitleOverlay(const NativeVideoFrame& frame, const D3D11_VIEWPORT& videoViewport);
     void DrawSubtitleOverlay();
     bool DrawSubtitleBitmapOverlays(const NativeVideoFrame& frame, const D3D11_VIEWPORT& videoViewport);
+    bool UpdateUiOverlayTexture();
+    bool DrawUiOverlay();
     void ReleaseAll();
     void LogHardwareTextureFailureOnce(const std::wstring& message);
     void LogInfo(const std::wstring& message) const;
@@ -241,9 +273,16 @@ private:
     UINT pendingResizeHeight_ = 1;
     std::optional<PendingColorPipeline> pendingColorPipeline_;
     std::optional<anvil::playback::SubtitleSettings> pendingSubtitleSettings_;
+    std::optional<PendingUiOverlay> pendingUiOverlay_;
     std::optional<bool> pendingDiagnosticsEnabled_;
     bool pendingResetStats_ = false;
     bool pendingClear_ = false;
+
+    // Render-thread-owned transaction state. Once an immediate UI update has
+    // been accepted it remains outstanding until a frame is actually
+    // presented with that overlay. Resize/cache invalidation may defer the
+    // transaction, but must never silently consume it.
+    bool uiPresentRequired_ = false;
 
     // Published statistics have a lock independent from the GPU worker. The
     // render thread only holds it while adding an already-computed snapshot,
@@ -256,6 +295,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
     Microsoft::WRL::ComPtr<IDXGISwapChain1> swapChain_;
+    Microsoft::WRL::ComPtr<IDXGISwapChain1> hlgSwapChain_;
     // DirectComposition visual tree that binds the composition swap chain to
     // the host HWND. This lets DWM composite the video surface so that GDI
     // sibling overlay windows (e.g. the subtitle menu popup) render correctly
@@ -266,7 +306,16 @@ private:
     Microsoft::WRL::ComPtr<IDCompositionDevice> dcompDevice_;
     Microsoft::WRL::ComPtr<IDCompositionTarget> dcompTarget_;
     Microsoft::WRL::ComPtr<IDCompositionVisual> dcompVisual_;
+    Microsoft::WRL::ComPtr<IUnknown> hlgCompositionSurface_;
+    HANDLE hlgCompositionSurfaceHandle_ = nullptr;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> backBuffer_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> hlgBackBuffer_;
+    Microsoft::WRL::ComPtr<ID3D11VideoDevice> videoDevice_;
+    Microsoft::WRL::ComPtr<ID3D11VideoContext1> videoContext1_;
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorEnumerator> hlgVideoProcessorEnumerator_;
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessor> hlgVideoProcessor_;
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> hlgVideoInputView_;
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> hlgVideoOutputView_;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> cachedOutputFrame_;
     bool cachedOutputFrameValid_ = false;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> rtv_;
@@ -297,6 +346,10 @@ private:
     int enhancementYuvTextureH_ = 0;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> subtitleTexture_;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> subtitleSrv_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> uiOverlayTexture_;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> uiOverlaySrv_;
+    std::shared_ptr<const D3D11UiOverlayBitmap> activeUiOverlay_;
+    std::shared_ptr<const D3D11UiOverlayBitmap> uploadedUiOverlay_;
     std::vector<HardwareSrvCacheEntry> hardwareSrvCache_;
     std::vector<SubtitleTextureCacheEntry> subtitleTextureCache_;
     D3D11_VIEWPORT viewport_{};
@@ -317,11 +370,20 @@ private:
     int activeSubtitleOffsetXPx_ = 0;
     int activeSubtitleOffsetYPx_ = 0;
     DXGI_COLOR_SPACE_TYPE activeColorSpace_ = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    NvidiaHdrOutput nvidiaHdrOutput_;
     bool hdrMetadataApplied_ = false;
+    bool suppressHdrMetadataForDolbyVision_ = false;
+    uint64_t activeHdrMetadataSignature_ = 0;
     bool hdrColorSpaceFailureLogged_ = false;
+    bool hlgColorSpaceFailureLogged_ = false;
+    bool hlgStudioColorSpaceSupported_ = false;
+    bool hlgFullColorSpaceSupported_ = false;
+    bool hlgCompositionSelected_ = false;
     bool dolbyVisionMetadataLogged_ = false;
+    bool hdr10PlusMetadataLogged_ = false;
     bool felOverlayLogged_ = false;
     bool subtitleBitmapOverlayLogged_ = false;
+    bool uiOverlayLogged_ = false;
     uint64_t subtitleDrawFrame_ = 0;
     bool doviEnabledLastFrame_ = false;  // tracks DV state to skip non-DV updates
     std::wstring activePipelineLabel_;

@@ -35,14 +35,28 @@ inline constexpr std::array<HdrToneCurvePoint, kHdrToneCurvePointCount> kDefault
 }};
 
 struct VideoSettings {
+    bool autoDisplayFormat = false;
     HardwareDecodeMode hardwareDecode = HardwareDecodeMode::Auto;
     std::wstring renderer = L"D3D11";
     int selectedTrackIndex = kVideoTrackAuto;
     HdrOutputMode hdrOutput = HdrOutputMode::Auto;
     ToneMappingMode toneMapping = ToneMappingMode::Balanced;
     DolbyVisionMode dolbyVision = DolbyVisionMode::FallbackOnly;
+    // Pass source mastering-display and content-light metadata to the active
+    // HDR swap chain. Color-space selection remains independent so disabling
+    // this switch never silently turns HDR video into SDR.
+    bool displayMetadataPassthrough = true;
+    // Opt-in Windows MediaEngine + Dolby renderer-extension presentation.
+    // The default remains the native FFmpeg/libplacebo RPU path.
+    bool dolbyVisionSystemPipelineExperimental = false;
+    // Prefer the Windows/native Dolby Vision presentation path when the
+    // display and installed system components expose it. The FFmpeg/D3D11
+    // renderer must fall back to software DV reshape when native signaling is
+    // unavailable; it must never label HDR10 output as native Dolby Vision.
     bool dolbyVisionHdrOutput = false;
-    bool dolbyVisionCmv4Approx = false;
+    // Dolby Vision creative trims and enhancement-layer processing are always
+    // enabled for supported software presentation paths.
+    bool dolbyVisionCmv4Approx = true;
     int peakBrightnessNits = 1000;
     std::array<HdrToneCurvePoint, kHdrToneCurvePointCount> hdrToneCurve = kDefaultHdrToneCurve;
 };

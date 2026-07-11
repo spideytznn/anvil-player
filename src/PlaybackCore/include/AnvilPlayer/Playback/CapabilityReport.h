@@ -9,6 +9,8 @@ struct DisplayCapabilities {
     bool hdrSupported = false;
     bool hdrEnabled = false;
     bool dolbyVisionSignalAvailable = false;
+    // True when Windows exposes a renderer-effect MFT advertising a supported
+    // Dolby Vision profile. Physical display signaling is reported separately.
     // True when the player can decode DV in software and reshape on the GPU,
     // producing correct-color HDR10 output (regardless of native DV signaling).
     // Always true when FFmpeg with dovi_meta.h is linked.
@@ -51,6 +53,11 @@ public:
     // starts one process-lifetime background probe and returns a conservative
     // "pending" report; later calls reuse the immutable published result.
     static CapabilityReport CollectBasic();
+    // Advanced Color is mutable while the process is running (for example
+    // when Windows switches between Dolby Vision desktop mode and HDR10).
+    // Query this lightweight display state instead of reusing the immutable
+    // process-wide codec/GPU capability snapshot.
+    static bool IsHdrEnabledNow();
 };
 
 }  // namespace anvil::playback

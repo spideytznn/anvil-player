@@ -138,7 +138,7 @@ input:focus-visible {
   width: 100%;
   min-height: 0;
   flex: 1 1 auto;
-  grid-template-rows: 56px minmax(0, 1fr) 96px;
+  grid-template-rows: 56px minmax(0, 1fr) 90px;
   gap: 12px;
   padding: 16px;
   background: transparent;
@@ -1477,7 +1477,7 @@ input:focus-visible {
   bottom: 18px;
   left: 18px;
   z-index: 520;
-  height: 96px;
+  height: 90px;
   opacity: 0;
   pointer-events: none;
   transform: translateY(var(--fullscreen-transport-hidden-y));
@@ -1568,8 +1568,8 @@ input:focus-visible {
 }
 
 .icon-button.is-primary {
-  width: 42px;
-  height: 42px;
+  width: 36px;
+  height: 36px;
   border-color: rgba(223, 118, 95, 0.52);
   background: #b95f50;
   color: white;
@@ -1785,7 +1785,7 @@ input:focus-visible {
 
 @media (max-width: 900px), (max-height: 560px) {
   .app-shell {
-    grid-template-rows: 48px minmax(0, 1fr) 88px;
+    grid-template-rows: 48px minmax(0, 1fr) 82px;
     gap: 8px;
     padding: 10px;
   }
@@ -1820,7 +1820,7 @@ input:focus-visible {
     right: 10px;
     bottom: 10px;
     left: 10px;
-    height: 88px;
+    height: 82px;
   }
 
   .transport-left,
@@ -1855,6 +1855,15 @@ input:focus-visible {
   }
 }
 
+.seek-ten-icon {
+  display: block;
+  width: 24px;
+  height: 24px;
+  object-fit: contain;
+  pointer-events: none;
+  user-select: none;
+}
+
 .refresh-rate-setting {
   display: flex;
   align-items: center;
@@ -1877,6 +1886,10 @@ input:focus-visible {
 .refresh-rate-setting small {
   color: var(--muted);
   font-size: 10px;
+}
+
+.refresh-rate-setting.is-unavailable small {
+  color: #d5a36b;
 }
 
 .refresh-rate-maximum {

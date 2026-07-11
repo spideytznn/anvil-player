@@ -13,6 +13,7 @@
 #include "AnvilPlayer/App/ui_draw.h"
 #include "AnvilPlayer/App/ui_types.h"
 #include "AnvilPlayer/App/wasapi_audio_player.h"
+#include "AnvilPlayer/App/system_dolby_vision_player.h"
 #include "AnvilPlayer/App/web_ui_host.h"
 #include "AnvilPlayer/Playback/PlayerController.h"
 #include "resource.h"
@@ -64,6 +65,10 @@ public:
     void SetPendingStartPositionRatio(double ratio) { pendingStartPositionRatio_ = ratio; }
     void SetPendingMediaTrackSelections(int audioTrackIndex, int subtitleTrackIndex);
     HWND Handle() const { return hwnd_; }
+    // Moves a restored player window onto the monitor containing `sourceWindow`.
+    // Popups owned by the player consequently open on the same display as the
+    // media library that initiated playback.
+    void MoveToMonitorOf(HWND sourceWindow);
     bool IsVisible() const;
     bool IsClosing() const { return closePending_; }
     // Must be called on the window thread after HWND destruction and before
@@ -75,8 +80,12 @@ public:
     // storage from the library window). Returns true when the WebView was
     // ready and the message was actually posted.
     bool DeliverEmbyPlaybackReport(const std::wstring& reportJson) const;
+    void SetLocalPlaybackProgressRelay(std::function<void(const std::wstring&)> callback) {
+        localPlaybackProgressRelay_ = std::move(callback);
+    }
     void RefreshUiLanguage() const { PostWebUiState(true); }
     void ApplyGlobalRefreshRatePreferences();
+    void ApplyGlobalVideoPassthroughPreferences();
 
 private:
     static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
@@ -142,8 +151,10 @@ private:
     void OnPlaybackTimerTick();
     void InvalidatePlaybackAreas() const;
     void InvalidateVideoSurface() const;
-    void InvalidateTransportArea() const;
-    void InvalidateFullscreenOverlay() const;
+    void InvalidateTransportArea();
+    void InvalidateFullscreenOverlay();
+    bool UsesGpuFullscreenUiOverlay() const;
+    void QueueGpuFullscreenUiOverlay(bool forceImmediatePresent = false);
     void InvalidateHdrToneCurveEditor() const;
 
     const anvil::playback::CapabilityReport& CachedCapabilities();
@@ -163,6 +174,9 @@ private:
                                              const anvil::playback::VideoSettings& settings) const;
     int SettingsVideoFieldCount() const;
     void ApplyDefaultHdrControlsForCurrentMedia();
+    bool ApplyAutomaticDisplayFormatForCurrentMedia();
+    void RestoreAutomaticDisplayFormat();
+    void SetAutomaticDisplayFormat(bool enabled);
 
     int Scale(int value) const;
     RECT PlaybackSurfaceBounds() const;
@@ -193,6 +207,7 @@ private:
 
     // main_window_input.cpp
     void OnMouseMove(int x, int y);
+    void OnMouseLeave();
     void OnLeftButtonDown(int x, int y);
     void OnLeftButtonUp(int x, int /*y*/);
     void OnMouseWheel(int delta, POINT screenPoint);
@@ -336,6 +351,8 @@ private:
     void ShowSubtitleMenu();
     void ToggleDolbyVisionHdrOutput();
     void ToggleDolbyVisionCmv4Approx();
+    void SetDisplayMetadataPassthrough(bool enabled);
+    void SetDolbyVisionSystemPipelineExperimental(bool enabled);
     void ToggleFullscreen();
     void SetRefreshRateSyncEnabled(bool enabled);
     void SetRefreshRateMaximumMultiple(bool enabled);
@@ -428,6 +445,7 @@ private:
     WasapiAudioPlayer audioPlayer_;
     std::optional<FfmpegVideoDecoder> nativeVideoDecoder_;
     std::optional<D3D11VideoRenderer> d3dRenderer_;
+    SystemDolbyVisionPlayer systemDolbyVisionPlayer_;
     IconPainter iconPainter_;
     std::unique_ptr<WebUiHost> webUiHost_;
     HWND videoHost_ = nullptr;
@@ -439,6 +457,8 @@ private:
     HWND hdrToneCurveWindow_ = nullptr;
     bool videoHostReady_ = false;
     bool videoHostInitializationFailureHandled_ = false;
+    bool gpuFullscreenUiOverlayActive_ = false;
+    bool gpuFullscreenUiOverlayLogged_ = false;
     bool webUiRequested_ = true;
     bool webUiActive_ = false;
     bool uiThreadResourcesReleased_ = false;
@@ -452,6 +472,9 @@ private:
     bool pendingPausedFrameRefresh_ = false;
     bool heldNativeFrameNeedsPresent_ = false;
     bool nativeSeekPrerollHoldingAudio_ = false;
+    bool systemDolbyVisionFallbackForCurrentMedia_ = false;
+    bool systemDolbyVisionPlayingLogged_ = false;
+    std::chrono::steady_clock::time_point systemDolbyVisionStartedAt_{};
     bool bufferingOverlayVisible_ = false;
     bool bufferingOverlayCreateFailedLogged_ = false;
     bool bufferingOverlaySuppressedLogged_ = false;
@@ -486,6 +509,7 @@ private:
     RECT lastBufferingOverlayScreenBounds_{};
     RECT lastSubtitleMenuOverlayBounds_{};
     bool trackingMouseLeave_ = false;
+    bool videoHostTrackingMouseLeave_ = false;
     bool hdrToneCurveWindowTrackingMouseLeave_ = false;
     int hoveredButton_ = -1;
     int hoveredInspectorPathItem_ = -1;
@@ -618,8 +642,14 @@ private:
     mutable std::shared_ptr<RecentMediaWriterState> recentMediaWriter_;
     std::vector<InspectorPathItem> inspectorPathItems_;
     std::vector<UiButton> buttons_;
+    bool automaticDisplayLeaseActive_ = false;
+    bool automaticDisplayOriginalHdrEnabled_ = false;
+    bool automaticDisplayChanged_ = false;
+    LUID automaticDisplayAdapterId_{};
+    UINT32 automaticDisplayTargetId_ = 0;
     mutable HBITMAP previewBitmap_ = nullptr;
     mutable std::filesystem::path previewBitmapPath_;
+    std::function<void(const std::wstring&)> localPlaybackProgressRelay_;
 };
 
 }  // namespace anvil::app

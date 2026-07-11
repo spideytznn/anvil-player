@@ -6,6 +6,7 @@
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mftransform.h>
+#include <propidl.h>
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -15,7 +16,9 @@
 #include <new>
 #include <process.h>
 #include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -91,10 +94,162 @@ void AddUnique(std::vector<std::wstring>& values, std::wstring value) {
     }
 }
 
-bool ContainsInsensitive(std::wstring value, std::wstring needle) {
-    std::transform(value.begin(), value.end(), value.begin(), ::towlower);
-    std::transform(needle.begin(), needle.end(), needle.begin(), ::towlower);
-    return value.find(needle) != std::wstring::npos;
+bool ContainsDolbyVisionLowLatencyVsvdb(const std::vector<BYTE>& edid) {
+    // CTA Vendor-Specific Video Data Block uses Dolby's little-endian IEEE
+    // OUI 00-D0-46 on the wire (46 D0 00). In VSVDB v2 the low bit of the
+    // third payload byte is the LLDV-over-HDMI capability used by Windows.
+    for (std::size_t index = 0; index + 5 < edid.size(); ++index) {
+        if (edid[index] == 0x46 && edid[index + 1] == 0xD0 && edid[index + 2] == 0x00) {
+            return (edid[index + 5] & 0x01) != 0;
+        }
+    }
+    return false;
+}
+
+bool ReadBinaryRegistryValue(HKEY key, const wchar_t* name, std::vector<BYTE>& value) {
+    DWORD type = 0;
+    DWORD size = 0;
+    if (RegQueryValueExW(key, name, nullptr, &type, nullptr, &size) != ERROR_SUCCESS ||
+        type != REG_BINARY || size == 0) {
+        return false;
+    }
+    value.resize(size);
+    return RegQueryValueExW(key, name, nullptr, &type, value.data(), &size) == ERROR_SUCCESS;
+}
+
+std::wstring MonitorRegistryPathFromInterface(std::wstring path) {
+    constexpr std::wstring_view prefix = L"\\\\?\\";
+    if (path.rfind(prefix, 0) == 0) {
+        path.erase(0, prefix.size());
+    }
+    const auto classGuid = path.find(L"#{");
+    if (classGuid != std::wstring::npos) {
+        path.resize(classGuid);
+    }
+    std::replace(path.begin(), path.end(), L'#', L'\\');
+    return L"SYSTEM\\CurrentControlSet\\Enum\\" + path + L"\\Device Parameters";
+}
+
+bool ActiveDisplaySupportsDolbyVisionLowLatency() {
+    UINT32 pathCount = 0;
+    UINT32 modeCount = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS ||
+        pathCount == 0) {
+        return false;
+    }
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS,
+                           &pathCount,
+                           paths.data(),
+                           &modeCount,
+                           modes.data(),
+                           nullptr) != ERROR_SUCCESS) {
+        return false;
+    }
+
+    for (UINT32 index = 0; index < pathCount; ++index) {
+        DISPLAYCONFIG_TARGET_DEVICE_NAME target{};
+        target.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+        target.header.size = sizeof(target);
+        target.header.adapterId = paths[index].targetInfo.adapterId;
+        target.header.id = paths[index].targetInfo.id;
+        if (DisplayConfigGetDeviceInfo(&target.header) != ERROR_SUCCESS || target.monitorDevicePath[0] == L'\0') {
+            continue;
+        }
+
+        const auto registryPath = MonitorRegistryPathFromInterface(target.monitorDevicePath);
+        HKEY parameters = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, registryPath.c_str(), 0, KEY_READ, &parameters) != ERROR_SUCCESS) {
+            continue;
+        }
+        std::vector<BYTE> edid;
+        const bool baseHasLldv = ReadBinaryRegistryValue(parameters, L"EDID", edid) &&
+                                 ContainsDolbyVisionLowLatencyVsvdb(edid);
+        HKEY overrideKey = nullptr;
+        bool overrideHasLldv = false;
+        if (RegOpenKeyExW(parameters, L"EDID_OVERRIDE", 0, KEY_READ, &overrideKey) == ERROR_SUCCESS) {
+            for (DWORD block = 0; block < 8 && !overrideHasLldv; ++block) {
+                const auto blockName = std::to_wstring(block);
+                std::vector<BYTE> overrideBlock;
+                overrideHasLldv = ReadBinaryRegistryValue(overrideKey, blockName.c_str(), overrideBlock) &&
+                                  ContainsDolbyVisionLowLatencyVsvdb(overrideBlock);
+            }
+            RegCloseKey(overrideKey);
+        }
+        RegCloseKey(parameters);
+        if (overrideHasLldv || baseHasLldv) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ActiveDisplayAdvancedColorEnabled(const LUID& adapterLuid) {
+    UINT32 pathCount = 0;
+    UINT32 modeCount = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS ||
+        pathCount == 0) {
+        return false;
+    }
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS,
+                           &pathCount,
+                           paths.data(),
+                           &modeCount,
+                           modes.data(),
+                           nullptr) != ERROR_SUCCESS) {
+        return false;
+    }
+
+    for (UINT32 index = 0; index < pathCount; ++index) {
+        if (paths[index].targetInfo.adapterId.HighPart != adapterLuid.HighPart ||
+            paths[index].targetInfo.adapterId.LowPart != adapterLuid.LowPart) {
+            continue;
+        }
+        DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO colorInfo{};
+        colorInfo.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+        colorInfo.header.size = sizeof(colorInfo);
+        colorInfo.header.adapterId = paths[index].targetInfo.adapterId;
+        colorInfo.header.id = paths[index].targetInfo.id;
+        if (DisplayConfigGetDeviceInfo(&colorInfo.header) == ERROR_SUCCESS &&
+            colorInfo.advancedColorSupported && colorInfo.advancedColorEnabled) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool AnyActiveDisplayAdvancedColorEnabled() {
+    UINT32 pathCount = 0;
+    UINT32 modeCount = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS ||
+        pathCount == 0) {
+        return false;
+    }
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS,
+                           &pathCount,
+                           paths.data(),
+                           &modeCount,
+                           modes.data(),
+                           nullptr) != ERROR_SUCCESS) {
+        return false;
+    }
+    for (UINT32 index = 0; index < pathCount; ++index) {
+        DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO colorInfo{};
+        colorInfo.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+        colorInfo.header.size = sizeof(colorInfo);
+        colorInfo.header.adapterId = paths[index].targetInfo.adapterId;
+        colorInfo.header.id = paths[index].targetInfo.id;
+        if (DisplayConfigGetDeviceInfo(&colorInfo.header) == ERROR_SUCCESS &&
+            colorInfo.advancedColorSupported && colorInfo.advancedColorEnabled) {
+            return true;
+        }
+    }
+    return false;
 }
 
 std::wstring DecoderProfileName(const GUID& profile) {
@@ -170,10 +325,17 @@ void PopulateDisplayCapabilities(IDXGIAdapter* adapter, DisplayCapabilities& dis
 
     display.colorSpace = ColorSpaceToString(desc.ColorSpace);
     display.reportedPeakBrightnessNits = static_cast<int>(desc.MaxLuminance + 0.5f);
-    display.hdrEnabled =
+    const bool pqDesktop =
         desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
         desc.ColorSpace == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020;
+    DXGI_ADAPTER_DESC adapterDesc{};
+    const bool advancedColorDesktop = SUCCEEDED(adapter->GetDesc(&adapterDesc)) &&
+                                      ActiveDisplayAdvancedColorEnabled(adapterDesc.AdapterLuid);
+    display.hdrEnabled = pqDesktop || advancedColorDesktop;
     display.hdrSupported = display.hdrEnabled || desc.MaxLuminance >= 400.0f;
+    if (advancedColorDesktop && !pqDesktop) {
+        display.colorSpace += L" (Advanced Color enabled)";
+    }
 }
 
 bool TryPopulateD3D11(CapabilityReport& report) {
@@ -285,8 +447,95 @@ struct CoTaskMemWideString {
     wchar_t* value = nullptr;
 };
 
+std::wstring ActivationFriendlyName(IMFActivate* activation,
+                                    const wchar_t* fallbackName) {
+    CoTaskMemWideString name;
+    UINT32 nameLength = 0;
+    std::wstring friendlyName = fallbackName;
+    if (activation &&
+        SUCCEEDED(activation->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute,
+                                                 &name.value,
+                                                 &nameLength)) &&
+        name.value) {
+        friendlyName.assign(name.value, name.value + nameLength);
+    }
+    GUID clsid{};
+    if (activation &&
+        SUCCEEDED(activation->GetGUID(MFT_TRANSFORM_CLSID_Attribute, &clsid))) {
+        wchar_t clsidText[64]{};
+        if (StringFromGUID2(clsid, clsidText, static_cast<int>(std::size(clsidText))) > 0) {
+            friendlyName += L" ";
+            friendlyName += clsidText;
+        }
+    }
+    return friendlyName;
+}
+
+void PopulateDolbyVisionRendererEffects(CodecCapabilities& codecs,
+                                        const UINT32 flags) {
+    MediaFoundationActivations activations;
+    const HRESULT result = MFTEnumEx(MFT_CATEGORY_VIDEO_RENDERER_EFFECT,
+                                     flags,
+                                     nullptr,
+                                     nullptr,
+                                     &activations.values,
+                                     &activations.count);
+    if (FAILED(result)) {
+        AddUnique(codecs.mediaFoundationTransforms,
+                  L"Video renderer effect enumeration failed " +
+                      std::to_wstring(static_cast<unsigned long>(result)));
+        return;
+    }
+
+    for (UINT32 index = 0; index < activations.count; ++index) {
+        IMFActivate* activation = activations.values[index];
+        if (!activation) {
+            continue;
+        }
+        PROPVARIANT profiles{};
+        PropVariantInit(&profiles);
+        const HRESULT profileResult = activation->GetItem(
+            MFT_ENUM_VIDEO_RENDERER_EXTENSION_PROFILE,
+            &profiles);
+        std::wstring advertisedProfiles;
+        bool advertisesDolbyVision = false;
+        if (SUCCEEDED(profileResult) && profiles.vt == (VT_VECTOR | VT_LPWSTR)) {
+            for (ULONG profileIndex = 0;
+                 profileIndex < profiles.calpwstr.cElems;
+                 ++profileIndex) {
+                const wchar_t* profile = profiles.calpwstr.pElems[profileIndex];
+                if (!profile) {
+                    continue;
+                }
+                if (!advertisedProfiles.empty()) {
+                    advertisedProfiles += L", ";
+                }
+                advertisedProfiles += profile;
+                if (_wcsicmp(profile, L"dvhe.05") == 0 ||
+                    _wcsicmp(profile, L"dvhe.08") == 0 ||
+                    _wcsicmp(profile, L"dvav.09") == 0) {
+                    advertisesDolbyVision = true;
+                }
+            }
+        }
+        PropVariantClear(&profiles);
+        if (!advertisesDolbyVision) {
+            continue;
+        }
+        codecs.dolbyVisionExtensionDetected = true;
+        std::wstring name = ActivationFriendlyName(
+            activation,
+            L"Unnamed Dolby Vision renderer effect");
+        if (!advertisedProfiles.empty()) {
+            name += L" [renderer profiles: " + advertisedProfiles + L"]";
+        }
+        AddUnique(codecs.mediaFoundationTransforms, std::move(name));
+    }
+}
+
 void PopulateMediaFoundationTransforms(CodecCapabilities& codecs) {
     codecs.mediaFoundationTransforms.clear();
+    codecs.dolbyVisionExtensionDetected = false;
 
     MediaFoundationSession mediaFoundation;
     HRESULT hr = mediaFoundation.Result();
@@ -300,12 +549,7 @@ void PopulateMediaFoundationTransforms(CodecCapabilities& codecs) {
     inputType.guidSubtype = MFVideoFormat_HEVC;
 
     MediaFoundationActivations activations;
-    const UINT32 flags =
-        MFT_ENUM_FLAG_SYNCMFT |
-        MFT_ENUM_FLAG_ASYNCMFT |
-        MFT_ENUM_FLAG_HARDWARE |
-        MFT_ENUM_FLAG_LOCALMFT |
-        MFT_ENUM_FLAG_SORTANDFILTER;
+    const UINT32 flags = MFT_ENUM_FLAG_ALL;
     hr = MFTEnumEx(
         MFT_CATEGORY_VIDEO_DECODER,
         flags,
@@ -314,8 +558,10 @@ void PopulateMediaFoundationTransforms(CodecCapabilities& codecs) {
         &activations.values,
         &activations.count);
     if (FAILED(hr)) {
-        codecs.mediaFoundationTransforms = {L"HEVC decoder MFT enumeration failed " + std::to_wstring(static_cast<unsigned long>(hr))};
-        return;
+        codecs.mediaFoundationTransforms = {
+            L"HEVC decoder MFT enumeration failed " +
+                std::to_wstring(static_cast<unsigned long>(hr)),
+        };
     }
 
     for (UINT32 index = 0; index < activations.count; ++index) {
@@ -323,34 +569,18 @@ void PopulateMediaFoundationTransforms(CodecCapabilities& codecs) {
             continue;
         }
 
-        CoTaskMemWideString name;
-        UINT32 nameLength = 0;
-        std::wstring friendlyName = L"Unnamed HEVC decoder MFT";
-        if (SUCCEEDED(activations.values[index]->GetAllocatedString(
-                MFT_FRIENDLY_NAME_Attribute,
-                &name.value,
-                &nameLength)) &&
-            name.value) {
-            friendlyName.assign(name.value, name.value + nameLength);
-        }
-
-        GUID clsid{};
-        if (SUCCEEDED(activations.values[index]->GetGUID(MFT_TRANSFORM_CLSID_Attribute, &clsid))) {
-            wchar_t clsidText[64]{};
-            if (StringFromGUID2(clsid, clsidText, static_cast<int>(std::size(clsidText))) > 0) {
-                friendlyName += L" ";
-                friendlyName += clsidText;
-            }
-        }
-
-        if (ContainsInsensitive(friendlyName, L"dolby")) {
-            codecs.dolbyVisionExtensionDetected = true;
-        }
+        std::wstring friendlyName = ActivationFriendlyName(
+            activations.values[index],
+            L"Unnamed HEVC decoder MFT");
         AddUnique(codecs.mediaFoundationTransforms, std::move(friendlyName));
     }
 
+    PopulateDolbyVisionRendererEffects(codecs, flags);
+
     if (codecs.mediaFoundationTransforms.empty()) {
-        codecs.mediaFoundationTransforms = {L"No HEVC video decoder MFT reported"};
+        codecs.mediaFoundationTransforms = {
+            L"No HEVC decoder or Dolby Vision renderer effect MFT reported",
+        };
     }
 }
 
@@ -381,6 +611,7 @@ private:
 CapabilityReport BuildCapabilityReport(const ComApartment& apartment) {
     CapabilityReport report = MakeConservativeReport();
     TryPopulateD3D11(report);
+    report.display.dolbyVisionSignalAvailable = ActiveDisplaySupportsDolbyVisionLowLatency();
     if (apartment.Available()) {
         PopulateMediaFoundationTransforms(report.codecs);
     } else {
@@ -506,6 +737,10 @@ CapabilityReport CapabilityDetector::CollectBasic() {
         return *published;
     }
     return state->conservative;
+}
+
+bool CapabilityDetector::IsHdrEnabledNow() {
+    return AnyActiveDisplayAdvancedColorEnabled();
 }
 
 }  // namespace anvil::playback

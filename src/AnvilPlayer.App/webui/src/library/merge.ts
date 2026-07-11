@@ -134,9 +134,13 @@ export function mediaVersionLabel(item: MediaItem): string {
       ? 'HDR10+'
       : /\bhdr(?:10)?\b/i.test(text)
         ? 'HDR'
-        : resolution
-          ? 'SDR'
-          : ''
+        : /\bhlg\b/i.test(text)
+          ? 'HLG'
+          : /\bpq\b|smpte[ ._-]?st[ ._-]?2084|smpte2084/i.test(text)
+            ? 'HDR'
+            : /\bsdr\b/i.test(text)
+              ? 'SDR'
+              : ''
   return [resolution, dynamicRange].filter(Boolean).join(' ')
 }
 

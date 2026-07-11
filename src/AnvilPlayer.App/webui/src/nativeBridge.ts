@@ -28,6 +28,13 @@ export interface PlayerState {
   inspectorTab: 'recent' | 'folder' | 'media' | 'system' | 'log' | 'settings'
   hdrAvailable: boolean
   hdrOutput: boolean
+  hdrOutputLocked: boolean
+  windowsHdrEnabled: boolean
+  autoDisplayFormat: boolean
+  displayMetadataPassthrough: boolean
+  dolbyVisionSystemPipelineExperimental: boolean
+  dolbyVisionSystemPipelineAvailable: boolean
+  dolbyVisionMedia: boolean
   cmv4Available: boolean
   cmv4Enabled: boolean
   audioSelectedTrack: number
@@ -183,7 +190,9 @@ export type NativeMessage =
   | MediaDetailsProbed
   | MediaDetailsProbeFailed
   | { type: 'windowChrome'; customTitleBar: boolean }
+  | { type: 'globalVideoPassthroughSettings'; autoDisplayFormat: boolean; displayMetadataPassthrough: boolean; dolbyVisionSystemPipelineExperimental: boolean; windowsHdrEnabled: boolean }
   | { type: 'deliverEmbyPlaybackReport'; report: unknown }
+  | { type: 'command'; command: 'localPlaybackProgress'; path: string; positionMs: number; durationMs: number; playbackState: string }
   | { type: 'bilibiliTrailerSearchCompleted'; requestId: string; response: unknown }
   | { type: 'bilibiliTrailerSearchFailed'; requestId: string; message: string }
 
@@ -215,6 +224,7 @@ export type NativeCommand =
   | { type: 'command'; command: 'probeMediaDetails'; requestId: string; path: string }
   | { type: 'command'; command: 'setWebUiRoute'; route: 'player' | 'library' }
   | { type: 'command'; command: 'requestPlayback'; path: string; startPositionRatio?: number; audioTrackIndex?: number; subtitleTrackIndex?: number }
+  | { type: 'command'; command: 'localPlaybackProgress'; path: string; positionMs: number; durationMs: number; playbackState: string }
   | { type: 'command'; command: 'openExternalUrl'; url: string }
   | { type: 'command'; command: 'focusPlayer' }
   | { type: 'command'; command: 'requestWindowChrome' }
@@ -236,6 +246,10 @@ export type NativeCommand =
   | { type: 'command'; command: 'dismissRefreshRateSyncUnavailable' }
   | { type: 'command'; command: 'setGlobalRefreshRateSync'; enabled: boolean }
   | { type: 'command'; command: 'setGlobalRefreshRateMaximumMultiple'; enabled: boolean }
+  | { type: 'command'; command: 'requestGlobalVideoPassthroughSettings' }
+  | { type: 'command'; command: 'setGlobalAutoDisplayFormat'; enabled: boolean }
+  | { type: 'command'; command: 'setGlobalDisplayMetadataPassthrough'; enabled: boolean }
+  | { type: 'command'; command: 'setGlobalDolbyVisionSystemPipelineExperimental'; enabled: boolean }
   | { type: 'command'; command: 'setUiLanguage'; language: 'en' | 'zh' }
   | { type: 'command'; command: 'showFullscreenTransport' }
   | { type: 'command'; command: 'subtitleMenu' }
@@ -248,6 +262,9 @@ export type NativeCommand =
   | { type: 'command'; command: 'inspectorLog' }
   | { type: 'command'; command: 'toggleHdr' }
   | { type: 'command'; command: 'toggleCmv4' }
+  | { type: 'command'; command: 'setAutoDisplayFormat'; enabled: boolean }
+  | { type: 'command'; command: 'setDisplayMetadataPassthrough'; enabled: boolean }
+  | { type: 'command'; command: 'setDolbyVisionSystemPipelineExperimental'; enabled: boolean }
   | { type: 'command'; command: 'setAudioTrack'; index: number }
   | { type: 'command'; command: 'setSubtitleTrack'; index: number }
   | { type: 'command'; command: 'setSubtitleDelay'; delayMs: number }
@@ -338,6 +355,13 @@ export const EMPTY_STATE: PlayerState = {
   inspectorTab: 'recent',
   hdrAvailable: false,
   hdrOutput: false,
+  hdrOutputLocked: false,
+  windowsHdrEnabled: false,
+  autoDisplayFormat: false,
+  displayMetadataPassthrough: true,
+  dolbyVisionSystemPipelineExperimental: false,
+  dolbyVisionSystemPipelineAvailable: false,
+  dolbyVisionMedia: false,
   cmv4Available: false,
   cmv4Enabled: false,
   audioSelectedTrack: -2,

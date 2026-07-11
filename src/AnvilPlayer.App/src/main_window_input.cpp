@@ -19,6 +19,29 @@ using anvil::playback::PlaybackState;
 
 namespace {
 
+void SavePassthroughSetting(const wchar_t* name, const bool enabled) {
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER,
+                        L"Software\\AnvilPlayer\\Video",
+                        0,
+                        nullptr,
+                        REG_OPTION_NON_VOLATILE,
+                        KEY_SET_VALUE,
+                        nullptr,
+                        &key,
+                        nullptr) != ERROR_SUCCESS) {
+        return;
+    }
+    const DWORD value = enabled ? 1u : 0u;
+    RegSetValueExW(key,
+                   name,
+                   0,
+                   REG_DWORD,
+                   reinterpret_cast<const BYTE*>(&value),
+                   sizeof(value));
+    RegCloseKey(key);
+}
+
 void NormalizeHdrToneCurveForEditing(std::array<anvil::playback::HdrToneCurvePoint,
                                                 anvil::playback::kHdrToneCurvePointCount>& curve) {
     for (std::size_t i = 0; i < curve.size() && i < anvil::playback::kDefaultHdrToneCurve.size(); ++i) {
@@ -169,15 +192,6 @@ void MainWindow::OnMouseMove(const int x, const int y) {
         return;
     }
 
-    if (!trackingMouseLeave_) {
-        TRACKMOUSEEVENT event{};
-        event.cbSize = sizeof(event);
-        event.dwFlags = TME_LEAVE;
-        event.hwndTrack = hwnd_;
-        TrackMouseEvent(&event);
-        trackingMouseLeave_ = true;
-    }
-
     SetProgressHover(ContainsPoint(ProgressHitRect(), point));
     const bool volumeHovered = ContainsPoint(VolumeSliderHitRect(), point);
     SetVolumeSliderHover(volumeHovered);
@@ -211,6 +225,17 @@ void MainWindow::OnMouseMove(const int x, const int y) {
     }
 }
 
+void MainWindow::OnMouseLeave() {
+    ClearButtonHoverTargets();
+    hoveredButton_ = -1;
+    hoveredInspectorPathItem_ = -1;
+    hoveredHdrToneCurvePoint_ = -1;
+    SetVolumeSliderHover(false);
+    SetProgressHover(false);
+    InvalidateFullscreenOverlay();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
 void MainWindow::OnLeftButtonDown(const int x, const int y) {
     SetFocus(hwnd_);
     const POINT point{x, y};
@@ -224,6 +249,16 @@ void MainWindow::OnLeftButtonDown(const int x, const int y) {
         if (fullscreenTransportWasHidden) {
             return;
         }
+    }
+    if (fullscreen_ && UsesGpuFullscreenUiOverlay()) {
+        LogApp(anvil::playback::LogLevel::Debug,
+               L"gpu_ui pointer_down x=" + std::to_wstring(x) +
+                   L" y=" + std::to_wstring(y) +
+                   L" button_hit=" + std::to_wstring(HitButton(point)) +
+                   L" progress_hit=" +
+                   std::wstring(ContainsPoint(ProgressHitRect(), point) ? L"true" : L"false") +
+                   L" transport_hit=" +
+                   std::wstring(ContainsPoint(transportBar_, point) ? L"true" : L"false"));
     }
 
     if (BeginSettingsScrollDrag(point)) {
@@ -829,6 +864,7 @@ bool MainWindow::ApplyVolume(const double volume, const bool restartExternalNow)
     if (backend_ == PlaybackBackend::NativeFfmpegD3D11 ||
         backend_ == PlaybackBackend::RawFrameBridge) {
         audioPlayer_.SetVolume(updated.volume);
+        systemDolbyVisionPlayer_.SetVolume(updated.volume);
     } else if (restartExternalNow) {
         RestartPlaybackIfPlaying();
     }
@@ -1743,11 +1779,25 @@ void MainWindow::CycleSubtitleTrack() {
 }
 
 void MainWindow::ToggleDolbyVisionHdrOutput() {
-    if (!CurrentMediaHasHdrControls()) {
+    if (controller_.Settings().video.autoDisplayFormat) {
+        LogApp(anvil::playback::LogLevel::Debug, L"hdr output toggle ignored auto_display_format=on");
+        return;
+    }
+    const bool windowsHdrEnabled = anvil::playback::CapabilityDetector::IsHdrEnabledNow();
+    const auto currentSettings = controller_.Settings();
+    if (!CurrentMediaHasHdrControls() ||
+        !windowsHdrEnabled ||
+        currentSettings.video.displayMetadataPassthrough ||
+        currentSettings.video.dolbyVisionSystemPipelineExperimental) {
+        LogApp(anvil::playback::LogLevel::Debug,
+               L"hdr output toggle ignored windows_hdr=" +
+                   std::wstring(windowsHdrEnabled ? L"on" : L"off") +
+                   L" passthrough=" +
+                   std::wstring(currentSettings.video.displayMetadataPassthrough ? L"on" : L"off"));
         return;
     }
 
-    auto settings = controller_.Settings();
+    auto settings = currentSettings;
     settings.video.dolbyVisionHdrOutput = !settings.video.dolbyVisionHdrOutput;
     if (!settings.video.dolbyVisionHdrOutput) {
         HideHdrToneCurveWindow();
@@ -1785,6 +1835,9 @@ void MainWindow::ToggleDolbyVisionHdrOutput() {
 
 void MainWindow::ToggleDolbyVisionCmv4Approx() {
     auto settings = controller_.Settings();
+    if (settings.video.autoDisplayFormat) {
+        return;
+    }
     if (!CurrentCmv4ControlEnabled(settings)) {
         return;
     }
@@ -1813,6 +1866,115 @@ void MainWindow::ToggleDolbyVisionCmv4Approx() {
         UpdateWindow(fullscreenOverlay_);
     }
     UpdateWindow(hwnd_);
+    PostWebUiState();
+}
+
+void MainWindow::SetDisplayMetadataPassthrough(const bool enabled) {
+    if (controller_.Settings().video.autoDisplayFormat) {
+        LogApp(anvil::playback::LogLevel::Debug,
+               L"display metadata passthrough change ignored auto_display_format=on");
+        PostWebUiState();
+        return;
+    }
+    const auto currentMedia = controller_.Snapshot().media;
+    if (currentMedia.has_value() &&
+        currentMedia->hasVideo &&
+        (currentMedia->dolbyVisionDetected ||
+         currentMedia->hdrFormat.find(L"Dolby Vision") != std::wstring::npos)) {
+        LogApp(anvil::playback::LogLevel::Debug,
+               L"display metadata passthrough change ignored media=dolby_vision");
+        PostWebUiState();
+        return;
+    }
+    auto settings = controller_.Settings();
+    const bool windowsHdrEnabled = anvil::playback::CapabilityDetector::IsHdrEnabledNow();
+    if (!windowsHdrEnabled) {
+        LogApp(anvil::playback::LogLevel::Debug,
+               L"display metadata passthrough change ignored windows_hdr=off");
+        PostWebUiState();
+        return;
+    }
+    const bool forceHdrOutput = enabled && !settings.video.dolbyVisionHdrOutput;
+    if (settings.video.displayMetadataPassthrough == enabled && !forceHdrOutput) {
+        return;
+    }
+    settings.video.displayMetadataPassthrough = enabled;
+    if (enabled) {
+        settings.video.dolbyVisionHdrOutput = true;
+        HideHdrToneCurveWindow();
+    }
+    controller_.ApplySettings(settings);
+    SavePassthroughSetting(L"DisplayMetadataPassthrough", enabled);
+    LogApp(anvil::playback::LogLevel::Info,
+           L"display metadata passthrough=" + std::wstring(enabled ? L"on" : L"off"));
+
+    const auto snapshot = controller_.Snapshot();
+    if (snapshot.media.has_value() && snapshot.media->hasVideo) {
+        ApplyNativeColorSettingsLive(snapshot);
+    }
+    MarkLayoutDirty();
+    EnsureLayout();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    PostWebUiState();
+}
+
+void MainWindow::SetDolbyVisionSystemPipelineExperimental(const bool enabled) {
+    if (controller_.Settings().video.autoDisplayFormat) {
+        LogApp(anvil::playback::LogLevel::Debug,
+               L"dolby vision system pipeline change ignored auto_display_format=on");
+        PostWebUiState();
+        return;
+    }
+    auto settings = controller_.Settings();
+    const bool windowsHdrEnabled = anvil::playback::CapabilityDetector::IsHdrEnabledNow();
+    if (enabled && !windowsHdrEnabled) {
+        LogApp(anvil::playback::LogLevel::Debug,
+               L"dolby vision experimental system pipeline change ignored windows_hdr=off");
+        PostWebUiState();
+        return;
+    }
+
+    const auto snapshot = controller_.Snapshot();
+    const bool mediaIsDolbyVision = snapshot.media.has_value() &&
+                                    snapshot.media->dolbyVisionDetected;
+    const bool desiredEnhanced = !enabled && mediaIsDolbyVision;
+    const bool forceHdrOutput = enabled && !settings.video.dolbyVisionHdrOutput;
+    if (settings.video.dolbyVisionSystemPipelineExperimental == enabled &&
+        settings.video.dolbyVisionCmv4Approx == desiredEnhanced &&
+        !forceHdrOutput) {
+        return;
+    }
+
+    settings.video.dolbyVisionSystemPipelineExperimental = enabled;
+    settings.video.dolbyVisionCmv4Approx = desiredEnhanced;
+    if (enabled) {
+        settings.video.dolbyVisionHdrOutput = true;
+        HideHdrToneCurveWindow();
+    }
+    systemDolbyVisionFallbackForCurrentMedia_ = false;
+    controller_.ApplySettings(settings);
+    SavePassthroughSetting(L"DolbyVisionSystemPipelineExperimental", enabled);
+    LogApp(anvil::playback::LogLevel::Info,
+           L"dolby vision experimental system pipeline=" +
+               std::wstring(enabled ? L"on" : L"off") +
+               L" default_path=" +
+               std::wstring(enabled ? L"media_engine_extensions" : L"ffmpeg_libplacebo"));
+
+    if (mediaIsDolbyVision) {
+        if (snapshot.state == PlaybackState::Paused) {
+            if (systemDolbyVisionPlayer_.IsActive()) {
+                QueuePausedNativeFrameRefresh(true);
+                StopRuntimeAsync(true);
+            } else {
+                RefreshPausedNativeFrame(snapshot, true);
+            }
+        } else {
+            RestartPlaybackIfPlaying(true);
+        }
+    }
+    MarkLayoutDirty();
+    EnsureLayout();
+    InvalidateRect(hwnd_, nullptr, FALSE);
     PostWebUiState();
 }
 

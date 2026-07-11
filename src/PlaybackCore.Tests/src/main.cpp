@@ -474,7 +474,7 @@ void TestHdrPlaybackPlanUsesStructuredColorMetadata() {
     assert(plan.videoMode == L"tone_mapped_sdr");
 }
 
-void TestDolbyVisionPlaybackPlanUsesSoftwareReshape() {
+void TestDolbyVisionPlaybackPlanPrefersSystemExtensions() {
     anvil::playback::MediaDescriptor media;
     media.hasVideo = true;
     media.videoCodec = L"HEVC";
@@ -490,10 +490,24 @@ void TestDolbyVisionPlaybackPlanUsesSoftwareReshape() {
     assert(plan.videoReason == L"dolby_vision_software_decode_for_reshape");
     assert(plan.videoMode == L"dolby_vision_software_reshape");
 
+    capabilities.codecs.dolbyVisionExtensionDetected = true;
+    plan = anvil::playback::PlaybackPlanner::Build(media, settings, capabilities);
+    assert(plan.videoMode == L"dolby_vision_software_reshape");
+
+    settings.video.dolbyVisionSystemPipelineExperimental = true;
+    plan = anvil::playback::PlaybackPlanner::Build(media, settings, capabilities);
+    assert(plan.videoMode == L"dolby_vision_system_extensions");
+
     settings.video.dolbyVision = anvil::playback::DolbyVisionMode::Off;
     plan = anvil::playback::PlaybackPlanner::Build(media, settings, capabilities);
     assert(plan.videoDecoder == L"ffmpeg_d3d11va");
     assert(plan.videoMode == L"dolby_vision_disabled_tone_map");
+}
+
+void TestDisplayMetadataPassthroughDefaults() {
+    const auto settings = anvil::playback::MakeDefaultSettings();
+    assert(settings.video.displayMetadataPassthrough);
+    assert(!settings.video.dolbyVisionSystemPipelineExperimental);
 }
 
 }  // namespace
@@ -515,7 +529,8 @@ int main() {
     TestRealAvformatProbeWhenFfmpegToolIsAvailable();
     TestCapabilityReportHasD3DShape();
     TestHdrPlaybackPlanUsesStructuredColorMetadata();
-    TestDolbyVisionPlaybackPlanUsesSoftwareReshape();
+    TestDolbyVisionPlaybackPlanPrefersSystemExtensions();
+    TestDisplayMetadataPassthroughDefaults();
     std::cout << "PlaybackCore tests passed\n";
     return 0;
 }

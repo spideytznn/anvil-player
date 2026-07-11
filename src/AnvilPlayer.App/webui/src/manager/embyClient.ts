@@ -36,6 +36,7 @@ import {
   filterSupportedLatestItems,
   imageBackground,
   itemTypesForLibraryView,
+  itemTypesForSearch,
   latestItemTypesForView,
   mapEpisodeItem,
   mapItem,
@@ -84,6 +85,8 @@ export interface EmbySearchOptions {
   sortOrder?: SortOrder
   limit?: number
 }
+
+const EMBY_LIST_PAGE_SIZE = 200
 
 export interface EmbyPlaybackTarget {
   itemId: string
@@ -565,7 +568,7 @@ export async function searchEmbyLibrary(
       Recursive: true,
       ParentId: options.libraryViewId,
       SearchTerm: searchTerm,
-      IncludeItemTypes: itemTypesForLibraryView(options.view),
+      IncludeItemTypes: itemTypesForSearch(options.view),
       Fields: EMBY_ITEM_FIELDS,
       Limit: options.limit ?? 80,
       SortBy: sort.SortBy,
@@ -579,6 +582,48 @@ export async function searchEmbyLibrary(
   return orderSearchResults(response.Items ?? []).map((item) =>
     mapItem(session, sourceId, item, options.libraryViewId)
   )
+}
+
+export async function listEmbyLibraryView(
+  session: EmbySession,
+  options: EmbySearchOptions & { libraryViewId: string }
+): Promise<MediaItem[]> {
+  const sourceId = sourceIdForSession(session)
+  const sort = sortParamsForSearch(options.sortKey, options.sortOrder)
+  const views = await fetchJson<import('./emby/core').EmbyViewsResponse>(
+    apiUrl(session.apiBaseUrl, `/Users/${session.userId}/Views`),
+    { method: 'GET', headers: authHeadersForSession(session) },
+    '读取 Emby 媒体库'
+  )
+  const collectionType = views.Items?.find((view) => view.Id === options.libraryViewId)?.CollectionType
+  const folderStructured = collectionType !== 'movies' && collectionType !== 'tvshows'
+  const rows: EmbyItem[] = []
+  let startIndex = 0
+
+  while (true) {
+    const response = await fetchJson<EmbyItemsResponse>(
+      apiUrl(session.apiBaseUrl, `/Users/${session.userId}/Items`, {
+        Recursive: !folderStructured,
+        ParentId: options.libraryViewId,
+        IncludeItemTypes: folderStructured ? 'Folder,BoxSet,Movie,Series,Video' : itemTypesForLibraryView(options.view),
+        Fields: EMBY_ITEM_FIELDS,
+        StartIndex: startIndex,
+        Limit: EMBY_LIST_PAGE_SIZE,
+        SortBy: sort.SortBy,
+        SortOrder: sort.SortOrder,
+        ...filterParamsForSearch(options.filterKey)
+      }),
+      { method: 'GET', headers: authHeadersForSession(session) },
+      '读取 Emby 媒体库'
+    )
+    const page = response.Items ?? []
+    rows.push(...page)
+    startIndex += page.length
+    if (!page.length || page.length < EMBY_LIST_PAGE_SIZE ||
+        (response.TotalRecordCount !== undefined && startIndex >= response.TotalRecordCount)) break
+  }
+
+  return rows.map((item) => mapItem(session, sourceId, item, options.libraryViewId))
 }
 
 export async function searchEmbyPersonLibrary(
@@ -599,10 +644,10 @@ export async function searchEmbyPersonLibrary(
       PersonIds: personId || undefined,
       Person: personId ? undefined : personName,
       IncludeItemTypes: options.view === 'movies'
-        ? 'BoxSet,Movie'
+        ? 'BoxSet,Movie,Video'
         : options.view === 'series'
           ? 'Series'
-          : 'BoxSet,Movie,Series',
+          : 'BoxSet,Movie,Series,Video',
       Fields: EMBY_ITEM_FIELDS,
       Limit: options.limit ?? 80,
       SortBy: sort.SortBy,
@@ -680,6 +725,38 @@ async function loadSeriesSeasons(session: EmbySession, sourceId: string, item: M
   }
 }
 
+async function loadFolderEpisodes(session: EmbySession, sourceId: string, item: MediaItem): Promise<SeasonItem[]> {
+  if (item.type !== 'folder') return []
+  try {
+    const response = await fetchJson<EmbyItemsResponse>(
+      apiUrl(session.apiBaseUrl, `/Users/${session.userId}/Items`, {
+        ParentId: item.id,
+        Recursive: true,
+        IncludeItemTypes: 'Movie,Video,Episode',
+        Fields: EMBY_ITEM_FIELDS,
+        SortBy: 'SortName',
+        SortOrder: 'Ascending'
+      }),
+      { method: 'GET', headers: authHeadersForSession(session) },
+      '读取 Emby 纪录片选集'
+    )
+    const episodes = (response.Items ?? []).map((episode) =>
+      mapEpisodeItem(session, sourceId, episode, item.libraryViewId)
+    )
+    if (!episodes.length) return []
+    return [{
+      id: `${item.id}:episodes`,
+      title: '选集',
+      index: 'S1',
+      episodeCount: episodes.length,
+      poster: item.poster,
+      episodes
+    }]
+  } catch {
+    return []
+  }
+}
+
 export async function loadEmbyItemDetails(session: EmbySession, item: MediaItem): Promise<MediaItem> {
   const sourceId = sourceIdForSession(session)
   const detail = await fetchJson<EmbyItem>(
@@ -693,7 +770,9 @@ export async function loadEmbyItemDetails(session: EmbySession, item: MediaItem)
   const mapped = mapItem(session, sourceId, detail, item.libraryViewId, item.continueWatching ?? false)
   const [similarItems, seasons] = await Promise.all([
     loadSimilarItems(session, sourceId, item.id, item.libraryViewId),
-    loadSeriesSeasons(session, sourceId, mapped)
+    mapped.type === 'series'
+      ? loadSeriesSeasons(session, sourceId, mapped)
+      : loadFolderEpisodes(session, sourceId, mapped)
   ])
 
   return {
@@ -723,7 +802,7 @@ async function loadLibraryForSession(
     fetchJson<EmbyItemsResponse>(
       apiUrl(apiBaseUrl, `/Users/${session.userId}/Items`, {
         Recursive: true,
-        IncludeItemTypes: 'Movie,Series',
+        IncludeItemTypes: 'Movie,Series,Video',
         Fields: fields,
         SortBy: 'DateCreated',
         SortOrder: 'Descending',
@@ -738,12 +817,15 @@ async function loadLibraryForSession(
   const viewRows = views.Items ?? []
   const mediaItems = items.Items ?? []
   const itemsByView = await Promise.all(viewRows.map(async (view): Promise<EmbyViewItems> => {
-    const includeItemTypes = latestItemTypesForView(view)
+    const folderStructured = view.CollectionType !== 'movies' && view.CollectionType !== 'tvshows'
+    const includeItemTypes = folderStructured
+      ? 'Folder,BoxSet,Movie,Series,Video'
+      : latestItemTypesForView(view)
     try {
       const response = await fetchJson<EmbyItemsResponse>(
         apiUrl(apiBaseUrl, `/Users/${session.userId}/Items`, {
           ParentId: view.Id,
-          Recursive: true,
+          Recursive: !folderStructured,
           IncludeItemTypes: includeItemTypes,
           Fields: fields,
           SortBy: 'DateCreated',
@@ -763,6 +845,10 @@ async function loadLibraryForSession(
     }
   }))
   const latestByView = await Promise.all(viewRows.map(async (view, index): Promise<EmbyViewLatest> => {
+    const folderStructured = view.CollectionType !== 'movies' && view.CollectionType !== 'tvshows'
+    if (folderStructured) {
+      return { view, items: itemsByView[index]?.items.slice(0, 16) ?? [] }
+    }
     const includeItemTypes = latestItemTypesForView(view)
     try {
       const latest = await fetchJson<EmbyItem[]>(

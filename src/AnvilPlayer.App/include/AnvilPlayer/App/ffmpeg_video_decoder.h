@@ -100,6 +100,10 @@ struct NativeVideoFrame {
     VideoTextureUvRect sourceUvRect;
     AVPixelFormat softwareFormat = AV_PIX_FMT_NONE;
     anvil::playback::VideoColorMetadata color;
+    std::shared_ptr<const std::vector<std::uint8_t>> hdr10PlusPayload;
+    // Original Dolby Vision RPU NAL unit for the Windows renderer-effect MFT.
+    // FFmpeg preserves NAL emulation-prevention bytes in this side data.
+    std::shared_ptr<const std::vector<std::uint8_t>> dolbyVisionRpu;
     // Per-frame Dolby Vision metadata (reshaping curves + color matrices).
     // nullptr for non-DV streams. When present, the renderer must apply the
     // IPTPQc2 reshaping before treating the pixels as BT.2020 PQ.
@@ -115,6 +119,8 @@ struct NativeVideoFrame {
     bool subtitlesPrepared = false;
     std::shared_ptr<AVFrame> hardwareFrameRef;
     std::chrono::milliseconds pts{0};
+    UINT32 frameRateNumerator = 0;
+    UINT32 frameRateDenominator = 1;
     uint64_t serial = 0;
     uint64_t timelineSerial = 0;
 
@@ -600,6 +606,8 @@ private:
     bool autoLoadExternalSubtitles_ = true;
     std::filesystem::path externalSubtitlePath_;
     bool oneShotFrame_ = false;
+    UINT32 videoFrameRateNumerator_ = 0;
+    UINT32 videoFrameRateDenominator_ = 1;
     int subtitleCanvasWidth_ = 0;
     int subtitleCanvasHeight_ = 0;
     bool subtitleCanvasLogged_ = false;

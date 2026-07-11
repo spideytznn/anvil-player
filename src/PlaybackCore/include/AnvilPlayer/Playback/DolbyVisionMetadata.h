@@ -108,6 +108,20 @@ struct DolbyVisionFrameMetadata {
     float yccToRgb[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};    // row-major 3x3
     float yccOffset[3] = {0, 0, 0};                      // neutral offset (pre-reshape)
     float rgbToLms[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};    // row-major 3x3 (CMv4.0)
+    // Original HDMI/RPU fixed-point representation. Keeping these codes avoids
+    // a float round-trip when rebuilding the baseband DM metadata packet.
+    int16_t yccToRgbCode[9] = {};
+    uint32_t yccOffsetCode[3] = {};
+    int16_t rgbToLmsCode[9] = {};
+    uint16_t signalEotf = 0;
+    uint16_t signalEotfParam0 = 0;
+    uint16_t signalEotfParam1 = 0;
+    uint32_t signalEotfParam2 = 0;
+    uint8_t signalBitDepth = 0;
+    uint8_t signalColorSpace = 0;
+    uint8_t signalChromaFormat = 0;
+    uint8_t signalFullRangeFlag = 0;
+    uint16_t sourceDiagonal = 0;
 
     // Source display peak metadata from AVDOVIColorMetadata. PQ codes are
     // 12-bit ST 2084 values; nits are precomputed for renderer tone mapping.

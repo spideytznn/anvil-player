@@ -117,6 +117,9 @@ bool Application::Initialize(HINSTANCE instance, int commandShow, const AppArgum
     library_->SetRefreshRatePreferencesChangedRequest([this] {
         if (player_) player_->ApplyGlobalRefreshRatePreferences();
     });
+    library_->SetVideoPassthroughPreferencesChangedRequest([this] {
+        if (player_) player_->ApplyGlobalVideoPassthroughPreferences();
+    });
     library_->SetEmbyPlaybackReportRelay([this](const std::wstring& reportJson) {
         RelayEmbyPlaybackReport(reportJson);
     });
@@ -162,6 +165,9 @@ void Application::EnsurePlayerWindow() {
     // The player window always shows the player route, so keep the WebView UI.
     player_->SetWebUiEnabled(true);
     player_->SetQuitHandler([this] { OnPlayerClosed(); });
+    player_->SetLocalPlaybackProgressRelay([this](const std::wstring& progressJson) {
+        if (library_) library_->DeliverLocalPlaybackProgress(progressJson);
+    });
     if (!player_->Create(instance_)) {
         player_.reset();
         return;
@@ -188,6 +194,7 @@ void Application::OpenInPlayer(const std::filesystem::path& path,
     if (!player_) {
         return;
     }
+    player_->MoveToMonitorOf(library_ ? library_->Handle() : nullptr);
     BringWindowToForeground(player_->Handle());
     // OpenInitialPath consumes pendingStartPositionRatio_ during playback start
     // to resume from a saved position.
