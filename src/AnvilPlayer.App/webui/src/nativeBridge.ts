@@ -18,6 +18,10 @@ export interface PlayerState {
   sidebarCollapsed: boolean
   fullscreen: boolean
   customTitleBar: boolean
+  frameInterpolationEnabled: boolean
+  frameInterpolationActive: boolean
+  frameInterpolationBackend: string
+  frameInterpolationReason: string
   refreshRateSyncEnabled: boolean
   refreshRateMaximumMultiple: boolean
   refreshRateSyncUnavailable: boolean
@@ -199,7 +203,7 @@ export type NativeMessage =
   | MediaDetailsProbed
   | MediaDetailsProbeFailed
   | { type: 'windowChrome'; customTitleBar: boolean }
-  | { type: 'globalVideoPassthroughSettings'; autoDisplayFormat: boolean; displayMetadataPassthrough: boolean; dolbyVisionSystemPipelineExperimental: boolean; windowsHdrEnabled: boolean; displayPeakBrightnessNits: number }
+  | { type: 'globalVideoPassthroughSettings'; frameInterpolationEnabled: boolean; autoDisplayFormat: boolean; displayMetadataPassthrough: boolean; dolbyVisionSystemPipelineExperimental: boolean; windowsHdrEnabled: boolean; displayPeakBrightnessNits: number }
   | { type: 'globalAudioPassthroughSettings'; enabled: boolean }
   | { type: 'deliverEmbyPlaybackReport'; report: unknown }
   | { type: 'command'; command: 'localPlaybackProgress'; path: string; positionMs: number; durationMs: number; playbackState: string }
@@ -251,11 +255,13 @@ export type NativeCommand =
   | { type: 'command'; command: 'forward' }
   | { type: 'command'; command: 'toggleSidebar' }
   | { type: 'command'; command: 'toggleFullscreen' }
+  | { type: 'command'; command: 'setFrameInterpolation'; enabled: boolean }
   | { type: 'command'; command: 'setRefreshRateSync'; enabled: boolean }
   | { type: 'command'; command: 'setRefreshRateMaximumMultiple'; enabled: boolean }
   | { type: 'command'; command: 'dismissRefreshRateSyncUnavailable' }
   | { type: 'command'; command: 'setGlobalRefreshRateSync'; enabled: boolean }
   | { type: 'command'; command: 'setGlobalRefreshRateMaximumMultiple'; enabled: boolean }
+  | { type: 'command'; command: 'setGlobalFrameInterpolation'; enabled: boolean }
   | { type: 'command'; command: 'requestGlobalVideoPassthroughSettings' }
   | { type: 'command'; command: 'setGlobalAutoDisplayFormat'; enabled: boolean }
   | { type: 'command'; command: 'setGlobalDisplayMetadataPassthrough'; enabled: boolean }
@@ -360,6 +366,10 @@ export const EMPTY_STATE: PlayerState = {
   sidebarCollapsed: false,
   fullscreen: false,
   customTitleBar: false,
+  frameInterpolationEnabled: false,
+  frameInterpolationActive: false,
+  frameInterpolationBackend: 'inactive',
+  frameInterpolationReason: '',
   refreshRateSyncEnabled: false,
   refreshRateMaximumMultiple: true,
   refreshRateSyncUnavailable: false,

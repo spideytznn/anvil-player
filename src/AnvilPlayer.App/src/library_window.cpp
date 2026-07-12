@@ -969,14 +969,10 @@ bool LibraryWindow::Create(HINSTANCE instance) {
         return false;
     }
 
-    // Forge-style borderless chrome: keep the native resize frame, shadow and
-    // taskbar behavior, but let the Web UI own the title bar and controls.
-    constexpr DWORD windowStyle = WS_POPUP |
-                                  WS_THICKFRAME |
-                                  WS_SYSMENU |
-                                  WS_MINIMIZEBOX |
-                                  WS_MAXIMIZEBOX |
-                                  WS_CLIPCHILDREN;
+    // Keep standard top-level window semantics so DWM owns minimize/restore
+    // transitions. WM_NCCALCSIZE still extends the client area across the
+    // native caption, allowing the Web UI to draw the visible title bar.
+    constexpr DWORD windowStyle = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
     constexpr DWORD windowExStyle = WS_EX_APPWINDOW;
     const auto adjustedWindowRect = [this, windowStyle, windowExStyle](const int clientWidth, const int clientHeight) {
         RECT rect = MakeRect(0, 0, clientWidth, clientHeight);
@@ -1017,14 +1013,6 @@ bool LibraryWindow::Create(HINSTANCE instance) {
         return false;
     }
 
-    // Do not rely solely on CreateWindowEx style normalization: explicitly
-    // remove any caption bits and recalculate the non-client frame. This keeps
-    // DWM's resize border/shadow without allowing a system title bar.
-    const LONG_PTR createdStyle = GetWindowLongPtrW(hwnd_, GWL_STYLE);
-    SetWindowLongPtrW(hwnd_, GWL_STYLE, createdStyle & ~static_cast<LONG_PTR>(WS_CAPTION));
-    SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
-                 SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE |
-                 SWP_NOZORDER | SWP_NOACTIVATE);
     ApplyWindowChrome();
 
     TryCreateWebUi();
@@ -1766,7 +1754,13 @@ void LibraryWindow::HandleWebUiMessage(const std::wstring_view message) {
     } else if (MessageContains(message, L"\"command\":\"setGlobalRefreshRateMaximumMultiple\"")) {
         DisplayRefreshRateController::SaveMaximumMultipleEnabled(MessageContains(message, L"\"enabled\":true"));
         if (refreshRatePreferencesChangedRequest_) refreshRatePreferencesChangedRequest_();
+    } else if (MessageContains(message, L"\"command\":\"setGlobalFrameInterpolation\"")) {
+        SaveVideoPassthroughSetting(
+            L"FrameInterpolationEnabled", MessageContains(message, L"\"enabled\":true"));
+        if (videoPassthroughPreferencesChangedRequest_) videoPassthroughPreferencesChangedRequest_();
     } else if (MessageContains(message, L"\"command\":\"requestGlobalVideoPassthroughSettings\"")) {
+        const bool frameInterpolation =
+            LoadVideoPassthroughSetting(L"FrameInterpolationEnabled", false);
         const bool displayMetadata = LoadVideoPassthroughSetting(L"DisplayMetadataPassthrough", false);
         const bool autoDisplayFormat = LoadVideoPassthroughSetting(L"AutoDisplayFormat", false);
         const bool windowsHdrEnabled = anvil::playback::CapabilityDetector::IsHdrEnabledNow();
@@ -1774,7 +1768,9 @@ void LibraryWindow::HandleWebUiMessage(const std::wstring_view message) {
         const bool dolbySystemPipeline =
             windowsHdrEnabled &&
             LoadVideoPassthroughSetting(L"DolbyVisionSystemPipelineExperimental", false);
-        PostScanResult(L"{\"type\":\"globalVideoPassthroughSettings\",\"autoDisplayFormat\":" +
+        PostScanResult(L"{\"type\":\"globalVideoPassthroughSettings\",\"frameInterpolationEnabled\":" +
+                       std::wstring(frameInterpolation ? L"true" : L"false") +
+                       L",\"autoDisplayFormat\":" +
                        std::wstring(autoDisplayFormat ? L"true" : L"false") +
                        L",\"displayMetadataPassthrough\":" +
                        std::wstring((autoDisplayFormat || displayMetadata) ? L"true" : L"false") +

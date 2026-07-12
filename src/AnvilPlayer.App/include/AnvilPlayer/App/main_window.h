@@ -369,7 +369,9 @@ private:
     void SetDisplayMetadataPassthrough(bool enabled);
     void SetDisplayPeakBrightnessNits(int peakNits);
     void SetDolbyVisionSystemPipelineExperimental(bool enabled);
+    void SetFrameInterpolationEnabled(bool enabled);
     void ToggleFullscreen();
+    bool RefreshRateSyncEffective() const;
     void SetRefreshRateSyncEnabled(bool enabled);
     void SetRefreshRateMaximumMultiple(bool enabled);
     void UpdateInspectorMediaLists(const std::filesystem::path& path);

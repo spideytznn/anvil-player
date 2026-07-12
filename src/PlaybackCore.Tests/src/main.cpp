@@ -512,6 +512,7 @@ void TestDolbyVisionPlaybackPlanPrefersSystemExtensions() {
 
 void TestDisplayMetadataPassthroughDefaults() {
     const auto settings = anvil::playback::MakeDefaultSettings();
+    assert(!settings.video.frameInterpolationEnabled);
     assert(!settings.video.displayMetadataPassthrough);
     assert(!settings.video.dolbyVisionSystemPipelineExperimental);
     // Zero means auto: use the player window's current monitor peak and let

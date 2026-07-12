@@ -1055,6 +1055,7 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
                                const bool oneShotFrame,
                                const bool preferDolbyVisionHdrOutput,
                                const bool enableDolbyVisionEnhancementDecode,
+                               const bool enableFrameInterpolation,
                                NativeAudioPacketSink audioPacketSink,
                                const uint64_t notificationCookie) {
     Stop();
@@ -1098,6 +1099,10 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
     oneShotFrame_ = oneShotFrame;
     preferDolbyVisionHdrOutput_ = preferDolbyVisionHdrOutput;
     enableDolbyVisionEnhancementDecode_ = enableDolbyVisionEnhancementDecode;
+    frameInterpolationRequested_ = enableFrameInterpolation && !oneShotFrame;
+    frameInterpolationUnavailable_ = false;
+    frameInterpolator_.reset();
+    frameInterpolationPreviousFrame_.reset();
     dolbyVisionEnhancementActive_ = false;
     dolbyVisionEnhancementFirstFrameLogged_ = false;
     dolbyVisionEnhancementDynamicMetadataLogged_ = false;
@@ -1122,6 +1127,8 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
     latestDolbyVisionEnhancementMetadataPts_ = std::chrono::milliseconds{0};
     dolbyVisionEnhancementFrames_.clear();
     pendingDolbyVisionBaseFrame_.reset();
+    ResetFrameInterpolationPipeline();
+    frameInterpolationUnavailable_ = false;
     subtitleCanvasWidth_ = 0;
     subtitleCanvasHeight_ = 0;
     subtitleCanvasLogged_ = false;
@@ -1183,6 +1190,10 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
         frameQueue_.clear();
         stats_ = {};
         stats_.decoder = preferHardwareDecode_ ? L"ffmpeg_d3d11va_pending" : L"ffmpeg_software";
+        stats_.frameInterpolationRequested = frameInterpolationRequested_;
+        stats_.frameInterpolationBackend = frameInterpolationRequested_
+                                               ? L"directml_rife_pending"
+                                               : L"disabled";
         ResetSeekRecoveryLocked();
     }
     running_.store(true);
@@ -1235,6 +1246,7 @@ void FfmpegVideoDecoder::Stop() {
         decodeThread_.join();
     }
     running_.store(false);
+    ResetFrameInterpolationPipeline();
     {
         std::scoped_lock lock(mutex_);
         ResetSeekRecoveryLocked();
@@ -3949,7 +3961,9 @@ bool FfmpegVideoDecoder::TryPublishDoviLibplaceboFrame(AVFrame* frame,
         }
 
         av_frame_free(&filtered);
-        const bool published = oneShotFrame_ ? PublishImmediateFrame(std::move(queued)) : EnqueueFrame(std::move(queued));
+        const bool published = oneShotFrame_
+                                   ? PublishImmediateFrame(std::move(queued))
+                                   : EnqueuePresentationFrame(std::move(queued));
         if (!published) {
             return false;
         }
@@ -4074,7 +4088,7 @@ bool FfmpegVideoDecoder::PublishPreparedDolbyVisionFrame(NativeVideoFrame&& fram
     }
     const bool published = oneShotFrame_
                                ? PublishImmediateFrame(std::move(frame))
-                               : EnqueueFrame(std::move(frame));
+                               : EnqueuePresentationFrame(std::move(frame));
     if (logFirstDoviQueue) {
         dolbyVisionFirstQueueLogged_ = true;
         LogThread(LogLevel::Debug,
@@ -4181,7 +4195,7 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
             if (oneShotFrame_) {
                 return PublishImmediateFrame(std::move(textureFrame));
             }
-            return EnqueueFrame(std::move(textureFrame));
+            return EnqueuePresentationFrame(std::move(textureFrame));
         }
 
         if (!softwareFrame) {
@@ -4379,7 +4393,7 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
     if (oneShotFrame_) {
         return PublishImmediateFrame(std::move(queued));
     }
-    return EnqueueFrame(std::move(queued));
+    return EnqueuePresentationFrame(std::move(queued));
 }
 
 bool FfmpegVideoDecoder::TryBuildD3DTextureFrame(AVFrame* frame, std::chrono::milliseconds pts, uint64_t& serial, NativeVideoFrame& out) {
@@ -4646,6 +4660,8 @@ bool FfmpegVideoDecoder::ApplyPendingSeek(AVFormatContext* formatCtx,
     latestDolbyVisionEnhancementMetadataPts_ = std::chrono::milliseconds{0};
     dolbyVisionEnhancementFrames_.clear();
     pendingDolbyVisionBaseFrame_.reset();
+    ResetFrameInterpolationPipeline();
+    frameInterpolationUnavailable_ = false;
     if (externalSubtitlesActive_) {
         subtitleCues_ = externalSubtitleCues_;
     } else {
@@ -4678,6 +4694,11 @@ bool FfmpegVideoDecoder::ApplyPendingSeek(AVFormatContext* formatCtx,
         stats_.driftMs = 0;
         stats_.rendered = 0;
         stats_.droppedStale = 0;
+        stats_.frameInterpolationActive = false;
+        stats_.frameInterpolationBackend = frameInterpolationRequested_
+                                               ? L"directml_rife_pending"
+                                               : L"disabled";
+        stats_.frameInterpolationReason.clear();
         BeginSeekRecoveryLocked(*target, prerollAfterSeek, seekTimelineSerial);
         UpdateBufferedStatsLocked();
     }
@@ -5506,9 +5527,206 @@ bool FfmpegVideoDecoder::SeekPrerollReadyLocked() const {
     return videoReady && stats_.readAheadDuration >= kSeekPrerollTimeoutMinReadAhead;
 }
 
+void FfmpegVideoDecoder::ResetFrameInterpolationPipeline() {
+    frameInterpolationPreviousFrame_.reset();
+    frameInterpolationOverBudgetCount_ = 0;
+    frameInterpolationGeneratedCount_ = 0;
+    frameInterpolationAverageMilliseconds_ = 0.0;
+    frameInterpolationDiagnosticLogged_ = false;
+    if (frameInterpolator_) {
+        frameInterpolator_->Reset();
+        frameInterpolator_.reset();
+    }
+}
+
+void FfmpegVideoDecoder::DisableFrameInterpolationForSession(const std::wstring& reason) {
+    frameInterpolationUnavailable_ = true;
+    ResetFrameInterpolationPipeline();
+    {
+        std::scoped_lock lock(mutex_);
+        stats_.frameInterpolationActive = false;
+        stats_.frameInterpolationBackend = L"unavailable";
+        stats_.frameInterpolationReason = reason;
+    }
+    LogThread(LogLevel::Warning,
+              L"decoder",
+              L"frame_interpolation unavailable reason=" + reason);
+}
+
+bool FfmpegVideoDecoder::EnqueuePresentationFrame(NativeVideoFrame&& frame) {
+    if (!frameInterpolationRequested_ || frameInterpolationUnavailable_ || oneShotFrame_) {
+        return EnqueueFrame(std::move(frame));
+    }
+
+    const bool hasDynamicMetadata =
+        frame.hdr10Plus ||
+        (frame.dovi && frame.dovi->valid) ||
+        (frame.enhancementDovi && frame.enhancementDovi->valid) ||
+        !frame.dynamicMetadataPath.empty();
+    if (hasDynamicMetadata) {
+        DisableFrameInterpolationForSession(L"dynamic_hdr_metadata_unsupported");
+        return EnqueueFrame(std::move(frame));
+    }
+    if (frame.color.IsHdr()) {
+        DisableFrameInterpolationForSession(L"hdr_transfer_unsupported_by_rife_model");
+        return EnqueueFrame(std::move(frame));
+    }
+    if (!frame.HasD3DTexture() || !sharedD3DDevice_) {
+        DisableFrameInterpolationForSession(L"gpu_texture_input_unavailable");
+        return EnqueueFrame(std::move(frame));
+    }
+    if (frame.d3dFormat != DXGI_FORMAT_NV12 && frame.d3dFormat != DXGI_FORMAT_P010) {
+        DisableFrameInterpolationForSession(L"gpu_texture_format_unsupported");
+        return EnqueueFrame(std::move(frame));
+    }
+
+    if (!frameInterpolationPreviousFrame_.has_value()) {
+        frameInterpolationPreviousFrame_ = frame;
+        return EnqueueFrame(std::move(frame));
+    }
+
+    const NativeVideoFrame& previous = *frameInterpolationPreviousFrame_;
+    const auto frameSpan = frame.pts - previous.pts;
+    const bool discontinuity =
+        previous.timelineSerial != frame.timelineSerial ||
+        frameSpan <= std::chrono::milliseconds{0} ||
+        frameSpan > std::chrono::milliseconds{250} ||
+        previous.d3dFormat != frame.d3dFormat ||
+        previous.d3dTextureWidth != frame.d3dTextureWidth ||
+        previous.d3dTextureHeight != frame.d3dTextureHeight;
+    if (discontinuity) {
+        ResetFrameInterpolationPipeline();
+        frameInterpolationPreviousFrame_ = frame;
+        return EnqueueFrame(std::move(frame));
+    }
+
+    if (!frameInterpolator_) {
+        D3D11_TEXTURE2D_DESC textureDesc{};
+        frame.d3dTexture->GetDesc(&textureDesc);
+        GpuFrameInterpolationConfig config{};
+        config.width = static_cast<UINT>(frame.width);
+        config.height = static_cast<UINT>(frame.height);
+        config.sourceFrameRateNumerator = videoFrameRateNumerator_;
+        config.sourceFrameRateDenominator = std::max<UINT32>(1, videoFrameRateDenominator_);
+        config.outputRateMultiplier = 2;
+        auto interpolator = std::make_unique<GpuFrameInterpolator>();
+        const auto capabilities = interpolator->Initialize(sharedD3DDevice_.Get(), config);
+        if (!capabilities.available) {
+            DisableFrameInterpolationForSession(
+                capabilities.unavailableReason.empty()
+                    ? L"gpu_backend_unavailable"
+                    : capabilities.unavailableReason);
+            return EnqueueFrame(std::move(frame));
+        }
+        frameInterpolator_ = std::move(interpolator);
+        {
+            std::scoped_lock lock(mutex_);
+            stats_.frameInterpolationActive = true;
+            stats_.frameInterpolationBackend = capabilities.backendName;
+            stats_.frameInterpolationReason.clear();
+        }
+        LogThread(LogLevel::Info,
+                  L"decoder",
+                  L"frame_interpolation active backend=" + capabilities.backendName +
+                      L" multiplier=2 zero_copy=" +
+                      std::wstring(capabilities.zeroCopy ? L"true" : L"false") +
+                      L" model_warmup_ms=" + std::to_wstring(capabilities.warmupMilliseconds) +
+                      L" size=" + std::to_wstring(config.width) + L"x" +
+                      std::to_wstring(config.height) +
+                      L" processing_size=" + std::to_wstring(capabilities.processingWidth) + L"x" +
+                      std::to_wstring(capabilities.processingHeight));
+    }
+
+    GpuInterpolationOutputSurface interpolatedSurface;
+    if (!frameInterpolator_->InterpolateMidpoint(
+            {previous.d3dTexture.Get(),
+             previous.d3dArraySlice,
+             previous.sourceUvRect,
+             previous.color},
+            {frame.d3dTexture.Get(),
+             frame.d3dArraySlice,
+             frame.sourceUvRect,
+             frame.color},
+            interpolatedSurface)) {
+        const std::wstring reason = frameInterpolator_->LastFailureReason();
+        DisableFrameInterpolationForSession(
+            reason.empty() ? L"gpu_interpolation_failed" : reason);
+        return EnqueueFrame(std::move(frame));
+    }
+
+    NativeVideoFrame interpolated = previous;
+    interpolated.width = interpolatedSurface.width;
+    interpolated.height = interpolatedSurface.height;
+    interpolated.stride = interpolatedSurface.stride;
+    interpolated.bgra = interpolatedSurface.bgra;
+    interpolated.d3dTexture.Reset();
+    interpolated.d3dArraySlice = 0;
+    interpolated.d3dFormat = DXGI_FORMAT_UNKNOWN;
+    interpolated.d3dTextureWidth = 0;
+    interpolated.d3dTextureHeight = 0;
+    interpolated.sourceUvRect = {};
+    interpolated.softwareFormat = AV_PIX_FMT_BGRA;
+    interpolated.hardwareFrameRef.reset();
+    interpolated.pts = previous.pts + frameSpan / 2;
+    interpolated.serial = frame.serial;
+    interpolated.subtitleText.clear();
+    interpolated.subtitleBitmaps.clear();
+    interpolated.subtitlesPrepared = false;
+    RefreshFrameSubtitles(interpolated, true);
+
+    const auto& diagnostics = interpolatedSurface.diagnostics;
+    const double sourceBudgetMs = static_cast<double>(frameSpan.count());
+    ++frameInterpolationGeneratedCount_;
+    frameInterpolationAverageMilliseconds_ = frameInterpolationGeneratedCount_ == 1
+                                                  ? diagnostics.totalMilliseconds
+                                                  : frameInterpolationAverageMilliseconds_ * 0.85 +
+                                                        diagnostics.totalMilliseconds * 0.15;
+    constexpr std::uint64_t kMinimumPerformanceSamples = 12;
+    constexpr double kPerformanceBudgetTolerance = 1.10;
+    if (frameInterpolationGeneratedCount_ >= kMinimumPerformanceSamples &&
+        frameInterpolationAverageMilliseconds_ > sourceBudgetMs * kPerformanceBudgetTolerance) {
+        ++frameInterpolationOverBudgetCount_;
+    } else {
+        frameInterpolationOverBudgetCount_ = 0;
+    }
+    if (!frameInterpolationDiagnosticLogged_ || frameInterpolationGeneratedCount_ % 120 == 0) {
+        frameInterpolationDiagnosticLogged_ = true;
+        std::wostringstream diagnostic;
+        diagnostic << std::fixed << std::setprecision(3)
+                   << L"frame_interpolation sample backend="
+                   << frameInterpolator_->Capabilities().backendName
+                   << L" inference_ms=" << diagnostics.inferenceMilliseconds
+                   << L" total_ms=" << diagnostics.totalMilliseconds
+                   << L" average_ms=" << frameInterpolationAverageMilliseconds_
+                   << L" budget_ms=" << sourceBudgetMs
+                   << L" source_delta=" << diagnostics.sourceDifference
+                   << L" midpoint_to_previous=" << diagnostics.midpointToPreviousDifference
+                   << L" midpoint_to_next=" << diagnostics.midpointToNextDifference
+                   << L" fingerprint=" << std::hex << diagnostics.outputFingerprint;
+        LogThread(LogLevel::Info, L"decoder", diagnostic.str());
+    }
+
+    if (!EnqueueFrame(std::move(interpolated))) {
+        return false;
+    }
+    {
+        std::scoped_lock lock(mutex_);
+        ++stats_.interpolatedFrames;
+    }
+    if (frameInterpolationOverBudgetCount_ >= 6) {
+        DisableFrameInterpolationForSession(L"inference_exceeded_source_frame_budget");
+        return EnqueueFrame(std::move(frame));
+    }
+    frameInterpolationPreviousFrame_ = frame;
+    return EnqueueFrame(std::move(frame));
+}
+
 bool FfmpegVideoDecoder::EnqueueFrame(NativeVideoFrame&& frame) {
     frame.frameRateNumerator = videoFrameRateNumerator_;
     frame.frameRateDenominator = videoFrameRateDenominator_;
+    if (frameInterpolationRequested_ && !frameInterpolationUnavailable_) {
+        frame.frameRateNumerator *= 2;
+    }
     if (!frame.subtitlesPrepared) {
         RefreshFrameSubtitles(frame);
     }

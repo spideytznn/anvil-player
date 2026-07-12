@@ -510,6 +510,8 @@ bool SetDisplayHdrState(const LUID adapterId, const UINT32 targetId, const bool 
 MainWindow::MainWindow(std::shared_ptr<anvil::playback::InMemoryLogSink> logSink)
     : controller_(std::move(logSink)) {
     auto settings = controller_.Settings();
+    settings.video.frameInterpolationEnabled =
+        LoadVideoBooleanSetting(L"FrameInterpolationEnabled").value_or(false);
     if (const auto value = LoadVideoBooleanSetting(L"DisplayMetadataPassthrough")) {
         settings.video.displayMetadataPassthrough = *value;
     }
@@ -644,12 +646,10 @@ bool MainWindow::Create(HINSTANCE instance) {
         return false;
     }
 
-    constexpr DWORD windowStyle = WS_POPUP |
-                                  WS_THICKFRAME |
-                                  WS_SYSMENU |
-                                  WS_MINIMIZEBOX |
-                                  WS_MAXIMIZEBOX |
-                                  WS_CLIPCHILDREN;
+    // Keep standard top-level window semantics so DWM owns minimize/restore
+    // transitions. WM_NCCALCSIZE still extends the client area across the
+    // native caption, allowing the Web UI to draw the visible title bar.
+    constexpr DWORD windowStyle = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
     constexpr DWORD windowExStyle = WS_EX_APPWINDOW;
     const auto adjustedWindowRect = [this, windowStyle, windowExStyle](const int clientWidth, const int clientHeight) {
         RECT rect = MakeRect(0, 0, clientWidth, clientHeight);
@@ -701,11 +701,6 @@ bool MainWindow::Create(HINSTANCE instance) {
         return false;
     }
 
-    const LONG_PTR createdStyle = GetWindowLongPtrW(hwnd_, GWL_STYLE);
-    SetWindowLongPtrW(hwnd_, GWL_STYLE, createdStyle & ~static_cast<LONG_PTR>(WS_CAPTION));
-    SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
-                 SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE |
-                 SWP_NOZORDER | SWP_NOACTIVATE);
     ApplyWindowChrome();
 
     playbackSupervisor_ = std::make_unique<PlaybackSupervisor>(controller_);
@@ -831,18 +826,23 @@ std::wstring MainWindow::BuildWebUiStateJson() const {
     long long bufferedEndMs = positionMs;
     bool buffering = false;
     uint64_t networkBytesPerSecond = 0;
+    NativeVideoQueueStats nativeStats{};
+    bool hasNativeStats = false;
     if (backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
         nativeVideoDecoder_ &&
-        snapshot.media.has_value() &&
-        snapshot.media->duration.count() > 0) {
+        snapshot.media.has_value()) {
         const auto stats = nativeVideoDecoder_->Stats();
+        nativeStats = stats;
+        hasNativeStats = true;
         buffering = stats.buffering;
         networkBytesPerSecond = stats.networkBytesPerSecond;
-        if (buffering) {
+        if (buffering && durationMs > 0) {
             positionMs = std::clamp<long long>(stats.clockPosition.count(), 0, durationMs);
             bufferedEndMs = positionMs;
         }
-        if ((stats.queueDepth > 0 || stats.packetQueueDepth > 0) && stats.bufferedEnd.count() > positionMs) {
+        if (durationMs > 0 &&
+            (stats.queueDepth > 0 || stats.packetQueueDepth > 0) &&
+            stats.bufferedEnd.count() > positionMs) {
             bufferedEndMs = std::clamp<long long>(stats.bufferedEnd.count(), positionMs, durationMs);
         }
     }
@@ -895,6 +895,14 @@ std::wstring MainWindow::BuildWebUiStateJson() const {
     json << L"\"sidebarCollapsed\":" << (inspectorCollapsed_ ? L"true" : L"false") << L",";
     json << L"\"fullscreen\":" << (fullscreen_ ? L"true" : L"false") << L",";
     json << L"\"customTitleBar\":true,";
+    json << L"\"frameInterpolationEnabled\":"
+         << (settings.video.frameInterpolationEnabled ? L"true" : L"false") << L",";
+    json << L"\"frameInterpolationActive\":"
+         << ((hasNativeStats && nativeStats.frameInterpolationActive) ? L"true" : L"false") << L",";
+    json << L"\"frameInterpolationBackend\":\""
+         << JsonEscape(hasNativeStats ? nativeStats.frameInterpolationBackend : L"inactive") << L"\",";
+    json << L"\"frameInterpolationReason\":\""
+         << JsonEscape(hasNativeStats ? nativeStats.frameInterpolationReason : L"") << L"\",";
     json << L"\"refreshRateSyncEnabled\":" << (refreshRateSyncEnabled_ ? L"true" : L"false") << L",";
     json << L"\"refreshRateMaximumMultiple\":" << (refreshRateMaximumMultiple_ ? L"true" : L"false") << L",";
     json << L"\"refreshRateSyncUnavailable\":" << (refreshRateSyncUnavailable_ ? L"true" : L"false") << L",";
@@ -1072,6 +1080,8 @@ void MainWindow::HandleWebUiMessage(const std::wstring_view message) {
         ToggleSidebar();
     } else if (MessageContains(message, L"\"command\":\"toggleFullscreen\"")) {
         ToggleFullscreen();
+    } else if (MessageContains(message, L"\"command\":\"setFrameInterpolation\"")) {
+        SetFrameInterpolationEnabled(MessageContains(message, L"\"enabled\":true"));
     } else if (MessageContains(message, L"\"command\":\"setRefreshRateSync\"")) {
         SetRefreshRateSyncEnabled(MessageContains(message, L"\"enabled\":true"));
     } else if (MessageContains(message, L"\"command\":\"setRefreshRateMaximumMultiple\"")) {
@@ -2247,6 +2257,10 @@ void MainWindow::MaybeLogNativeSchedulerStats(const NativeVideoQueueStats& stats
                     L" buffering=" + std::wstring(stats.buffering ? L"true" : L"false") +
                     L" net_kbps=" + std::to_wstring(stats.networkBytesPerSecond / 1024) +
                     L" rendered=" + std::to_wstring(stats.rendered) +
+                   L" interpolation_active=" +
+                       std::wstring(stats.frameInterpolationActive ? L"true" : L"false") +
+                   L" interpolated_frames=" + std::to_wstring(stats.interpolatedFrames) +
+                   L" interpolation_backend=" + stats.frameInterpolationBackend +
                    L" hardware_frames=" + std::to_wstring(stats.hardwareFrames) +
                    L" zero_copy_frames=" + std::to_wstring(stats.zeroCopyFrames) +
                    L" cpu_transfer_frames=" + std::to_wstring(stats.cpuTransferFrames) +
@@ -4873,8 +4887,9 @@ bool MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
                                                    false,
                                                    preferDolbyVisionHdrOutput,
                                                    enableDolbyVisionEnhancementDecode,
-                                                  std::move(audioPacketSink),
-                                                  windowLifetimeCookie_);
+                                                   settings.video.frameInterpolationEnabled,
+                                                   std::move(audioPacketSink),
+                                                   windowLifetimeCookie_);
         if (videoStarted) {
             MarkLayoutDirty();
             EnsureLayout();
@@ -5177,6 +5192,7 @@ void MainWindow::RefreshPausedNativeFrame(const PlaybackSessionSnapshot& snapsho
                                                      true,
                                                      preferDolbyVisionHdrOutput,
                                                      enableDolbyVisionEnhancementDecode,
+                                                     false,
                                                     NativeAudioPacketSink{},
                                                     windowLifetimeCookie_);
     if (started) {
@@ -5205,6 +5221,8 @@ void MainWindow::OpenPath(const std::filesystem::path& path, const bool autoplay
     audioPassthroughOverridden_ = false;
     {
         auto settings = controller_.Settings();
+        settings.video.frameInterpolationEnabled =
+            LoadVideoBooleanSetting(L"FrameInterpolationEnabled").value_or(false);
         settings.audio.passthroughPreferred = LoadAudioPassthroughSetting().value_or(false);
         controller_.ApplySettings(settings);
     }
@@ -5626,7 +5644,7 @@ void MainWindow::StartPlayback() {
 
     controller_.Play();
     const auto snapshot = controller_.Snapshot();
-    if (fullscreen_ && refreshRateSyncEnabled_ && snapshot.media.has_value() && snapshot.media->videoFrameRate > 0.0) {
+    if (fullscreen_ && RefreshRateSyncEffective() && snapshot.media.has_value() && snapshot.media->videoFrameRate > 0.0) {
         refreshRateSyncUnavailable_ =
             !refreshRateController_.ApplyForWindow(hwnd_, snapshot.media->videoFrameRate, refreshRateMaximumMultiple_);
     }
@@ -5873,7 +5891,7 @@ void MainWindow::ToggleFullscreen() {
     if (!fullscreen_) {
         refreshRateSyncUnavailable_ = false;
         const auto snapshot = controller_.Snapshot();
-        if (refreshRateSyncEnabled_ && snapshot.media.has_value() && snapshot.media->videoFrameRate > 0.0) {
+        if (RefreshRateSyncEffective() && snapshot.media.has_value() && snapshot.media->videoFrameRate > 0.0) {
             const bool matched = refreshRateController_.ApplyForWindow(hwnd_, snapshot.media->videoFrameRate, refreshRateMaximumMultiple_);
             refreshRateSyncUnavailable_ = !matched;
             LogApp(matched ? LogLevel::Info : LogLevel::Warning,
@@ -5963,7 +5981,50 @@ void MainWindow::ToggleFullscreen() {
     PostWebUiState();
 }
 
+bool MainWindow::RefreshRateSyncEffective() const {
+    return refreshRateSyncEnabled_ && !controller_.Settings().video.frameInterpolationEnabled;
+}
+
+void MainWindow::SetFrameInterpolationEnabled(const bool enabled) {
+    auto settings = controller_.Settings();
+    if (settings.video.frameInterpolationEnabled == enabled) {
+        return;
+    }
+    settings.video.frameInterpolationEnabled = enabled;
+    controller_.ApplySettings(settings);
+    SaveVideoBooleanSetting(L"FrameInterpolationEnabled", enabled);
+
+    refreshRateController_.Restore();
+    refreshRateSyncUnavailable_ = false;
+    const auto snapshot = controller_.Snapshot();
+    if (!enabled && fullscreen_ && refreshRateSyncEnabled_ &&
+        snapshot.media.has_value() && snapshot.media->videoFrameRate > 0.0) {
+        refreshRateSyncUnavailable_ =
+            !refreshRateController_.ApplyForWindow(
+                hwnd_, snapshot.media->videoFrameRate, refreshRateMaximumMultiple_);
+    }
+
+    LogApp(LogLevel::Info,
+           L"frame interpolation requested=" + std::wstring(enabled ? L"true" : L"false") +
+               L" target=x2");
+    if (snapshot.state == PlaybackState::Playing && snapshot.media.has_value() && snapshot.media->hasVideo) {
+        RequestRuntimeStart(true, true);
+    } else if (snapshot.state == PlaybackState::Paused &&
+               snapshot.media.has_value() && snapshot.media->hasVideo &&
+               backend_ == PlaybackBackend::NativeFfmpegD3D11) {
+        RefreshPausedNativeFrame(snapshot, true);
+    }
+    MarkLayoutDirty();
+    EnsureLayout();
+    UpdateVideoHost();
+    PostWebUiState();
+}
+
 void MainWindow::SetRefreshRateSyncEnabled(const bool enabled) {
+    if (controller_.Settings().video.frameInterpolationEnabled) {
+        PostWebUiState();
+        return;
+    }
     refreshRateSyncOverridden_ = true;
     refreshRateSyncEnabled_ = enabled;
     if (!enabled) {
@@ -5987,9 +6048,13 @@ void MainWindow::SetRefreshRateSyncEnabled(const bool enabled) {
 }
 
 void MainWindow::SetRefreshRateMaximumMultiple(const bool enabled) {
+    if (controller_.Settings().video.frameInterpolationEnabled) {
+        PostWebUiState();
+        return;
+    }
     refreshRateMaximumMultipleOverridden_ = true;
     refreshRateMaximumMultiple_ = enabled;
-    if (refreshRateSyncEnabled_ && fullscreen_) {
+    if (RefreshRateSyncEffective() && fullscreen_) {
         refreshRateController_.Restore();
         const auto snapshot = controller_.Snapshot();
         if (snapshot.media.has_value() && snapshot.media->videoFrameRate > 0.0) {
@@ -6019,7 +6084,7 @@ void MainWindow::ApplyGlobalRefreshRatePreferences() {
     if (changed) {
         refreshRateController_.Restore();
         const auto snapshot = controller_.Snapshot();
-        if (fullscreen_ && refreshRateSyncEnabled_ && snapshot.media.has_value() && snapshot.media->videoFrameRate > 0.0) {
+        if (fullscreen_ && RefreshRateSyncEffective() && snapshot.media.has_value() && snapshot.media->videoFrameRate > 0.0) {
             refreshRateSyncUnavailable_ = !refreshRateController_.ApplyForWindow(hwnd_, snapshot.media->videoFrameRate, refreshRateMaximumMultiple_);
         } else {
             refreshRateSyncUnavailable_ = false;
@@ -6029,12 +6094,15 @@ void MainWindow::ApplyGlobalRefreshRatePreferences() {
 }
 
 void MainWindow::ApplyGlobalVideoPassthroughPreferences() {
+    const bool frameInterpolation =
+        LoadVideoBooleanSetting(L"FrameInterpolationEnabled").value_or(false);
     const bool autoDisplayFormat = LoadVideoBooleanSetting(L"AutoDisplayFormat").value_or(false);
     const bool displayMetadata = LoadVideoBooleanSetting(L"DisplayMetadataPassthrough").value_or(false);
     const bool dolbySystemPipeline =
         LoadVideoBooleanSetting(L"DolbyVisionSystemPipelineExperimental").value_or(false);
     const int displayPeakBrightnessNits =
         LoadVideoDwordSetting(L"DisplayPeakBrightnessNits").value_or(0);
+    SetFrameInterpolationEnabled(frameInterpolation);
     SetAutomaticDisplayFormat(autoDisplayFormat);
     if (!autoDisplayFormat) {
         SetDisplayMetadataPassthrough(displayMetadata);

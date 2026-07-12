@@ -36,6 +36,10 @@ inline constexpr std::array<HdrToneCurvePoint, kHdrToneCurvePointCount> kDefault
 
 struct VideoSettings {
     bool autoDisplayFormat = false;
+    // Generate GPU motion-compensated intermediate frames. The saved refresh
+    // rate synchronization preference remains intact, but is not effective
+    // while this option is enabled.
+    bool frameInterpolationEnabled = false;
     HardwareDecodeMode hardwareDecode = HardwareDecodeMode::Auto;
     std::wstring renderer = L"D3D11";
     int selectedTrackIndex = kVideoTrackAuto;

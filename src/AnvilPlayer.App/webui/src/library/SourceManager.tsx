@@ -11,7 +11,12 @@ function locationKey(value: string): string {
 
 function displayName(value: string): string {
   const normalized = value.replace(/[\\/]+$/g, '')
-  return normalized.split(/[\\/]/).filter(Boolean).at(-1) ?? normalized
+  const name = normalized.split(/[\\/]/).filter(Boolean).at(-1) ?? normalized
+  try {
+    return decodeURIComponent(name)
+  } catch {
+    return name
+  }
 }
 
 export function FileServiceDirectoryBrowser(props: {

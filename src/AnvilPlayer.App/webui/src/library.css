@@ -2808,6 +2808,10 @@
   flex-wrap: wrap;
 }
 
+.library-refresh-sync-controls.is-disabled {
+  opacity: 0.48;
+}
+
 .library-checkbox-option {
   display: inline-flex;
   align-items: center;

@@ -1737,6 +1737,9 @@ const settingsCopy: Record<UiLanguage, {
   nits: string
   dolbyVisionSystemPipelineExperimental: string
   dolbyVisionSystemPipelineExperimentalCaption: string
+  frameInterpolation: string
+  frameInterpolationCaption: string
+  frameInterpolationRefreshBlocked: string
   refreshRateSync: string
   refreshRateSyncCaption: string
   refreshRateSyncRequirement: string
@@ -1793,6 +1796,9 @@ const settingsCopy: Record<UiLanguage, {
     nits: '尼特',
     dolbyVisionSystemPipelineExperimental: '杜比视界直通（实验性）',
     dolbyVisionSystemPipelineExperimentalCaption: '强制杜比视界片源使用 Windows MediaEngine 与 Dolby Vision Extensions；默认关闭。',
+    frameInterpolation: 'GPU 补帧',
+    frameInterpolationCaption: '全局默认。使用显卡运动补偿生成中间帧，当前版本输出为源帧率的 2 倍。',
+    frameInterpolationRefreshBlocked: 'GPU 补帧开启时，刷新率同步会保留原设置但暂时失效。',
     refreshRateSync: '智能刷新率同步',
     refreshRateSyncCaption: '全局默认。播放视频进入全屏时，自动选择与帧率整数倍匹配的最高刷新率。',
     refreshRateSyncRequirement: '请先在显卡控制面板创建片源所需的精确刷新率，例如 23.976 Hz 或 119.880 Hz。',
@@ -1849,6 +1855,9 @@ const settingsCopy: Record<UiLanguage, {
     nits: 'nits',
     dolbyVisionSystemPipelineExperimental: 'Dolby Vision passthrough (experimental)',
     dolbyVisionSystemPipelineExperimentalCaption: 'Force Dolby Vision sources through Windows MediaEngine and Dolby Vision Extensions. Disabled by default.',
+    frameInterpolation: 'GPU frame interpolation',
+    frameInterpolationCaption: 'Global default. Use GPU motion compensation to generate intermediate frames at 2x the source rate.',
+    frameInterpolationRefreshBlocked: 'Refresh-rate sync keeps its saved preference but is temporarily unavailable while interpolation is enabled.',
     refreshRateSync: 'Smart refresh-rate sync',
     refreshRateSyncCaption: 'Global default. In fullscreen, select the highest refresh rate that is an integer multiple of the video frame rate.',
     refreshRateSyncRequirement: 'Create the exact required mode in the GPU control panel first, such as 23.976 Hz or 119.880 Hz.',
@@ -1893,6 +1902,8 @@ function LibrarySettingsPage(props: {
   onTestTmdb: () => void
   trailerSettings: TrailerSettings
   onTrailerSettingsChange: (settings: TrailerSettings) => void
+  frameInterpolationEnabled: boolean
+  onFrameInterpolationChange: (enabled: boolean) => void
   refreshRateSyncEnabled: boolean
   onRefreshRateSyncChange: (enabled: boolean) => void
   refreshRateMaximumMultiple: boolean
@@ -2150,22 +2161,34 @@ function LibrarySettingsPage(props: {
           <Tv size={16} />
           <span>{t.refreshRateSync}</span>
         </div>
-        <p>{t.refreshRateSyncCaption}</p>
-        <p className="library-settings-warning">{t.refreshRateSyncRequirement}</p>
-        <div className="library-refresh-sync-controls">
-          <div className="library-setting-options" role="group" aria-label={t.refreshRateSync}>
-            <button className={props.refreshRateSyncEnabled ? 'is-selected' : ''} type="button" onClick={() => props.onRefreshRateSyncChange(true)}>
+        <label className="library-settings-field">
+          <span>{t.frameInterpolation}</span>
+          <small>{t.frameInterpolationCaption}</small>
+          <div className="library-setting-options" role="group" aria-label={t.frameInterpolation}>
+            <button className={props.frameInterpolationEnabled ? 'is-selected' : ''} type="button" onClick={() => props.onFrameInterpolationChange(true)}>
               <span>{t.enabled}</span>
             </button>
-            <button className={!props.refreshRateSyncEnabled ? 'is-selected' : ''} type="button" onClick={() => props.onRefreshRateSyncChange(false)}>
+            <button className={!props.frameInterpolationEnabled ? 'is-selected' : ''} type="button" onClick={() => props.onFrameInterpolationChange(false)}>
               <span>{t.disabled}</span>
             </button>
           </div>
-          <label className={`library-checkbox-option ${props.refreshRateSyncEnabled ? '' : 'is-disabled'}`}>
+        </label>
+        <p>{t.refreshRateSyncCaption}</p>
+        <p className="library-settings-warning">{props.frameInterpolationEnabled ? t.frameInterpolationRefreshBlocked : t.refreshRateSyncRequirement}</p>
+        <div className={`library-refresh-sync-controls ${props.frameInterpolationEnabled ? 'is-disabled' : ''}`}>
+          <div className="library-setting-options" role="group" aria-label={t.refreshRateSync}>
+            <button className={props.refreshRateSyncEnabled ? 'is-selected' : ''} type="button" disabled={props.frameInterpolationEnabled} onClick={() => props.onRefreshRateSyncChange(true)}>
+              <span>{t.enabled}</span>
+            </button>
+            <button className={!props.refreshRateSyncEnabled ? 'is-selected' : ''} type="button" disabled={props.frameInterpolationEnabled} onClick={() => props.onRefreshRateSyncChange(false)}>
+              <span>{t.disabled}</span>
+            </button>
+          </div>
+          <label className={`library-checkbox-option ${props.refreshRateSyncEnabled && !props.frameInterpolationEnabled ? '' : 'is-disabled'}`}>
             <input
               type="checkbox"
               checked={props.refreshRateMaximumMultiple}
-              disabled={!props.refreshRateSyncEnabled}
+              disabled={!props.refreshRateSyncEnabled || props.frameInterpolationEnabled}
               onChange={(event) => props.onRefreshRateMaximumMultipleChange(event.currentTarget.checked)}
             />
             <span>{t.maximumRefreshMultiple}</span>
@@ -2280,6 +2303,7 @@ export default function LibraryApp(): JSX.Element {
   const [videoPassthroughSettingsLoaded, setVideoPassthroughSettingsLoaded] = useState(false)
   const [audioPassthroughEnabled, setAudioPassthroughEnabled] = useState(false)
   const [audioPassthroughSettingsLoaded, setAudioPassthroughSettingsLoaded] = useState(false)
+  const [frameInterpolationEnabled, setFrameInterpolationEnabled] = useState(false)
   const [refreshRateSyncEnabled, setRefreshRateSyncEnabled] = useState(() => localStorage.getItem('anvil-player.refresh-rate-sync') === 'true')
   const [refreshRateMaximumMultiple, setRefreshRateMaximumMultiple] = useState(() => localStorage.getItem('anvil-player.refresh-rate-maximum-multiple') !== 'false')
   const { settings: tmdbSettings, status: tmdbStatus, isTesting: isTestingTmdb, updateSettings: updateTmdbSettings, testConnection: testTmdbSettingsConnection } = useTmdbSettings()
@@ -2613,6 +2637,12 @@ export default function LibraryApp(): JSX.Element {
     saveUiLanguage(language)
     postNativeCommand({ type: 'command', command: 'setUiLanguage', language })
   }, [language])
+
+  useEffect(() => {
+    if (!videoPassthroughSettingsLoaded) return
+    localStorage.setItem('anvil-player.frame-interpolation', String(frameInterpolationEnabled))
+    postNativeCommand({ type: 'command', command: 'setGlobalFrameInterpolation', enabled: frameInterpolationEnabled })
+  }, [frameInterpolationEnabled, videoPassthroughSettingsLoaded])
 
   useEffect(() => {
     localStorage.setItem('anvil-player.refresh-rate-sync', String(refreshRateSyncEnabled))
@@ -2986,6 +3016,7 @@ export default function LibraryApp(): JSX.Element {
       } else if (message.type === 'windowChrome') {
         setCustomTitleBarEnabled(message.customTitleBar)
       } else if (message.type === 'globalVideoPassthroughSettings') {
+        setFrameInterpolationEnabled(message.frameInterpolationEnabled)
         setAutoDisplayFormat(message.autoDisplayFormat)
         setDisplayMetadataPassthrough(message.displayMetadataPassthrough)
         setDisplayPeakBrightnessNits(message.displayPeakBrightnessNits)
@@ -5542,6 +5573,7 @@ export default function LibraryApp(): JSX.Element {
             autoDisplayFormat={autoDisplayFormat}
             dolbyVisionSystemPipelineExperimental={dolbyVisionSystemPipelineExperimental}
             windowsHdrEnabled={windowsHdrEnabled}
+            frameInterpolationEnabled={frameInterpolationEnabled}
             refreshRateSyncEnabled={refreshRateSyncEnabled}
             refreshRateMaximumMultiple={refreshRateMaximumMultiple}
             audioPassthroughEnabled={audioPassthroughEnabled}
@@ -5554,6 +5586,7 @@ export default function LibraryApp(): JSX.Element {
             onDisplayPeakBrightnessChange={setDisplayPeakBrightnessNits}
             onAutoDisplayFormatChange={setAutoDisplayFormat}
             onDolbyVisionSystemPipelineExperimentalChange={setDolbyVisionSystemPipelineExperimental}
+            onFrameInterpolationChange={setFrameInterpolationEnabled}
             onRefreshRateSyncChange={setRefreshRateSyncEnabled}
             onRefreshRateMaximumMultipleChange={setRefreshRateMaximumMultiple}
             onAudioPassthroughChange={setAudioPassthroughEnabled}

@@ -132,6 +132,7 @@ Copy-Item -LiteralPath (Join-Path $root 'third_party\ffmpeg\bin\ffmpeg.exe') -De
 Copy-Item -LiteralPath (Join-Path $root 'third_party\ffmpeg\bin\ffprobe.exe') -Destination $appStage -Force
 Copy-Item -LiteralPath (Join-Path $root 'third_party\ffmpeg\bin\ffplay.exe') -Destination $appStage -Force
 Copy-Item -Path (Join-Path $root 'third_party\libass\bin\*.dll') -Destination $appStage -Force
+Copy-Item -Path (Join-Path $root 'third_party\onnxruntime-directml\bin\x64\*.dll') -Destination $appStage -Force
 
 Copy-Item -LiteralPath $webViewExtract -Destination (Join-Path $appStage 'WebView2Runtime') -Recurse -Force
 
@@ -150,11 +151,21 @@ Microsoft Edge WebView2
 libass
 - Runtime DLLs and dependencies are bundled from third_party/libass.
 - License files are available under third_party/libass/licenses in this repository.
+
+ONNX Runtime DirectML
+- ONNX Runtime executes the frame-interpolation model through DirectML.
+- License and notices: see ONNXRUNTIME-LICENSE.txt and ONNXRUNTIME-NOTICES.txt.
+
+RIFE 4.25 Lite
+- The bundled optical-flow frame-interpolation model is derived from Practical-RIFE.
+- License: see assets/models/RIFE-LICENSE.txt.
 "@
 Set-Content -LiteralPath (Join-Path $appStage 'THIRD-PARTY-NOTICES.txt') -Value $notice -Encoding UTF8
 Copy-Item -LiteralPath (Join-Path $root 'third_party\ffmpeg\LICENSE.txt') -Destination (Join-Path $appStage 'FFMPEG-LICENSE.txt') -Force
 Copy-Item -LiteralPath (Join-Path $root 'third_party\webview2\LICENSE.txt') -Destination (Join-Path $appStage 'WEBVIEW2-SDK-LICENSE.txt') -Force
 Copy-Item -LiteralPath (Join-Path $root 'third_party\webview2\NOTICE.txt') -Destination (Join-Path $appStage 'WEBVIEW2-SDK-NOTICE.txt') -Force
+Copy-Item -LiteralPath (Join-Path $root 'third_party\onnxruntime-directml\LICENSE.txt') -Destination (Join-Path $appStage 'ONNXRUNTIME-LICENSE.txt') -Force
+Copy-Item -LiteralPath (Join-Path $root 'third_party\onnxruntime-directml\ThirdPartyNotices.txt') -Destination (Join-Path $appStage 'ONNXRUNTIME-NOTICES.txt') -Force
 
 New-Item -ItemType Directory -Force -Path $distDir | Out-Null
 Write-Host "Compiling Inno Setup installer..."

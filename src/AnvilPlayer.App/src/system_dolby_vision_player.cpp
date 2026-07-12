@@ -26,7 +26,7 @@ SystemDolbyVisionPlayer::~SystemDolbyVisionPlayer() {
 }
 
 HRESULT STDMETHODCALLTYPE SystemDolbyVisionPlayer::Notify::QueryInterface(
-    const REFIID iid,
+    REFIID iid,
     void** object) {
     if (!object) {
         return E_POINTER;

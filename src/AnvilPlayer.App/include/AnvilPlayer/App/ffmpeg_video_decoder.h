@@ -2,6 +2,7 @@
 
 #include "AnvilPlayer/App/color_metadata_util.h"
 #include "AnvilPlayer/App/log_sink_ptr.h"
+#include "AnvilPlayer/App/gpu_frame_interpolator.h"
 #include "AnvilPlayer/App/video_texture_sampling_math.h"
 #include "AnvilPlayer/Playback/DolbyVisionMetadata.h"
 #include "AnvilPlayer/Playback/Settings.h"
@@ -177,6 +178,11 @@ struct NativeVideoQueueStats {
     uint64_t networkBytesPerSecond = 0;
     bool usingAudioClock = false;
     bool usingHardwareDecode = false;
+    bool frameInterpolationRequested = false;
+    bool frameInterpolationActive = false;
+    uint64_t interpolatedFrames = 0;
+    std::wstring frameInterpolationBackend = L"unavailable";
+    std::wstring frameInterpolationReason;
     std::wstring decoder = L"ffmpeg_software";
     std::wstring fallbackReason;
 };
@@ -234,6 +240,7 @@ public:
                bool oneShotFrame = false,
                bool preferDolbyVisionHdrOutput = false,
                bool enableDolbyVisionEnhancementDecode = false,
+               bool enableFrameInterpolation = false,
                NativeAudioPacketSink audioPacketSink = {},
                uint64_t notificationCookie = 0);
 
@@ -507,6 +514,9 @@ private:
     bool SeekPrerollReadyLocked() const;
 
     bool EnqueueFrame(NativeVideoFrame&& frame);
+    bool EnqueuePresentationFrame(NativeVideoFrame&& frame);
+    void ResetFrameInterpolationPipeline();
+    void DisableFrameInterpolationForSession(const std::wstring& reason);
     void DrainQueuedFrames();
     void SchedulerLoop();
     void WakeScheduler();
@@ -571,6 +581,14 @@ private:
     uint64_t dolbyVisionLastDynamicMetadataFingerprint_ = 0;
     bool preferDolbyVisionHdrOutput_ = false;
     bool enableDolbyVisionEnhancementDecode_ = false;
+    bool frameInterpolationRequested_ = false;
+    bool frameInterpolationUnavailable_ = false;
+    std::unique_ptr<GpuFrameInterpolator> frameInterpolator_;
+    std::optional<NativeVideoFrame> frameInterpolationPreviousFrame_;
+    UINT32 frameInterpolationOverBudgetCount_ = 0;
+    std::uint64_t frameInterpolationGeneratedCount_ = 0;
+    double frameInterpolationAverageMilliseconds_ = 0.0;
+    bool frameInterpolationDiagnosticLogged_ = false;
     int selectedVideoTrackIndex_ = anvil::playback::kVideoTrackAuto;
     std::unique_ptr<DoviLibplaceboFilterState> doviLibplaceboFilter_;
     // Stream-level DV configuration (not present in per-frame metadata).
