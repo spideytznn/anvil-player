@@ -42,15 +42,23 @@ import { applyAppearanceSettings } from './appearance'
 import { loadSavedEmbyConnections, removeSavedEmbyConnection, saveSavedEmbyConnection, type SavedEmbyConnection } from './manager/connectionStorage'
 import { createEmptyLibraryClient } from './manager/mediaLibraryClient'
 import {
+  addItemToEmbyPlaylist,
+  createEmbyPlaylist,
   listEmbyLibraryView,
+  listEmbyFavoriteItems,
+  listEmbyPlaylists,
   loadEmbyItemDetails,
   loadEmbyLibrary,
   notifyPendingEmbyPlaybackReport,
+  removeItemFromEmbyPlaylist,
   refreshEmbyLibrary,
   resolveEmbyPlaybackTarget,
   savePendingEmbyPlaybackReport,
   searchEmbyLibrary,
   searchEmbyPersonLibrary,
+  setEmbyFavorite,
+  type EmbyLibrarySnapshot,
+  type EmbyPlaylistSnapshot,
   type EmbySession
 } from './manager/embyClient'
 import { buildLocalFolderLibrary, buildLocalFolderSource } from './manager/localFolderLibrary'
@@ -144,6 +152,15 @@ const WATCH_LATER_PLAYLIST_ID = 'watch-later'
 interface MediaPlaylist {
   id: string
   name: string
+  sourceId?: string
+  serverId?: string
+}
+
+interface LibraryConfirmation {
+  title: string
+  message: string
+  confirmLabel: string
+  danger?: boolean
 }
 
 function loadMediaPlaylists(): MediaPlaylist[] {
@@ -160,6 +177,61 @@ function loadMediaPlaylists(): MediaPlaylist[] {
 
 function saveMediaPlaylists(playlists: MediaPlaylist[]): void {
   localStorage.setItem(PLAYLISTS_KEY, JSON.stringify(playlists.filter((row) => row.id !== WATCH_LATER_PLAYLIST_ID)))
+}
+
+function embyPlaylistUiId(sourceId: string, serverId: string): string {
+  return `emby-playlist:${sourceId}:${serverId}`
+}
+
+function embyMediaPlaylists(sourceId: string, snapshots: EmbyPlaylistSnapshot[]): MediaPlaylist[] {
+  return snapshots.map((playlist) => ({
+    id: embyPlaylistUiId(sourceId, playlist.id),
+    name: playlist.name,
+    sourceId,
+    serverId: playlist.id
+  }))
+}
+
+function applyEmbyPlaylistMembership(
+  sourceId: string,
+  items: MediaItem[],
+  playlists: EmbyPlaylistSnapshot[]
+): MediaItem[] {
+  const playlistIdsByItemId = new Map<string, string[]>()
+  playlists.forEach((playlist) => {
+    const playlistId = embyPlaylistUiId(sourceId, playlist.id)
+    playlist.items.forEach((item) => {
+      playlistIdsByItemId.set(item.id, [...(playlistIdsByItemId.get(item.id) ?? []), playlistId])
+    })
+  })
+  return items.map((item) => ({
+    ...item,
+    inPlaylist: false,
+    playlistIds: playlistIdsByItemId.get(item.id) ?? []
+  }))
+}
+
+function mergeEmbyUserCollections(
+  snapshot: EmbyLibrarySnapshot,
+  favorites: MediaItem[],
+  playlists: EmbyPlaylistSnapshot[]
+): EmbyLibrarySnapshot {
+  const favoriteIds = new Set(favorites.map((item) => item.id))
+  const itemsById = new Map<string, MediaItem>()
+  const collectionItems = [...snapshot.items, ...favorites, ...playlists.flatMap((playlist) => playlist.items)]
+  collectionItems.forEach((item) => {
+    const existing = itemsById.get(item.id)
+    itemsById.set(item.id, existing ? { ...existing, ...item } : item)
+  })
+
+  return {
+    ...snapshot,
+    items: applyEmbyPlaylistMembership(
+      snapshot.source.id,
+      [...itemsById.values()].map((item) => ({ ...item, favorite: item.favorite || favoriteIds.has(item.id) })),
+      playlists
+    )
+  }
 }
 
 function loadDissolvedCollectionPaths(): Set<string> {
@@ -2023,6 +2095,9 @@ const settingsCopy: Record<UiLanguage, {
   tone: string
   playerTone: string
   playbackHint: string
+  audioOutput: string
+  audioPassthrough: string
+  audioPassthroughCaption: string
   displayPassthrough: string
   displayPassthroughCaption: string
   autoDisplayFormat: string
@@ -2076,6 +2151,9 @@ const settingsCopy: Record<UiLanguage, {
     tone: '色调',
     playerTone: '跟随播放器',
     playbackHint: '播放相关设置仍在播放器侧边栏中调整。',
+    audioOutput: '音频输出',
+    audioPassthrough: '音频直通',
+    audioPassthroughCaption: '全局默认。优先将 AC-3、E-AC-3、TrueHD、DTS 或 DTS-HD 原样交给电视或功放；格式或设备不支持时自动回退 PCM。',
     displayPassthrough: '显示直通',
     displayPassthroughCaption: '全局默认。播放器会根据片源规格选择显示输出，并在停止播放时恢复。',
     autoDisplayFormat: '自动匹配显示格式',
@@ -2129,6 +2207,9 @@ const settingsCopy: Record<UiLanguage, {
     tone: 'Tone',
     playerTone: 'Follow player',
     playbackHint: 'Playback-specific settings remain in the player sidebar.',
+    audioOutput: 'Audio output',
+    audioPassthrough: 'Audio passthrough',
+    audioPassthroughCaption: 'Global default. Prefer sending AC-3, E-AC-3, TrueHD, DTS, or DTS-HD streams to the TV or receiver; automatically fall back to PCM when unavailable.',
     displayPassthrough: 'Display passthrough',
     displayPassthroughCaption: 'Global default. Match the display output to the source and restore it when playback stops.',
     autoDisplayFormat: 'Automatically match display format',
@@ -2189,6 +2270,8 @@ function LibrarySettingsPage(props: {
   onRefreshRateSyncChange: (enabled: boolean) => void
   refreshRateMaximumMultiple: boolean
   onRefreshRateMaximumMultipleChange: (enabled: boolean) => void
+  audioPassthroughEnabled: boolean
+  onAudioPassthroughChange: (enabled: boolean) => void
   displayMetadataPassthrough: boolean
   displayPeakBrightnessNits: number
   autoDisplayFormat: boolean
@@ -2418,6 +2501,25 @@ function LibrarySettingsPage(props: {
 
       <section className="library-settings-panel">
         <div className="library-settings-panel-title">
+          <Volume2 size={16} />
+          <span>{t.audioOutput}</span>
+        </div>
+        <p>{t.audioPassthroughCaption}</p>
+        <label className="library-settings-field">
+          <span>{t.audioPassthrough}</span>
+          <div className="library-setting-options" role="group" aria-label={t.audioPassthrough}>
+            <button className={props.audioPassthroughEnabled ? 'is-selected' : ''} type="button" onClick={() => props.onAudioPassthroughChange(true)}>
+              <span>{t.enabled}</span>
+            </button>
+            <button className={!props.audioPassthroughEnabled ? 'is-selected' : ''} type="button" onClick={() => props.onAudioPassthroughChange(false)}>
+              <span>{t.disabled}</span>
+            </button>
+          </div>
+        </label>
+      </section>
+
+      <section className="library-settings-panel">
+        <div className="library-settings-panel-title">
           <Tv size={16} />
           <span>{t.refreshRateSync}</span>
         </div>
@@ -2532,16 +2634,24 @@ export default function LibraryApp(): JSX.Element {
   const client = useMemo(() => createEmptyLibraryClient(), [])
   const [language, setLanguage] = useState<UiLanguage>(() => getInitialLanguage())
   const [playlists, setPlaylists] = useState<MediaPlaylist[]>(() => loadMediaPlaylists())
+  const [embyPlaylistsBySourceId, setEmbyPlaylistsBySourceId] = useState<Map<string, EmbyPlaylistSnapshot[]>>(() => new Map())
   const [newPlaylistItem, setNewPlaylistItem] = useState<MediaItem | undefined>()
   const [newPlaylistName, setNewPlaylistName] = useState('')
+  const [isPlaylistMutationPending, setIsPlaylistMutationPending] = useState(false)
+  const [libraryConfirmation, setLibraryConfirmation] = useState<LibraryConfirmation | undefined>()
+  const libraryConfirmationResolverRef = useRef<((confirmed: boolean) => void) | undefined>()
+  const libraryConfirmationTitleId = useId()
+  const libraryConfirmationBodyId = useId()
   const [customTitleBarEnabled, setCustomTitleBarEnabled] = useState(false)
   currentLibraryLanguage = language
-  const [displayMetadataPassthrough, setDisplayMetadataPassthrough] = useState(true)
+  const [displayMetadataPassthrough, setDisplayMetadataPassthrough] = useState(false)
   const [displayPeakBrightnessNits, setDisplayPeakBrightnessNits] = useState(0)
   const [autoDisplayFormat, setAutoDisplayFormat] = useState(false)
   const [dolbyVisionSystemPipelineExperimental, setDolbyVisionSystemPipelineExperimental] = useState(false)
   const [windowsHdrEnabled, setWindowsHdrEnabled] = useState(false)
   const [videoPassthroughSettingsLoaded, setVideoPassthroughSettingsLoaded] = useState(false)
+  const [audioPassthroughEnabled, setAudioPassthroughEnabled] = useState(false)
+  const [audioPassthroughSettingsLoaded, setAudioPassthroughSettingsLoaded] = useState(false)
   const [refreshRateSyncEnabled, setRefreshRateSyncEnabled] = useState(() => localStorage.getItem('anvil-player.refresh-rate-sync') === 'true')
   const [refreshRateMaximumMultiple, setRefreshRateMaximumMultiple] = useState(() => localStorage.getItem('anvil-player.refresh-rate-maximum-multiple') !== 'false')
   const { settings: tmdbSettings, status: tmdbStatus, isTesting: isTestingTmdb, updateSettings: updateTmdbSettings, testConnection: testTmdbSettingsConnection } = useTmdbSettings()
@@ -2887,6 +2997,11 @@ export default function LibraryApp(): JSX.Element {
   }, [dolbyVisionSystemPipelineExperimental, videoPassthroughSettingsLoaded, autoDisplayFormat])
 
   useEffect(() => {
+    if (!audioPassthroughSettingsLoaded) return
+    postNativeCommand({ type: 'command', command: 'setGlobalAudioPassthrough', enabled: audioPassthroughEnabled })
+  }, [audioPassthroughEnabled, audioPassthroughSettingsLoaded])
+
+  useEffect(() => {
     saveTrailerSettings(trailerSettings)
   }, [trailerSettings])
 
@@ -3229,6 +3344,9 @@ export default function LibraryApp(): JSX.Element {
         setDolbyVisionSystemPipelineExperimental(message.dolbyVisionSystemPipelineExperimental)
         setWindowsHdrEnabled(message.windowsHdrEnabled)
         setVideoPassthroughSettingsLoaded(true)
+      } else if (message.type === 'globalAudioPassthroughSettings') {
+        setAudioPassthroughEnabled(message.enabled)
+        setAudioPassthroughSettingsLoaded(true)
       } else if (message.type === 'localFolderPicked') {
         void importLocalFolder(message)
       } else if (message.type === 'localFolderScanCompleted') {
@@ -3306,6 +3424,7 @@ export default function LibraryApp(): JSX.Element {
     })
     postNativeCommand({ type: 'command', command: 'requestWindowChrome' })
     postNativeCommand({ type: 'command', command: 'requestGlobalVideoPassthroughSettings' })
+    postNativeCommand({ type: 'command', command: 'requestGlobalAudioPassthroughSettings' })
     return unsubscribe
   }, [activeLibraryViewId, activeNav, activeView, client, debouncedQuery, mediaFilter, selectedId, sortKey, sortOrder, sources])
 
@@ -3337,7 +3456,9 @@ export default function LibraryApp(): JSX.Element {
             command: 'setAllowInsecureCertificates',
             enabled: connection.ignoreCertificateErrors
           })
-          const snapshot = await refreshEmbyLibrary(savedSession, connection.name)
+          const snapshot = await enrichEmbySnapshot(
+            await refreshEmbyLibrary(savedSession, connection.name)
+          )
           await client.upsertSourceItems(snapshot.source, snapshot.items, snapshot.homeSections)
 
           saveSavedEmbyConnection({
@@ -3405,7 +3526,13 @@ export default function LibraryApp(): JSX.Element {
             sortKey,
             sortOrder
           })
-          if (!cancelled) setVisibleItems(rows)
+          if (!cancelled) {
+            setVisibleItems(applyEmbyPlaylistMembership(
+              activeSourceId,
+              rows,
+              embyPlaylistsBySourceId.get(activeSourceId) ?? []
+            ))
+          }
           return
         } catch (error) {
           debugLibraryPlayback(`emby view load failed source=${activeSourceId} view=${activeLibraryViewId} error=${errorText(error)}`)
@@ -3432,7 +3559,13 @@ export default function LibraryApp(): JSX.Element {
                 sortKey,
                 sortOrder
               })
-          if (!cancelled) setVisibleItems(rows)
+          if (!cancelled) {
+            setVisibleItems(applyEmbyPlaylistMembership(
+              activeSourceId,
+              rows,
+              embyPlaylistsBySourceId.get(activeSourceId) ?? []
+            ))
+          }
           return
         } catch (error) {
           debugLibraryPlayback(`emby search failed source=${activeSourceId} error=${errorText(error)}`)
@@ -3455,21 +3588,29 @@ export default function LibraryApp(): JSX.Element {
     return () => {
       cancelled = true
     }
-  }, [activeLibraryViewId, activeNav, activeView, client, debouncedQuery, embySessionsBySourceId, mediaFilter, personSearch, sortKey, sortOrder, sources])
+  }, [activeLibraryViewId, activeNav, activeView, client, debouncedQuery, embyPlaylistsBySourceId, embySessionsBySourceId, mediaFilter, personSearch, sortKey, sortOrder, sources])
 
   useEffect(() => {
+    const selectedItemStillAvailable = Boolean(
+      selectedId && (
+        visibleItems.some((item) => item.id === selectedId) ||
+        continueItems.some((item) => item.id === selectedId) ||
+        allItems.some((item) => item.id === selectedId) ||
+        detailItemsById.has(selectedId)
+      )
+    )
     if (!visibleItems.length) {
-      if (selectedId) setSelectedId('')
+      if (selectedId && !selectedItemStillAvailable) setSelectedId('')
       return
     }
     if (!isDetailOpen) {
       if (selectedId && !visibleItems.some((item) => item.id === selectedId)) setSelectedId('')
       return
     }
-    if (!visibleItems.some((item) => item.id === selectedId)) {
+    if (!selectedItemStillAvailable) {
       setSelectedId(visibleItems[0].id)
     }
-  }, [activeNav, isDetailOpen, selectedId, sources, visibleItems])
+  }, [activeNav, allItems, continueItems, detailItemsById, isDetailOpen, selectedId, sources, visibleItems])
 
   useEffect(() => {
     setListingPage(1)
@@ -3488,12 +3629,20 @@ export default function LibraryApp(): JSX.Element {
     effectiveListingPage * LIBRARY_LISTING_PAGE_SIZE,
     visibleItems.length
   )
+  const remoteMediaPlaylists = useMemo(
+    () => [...embyPlaylistsBySourceId].flatMap(([sourceId, snapshots]) => embyMediaPlaylists(sourceId, snapshots)),
+    [embyPlaylistsBySourceId]
+  )
+  const allMediaPlaylists = useMemo(
+    () => [...playlists, ...remoteMediaPlaylists],
+    [playlists, remoteMediaPlaylists]
+  )
   const classificationGroups = useMemo(() => {
     if (!['playlist', 'genre', 'rating', 'release'].includes(activeNav)) return [] as Array<{ label: string; items: MediaItem[] }>
     const groups = new Map<string, MediaItem[]>()
     visibleItems.forEach((item) => {
       const labels = activeNav === 'playlist'
-        ? playlists.filter((playlist) => item.playlistIds?.includes(playlist.id) || (item.inPlaylist && playlist.id === WATCH_LATER_PLAYLIST_ID)).map((playlist) => playlist.name)
+        ? allMediaPlaylists.filter((playlist) => item.playlistIds?.includes(playlist.id) || (item.inPlaylist && playlist.id === WATCH_LATER_PLAYLIST_ID)).map((playlist) => playlist.name)
         : activeNav === 'genre'
         ? (item.genres.length ? item.genres : ['未分类'])
         : activeNav === 'rating'
@@ -3505,7 +3654,7 @@ export default function LibraryApp(): JSX.Element {
     return activeNav === 'genre' || activeNav === 'playlist'
       ? rows.sort((a, b) => a.label.localeCompare(b.label, 'zh-Hans-CN'))
       : rows.sort((a, b) => (Number.parseFloat(b.label) || -1) - (Number.parseFloat(a.label) || -1))
-  }, [activeNav, playlists, visibleItems])
+  }, [activeNav, allMediaPlaylists, visibleItems])
 
   useEffect(() => {
     if (listingPage > listingPageCount) setListingPage(listingPageCount)
@@ -3545,6 +3694,7 @@ export default function LibraryApp(): JSX.Element {
   const selectedItem = isSourceSetup
     ? undefined
     : visibleItems.find((item) => item.id === selectedId)
+      ?? continueItems.find((item) => item.id === selectedId && (!activeSource || item.sourceId === activeSource.id))
       ?? allItems.find((item) => item.id === selectedId && (!activeSource || item.sourceId === activeSource.id))
       ?? detailItemsById.get(selectedId)
   const selectedDetailItem = selectedItem ? detailItemsById.get(selectedItem.id) ?? selectedItem : undefined
@@ -3742,7 +3892,9 @@ export default function LibraryApp(): JSX.Element {
     async function refreshMissingHomeSections(): Promise<void> {
       try {
         debugLibraryPlayback(`emby home refresh start source=${sourceId}`)
-        const snapshot = await refreshEmbyLibrary(refreshSession, refreshSourceName)
+        const snapshot = await enrichEmbySnapshot(
+          await refreshEmbyLibrary(refreshSession, refreshSourceName)
+        )
         await client.upsertSourceItems(snapshot.source, snapshot.items, snapshot.homeSections)
 
         const saved = savedConnections.find((connection) => connection.sourceId === snapshot.source.id)
@@ -3958,6 +4110,52 @@ export default function LibraryApp(): JSX.Element {
     activateFileSystemSource(source, visibleRows)
   }
 
+  async function enrichEmbySnapshot(snapshot: EmbyLibrarySnapshot): Promise<EmbyLibrarySnapshot> {
+    const [favoritesResult, playlistsResult] = await Promise.allSettled([
+      listEmbyFavoriteItems(snapshot.session),
+      listEmbyPlaylists(snapshot.session)
+    ])
+    const favorites = favoritesResult.status === 'fulfilled'
+      ? favoritesResult.value
+      : allItemsRef.current.filter((item) => item.sourceId === snapshot.source.id && item.favorite)
+    const remotePlaylists = playlistsResult.status === 'fulfilled'
+      ? playlistsResult.value
+      : embyPlaylistsBySourceId.get(snapshot.source.id) ?? []
+
+    if (favoritesResult.status === 'rejected') {
+      debugLibraryPlayback(`emby favorites refresh failed source=${snapshot.source.id} error=${errorText(favoritesResult.reason)}`)
+    }
+    if (playlistsResult.status === 'rejected') {
+      debugLibraryPlayback(`emby playlists refresh failed source=${snapshot.source.id} error=${errorText(playlistsResult.reason)}`)
+    } else {
+      setEmbyPlaylistsBySourceId((current) => {
+        const next = new Map(current)
+        next.set(snapshot.source.id, remotePlaylists)
+        return next
+      })
+    }
+    return mergeEmbyUserCollections(snapshot, favorites, remotePlaylists)
+  }
+
+  async function refreshEmbyPlaylistsForSource(
+    sourceId: string,
+    session: EmbySession
+  ): Promise<EmbyPlaylistSnapshot[]> {
+    const remotePlaylists = await listEmbyPlaylists(session)
+    setEmbyPlaylistsBySourceId((current) => {
+      const next = new Map(current)
+      next.set(sourceId, remotePlaylists)
+      return next
+    })
+    return remotePlaylists
+  }
+
+  function embyPlaylistIdsForItem(sourceId: string, itemId: string, remotePlaylists: EmbyPlaylistSnapshot[]): string[] {
+    return remotePlaylists
+      .filter((playlist) => playlist.items.some((item) => item.id === itemId))
+      .map((playlist) => embyPlaylistUiId(sourceId, playlist.id))
+  }
+
   async function applyUpdatedMediaItem(updatedItem: MediaItem): Promise<void> {
     const source = sourceFor(updatedItem.sourceId)
     const nextAllItems = allItems.some((item) => item.id === updatedItem.id)
@@ -4058,10 +4256,78 @@ export default function LibraryApp(): JSX.Element {
   }
 
   async function updateLibraryFlags(item: MediaItem, flags: Pick<Partial<MediaItem>, 'favorite' | 'inPlaylist'>): Promise<void> {
+    const source = sourceFor(item.sourceId)
+    if (source.kind === 'Emby' && flags.favorite !== undefined) {
+      const session = embySessionsBySourceId.get(item.sourceId)
+      if (!session) {
+        setConnectTone('error')
+        setConnectMessage(language === 'zh' ? 'Emby 会话不可用，请重新连接服务器。' : 'The Emby session is unavailable. Reconnect the server.')
+        return
+      }
+      try {
+        await setEmbyFavorite(session, item.id, flags.favorite)
+        await applyUpdatedMediaItem({ ...item, favorite: flags.favorite })
+        setConnectTone('success')
+        setConnectMessage(flags.favorite
+          ? (language === 'zh' ? `已在 Emby 收藏“${item.title}”。` : `Favorited “${item.title}” on Emby.`)
+          : (language === 'zh' ? `已从 Emby 收藏移除“${item.title}”。` : `Removed “${item.title}” from Emby favorites.`))
+      } catch (error) {
+        setConnectTone('error')
+        setConnectMessage(errorText(error))
+      }
+      return
+    }
     await applyUpdatedMediaItem({ ...item, ...flags })
   }
 
   async function toggleItemPlaylist(item: MediaItem, playlistId: string): Promise<void> {
+    const source = sourceFor(item.sourceId)
+    if (source.kind === 'Emby') {
+      const session = embySessionsBySourceId.get(item.sourceId)
+      const playlist = allMediaPlaylists.find((candidate) =>
+        candidate.id === playlistId && candidate.sourceId === item.sourceId && candidate.serverId
+      )
+      if (!session || !playlist?.serverId || isPlaylistMutationPending) return
+
+      setIsPlaylistMutationPending(true)
+      try {
+        const selected = item.playlistIds?.includes(playlistId) ?? false
+        let remotePlaylists = embyPlaylistsBySourceId.get(item.sourceId) ?? []
+        if (selected) {
+          let entryId = remotePlaylists
+            .find((candidate) => candidate.id === playlist.serverId)
+            ?.entryIdsByItemId[item.id]
+          if (!entryId) {
+            remotePlaylists = await refreshEmbyPlaylistsForSource(item.sourceId, session)
+            entryId = remotePlaylists
+              .find((candidate) => candidate.id === playlist.serverId)
+              ?.entryIdsByItemId[item.id]
+          }
+          if (!entryId) throw new Error('移出 Emby 片单失败：服务器没有返回片单条目 ID')
+          await removeItemFromEmbyPlaylist(session, playlist.serverId, entryId)
+        } else {
+          await addItemToEmbyPlaylist(session, playlist.serverId, item.id)
+        }
+
+        remotePlaylists = await refreshEmbyPlaylistsForSource(item.sourceId, session)
+        await applyUpdatedMediaItem({
+          ...item,
+          inPlaylist: false,
+          playlistIds: embyPlaylistIdsForItem(item.sourceId, item.id, remotePlaylists)
+        })
+        setConnectTone('success')
+        setConnectMessage(selected
+          ? (language === 'zh' ? `已从 Emby 片单“${playlist.name}”移除。` : `Removed from Emby playlist “${playlist.name}”.`)
+          : (language === 'zh' ? `已加入 Emby 片单“${playlist.name}”。` : `Added to Emby playlist “${playlist.name}”.`))
+      } catch (error) {
+        setConnectTone('error')
+        setConnectMessage(errorText(error))
+      } finally {
+        setIsPlaylistMutationPending(false)
+      }
+      return
+    }
+
     const current = new Set(item.playlistIds ?? (item.inPlaylist ? [WATCH_LATER_PLAYLIST_ID] : []))
     if (current.has(playlistId)) current.delete(playlistId)
     else current.add(playlistId)
@@ -4077,11 +4343,41 @@ export default function LibraryApp(): JSX.Element {
     setNewPlaylistName('')
   }
 
-  function confirmCreatePlaylist(): void {
+  async function confirmCreatePlaylist(): Promise<void> {
     const item = newPlaylistItem
     const name = newPlaylistName.trim()
-    if (!item || !name) return
-    if (!name) return
+    if (!item || !name || isPlaylistMutationPending) return
+
+    const source = sourceFor(item.sourceId)
+    if (source.kind === 'Emby') {
+      const session = embySessionsBySourceId.get(item.sourceId)
+      if (!session) {
+        setConnectTone('error')
+        setConnectMessage(language === 'zh' ? 'Emby 会话不可用，请重新连接服务器。' : 'The Emby session is unavailable. Reconnect the server.')
+        return
+      }
+      setIsPlaylistMutationPending(true)
+      try {
+        await createEmbyPlaylist(session, name, item.id)
+        const remotePlaylists = await refreshEmbyPlaylistsForSource(item.sourceId, session)
+        await applyUpdatedMediaItem({
+          ...item,
+          inPlaylist: false,
+          playlistIds: embyPlaylistIdsForItem(item.sourceId, item.id, remotePlaylists)
+        })
+        setNewPlaylistItem(undefined)
+        setNewPlaylistName('')
+        setConnectTone('success')
+        setConnectMessage(language === 'zh' ? `已在 Emby 创建片单“${name}”。` : `Created Emby playlist “${name}”.`)
+      } catch (error) {
+        setConnectTone('error')
+        setConnectMessage(errorText(error))
+      } finally {
+        setIsPlaylistMutationPending(false)
+      }
+      return
+    }
+
     const id = `playlist-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
     const next = [...playlists, { id, name }]
     setPlaylists(next)
@@ -4193,11 +4489,32 @@ export default function LibraryApp(): JSX.Element {
       : `Metadata removed and dissolved into ${members.length} individual videos`)
   }
 
+  function requestLibraryConfirmation(options: LibraryConfirmation): Promise<boolean> {
+    return new Promise((resolve) => {
+      const previousResolver = libraryConfirmationResolverRef.current
+      libraryConfirmationResolverRef.current = resolve
+      setLibraryConfirmation(options)
+      previousResolver?.(false)
+    })
+  }
+
+  function resolveLibraryConfirmation(confirmed: boolean): void {
+    const resolver = libraryConfirmationResolverRef.current
+    libraryConfirmationResolverRef.current = undefined
+    setLibraryConfirmation(undefined)
+    resolver?.(confirmed)
+  }
+
   async function removeMediaFromLibrary(item: MediaItem): Promise<void> {
-    const message = language === 'zh'
-      ? `从媒体库中移除“${item.title}”？\n\n只会删除媒体库展示和缓存，不会删除真实文件。`
-      : `Remove “${item.title}” from the library?\n\nThis only removes the library entry and cache. The real file will not be deleted.`
-    if (!window.confirm(message)) return
+    const confirmed = await requestLibraryConfirmation({
+      title: language === 'zh' ? '从媒体库移除' : 'Remove from library',
+      message: language === 'zh'
+        ? `移除“${item.title}”的媒体库展示和缓存，不会删除真实文件。`
+        : `Remove “${item.title}” from the library and cache. The real file will not be deleted.`,
+      confirmLabel: language === 'zh' ? '移除' : 'Remove',
+      danger: true
+    })
+    if (!confirmed) return
     await client.hideItem(item)
     const visibleRows = await refreshLibraryRowsFor({
       navKey: activeNav,
@@ -4224,7 +4541,15 @@ export default function LibraryApp(): JSX.Element {
   async function clearSourceMetadata(sourceId: string): Promise<void> {
     const source = sourceMap.get(sourceId)
     if (!source || source.kind === 'Emby') return
-    if (!window.confirm(`清空 ${source.name} 的全部 TMDB 元数据？`)) return
+    const confirmed = await requestLibraryConfirmation({
+      title: language === 'zh' ? '清空媒体源元数据' : 'Clear source metadata',
+      message: language === 'zh'
+        ? `清空“${source.name}”的全部 TMDB 元数据，媒体文件和媒体源会保留。`
+        : `Clear all TMDB metadata for “${source.name}”. Media files and the source will be kept.`,
+      confirmLabel: language === 'zh' ? '清空' : 'Clear',
+      danger: true
+    })
+    if (!confirmed) return
     const nextAllItems = allItems.map((item) => item.sourceId === sourceId ? clearLocalMetadata(item) : item)
     const nextSourceItems = nextAllItems.filter((item) => item.sourceId === sourceId)
     await client.upsertSourceItems({ ...source, itemCount: nextSourceItems.length }, nextSourceItems)
@@ -4259,7 +4584,15 @@ export default function LibraryApp(): JSX.Element {
   async function deleteSource(sourceId: string): Promise<void> {
     const source = sourceMap.get(sourceId)
     if (!source) return
-    if (!window.confirm(`删除媒体源 ${source.name}？这会移除该源的缓存条目。`)) return
+    const confirmed = await requestLibraryConfirmation({
+      title: language === 'zh' ? '删除媒体源' : 'Delete media source',
+      message: language === 'zh'
+        ? `删除“${source.name}”并移除该源的缓存条目，不会删除真实媒体文件。`
+        : `Delete “${source.name}” and remove its cached entries. Real media files will not be deleted.`,
+      confirmLabel: language === 'zh' ? '删除' : 'Delete',
+      danger: true
+    })
+    if (!confirmed) return
     if (source.kind !== 'Emby' && scanningLocalFolderSourceIds.has(sourceId)) {
       ignoredLocalFolderScanSourceIdsRef.current.add(sourceId)
     }
@@ -4278,6 +4611,11 @@ export default function LibraryApp(): JSX.Element {
     if (source.kind === 'Emby') {
       removeSavedEmbyConnection(sourceId)
       setEmbySessionsBySourceId((current) => {
+        const next = new Map(current)
+        next.delete(sourceId)
+        return next
+      })
+      setEmbyPlaylistsBySourceId((current) => {
         const next = new Map(current)
         next.delete(sourceId)
         return next
@@ -5208,18 +5546,19 @@ export default function LibraryApp(): JSX.Element {
         command: 'setAllowInsecureCertificates',
         enabled: ignoreCertificateErrors
       })
-      const snapshot = password
+      const rawSnapshot = password
         ? await loadEmbyLibrary({
             serverUrl,
             username,
             password,
             displayName: connectionName
           })
-        : await refreshEmbyLibrary({
+          : await refreshEmbyLibrary({
             ...(editingSession as EmbySession),
             apiBaseUrl: serverUrl,
             userName: username.trim() || editingSession?.userName || ''
           }, connectionName)
+      const snapshot = await enrichEmbySnapshot(rawSnapshot)
       await client.upsertSourceItems(snapshot.source, snapshot.items, snapshot.homeSections)
       saveSavedEmbyConnection({
         sourceId: snapshot.source.id,
@@ -5514,6 +5853,7 @@ export default function LibraryApp(): JSX.Element {
             windowsHdrEnabled={windowsHdrEnabled}
             refreshRateSyncEnabled={refreshRateSyncEnabled}
             refreshRateMaximumMultiple={refreshRateMaximumMultiple}
+            audioPassthroughEnabled={audioPassthroughEnabled}
             tmdbSettings={tmdbSettings}
             tmdbStatus={tmdbStatus}
             isTestingTmdb={isTestingTmdb}
@@ -5525,6 +5865,7 @@ export default function LibraryApp(): JSX.Element {
             onDolbyVisionSystemPipelineExperimentalChange={setDolbyVisionSystemPipelineExperimental}
             onRefreshRateSyncChange={setRefreshRateSyncEnabled}
             onRefreshRateMaximumMultipleChange={setRefreshRateMaximumMultiple}
+            onAudioPassthroughChange={setAudioPassthroughEnabled}
             onTmdbSettingsChange={updateTmdbSettings}
             onTestTmdb={() => { void testTmdbSettingsConnection() }}
             onTrailerSettingsChange={setTrailerSettings}
@@ -6107,7 +6448,9 @@ export default function LibraryApp(): JSX.Element {
           onTrailerIntent={resolveMediaTrailer}
           onRemoveFromLibrary={(item) => { void removeMediaFromLibrary(item) }}
           onToggleFavorite={(item) => { void updateLibraryFlags(item, { favorite: !item.favorite }) }}
-          playlists={playlists}
+          playlists={sourceFor(selectedDetailItem.sourceId).kind === 'Emby'
+            ? remoteMediaPlaylists.filter((playlist) => playlist.sourceId === selectedDetailItem.sourceId)
+            : playlists}
           onTogglePlaylist={(item, playlistId) => { void toggleItemPlaylist(item, playlistId) }}
           onCreatePlaylist={createPlaylistForItem}
           onScrapeIntent={(item) => { void scrapeMediaMetadata(item) }}
@@ -6121,11 +6464,52 @@ export default function LibraryApp(): JSX.Element {
         <EmptyDetail />
       ) : null}
 
+      {libraryConfirmation ? (
+        <div
+          className="library-playlist-dialog-backdrop"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) resolveLibraryConfirmation(false)
+          }}
+        >
+          <section
+            className="library-playlist-dialog library-confirm-dialog"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby={libraryConfirmationTitleId}
+            aria-describedby={libraryConfirmationBodyId}
+            onKeyDown={(event) => {
+              if (event.key === 'Escape') resolveLibraryConfirmation(false)
+            }}
+          >
+            <div className={`library-playlist-dialog-icon ${libraryConfirmation.danger ? 'is-danger' : ''}`}>
+              <Trash2 size={19} />
+            </div>
+            <div className="library-playlist-dialog-copy">
+              <h2 id={libraryConfirmationTitleId}>{libraryConfirmation.title}</h2>
+              <p id={libraryConfirmationBodyId}>{libraryConfirmation.message}</p>
+            </div>
+            <div className="library-playlist-dialog-actions">
+              <button type="button" autoFocus onClick={() => resolveLibraryConfirmation(false)}>
+                {language === 'zh' ? '取消' : 'Cancel'}
+              </button>
+              <button
+                className={libraryConfirmation.danger ? 'is-danger' : 'is-primary'}
+                type="button"
+                onClick={() => resolveLibraryConfirmation(true)}
+              >
+                {libraryConfirmation.confirmLabel}
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
+
       {newPlaylistItem ? (
         <div className="library-playlist-dialog-backdrop" role="presentation" onMouseDown={(event) => {
           if (event.target === event.currentTarget) setNewPlaylistItem(undefined)
         }}>
-          <form className="library-playlist-dialog" onSubmit={(event) => { event.preventDefault(); confirmCreatePlaylist() }}>
+          <form className="library-playlist-dialog" onSubmit={(event) => { event.preventDefault(); void confirmCreatePlaylist() }}>
             <div className="library-playlist-dialog-icon"><ListPlus size={19} /></div>
             <div className="library-playlist-dialog-copy">
               <h2>{language === 'zh' ? '新建片单' : 'New playlist'}</h2>
@@ -6133,11 +6517,11 @@ export default function LibraryApp(): JSX.Element {
             </div>
             <label>
               <span>{language === 'zh' ? '名称' : 'Name'}</span>
-              <input autoFocus value={newPlaylistName} maxLength={40} onChange={(event) => setNewPlaylistName(event.target.value)} placeholder={language === 'zh' ? '周末电影' : 'Weekend movies'} />
+              <input autoFocus disabled={isPlaylistMutationPending} value={newPlaylistName} maxLength={40} onChange={(event) => setNewPlaylistName(event.target.value)} placeholder={language === 'zh' ? '周末电影' : 'Weekend movies'} />
             </label>
             <div className="library-playlist-dialog-actions">
-              <button type="button" onClick={() => setNewPlaylistItem(undefined)}>{language === 'zh' ? '取消' : 'Cancel'}</button>
-              <button className="is-primary" type="submit" disabled={!newPlaylistName.trim()}>{language === 'zh' ? '创建' : 'Create'}</button>
+              <button type="button" disabled={isPlaylistMutationPending} onClick={() => setNewPlaylistItem(undefined)}>{language === 'zh' ? '取消' : 'Cancel'}</button>
+              <button className="is-primary" type="submit" disabled={!newPlaylistName.trim() || isPlaylistMutationPending}>{isPlaylistMutationPending ? (language === 'zh' ? '同步中…' : 'Syncing…') : (language === 'zh' ? '创建' : 'Create')}</button>
             </div>
           </form>
         </div>

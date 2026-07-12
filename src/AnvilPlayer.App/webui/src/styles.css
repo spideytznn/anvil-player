@@ -2154,3 +2154,19 @@ input:focus-visible {
 *.is-scrollbar-active::-webkit-scrollbar-track:vertical {
   background-color: transparent;
 }
+.audio-passthrough-toggle:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.audio-passthrough-status {
+  display: block;
+  margin-top: 7px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.audio-passthrough-status.is-active {
+  color: #9fddba;
+}

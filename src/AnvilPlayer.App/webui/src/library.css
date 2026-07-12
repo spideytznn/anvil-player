@@ -3910,6 +3910,12 @@
   background: var(--library-panel-soft);
 }
 
+.library-playlist-dialog-icon.is-danger {
+  border-color: rgba(240, 124, 114, 0.4);
+  background: rgba(102, 35, 31, 0.2);
+  color: #f49a91;
+}
+
 .library-playlist-dialog label > span {
   color: var(--library-muted);
   font-size: 11px;
@@ -3978,6 +3984,18 @@
 .library-playlist-dialog-actions button.is-primary {
   border-color: transparent;
   background: var(--library-accent);
+  color: #fff;
+}
+
+.library-playlist-dialog-actions button.is-danger {
+  border-color: rgba(240, 124, 114, 0.58);
+  background: rgba(118, 41, 36, 0.42);
+  color: #ffc0b9;
+}
+
+.library-playlist-dialog-actions button.is-danger:hover {
+  border-color: rgba(255, 151, 140, 0.82);
+  background: rgba(145, 51, 44, 0.62);
   color: #fff;
 }
 

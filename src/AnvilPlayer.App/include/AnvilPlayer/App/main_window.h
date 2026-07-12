@@ -87,6 +87,7 @@ public:
     void RefreshUiLanguage() const { PostWebUiState(true); }
     void ApplyGlobalRefreshRatePreferences();
     void ApplyGlobalVideoPassthroughPreferences();
+    void ApplyGlobalAudioPassthroughPreferences();
 
 private:
     static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
@@ -156,6 +157,8 @@ private:
     void InvalidateFullscreenOverlay();
     bool UsesGpuFullscreenUiOverlay() const;
     void QueueGpuFullscreenUiOverlay(bool forceImmediatePresent = false);
+    void QueueGpuFullscreenSubtitleMenuOverlay(bool forceImmediatePresent = false);
+    void UpdateGpuFullscreenSubtitleMenuPresentation(bool forceImmediatePresent = false);
     void InvalidateHdrToneCurveEditor() const;
 
     const anvil::playback::CapabilityReport& CachedCapabilities();
@@ -204,6 +207,9 @@ private:
     void EnsureHdrToneCurveWindow();
     void UpdateHdrToneCurveFloatingLayout();
     void UpdateSubtitleMenuLayout();
+    RECT SubtitleMenuFooterRect() const;
+    RECT SubtitleMenuToggleRect() const;
+    int SubtitleMenuStyleRowHeight() const;
     int HitButton(POINT point) const;
     int HitInspectorPathItem(POINT point) const;
 
@@ -231,9 +237,11 @@ private:
     bool IsPointInSubtitleMenu(POINT point) const;
     enum class SubtitleMenuAction {
         None,
+        ToggleMenu,
         TabAudio,
         TabSubtitles,
         TabDanmaku,
+        AudioPassthroughToggle,
         DelayDown,
         DelayUp,
         AddFile,
@@ -342,6 +350,7 @@ private:
     void SeekToPosition(std::chrono::milliseconds position);
     void SeekFromProgress(int x);
     void ApplyAudioSelection(int selectedTrackIndex);
+    void SetCurrentAudioPassthrough(bool enabled);
     void ApplySubtitleSelection(int selectedTrackIndex);
     void ApplySubtitleDelayDelta(int deltaMs);
     void ApplySubtitleFontScaleDelta(double delta);
@@ -445,6 +454,7 @@ private:
     std::unique_ptr<PlaybackSupervisor> playbackSupervisor_;
     anvil::playback::CapabilityReport cachedCapabilities_;
     bool capabilitiesCached_ = false;
+    bool audioPassthroughOverridden_ = false;
     EmbeddedFfplayPlayer playbackPlayer_;
     ExternalVideoDecoder videoDecoder_;
     WasapiAudioPlayer audioPlayer_;
@@ -463,7 +473,9 @@ private:
     bool videoHostReady_ = false;
     bool videoHostInitializationFailureHandled_ = false;
     bool gpuFullscreenUiOverlayActive_ = false;
+    bool gpuFullscreenSubtitleMenuOverlayActive_ = false;
     bool gpuFullscreenUiOverlayLogged_ = false;
+    bool videoHostHasGpuOverlayRegion_ = false;
     bool webUiRequested_ = true;
     bool webUiActive_ = false;
     bool uiThreadResourcesReleased_ = false;

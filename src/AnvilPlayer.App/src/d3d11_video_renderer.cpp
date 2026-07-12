@@ -1155,7 +1155,7 @@ void D3D11VideoRenderer::ConfigureSubtitleSettings(const anvil::playback::Subtit
 }
 
 void D3D11VideoRenderer::ConfigureUiOverlay(std::shared_ptr<const D3D11UiOverlayBitmap> overlay,
-                                            const bool requestImmediatePresent) {
+                                              const bool requestImmediatePresent) {
     {
         std::lock_guard lock(commandMutex_);
         if (!acceptingCommands_) {
@@ -1165,10 +1165,56 @@ void D3D11VideoRenderer::ConfigureUiOverlay(std::shared_ptr<const D3D11UiOverlay
         // edge-triggered state. A hover/geometry update arriving after a reveal
         // must not downgrade the reveal's immediate-present request before the
         // render thread consumes the batch.
+          const bool mergedImmediatePresent =
+              requestImmediatePresent ||
+              (pendingUiOverlays_[kTransportUiOverlaySlot].has_value() &&
+               pendingUiOverlays_[kTransportUiOverlaySlot]->requestImmediatePresent);
+          pendingUiOverlays_[kTransportUiOverlaySlot] =
+              PendingUiOverlay{std::move(overlay), mergedImmediatePresent};
+      }
+      commandCv_.notify_one();
+  }
+
+void D3D11VideoRenderer::ConfigureUiMenuOverlay(std::shared_ptr<const D3D11UiOverlayBitmap> overlay,
+                                                const bool requestImmediatePresent) {
+    {
+        std::lock_guard lock(commandMutex_);
+        if (!acceptingCommands_) {
+            return;
+        }
         const bool mergedImmediatePresent =
             requestImmediatePresent ||
-            (pendingUiOverlay_.has_value() && pendingUiOverlay_->requestImmediatePresent);
-        pendingUiOverlay_ = PendingUiOverlay{std::move(overlay), mergedImmediatePresent};
+            (pendingUiOverlays_[kMenuUiOverlaySlot].has_value() &&
+             pendingUiOverlays_[kMenuUiOverlaySlot]->requestImmediatePresent);
+        pendingUiOverlays_[kMenuUiOverlaySlot] =
+            PendingUiOverlay{std::move(overlay), mergedImmediatePresent};
+    }
+    commandCv_.notify_one();
+}
+
+void D3D11VideoRenderer::ConfigureUiMenuOverlayPresentation(
+    const int destinationX,
+    const int destinationY,
+    const int displayWidth,
+    const int displayHeight,
+    const float opacity,
+    const bool requestImmediatePresent) {
+    {
+        std::lock_guard lock(commandMutex_);
+        if (!acceptingCommands_) {
+            return;
+        }
+        const bool mergedImmediatePresent =
+            requestImmediatePresent ||
+            (pendingUiMenuOverlayPresentation_.has_value() &&
+             pendingUiMenuOverlayPresentation_->requestImmediatePresent);
+        pendingUiMenuOverlayPresentation_ = PendingUiOverlayPresentation{
+            destinationX,
+            destinationY,
+            displayWidth,
+            displayHeight,
+            std::clamp(opacity, 0.0f, 1.0f),
+            mergedImmediatePresent};
     }
     commandCv_.notify_one();
 }
@@ -1365,7 +1411,9 @@ bool D3D11VideoRenderer::HasPendingWorkLocked() const {
            pendingResize_ ||
            pendingColorPipeline_.has_value() ||
            pendingSubtitleSettings_.has_value() ||
-           pendingUiOverlay_.has_value() ||
+           pendingUiOverlays_[kTransportUiOverlaySlot].has_value() ||
+           pendingUiOverlays_[kMenuUiOverlaySlot].has_value() ||
+           pendingUiMenuOverlayPresentation_.has_value() ||
            pendingDiagnosticsEnabled_.has_value() ||
            pendingResetStats_ ||
            pendingClear_;
@@ -1476,7 +1524,10 @@ void D3D11VideoRenderer::RenderThreadMain() {
             pendingResize_ = false;
             pendingColorPipeline_.reset();
             pendingSubtitleSettings_.reset();
-            pendingUiOverlay_.reset();
+            for (auto& pendingUiOverlay : pendingUiOverlays_) {
+                pendingUiOverlay.reset();
+            }
+            pendingUiMenuOverlayPresentation_.reset();
             pendingDiagnosticsEnabled_.reset();
             pendingResetStats_ = false;
             pendingClear_ = false;
@@ -1536,7 +1587,8 @@ void D3D11VideoRenderer::RenderThreadMain() {
         D3D11QueuedVideoFrame* frame = nullptr;
         std::optional<PendingColorPipeline> colorPipeline;
         std::optional<anvil::playback::SubtitleSettings> subtitleSettings;
-        std::optional<PendingUiOverlay> uiOverlay;
+        std::array<std::optional<PendingUiOverlay>, kUiOverlaySlotCount> uiOverlays;
+        std::optional<PendingUiOverlayPresentation> uiMenuOverlayPresentation;
         std::optional<bool> diagnosticsEnabled;
         bool resize = false;
         UINT resizeWidth = 1;
@@ -1561,8 +1613,12 @@ void D3D11VideoRenderer::RenderThreadMain() {
             pendingColorPipeline_.reset();
             subtitleSettings = std::move(pendingSubtitleSettings_);
             pendingSubtitleSettings_.reset();
-            uiOverlay = std::move(pendingUiOverlay_);
-            pendingUiOverlay_.reset();
+            for (std::size_t slotIndex = 0; slotIndex < kUiOverlaySlotCount; ++slotIndex) {
+                uiOverlays[slotIndex] = std::move(pendingUiOverlays_[slotIndex]);
+                pendingUiOverlays_[slotIndex].reset();
+            }
+            uiMenuOverlayPresentation = std::move(pendingUiMenuOverlayPresentation_);
+            pendingUiMenuOverlayPresentation_.reset();
             diagnosticsEnabled = pendingDiagnosticsEnabled_;
             pendingDiagnosticsEnabled_.reset();
             resize = pendingResize_;
@@ -1581,9 +1637,30 @@ void D3D11VideoRenderer::RenderThreadMain() {
         if (subtitleSettings) {
             ApplySubtitleConfiguration(*subtitleSettings);
         }
-        if (uiOverlay) {
-            activeUiOverlay_ = std::move(uiOverlay->overlay);
-            uiPresentRequired_ = uiPresentRequired_ || uiOverlay->requestImmediatePresent;
+        for (std::size_t slotIndex = 0; slotIndex < kUiOverlaySlotCount; ++slotIndex) {
+            if (!uiOverlays[slotIndex]) {
+                continue;
+            }
+            auto& slot = uiOverlaySlots_[slotIndex];
+            slot.active = std::move(uiOverlays[slotIndex]->overlay);
+            if (slot.active) {
+                slot.destinationX = slot.active->destinationX;
+                slot.destinationY = slot.active->destinationY;
+                slot.displayWidth = slot.active->width;
+                slot.displayHeight = slot.active->height;
+                slot.opacity = slot.active->opacity;
+            }
+            uiPresentRequired_ = uiPresentRequired_ || uiOverlays[slotIndex]->requestImmediatePresent;
+        }
+        if (uiMenuOverlayPresentation) {
+            auto& menuSlot = uiOverlaySlots_[kMenuUiOverlaySlot];
+            menuSlot.destinationX = uiMenuOverlayPresentation->destinationX;
+            menuSlot.destinationY = uiMenuOverlayPresentation->destinationY;
+            menuSlot.displayWidth = uiMenuOverlayPresentation->displayWidth;
+            menuSlot.displayHeight = uiMenuOverlayPresentation->displayHeight;
+            menuSlot.opacity = uiMenuOverlayPresentation->opacity;
+            uiPresentRequired_ = uiPresentRequired_ ||
+                                 uiMenuOverlayPresentation->requestImmediatePresent;
         }
         if (diagnosticsEnabled) {
             SetDiagnosticsEnabledOnRenderThread(*diagnosticsEnabled);
@@ -4961,29 +5038,30 @@ void D3D11VideoRenderer::DrawSubtitleOverlay() {
     context_->PSSetConstantBuffers(0, 1, nullConstants);
 }
 
-bool D3D11VideoRenderer::UpdateUiOverlayTexture() {
-    if (!device_ || !context_ || !activeUiOverlay_ ||
-        activeUiOverlay_->width <= 0 || activeUiOverlay_->height <= 0 ||
-        !activeUiOverlay_->bgraPremultiplied ||
-        activeUiOverlay_->bgraPremultiplied->size() <
-            static_cast<std::size_t>(activeUiOverlay_->width) *
-                static_cast<std::size_t>(activeUiOverlay_->height) * 4) {
+bool D3D11VideoRenderer::UpdateUiOverlayTexture(const std::size_t slotIndex) {
+    auto& slot = uiOverlaySlots_[slotIndex];
+    if (!device_ || !context_ || !slot.active ||
+        slot.active->width <= 0 || slot.active->height <= 0 ||
+        !slot.active->bgraPremultiplied ||
+        slot.active->bgraPremultiplied->size() <
+            static_cast<std::size_t>(slot.active->width) *
+                static_cast<std::size_t>(slot.active->height) * 4) {
         return false;
     }
-    if (uploadedUiOverlay_ == activeUiOverlay_ && uiOverlaySrv_) {
+    if (slot.uploaded == slot.active && slot.srv) {
         return true;
     }
 
-    const bool sizeChanged = !uiOverlayTexture_ || !uiOverlaySrv_ ||
-                             !uploadedUiOverlay_ ||
-                             uploadedUiOverlay_->width != activeUiOverlay_->width ||
-                             uploadedUiOverlay_->height != activeUiOverlay_->height;
+    const bool sizeChanged = !slot.texture || !slot.srv ||
+                             !slot.uploaded ||
+                             slot.uploaded->width != slot.active->width ||
+                             slot.uploaded->height != slot.active->height;
     if (sizeChanged) {
-        uiOverlaySrv_.Reset();
-        uiOverlayTexture_.Reset();
+        slot.srv.Reset();
+        slot.texture.Reset();
         D3D11_TEXTURE2D_DESC desc{};
-        desc.Width = static_cast<UINT>(activeUiOverlay_->width);
-        desc.Height = static_cast<UINT>(activeUiOverlay_->height);
+        desc.Width = static_cast<UINT>(slot.active->width);
+        desc.Height = static_cast<UINT>(slot.active->height);
         desc.MipLevels = 1;
         desc.ArraySize = 1;
         desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -4991,36 +5069,37 @@ bool D3D11VideoRenderer::UpdateUiOverlayTexture() {
         desc.Usage = D3D11_USAGE_DYNAMIC;
         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-        if (FAILED(device_->CreateTexture2D(&desc, nullptr, &uiOverlayTexture_)) ||
-            FAILED(device_->CreateShaderResourceView(uiOverlayTexture_.Get(), nullptr, &uiOverlaySrv_))) {
-            uiOverlayTexture_.Reset();
-            uiOverlaySrv_.Reset();
+        if (FAILED(device_->CreateTexture2D(&desc, nullptr, &slot.texture)) ||
+            FAILED(device_->CreateShaderResourceView(slot.texture.Get(), nullptr, &slot.srv))) {
+            slot.texture.Reset();
+            slot.srv.Reset();
             return false;
         }
     }
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
-    if (FAILED(context_->Map(uiOverlayTexture_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+    if (FAILED(context_->Map(slot.texture.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
         return false;
     }
-    const int sourcePitch = activeUiOverlay_->width * 4;
-    for (int y = 0; y < activeUiOverlay_->height; ++y) {
+    const int sourcePitch = slot.active->width * 4;
+    for (int y = 0; y < slot.active->height; ++y) {
         std::memcpy(static_cast<uint8_t*>(mapped.pData) + static_cast<std::size_t>(mapped.RowPitch) * y,
-                    activeUiOverlay_->bgraPremultiplied->data() + static_cast<std::size_t>(sourcePitch) * y,
+                    slot.active->bgraPremultiplied->data() + static_cast<std::size_t>(sourcePitch) * y,
                     static_cast<std::size_t>(sourcePitch));
     }
-    context_->Unmap(uiOverlayTexture_.Get(), 0);
-    uploadedUiOverlay_ = activeUiOverlay_;
+    context_->Unmap(slot.texture.Get(), 0);
+    slot.uploaded = slot.active;
     return true;
 }
 
-bool D3D11VideoRenderer::DrawUiOverlay() {
+bool D3D11VideoRenderer::DrawUiOverlaySlot(const std::size_t slotIndex) {
+    auto& slot = uiOverlaySlots_[slotIndex];
     // A null overlay is a valid UI transaction: presenting the cached video
     // frame removes the previously composited controls.
-    if (!activeUiOverlay_) {
+    if (!slot.active) {
         return true;
     }
-    if (!UpdateUiOverlayTexture() || !context_ || !uiOverlaySrv_ ||
+    if (!UpdateUiOverlayTexture(slotIndex) || !context_ || !slot.srv ||
         !ActiveRgbRenderTarget() || !subtitleBlend_ || !vs_ || !psSubtitle_ || !subtitleConstants_) {
         return false;
     }
@@ -5032,16 +5111,16 @@ bool D3D11VideoRenderer::DrawUiOverlay() {
     ID3D11RenderTargetView* activeRenderTarget = ActiveRgbRenderTarget();
     context_->OMSetRenderTargets(1, &activeRenderTarget, nullptr);
 
-    const float left = std::clamp(static_cast<float>(activeUiOverlay_->destinationX),
+    const float left = std::clamp(static_cast<float>(slot.destinationX),
                                   0.0f,
                                   viewport_.Width);
-    const float top = std::clamp(static_cast<float>(activeUiOverlay_->destinationY),
+    const float top = std::clamp(static_cast<float>(slot.destinationY),
                                  0.0f,
                                  viewport_.Height);
-    const float right = std::clamp(left + static_cast<float>(activeUiOverlay_->width),
+    const float right = std::clamp(left + static_cast<float>(slot.displayWidth),
                                    left,
                                    viewport_.Width);
-    const float bottom = std::clamp(top + static_cast<float>(activeUiOverlay_->height),
+    const float bottom = std::clamp(top + static_cast<float>(slot.displayHeight),
                                     top,
                                     viewport_.Height);
     if (right <= left || bottom <= top) {
@@ -5057,8 +5136,8 @@ bool D3D11VideoRenderer::DrawUiOverlay() {
     constants.hlgUi = hlgUi ? 1.0f : 0.0f;
     constants.hlgFullRange =
         activeColorSpace_ == DXGI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020 ? 1.0f : 0.0f;
-    constants.alphaFromRgb = activeUiOverlay_->alphaFromRgb ? 1.0f : 0.0f;
-    constants.overlayOpacity = activeUiOverlay_->opacity;
+    constants.alphaFromRgb = slot.active->alphaFromRgb ? 1.0f : 0.0f;
+    constants.overlayOpacity = slot.opacity;
     context_->UpdateSubresource(subtitleConstants_.Get(), 0, nullptr, &constants, 0, 0);
     ID3D11Buffer* constantBuffers[1] = {subtitleConstants_.Get()};
     context_->PSSetConstantBuffers(0, 1, constantBuffers);
@@ -5074,7 +5153,7 @@ bool D3D11VideoRenderer::DrawUiOverlay() {
     context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     context_->VSSetShader(vs_.Get(), nullptr, 0);
     context_->PSSetShader(psSubtitle_.Get(), nullptr, 0);
-    context_->PSSetShaderResources(0, 1, uiOverlaySrv_.GetAddressOf());
+    context_->PSSetShaderResources(0, 1, slot.srv.GetAddressOf());
     context_->PSSetSamplers(0, 1, sampler_.GetAddressOf());
     float blendFactor[4] = {};
     context_->OMSetBlendState(subtitleBlend_.Get(), blendFactor, 0xffffffff);
@@ -5084,11 +5163,21 @@ bool D3D11VideoRenderer::DrawUiOverlay() {
     context_->PSSetShaderResources(0, 1, nullView);
     ID3D11Buffer* nullConstants[1] = {};
     context_->PSSetConstantBuffers(0, 1, nullConstants);
-    if (!uiOverlayLogged_) {
-        uiOverlayLogged_ = true;
-        LogInfo(L"ui_overlay composited=true target=video_backbuffer size=" +
-                std::to_wstring(activeUiOverlay_->width) + L"x" +
-                std::to_wstring(activeUiOverlay_->height));
+    if (!slot.logged) {
+        slot.logged = true;
+        LogInfo(L"ui_overlay composited=true target=video_backbuffer slot=" +
+                std::wstring(slotIndex == kMenuUiOverlaySlot ? L"menu" : L"transport") +
+                L" size=" + std::to_wstring(slot.active->width) + L"x" +
+                std::to_wstring(slot.active->height));
+    }
+    return true;
+}
+
+bool D3D11VideoRenderer::DrawUiOverlay() {
+    for (std::size_t slotIndex = 0; slotIndex < kUiOverlaySlotCount; ++slotIndex) {
+        if (!DrawUiOverlaySlot(slotIndex)) {
+            return false;
+        }
     }
     return true;
 }
@@ -5102,10 +5191,18 @@ void D3D11VideoRenderer::ReleaseAll() {
     subtitleTextureCache_.clear();
     subtitleSrv_.Reset();
     subtitleTexture_.Reset();
-    uiOverlaySrv_.Reset();
-    uiOverlayTexture_.Reset();
-    activeUiOverlay_.reset();
-    uploadedUiOverlay_.reset();
+    for (auto& slot : uiOverlaySlots_) {
+        slot.srv.Reset();
+        slot.texture.Reset();
+        slot.active.reset();
+        slot.uploaded.reset();
+        slot.destinationX = 0;
+        slot.destinationY = 0;
+        slot.displayWidth = 0;
+        slot.displayHeight = 0;
+        slot.opacity = 1.0f;
+        slot.logged = false;
+    }
     uiPresentRequired_ = false;
     hwSrvUV_.Reset();
     hwSrvY_.Reset();

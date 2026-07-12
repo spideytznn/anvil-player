@@ -41,6 +41,11 @@ export interface PlayerState {
   dolbyVisionMedia: boolean
   cmv4Available: boolean
   cmv4Enabled: boolean
+  audioPassthroughRequested: boolean
+  audioPassthroughActive: boolean
+  audioPassthroughReason: string
+  audioPassthroughCodec: string
+  audioPassthroughOutput: string
   audioSelectedTrack: number
   subtitleSelectedTrack: number
   subtitleDelayMs: number
@@ -195,6 +200,7 @@ export type NativeMessage =
   | MediaDetailsProbeFailed
   | { type: 'windowChrome'; customTitleBar: boolean }
   | { type: 'globalVideoPassthroughSettings'; autoDisplayFormat: boolean; displayMetadataPassthrough: boolean; dolbyVisionSystemPipelineExperimental: boolean; windowsHdrEnabled: boolean; displayPeakBrightnessNits: number }
+  | { type: 'globalAudioPassthroughSettings'; enabled: boolean }
   | { type: 'deliverEmbyPlaybackReport'; report: unknown }
   | { type: 'command'; command: 'localPlaybackProgress'; path: string; positionMs: number; durationMs: number; playbackState: string }
   | { type: 'bilibiliTrailerSearchCompleted'; requestId: string; response: unknown }
@@ -255,6 +261,8 @@ export type NativeCommand =
   | { type: 'command'; command: 'setGlobalDisplayMetadataPassthrough'; enabled: boolean }
   | { type: 'command'; command: 'setGlobalDisplayPeakBrightness'; peakNits: number }
   | { type: 'command'; command: 'setGlobalDolbyVisionSystemPipelineExperimental'; enabled: boolean }
+  | { type: 'command'; command: 'requestGlobalAudioPassthroughSettings' }
+  | { type: 'command'; command: 'setGlobalAudioPassthrough'; enabled: boolean }
   | { type: 'command'; command: 'setUiLanguage'; language: 'en' | 'zh' }
   | { type: 'command'; command: 'showFullscreenTransport' }
   | { type: 'command'; command: 'subtitleMenu' }
@@ -271,6 +279,7 @@ export type NativeCommand =
   | { type: 'command'; command: 'setDisplayPeakBrightness'; peakNits: number }
   | { type: 'command'; command: 'setDisplayMetadataPassthrough'; enabled: boolean }
   | { type: 'command'; command: 'setDolbyVisionSystemPipelineExperimental'; enabled: boolean }
+  | { type: 'command'; command: 'setCurrentAudioPassthrough'; enabled: boolean }
   | { type: 'command'; command: 'setAudioTrack'; index: number }
   | { type: 'command'; command: 'setSubtitleTrack'; index: number }
   | { type: 'command'; command: 'setSubtitleDelay'; delayMs: number }
@@ -368,12 +377,17 @@ export const EMPTY_STATE: PlayerState = {
   hdrDisplayPeakDetectedNits: 0,
   hdrDisplayPeakEffectiveNits: 1000,
   autoDisplayFormat: false,
-  displayMetadataPassthrough: true,
+  displayMetadataPassthrough: false,
   dolbyVisionSystemPipelineExperimental: false,
   dolbyVisionSystemPipelineAvailable: false,
   dolbyVisionMedia: false,
   cmv4Available: false,
   cmv4Enabled: false,
+  audioPassthroughRequested: false,
+  audioPassthroughActive: false,
+  audioPassthroughReason: 'disabled',
+  audioPassthroughCodec: '',
+  audioPassthroughOutput: 'wasapi shared pcm',
   audioSelectedTrack: -2,
   subtitleSelectedTrack: -2,
   subtitleDelayMs: 0,

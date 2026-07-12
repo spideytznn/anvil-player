@@ -388,14 +388,20 @@ void MainWindow::OnLeftButtonDown(const int x, const int y) {
                    std::wstring(ContainsPoint(transportBar_, point) ? L"true" : L"false"));
     }
 
-    if (BeginSettingsScrollDrag(point)) {
-        return;
-    }
-    if (BeginVolumeDrag(point)) {
-        return;
+    // The fullscreen GPU menu is composited over the transport, but pointer
+    // input still arrives through the shared video host. Do not let controls
+    // underneath the visible menu steal the press before menu hit-testing.
+    const bool subtitleMenuVisible = subtitleMenuAmount_ > 0.01 || subtitleMenuTarget_ > 0.0;
+    if (!subtitleMenuVisible) {
+        if (BeginSettingsScrollDrag(point)) {
+            return;
+        }
+        if (BeginVolumeDrag(point)) {
+            return;
+        }
     }
 
-    if (subtitleMenuAmount_ > 0.01 || subtitleMenuTarget_ > 0.0) {
+    if (subtitleMenuVisible) {
         const int item = HitSubtitleMenuItem(point);
         if (item >= 0) {
             if (subtitleMenuPage_ == SubtitleMenuPage::Audio) {
@@ -414,6 +420,9 @@ void MainWindow::OnLeftButtonDown(const int x, const int y) {
             return;
         }
         switch (HitSubtitleMenuAction(point)) {
+        case SubtitleMenuAction::ToggleMenu:
+            HideSubtitleMenu();
+            return;
         case SubtitleMenuAction::TabAudio:
             subtitleMenuPage_ = SubtitleMenuPage::Audio;
             hoveredSubtitleMenuItem_ = -1;
@@ -421,6 +430,7 @@ void MainWindow::OnLeftButtonDown(const int x, const int y) {
             MarkLayoutDirty();
             EnsureLayout();
             InvalidateTransportArea();
+            InvalidateFullscreenOverlay();
             return;
         case SubtitleMenuAction::TabSubtitles:
             subtitleMenuPage_ = SubtitleMenuPage::Subtitles;
@@ -429,6 +439,7 @@ void MainWindow::OnLeftButtonDown(const int x, const int y) {
             MarkLayoutDirty();
             EnsureLayout();
             InvalidateTransportArea();
+            InvalidateFullscreenOverlay();
             return;
         case SubtitleMenuAction::TabDanmaku:
             subtitleMenuPage_ = SubtitleMenuPage::Danmaku;
@@ -437,7 +448,15 @@ void MainWindow::OnLeftButtonDown(const int x, const int y) {
             MarkLayoutDirty();
             EnsureLayout();
             InvalidateTransportArea();
+            InvalidateFullscreenOverlay();
             return;
+        case SubtitleMenuAction::AudioPassthroughToggle: {
+            const auto snapshot = controller_.Snapshot();
+            if (snapshot.media.has_value() && snapshot.media->hasAudio) {
+                SetCurrentAudioPassthrough(!controller_.Settings().audio.passthroughPreferred);
+            }
+            return;
+        }
         case SubtitleMenuAction::DelayDown:
             ApplySubtitleDelayDelta(-100);
             return;
@@ -808,7 +827,9 @@ int MainWindow::HitSubtitleMenuItem(const POINT point) const {
     const int headerHeight = Scale(62);
     const int listGap = Scale(8);
     const int itemHeight = Scale(42);
-    const int y = point.y - subtitleMenu_.top - headerHeight - listGap;
+    const int audioPassthroughHeight = Scale(64);
+    const int audioOffset = subtitleMenuPage_ == SubtitleMenuPage::Audio ? audioPassthroughHeight : 0;
+    const int y = point.y - subtitleMenu_.top - headerHeight - listGap - audioOffset;
     if (y < 0) {
         return -1;
     }
@@ -831,16 +852,25 @@ MainWindow::SubtitleMenuAction MainWindow::HitSubtitleMenuAction(const POINT poi
         return SubtitleMenuAction::None;
     }
 
+    const RECT toggle = SubtitleMenuToggleRect();
+    if (ContainsPoint(toggle, point)) {
+        return SubtitleMenuAction::ToggleMenu;
+    }
+    const RECT footer = SubtitleMenuFooterRect();
+    if (ContainsPoint(footer, point)) {
+        return SubtitleMenuAction::None;
+    }
+
     const int headerHeight = Scale(62);
     const RECT header = MakeRect(subtitleMenu_.left,
                                  subtitleMenu_.top,
                                  subtitleMenu_.right,
                                  subtitleMenu_.top + headerHeight);
-    const int tabGap = Scale(8);
-    const RECT tabRail = MakeRect(header.left + Scale(14),
-                                  header.top + Scale(12),
-                                  header.right - Scale(14),
-                                  header.bottom - Scale(14));
+    const int tabGap = Scale(6);
+    const RECT tabRail = MakeRect(header.left + Scale(8),
+                                  header.top + Scale(8),
+                                  header.right - Scale(8),
+                                  header.bottom - Scale(8));
     const int tabWidth = (RectWidth(tabRail) - tabGap * 2) / 3;
     for (int index = 0; index < 3; ++index) {
         const RECT tab = MakeRect(tabRail.left + index * (tabWidth + tabGap),
@@ -851,10 +881,10 @@ MainWindow::SubtitleMenuAction MainWindow::HitSubtitleMenuAction(const POINT poi
             continue;
         }
         if (index == 0) {
-            return SubtitleMenuAction::TabAudio;
+            return SubtitleMenuAction::TabSubtitles;
         }
         if (index == 1) {
-            return SubtitleMenuAction::TabSubtitles;
+            return SubtitleMenuAction::TabAudio;
         }
         return SubtitleMenuAction::TabDanmaku;
     }
@@ -864,7 +894,7 @@ MainWindow::SubtitleMenuAction MainWindow::HitSubtitleMenuAction(const POINT poi
     const int listBottomGap = Scale(6);
     const int delayHeight = Scale(56);
     const int actionHeight = Scale(44);
-    const int styleHeight = Scale(48);
+    const int styleHeight = SubtitleMenuStyleRowHeight();
 
     if (subtitleMenuPage_ == SubtitleMenuPage::Danmaku) {
         int rowTop = subtitleMenu_.top + headerHeight + Scale(8);
@@ -906,6 +936,13 @@ MainWindow::SubtitleMenuAction MainWindow::HitSubtitleMenuAction(const POINT poi
     }
 
     if (subtitleMenuPage_ == SubtitleMenuPage::Audio) {
+        const RECT passthroughRow = MakeRect(subtitleMenu_.left + Scale(14),
+                                             subtitleMenu_.top + headerHeight + Scale(10),
+                                             subtitleMenu_.right - Scale(14),
+                                             subtitleMenu_.top + headerHeight + Scale(48));
+        if (ContainsPoint(passthroughRow, point)) {
+            return SubtitleMenuAction::AudioPassthroughToggle;
+        }
         return SubtitleMenuAction::None;
     }
 
@@ -1773,6 +1810,34 @@ void MainWindow::ApplyAudioSelection(const int selectedTrackIndex) {
     InvalidateTransportArea();
     InvalidateFullscreenOverlay();
     InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::SetCurrentAudioPassthrough(const bool enabled) {
+    auto settings = controller_.Settings();
+    if (settings.audio.passthroughPreferred == enabled && audioPassthroughOverridden_) {
+        return;
+    }
+    settings.audio.passthroughPreferred = enabled;
+    controller_.ApplySettings(settings);
+    audioPassthroughOverridden_ = true;
+    LogApp(anvil::playback::LogLevel::Info,
+           L"audio passthrough current_media=" + std::wstring(enabled ? L"preferred" : L"disabled"));
+
+    const auto updated = controller_.Snapshot();
+    if (updated.state == PlaybackState::Playing) {
+        RestartPlaybackIfPlaying();
+    } else if (updated.state == PlaybackState::Paused &&
+               updated.media.has_value() &&
+               updated.media->hasAudio &&
+               backend_ == PlaybackBackend::NativeFfmpegD3D11) {
+        StopRuntimeAsync(false);
+    }
+    MarkLayoutDirty();
+    EnsureLayout();
+    InvalidateTransportArea();
+    InvalidateFullscreenOverlay();
+    InvalidateRect(hwnd_, nullptr, FALSE);
+    PostWebUiState(true);
 }
 
 void MainWindow::ApplySubtitleDelayDelta(const int deltaMs) {

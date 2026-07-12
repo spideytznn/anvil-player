@@ -449,10 +449,6 @@ void MainWindow::QueueGpuFullscreenUiOverlay(const bool forceImmediatePresent) {
         !nativeVideoDecoder_->Stats().buffering;
     const bool requestImmediatePresent = forceImmediatePresent || !videoFramesAdvancing;
     const double transportOpacity = std::clamp(fullscreenTransportAmount_, 0.0, 1.0);
-    const double menuOpacity = std::clamp(subtitleMenuAmount_, 0.0, 1.0);
-    const bool hasMenuSurface = menuOpacity > 0.0 &&
-                                RectWidth(subtitleMenu_) > 0 &&
-                                RectHeight(subtitleMenu_) > 0;
     if (!UsesGpuFullscreenUiOverlay() ||
         fullscreenTransportAmount_ <= 0.01 ||
         RectWidth(transportBar_) <= 0 ||
@@ -466,12 +462,7 @@ void MainWindow::QueueGpuFullscreenUiOverlay(const bool forceImmediatePresent) {
 
     RECT client{};
     GetClientRect(hwnd_, &client);
-    RECT overlayBounds = transportBar_;
-    if (hasMenuSurface) {
-        RECT menuBounds = subtitleMenu_;
-        InflateRect(&menuBounds, Scale(4), Scale(4));
-        UnionRect(&overlayBounds, &overlayBounds, &menuBounds);
-    }
+    const RECT overlayBounds = transportBar_;
     RECT clippedBounds{};
     if (!IntersectRect(&clippedBounds, &overlayBounds, &client)) {
         return;
@@ -510,44 +501,14 @@ void MainWindow::QueueGpuFullscreenUiOverlay(const bool forceImmediatePresent) {
     SetViewportOrgEx(memoryDc, -clippedBounds.left, -clippedBounds.top, &oldOrigin);
 
     fullscreenTransportAmount_ = 1.0;
-    if (menuOpacity > 0.0) {
-        subtitleMenuAmount_ = 1.0;
-    }
     DrawTransport(memoryDc, snapshot);
     DrawButtons(memoryDc, snapshot);
-    if (hasMenuSurface) {
-        DrawSubtitleMenu(memoryDc, snapshot);
-    }
     fullscreenTransportAmount_ = transportOpacity;
-    subtitleMenuAmount_ = menuOpacity;
     SetViewportOrgEx(memoryDc, oldOrigin.x, oldOrigin.y, nullptr);
 
     auto pixels = std::make_shared<std::vector<uint8_t>>(
         static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
     std::memcpy(pixels->data(), dibPixels, pixels->size());
-    if (hasMenuSurface) {
-        for (int y = 0; y < height; ++y) {
-            const int clientY = clippedBounds.top + y;
-            for (int x = 0; x < width; ++x) {
-                const int clientX = clippedBounds.left + x;
-                uint8_t* pixel = pixels->data() +
-                                 (static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
-                                  static_cast<std::size_t>(x)) * 4;
-                if ((pixel[0] | pixel[1] | pixel[2]) == 0) {
-                    pixel[3] = 0;
-                    continue;
-                }
-                const bool inMenu = clientX >= subtitleMenu_.left && clientX < subtitleMenu_.right &&
-                                    clientY >= subtitleMenu_.top && clientY < subtitleMenu_.bottom;
-                const double opacity = transportOpacity * (inMenu ? menuOpacity : 1.0);
-                const uint8_t alpha = static_cast<uint8_t>(std::clamp(std::lround(opacity * 255.0), 0L, 255L));
-                pixel[0] = static_cast<uint8_t>((static_cast<unsigned>(pixel[0]) * alpha + 127u) / 255u);
-                pixel[1] = static_cast<uint8_t>((static_cast<unsigned>(pixel[1]) * alpha + 127u) / 255u);
-                pixel[2] = static_cast<uint8_t>((static_cast<unsigned>(pixel[2]) * alpha + 127u) / 255u);
-                pixel[3] = alpha;
-            }
-        }
-    }
 
     SelectObject(memoryDc, oldBitmap);
     DeleteObject(bitmap);
@@ -560,7 +521,7 @@ void MainWindow::QueueGpuFullscreenUiOverlay(const bool forceImmediatePresent) {
     overlay->height = height;
     overlay->destinationX = clippedBounds.left - hostBounds.left;
     overlay->destinationY = clippedBounds.top - hostBounds.top;
-    overlay->alphaFromRgb = !hasMenuSurface;
+    overlay->alphaFromRgb = true;
     overlay->opacity = static_cast<float>(transportOpacity);
     overlay->bgraPremultiplied = std::move(pixels);
     d3dRenderer_->ConfigureUiOverlay(std::move(overlay), requestImmediatePresent);
@@ -570,6 +531,142 @@ void MainWindow::QueueGpuFullscreenUiOverlay(const bool forceImmediatePresent) {
         LogApp(anvil::playback::LogLevel::Info,
                L"fullscreen ui overlay gpu=active surface=video_backbuffer webview_cutout=false");
     }
+}
+
+void MainWindow::QueueGpuFullscreenSubtitleMenuOverlay(const bool forceImmediatePresent) {
+    if (!d3dRenderer_) {
+        gpuFullscreenSubtitleMenuOverlayActive_ = false;
+        return;
+    }
+
+    const double menuOpacity = std::clamp(subtitleMenuAmount_, 0.0, 1.0);
+    const bool menuVisible = UsesGpuFullscreenUiOverlay() &&
+                             (subtitleMenuTarget_ > 0.0 || menuOpacity > 0.01) &&
+                             RectWidth(subtitleMenu_) > 0 &&
+                             RectHeight(subtitleMenu_) > 0;
+    if (!menuVisible) {
+        if (gpuFullscreenSubtitleMenuOverlayActive_) {
+            d3dRenderer_->ConfigureUiMenuOverlay(nullptr, forceImmediatePresent);
+            gpuFullscreenSubtitleMenuOverlayActive_ = false;
+        }
+        return;
+    }
+
+    RECT client{};
+    GetClientRect(hwnd_, &client);
+    RECT clippedBounds{};
+    if (!IntersectRect(&clippedBounds, &subtitleMenu_, &client)) {
+        return;
+    }
+
+    const int width = RectWidth(clippedBounds);
+    const int height = RectHeight(clippedBounds);
+    HDC windowDc = GetDC(hwnd_);
+    HDC memoryDc = windowDc ? CreateCompatibleDC(windowDc) : nullptr;
+    if (!windowDc || !memoryDc) {
+        if (memoryDc) DeleteDC(memoryDc);
+        if (windowDc) ReleaseDC(hwnd_, windowDc);
+        return;
+    }
+
+    BITMAPINFO bitmapInfo{};
+    bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bitmapInfo.bmiHeader.biWidth = width;
+    bitmapInfo.bmiHeader.biHeight = -height;
+    bitmapInfo.bmiHeader.biPlanes = 1;
+    bitmapInfo.bmiHeader.biBitCount = 32;
+    bitmapInfo.bmiHeader.biCompression = BI_RGB;
+    void* dibPixels = nullptr;
+    HBITMAP bitmap = CreateDIBSection(windowDc, &bitmapInfo, DIB_RGB_COLORS, &dibPixels, nullptr, 0);
+    if (!bitmap || !dibPixels) {
+        if (bitmap) DeleteObject(bitmap);
+        DeleteDC(memoryDc);
+        ReleaseDC(hwnd_, windowDc);
+        return;
+    }
+
+    std::memset(dibPixels, 0, static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
+    HGDIOBJ oldBitmap = SelectObject(memoryDc, bitmap);
+    SetBkMode(memoryDc, TRANSPARENT);
+    POINT oldOrigin{};
+    SetViewportOrgEx(memoryDc, -clippedBounds.left, -clippedBounds.top, &oldOrigin);
+    const double savedMenuAmount = subtitleMenuAmount_;
+    subtitleMenuAmount_ = 1.0;
+    DrawSubtitleMenu(memoryDc, controller_.Snapshot());
+    subtitleMenuAmount_ = savedMenuAmount;
+    SetViewportOrgEx(memoryDc, oldOrigin.x, oldOrigin.y, nullptr);
+
+    auto pixels = std::make_shared<std::vector<uint8_t>>(
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4);
+    std::memcpy(pixels->data(), dibPixels, pixels->size());
+    SelectObject(memoryDc, oldBitmap);
+    DeleteObject(bitmap);
+    DeleteDC(memoryDc);
+    ReleaseDC(hwnd_, windowDc);
+
+    const auto snapshot = controller_.Snapshot();
+    const bool videoFramesAdvancing =
+        snapshot.state == PlaybackState::Playing &&
+        nativeVideoDecoder_ &&
+        nativeVideoDecoder_->IsRunning() &&
+        !nativeVideoDecoder_->Stats().buffering;
+    const RECT hostBounds = PlaybackSurfaceBounds();
+    auto overlay = std::make_shared<D3D11UiOverlayBitmap>();
+    overlay->width = width;
+    overlay->height = height;
+    overlay->destinationX = clippedBounds.left - hostBounds.left;
+    overlay->destinationY = clippedBounds.top - hostBounds.top;
+    overlay->alphaFromRgb = true;
+    overlay->opacity = static_cast<float>(menuOpacity);
+    overlay->bgraPremultiplied = std::move(pixels);
+    d3dRenderer_->ConfigureUiMenuOverlay(std::move(overlay),
+                                         forceImmediatePresent || !videoFramesAdvancing);
+    gpuFullscreenSubtitleMenuOverlayActive_ = true;
+    UpdateGpuFullscreenSubtitleMenuPresentation(forceImmediatePresent);
+}
+
+void MainWindow::UpdateGpuFullscreenSubtitleMenuPresentation(const bool forceImmediatePresent) {
+    if (!d3dRenderer_ ||
+        !gpuFullscreenSubtitleMenuOverlayActive_ ||
+        !UsesGpuFullscreenUiOverlay() ||
+        RectWidth(subtitleMenu_) <= 0 ||
+        RectHeight(subtitleMenu_) <= 0) {
+        return;
+    }
+
+    const double amount = std::clamp(subtitleMenuAmount_, 0.0, 1.0);
+    RECT presentationBounds = subtitleMenu_;
+    const RECT toggle = SubtitleMenuToggleRect();
+    if (RectWidth(toggle) > 0 && RectHeight(toggle) > 0) {
+        const auto interpolate = [amount](const LONG from, const LONG to) {
+            return static_cast<LONG>(std::lround(
+                static_cast<double>(from) +
+                (static_cast<double>(to) - static_cast<double>(from)) * amount));
+        };
+        presentationBounds = MakeRect(interpolate(toggle.left, subtitleMenu_.left),
+                                      interpolate(toggle.top, subtitleMenu_.top),
+                                      interpolate(toggle.right, subtitleMenu_.right),
+                                      interpolate(toggle.bottom, subtitleMenu_.bottom));
+    }
+    const int displayWidth = std::max(1, RectWidth(presentationBounds));
+    const int displayHeight = std::max(1, RectHeight(presentationBounds));
+    const RECT hostBounds = PlaybackSurfaceBounds();
+    const int destinationX = presentationBounds.left - hostBounds.left;
+    const int destinationY = presentationBounds.top - hostBounds.top;
+
+    const auto snapshot = controller_.Snapshot();
+    const bool videoFramesAdvancing =
+        snapshot.state == PlaybackState::Playing &&
+        nativeVideoDecoder_ &&
+        nativeVideoDecoder_->IsRunning() &&
+        !nativeVideoDecoder_->Stats().buffering;
+    d3dRenderer_->ConfigureUiMenuOverlayPresentation(
+        destinationX,
+        destinationY,
+        displayWidth,
+        displayHeight,
+        static_cast<float>(amount),
+        forceImmediatePresent || !videoFramesAdvancing);
 }
 
 void MainWindow::RenderBufferingHudOverlay(const NativeVideoQueueStats& stats) {
@@ -925,6 +1022,17 @@ void MainWindow::DrawButtons(HDC hdc, const PlaybackSessionSnapshot& snapshot) c
 
     for (std::size_t index = 0; index < buttons_.size(); ++index) {
         const auto& button = buttons_[index];
+        if (fullscreen_ &&
+            UsesGpuFullscreenUiOverlay() &&
+            button.command == Command::SubtitleMenu &&
+            (subtitleMenuTarget_ > 0.0 || subtitleMenuAmount_ > 0.01)) {
+            // Match the WebUI popover: its transport button becomes a blank
+            // layout placeholder while the separately layered top icon owns
+            // both visuals and interaction. Drawing the selected native
+            // button here lets its accent fill bleed through the translucent
+            // GPU menu footer.
+            continue;
+        }
         const bool hovered = button.enabled && static_cast<int>(index) == hoveredButton_;
         const double hoverMotion = button.enabled ? ButtonHoverAmount(button.command) : 0.0;
         const double pressMotion = button.enabled ? ButtonPressAmount(button.command) : 0.0;
@@ -1550,7 +1658,10 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
         return;
     }
 
-    const double opacity = (fullscreen_ ? std::clamp(fullscreenTransportAmount_, 0.0, 1.0) : 1.0) * amount;
+    // The fullscreen subtitle menu is interactive independently of the
+    // auto-hiding transport. Tying its alpha to the transport fade makes the
+    // panel turn transparent while it is still open and accepting input.
+    const double opacity = amount;
     if (opacity <= 0.02) {
         return;
     }
@@ -1564,13 +1675,20 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
 
     const int savedDc = SaveDC(hdc);
 
-    const COLORREF panel = RGB(16, 19, 24);
-    const COLORREF panelLine = RGB(39, 44, 53);
-    const COLORREF panelRaised = RGB(21, 25, 34);
-    const COLORREF panelHover = RGB(25, 30, 40);
+    // Keep the native fullscreen menu on the same visual tokens as the
+    // windowed WebUI popover in styles.css.
+    const COLORREF panel = RGB(5, 9, 14);
+    const COLORREF panelSoft = RGB(3, 6, 10);
+    const COLORREF panelLine = RGB(23, 30, 39);
+    const COLORREF panelLineStrong = RGB(38, 49, 63);
+    const COLORREF panelRaised = RGB(10, 17, 24);
     const COLORREF panelMuted = RGB(152, 161, 175);
+    const COLORREF panelDim = RGB(104, 113, 127);
     const COLORREF panelText = RGB(238, 241, 245);
     const COLORREF panelAccent = RGB(223, 118, 95);
+    const COLORREF panelAccentStrong = RGB(255, 150, 123);
+    const RECT footer = SubtitleMenuFooterRect();
+    const RECT toggle = SubtitleMenuToggleRect();
 
     FillRoundRect(hdc, subtitleMenu_, fade(panel), Scale(8));
     StrokeRoundRect(hdc, subtitleMenu_, fade(BlendColor(panelLine, panelText, 0.08)), Scale(8));
@@ -1581,13 +1699,14 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
                    fade(BlendColor(panelLine, palette_.accent, 0.14)),
                    Scale(10));
 
-    HFONT tabFont = CreateUiFont(Scale(13), FW_SEMIBOLD);
-    HFONT itemFont = CreateUiFont(Scale(13), FW_NORMAL);
-    HFONT selectedItemFont = CreateUiFont(Scale(13), FW_SEMIBOLD);
+    HFONT tabFont = CreateUiFont(Scale(12), FW_SEMIBOLD);
+    HFONT itemFont = CreateUiFont(Scale(12), FW_SEMIBOLD);
+    HFONT selectedItemFont = CreateUiFont(Scale(12), FW_SEMIBOLD);
     HFONT metaFont = CreateUiFont(Scale(10), FW_NORMAL);
     HFONT smallFont = CreateUiFont(Scale(10), FW_SEMIBOLD);
     HFONT valueFont = CreateUiFont(Scale(13), FW_SEMIBOLD);
     const auto settings = controller_.Settings();
+    const bool chineseUi = DisplayRefreshRateController::LoadUiLanguage() == L"zh";
     const auto finish = [&]() {
         RestoreDC(hdc, savedDc);
         DeleteObject(valueFont);
@@ -1600,10 +1719,11 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
     const int headerHeight = Scale(62);
     const int itemHeight = Scale(42);
     const int listGap = Scale(8);
-    const int rowInset = Scale(8);
+    const int audioPassthroughHeight = Scale(64);
+    const int rowInset = Scale(14);
     const int delayHeight = Scale(56);
     const int actionHeight = Scale(44);
-    const int styleHeight = Scale(48);
+    const int styleHeight = SubtitleMenuStyleRowHeight();
     const bool audioPage = subtitleMenuPage_ == SubtitleMenuPage::Audio;
     const bool subtitlePage = subtitleMenuPage_ == SubtitleMenuPage::Subtitles;
     const bool danmakuPage = subtitleMenuPage_ == SubtitleMenuPage::Danmaku;
@@ -1620,14 +1740,40 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
                                  subtitleMenu_.top,
                                  subtitleMenu_.right,
                                  subtitleMenu_.top + headerHeight);
-    const int tabGap = Scale(8);
-    const RECT tabRail = MakeRect(header.left + Scale(14),
-                                  header.top + Scale(12),
-                                  header.right - Scale(14),
-                                  header.bottom - Scale(14));
+    const int tabGap = Scale(6);
+    const RECT tabRail = MakeRect(header.left + Scale(8),
+                                  header.top + Scale(8),
+                                  header.right - Scale(8),
+                                  header.bottom - Scale(8));
     const int tabWidth = (RectWidth(tabRail) - tabGap * 2) / 3;
-    const int activeTab = audioPage ? 0 : (subtitlePage ? 1 : 2);
-    const wchar_t* tabLabels[] = {L"Audio", L"Subtitles", L"Danmaku"};
+    const int activeTab = subtitlePage ? 0 : (audioPage ? 1 : 2);
+    const wchar_t* tabLabels[] = {
+        chineseUi ? L"\u5b57\u5e55" : L"Subtitles",
+        chineseUi ? L"\u97f3\u9891" : L"Audio",
+        chineseUi ? L"\u5f39\u5e55" : L"Danmaku"
+    };
+    const auto localizedSelection = [chineseUi](std::wstring value) {
+        if (!chineseUi) {
+            return value;
+        }
+        if (value == L"Auto") {
+            return std::wstring{L"\u81ea\u52a8"};
+        }
+        if (value == L"Off") {
+            return std::wstring{L"\u5173"};
+        }
+        return value;
+    };
+    const std::wstring tabValues[] = {
+        localizedSelection(SubtitleMenuPrimaryLabel(settings.subtitles.selectedTrackIndex, snapshot.media)),
+        localizedSelection(AudioMenuPrimaryLabel(settings.audio.selectedTrackIndex, snapshot.media)),
+        settings.danmaku.enabled ? (chineseUi ? L"\u5f00" : L"On") : (chineseUi ? L"\u5173" : L"Off")
+    };
+    const IconKind tabIcons[] = {
+        IconKind::Subtitles,
+        IconKind::VolumeUp,
+        IconKind::Subtitles
+    };
     for (int index = 0; index < 3; ++index) {
         const RECT tab = MakeRect(tabRail.left + index * (tabWidth + tabGap),
                                   tabRail.top,
@@ -1635,12 +1781,27 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
                                   tabRail.bottom);
         if (index == activeTab) {
             FillRoundRect(hdc, tab, fade(panelRaised), Scale(6));
+            StrokeRoundRect(hdc, tab, fade(panelLine), Scale(6));
         }
+        const RECT iconRect = MakeRect(tab.left + Scale(11),
+                                       tab.top + RectHeight(tab) / 2 - Scale(7),
+                                       tab.left + Scale(25),
+                                       tab.top + RectHeight(tab) / 2 + Scale(7));
+        iconPainter_.Draw(hdc,
+                          tabIcons[index],
+                          iconRect,
+                          fade(index == activeTab ? panelText : panelMuted));
         DrawTextInRect(hdc,
                        tabLabels[index],
-                       tab,
+                       MakeRect(tab.left + Scale(32), tab.top + Scale(3), tab.right - Scale(7), tab.top + RectHeight(tab) / 2 + Scale(2)),
                        tabFont,
                        fade(index == activeTab ? panelText : panelMuted),
+                       DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        DrawTextInRect(hdc,
+                       tabValues[index],
+                       MakeRect(tab.left + Scale(32), tab.top + RectHeight(tab) / 2 - Scale(1), tab.right - Scale(7), tab.bottom - Scale(2)),
+                       metaFont,
+                       fade(index == activeTab ? panelAccentStrong : panelDim),
                        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
     DrawLine(hdc,
@@ -1650,13 +1811,101 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
              header.bottom,
              fade(panelLine));
 
-    const int listTop = header.bottom + listGap;
+    const int listTop = header.bottom + listGap + (audioPage ? audioPassthroughHeight : 0);
+
+    if (audioPage) {
+        const bool hasAudio = snapshot.media.has_value() && snapshot.media->hasAudio;
+        const bool requested = settings.audio.passthroughPreferred;
+        const bool active = audioPlayer_.IsPassthroughActive();
+        std::wstring reason = requested ? audioPlayer_.PassthroughReason() : L"disabled";
+        if (requested && !hasAudio) {
+            reason = L"no_audio";
+        } else if (requested &&
+                   !audioPlayer_.IsRunning() &&
+                   (snapshot.state == PlaybackState::Ready ||
+                    snapshot.state == PlaybackState::Paused ||
+                    snapshot.state == PlaybackState::Stopped)) {
+            reason = L"pending";
+        }
+
+        const RECT passthroughButton = MakeRect(subtitleMenu_.left + Scale(14),
+                                                header.bottom + Scale(10),
+                                                subtitleMenu_.right - Scale(14),
+                                                header.bottom + Scale(48));
+        FillRoundRect(hdc,
+                      passthroughButton,
+                      fade(requested && hasAudio ? panelRaised : panelSoft),
+                      Scale(7));
+        StrokeRoundRect(hdc,
+                        passthroughButton,
+                        fade(requested && hasAudio ? panelLineStrong : panelLine),
+                        Scale(7));
+        const COLORREF buttonLabelColor = hasAudio ? panelText : BlendColor(panelMuted, panel, 0.45);
+        const COLORREF buttonValueColor = !hasAudio
+                                              ? BlendColor(panelMuted, panel, 0.45)
+                                              : (requested ? panelAccentStrong : panelMuted);
+        DrawTextInRect(hdc,
+                       chineseUi ? L"\u97f3\u9891\u76f4\u901a" : L"Audio passthrough",
+                       MakeRect(passthroughButton.left + Scale(10),
+                                passthroughButton.top,
+                                passthroughButton.right - Scale(58),
+                                passthroughButton.bottom),
+                       itemFont,
+                       fade(buttonLabelColor),
+                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        DrawTextInRect(hdc,
+                       requested ? (chineseUi ? L"\u5f00" : L"On") : (chineseUi ? L"\u5173" : L"Off"),
+                       MakeRect(passthroughButton.right - Scale(54),
+                                passthroughButton.top,
+                                passthroughButton.right - Scale(10),
+                                passthroughButton.bottom),
+                       smallFont,
+                       fade(buttonValueColor),
+                       DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+        std::wstring status;
+        if (!requested) {
+            status = chineseUi ? L"\u5173" : L"Off";
+        } else if (active) {
+            status = chineseUi ? L"\u6b63\u5728\u76f4\u901a" : L"Passthrough active";
+            const std::wstring codec = audioPlayer_.PassthroughCodec();
+            if (!codec.empty()) {
+                status += L" \u00b7 " + codec;
+            }
+        } else if (reason == L"pending" || reason == L"negotiating") {
+            status = chineseUi ? L"\u64ad\u653e\u65f6\u5c06\u81ea\u52a8\u534f\u5546" : L"Will be negotiated when playback starts";
+        } else {
+            std::wstring detail = chineseUi ? L"\u76f4\u901a\u4e0d\u53ef\u7528" : L"Passthrough unavailable";
+            if (reason == L"unsupported_codec") {
+                detail = chineseUi ? L"\u5f53\u524d\u97f3\u9891\u683c\u5f0f\u4e0d\u652f\u6301\u76f4\u901a" : L"The current codec cannot be passed through";
+            } else if (reason == L"endpoint_format_unsupported") {
+                detail = chineseUi ? L"\u8f93\u51fa\u8bbe\u5907\u4e0d\u63a5\u53d7\u6b64\u97f3\u9891\u683c\u5f0f" : L"The output device does not accept this format";
+            } else if (reason == L"exclusive_mode_unavailable") {
+                detail = chineseUi ? L"\u65e0\u6cd5\u4f7f\u7528\u72ec\u5360\u97f3\u9891" : L"Exclusive audio is unavailable";
+            } else if (reason == L"playback_rate_unsupported") {
+                detail = chineseUi ? L"\u76f4\u901a\u4ec5\u652f\u6301 1.0 \u500d\u901f" : L"Passthrough requires 1.0x playback";
+            } else if (reason == L"runtime_write_failed" || reason == L"runtime_failed") {
+                detail = chineseUi ? L"\u76f4\u901a\u8f93\u51fa\u5df2\u4e2d\u65ad" : L"Passthrough output was interrupted";
+            }
+            status = (chineseUi ? L"\u5df2\u56de\u9000 PCM \u00b7 " : L"Fallback to PCM \u00b7 ") + detail;
+        }
+        DrawTextInRect(hdc,
+                       status,
+                       MakeRect(passthroughButton.left,
+                                passthroughButton.bottom + Scale(4),
+                                passthroughButton.right,
+                                listTop - Scale(2)),
+                       metaFont,
+                       fade(active ? RGB(159, 221, 186) : panelMuted),
+                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+
     for (int localIndex = 0; localIndex < visibleItemCount; ++localIndex) {
         const int index = firstItem + localIndex;
         const RECT item = MakeRect(subtitleMenu_.left + rowInset,
-                                   listTop + itemHeight * localIndex,
+                                   listTop + itemHeight * localIndex + Scale(3),
                                    subtitleMenu_.right - rowInset,
-                                   listTop + itemHeight * (localIndex + 1));
+                                   listTop + itemHeight * (localIndex + 1) - Scale(3));
         if (item.bottom < subtitleMenu_.top || item.top > subtitleMenu_.bottom) {
             continue;
         }
@@ -1667,21 +1916,13 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
                               track == (audioPage ? settings.audio.selectedTrackIndex
                                                   : settings.subtitles.selectedTrackIndex);
         const bool hovered = hasTrack && index == hoveredSubtitleMenuItem_;
-        if (selected || hovered) {
-            FillRoundRect(hdc,
-                          item,
-                          fade(selected ? panelRaised : panelHover),
-                          Scale(5));
-        }
+        FillRoundRect(hdc, item, fade(selected || hovered ? panelRaised : panelSoft), Scale(7));
+        StrokeRoundRect(hdc,
+                        item,
+                        fade(selected || hovered ? panelLineStrong : panelLine),
+                        Scale(7));
 
-        if (selected) {
-            DrawCheckMark(hdc,
-                          POINT{item.left + Scale(26), item.top + RectHeight(item) / 2},
-                          Scale(16),
-                          fade(panelAccent));
-        }
-
-        const std::wstring label = hasTrack ? SubtitleMenuPrimaryLabel(track, snapshot.media) : L"No subtitles";
+        const std::wstring label = hasTrack ? SubtitleMenuPrimaryLabel(track, snapshot.media) : (chineseUi ? L"\u65e0\u5b57\u5e55" : L"No subtitles");
         const std::wstring codec = hasTrack
                                        ? (audioPage ? AudioMenuCodecLabel(track, snapshot.media)
                                                     : SubtitleMenuCodecLabel(track, snapshot.media))
@@ -1689,26 +1930,27 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
         const std::wstring displayLabel = hasTrack
                                               ? (audioPage ? AudioMenuPrimaryLabel(track, snapshot.media)
                                                            : label)
-                                              : (audioPage ? L"No audio tracks" : L"No subtitles");
-        const RECT codecText = MakeRect(item.right - Scale(76), item.top, item.right - Scale(12), item.bottom);
-        const int labelLeft = hasTrack ? item.left + Scale(50) : item.left + Scale(16);
-        RECT text = MakeRect(labelLeft,
-                             item.top,
-                             codec.empty() ? item.right - Scale(12) : codecText.left - Scale(8),
-                             item.bottom);
+                                              : (audioPage
+                                                     ? (chineseUi ? L"\u65e0\u97f3\u8f68" : L"No audio tracks")
+                                                     : (chineseUi ? L"\u65e0\u5b57\u5e55" : L"No subtitles"));
+        const int textLeft = item.left + Scale(9);
+        const int textRight = item.right - Scale(9);
+        const RECT labelText = codec.empty()
+                                   ? MakeRect(textLeft, item.top, textRight, item.bottom)
+                                   : MakeRect(textLeft, item.top + Scale(2), textRight, item.top + Scale(20));
         DrawTextInRect(hdc,
                        displayLabel,
-                       text,
+                       labelText,
                        selected ? selectedItemFont : itemFont,
-                       fade(hasTrack ? (selected ? panelText : RGB(226, 226, 225)) : panelMuted),
+                       fade(hasTrack ? (selected ? panelAccentStrong : panelText) : panelMuted),
                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         if (!codec.empty()) {
             DrawTextInRect(hdc,
                            codec,
-                           codecText,
+                           MakeRect(textLeft, item.top + Scale(18), textRight, item.bottom - Scale(1)),
                            metaFont,
-                           fade(panelMuted),
-                           DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                           fade(panelDim),
+                           DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         }
     }
 
@@ -1794,8 +2036,37 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
                            DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         }
     };
+    const auto drawFooter = [&]() {
+        if (RectWidth(footer) <= 0 || RectHeight(footer) <= 0 ||
+            RectWidth(toggle) <= 0 || RectHeight(toggle) <= 0) {
+            return;
+        }
+        const int footerDc = SaveDC(hdc);
+        HRGN panelClip = CreateRoundRectRgn(subtitleMenu_.left,
+                                            subtitleMenu_.top,
+                                            subtitleMenu_.right + 1,
+                                            subtitleMenu_.bottom + 1,
+                                            Scale(8),
+                                            Scale(8));
+        SelectClipRgn(hdc, panelClip);
+        FillRectColor(hdc, footer, fade(panel));
+        SelectClipRgn(hdc, nullptr);
+        DeleteObject(panelClip);
+        RestoreDC(hdc, footerDc);
+        DrawLine(hdc, footer.left, footer.top, footer.right, footer.top, fade(panelLine));
+        const double iconHover = std::clamp(ButtonHoverAmount(Command::SubtitleMenu), 0.0, 1.0);
+        const int iconSize = std::min({static_cast<int>(std::lround(Scale(18) * (1.0 + 0.08 * iconHover))),
+                                       RectWidth(toggle),
+                                       RectHeight(toggle)});
+        const RECT iconRect = MakeRect(toggle.left + (RectWidth(toggle) - iconSize) / 2,
+                                       toggle.top + (RectHeight(toggle) - iconSize) / 2,
+                                       toggle.left + (RectWidth(toggle) + iconSize) / 2,
+                                       toggle.top + (RectHeight(toggle) + iconSize) / 2);
+        iconPainter_.Draw(hdc, IconKind::Subtitles, iconRect, fade(panelText));
+    };
 
     if (audioPage) {
+        drawFooter();
         finish();
         return;
     }
@@ -1815,7 +2086,7 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
                           fade(panelAccent));
         }
         DrawTextInRect(hdc,
-                       L"Enable danmaku",
+                       chineseUi ? L"\u542f\u7528\u5f39\u5e55" : L"Enable danmaku",
                        MakeRect(toggleRow.left + Scale(62), toggleRow.top, toggleRow.right - Scale(18), toggleRow.bottom),
                        itemFont,
                        fade(panelText),
@@ -1823,21 +2094,27 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
         DrawLine(hdc, subtitleMenu_.left, toggleRow.bottom, subtitleMenu_.right, toggleRow.bottom, fade(panelLine));
 
         const RECT modeRow = nextRow(actionHeight);
-        drawMenuActionRow(modeRow, IconKind::Subtitles, L"Display mode", DanmakuModeText(settings.danmaku.mode));
+        const std::wstring danmakuMode = chineseUi
+                                             ? (settings.danmaku.mode == 1 ? L"\u9876\u90e8"
+                                                : settings.danmaku.mode == 2 ? L"\u5e95\u90e8"
+                                                                             : L"\u6eda\u52a8")
+                                             : DanmakuModeText(settings.danmaku.mode);
+        drawMenuActionRow(modeRow, IconKind::Subtitles, chineseUi ? L"\u663e\u793a\u6a21\u5f0f" : L"Display mode", danmakuMode);
         DrawLine(hdc, subtitleMenu_.left, modeRow.bottom, subtitleMenu_.right, modeRow.bottom, fade(panelLine));
 
         const RECT opacityRow = nextRow(styleHeight);
-        drawStepperRow(opacityRow, L"Opacity", PercentTextFromInt(settings.danmaku.opacityPercent));
+        drawStepperRow(opacityRow, chineseUi ? L"\u900f\u660e\u5ea6" : L"Opacity", PercentTextFromInt(settings.danmaku.opacityPercent));
         DrawLine(hdc, subtitleMenu_.left, opacityRow.bottom, subtitleMenu_.right, opacityRow.bottom, fade(panelLine));
 
         const RECT speedRow = nextRow(styleHeight);
-        drawStepperRow(speedRow, L"Speed", PercentTextFromInt(settings.danmaku.speedPercent));
+        drawStepperRow(speedRow, chineseUi ? L"\u901f\u5ea6" : L"Speed", PercentTextFromInt(settings.danmaku.speedPercent));
         DrawLine(hdc, subtitleMenu_.left, speedRow.bottom, subtitleMenu_.right, speedRow.bottom, fade(panelLine));
 
         const std::wstring danmakuMeta = settings.danmaku.externalDanmakuPath.empty()
                                              ? L"XML/JSON/ASS"
                                              : settings.danmaku.externalDanmakuPath.filename().wstring();
-        drawMenuActionRow(nextRow(actionHeight), IconKind::Folder, L"Add danmaku file...", danmakuMeta);
+        drawMenuActionRow(nextRow(actionHeight), IconKind::Folder, chineseUi ? L"\u6dfb\u52a0\u5f39\u5e55\u6587\u4ef6..." : L"Add danmaku file...", danmakuMeta);
+        drawFooter();
         finish();
         return;
     }
@@ -1861,7 +2138,7 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
                    fade(panelText),
                    DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     DrawTextInRect(hdc,
-                   L"Subtitle delay",
+                   chineseUi ? L"\u5b57\u5e55\u5ef6\u8fdf" : L"Subtitle delay",
                    MakeRect(delayRow.left + Scale(70), delayRow.top + Scale(8), delayRow.right - Scale(70), delayRow.top + Scale(26)),
                    smallFont,
                    fade(panelMuted),
@@ -1906,29 +2183,30 @@ void MainWindow::DrawSubtitleMenu(HDC hdc, const PlaybackSessionSnapshot& snapsh
                        fade(panelMuted),
                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     };
-    drawActionRow(addRow, IconKind::Folder, L"Add subtitle file...", true);
+    drawActionRow(addRow, IconKind::Folder, chineseUi ? L"\u6dfb\u52a0\u5b57\u5e55\u6587\u4ef6..." : L"Add subtitle file...", true);
     DrawLine(hdc,
              subtitleMenu_.left,
              addRow.bottom,
              subtitleMenu_.right,
              addRow.bottom,
              fade(panelLine));
-    drawStepperRow(sizeRow, L"Subtitle size", SubtitleScaleText(settings.subtitles.fontScale));
+    drawStepperRow(sizeRow, chineseUi ? L"\u5b57\u5e55\u5927\u5c0f" : L"Subtitle size", SubtitleScaleText(settings.subtitles.fontScale));
     DrawLine(hdc,
              subtitleMenu_.left,
              sizeRow.bottom,
              subtitleMenu_.right,
              sizeRow.bottom,
              fade(panelLine));
-    drawStepperRow(offsetXRow, L"Horizontal offset", PixelOffsetText(settings.subtitles.offsetXPx));
+    drawStepperRow(offsetXRow, chineseUi ? L"\u6c34\u5e73\u504f\u79fb" : L"Horizontal offset", PixelOffsetText(settings.subtitles.offsetXPx));
     DrawLine(hdc,
              subtitleMenu_.left,
              offsetXRow.bottom,
              subtitleMenu_.right,
              offsetXRow.bottom,
              fade(panelLine));
-    drawStepperRow(offsetYRow, L"Vertical offset", PixelOffsetText(settings.subtitles.offsetYPx));
+    drawStepperRow(offsetYRow, chineseUi ? L"\u5782\u76f4\u504f\u79fb" : L"Vertical offset", PixelOffsetText(settings.subtitles.offsetYPx));
 
+    drawFooter();
     finish();
 }
 

@@ -443,6 +443,9 @@ void MainWindow::UpdateLayout() {
                 rightX += cmv4ButtonWidth + rightButtonGap;
             }
             if (showFullscreenSubtitleButton) {
+                // The button opens subtitle settings; an enabled subtitle
+                // track is represented inside that menu, not as an active
+                // transport command.
                 buttons_.push_back(UiButton{Command::SubtitleMenu,
                                             MakeRect(rightX, rightTop, rightX + rightButtonSize, rightTop + rightButtonSize),
                                             L"",
@@ -450,7 +453,7 @@ void MainWindow::UpdateLayout() {
                                             IconKind::Subtitles,
                                             ButtonKind::TransportIcon,
                                             false,
-                                            subtitlesEnabled});
+                                            false});
                 rightX += rightButtonSize + rightButtonGap;
             }
             buttons_.push_back(UiButton{Command::Fullscreen,
@@ -811,6 +814,7 @@ void MainWindow::UpdateVideoHost() {
         if (!RectEquals(lastVideoHostBounds_, empty)) {
             lastVideoHostBounds_ = empty;
         }
+        videoHostHasGpuOverlayRegion_ = false;
         QueueGpuFullscreenUiOverlay();
         UpdateBufferingOverlay();
         return;
@@ -923,16 +927,27 @@ void MainWindow::UpdateVideoHost() {
             if (fullscreen_ && refreshRateSyncUnavailable_) {
                 subtractCutout(bounds, 0);
             }
-            const bool applyRegion = !gpuFullscreenUiOverlay || boundsChanged || !wasVisible;
+            // Startup briefly uses WebView cutouts before the D3D renderer is
+            // ready. Bounds do not necessarily change when the GPU overlay
+            // takes ownership, so explicitly detect that one-time region-mode
+            // transition. Repeating SetWindowRgn on playback ticks stalls DWM
+            // composition and the HDR swap chain.
+            const bool applyRegion = !gpuFullscreenUiOverlay ||
+                                     boundsChanged ||
+                                     !wasVisible ||
+                                     !videoHostHasGpuOverlayRegion_;
             if (applyRegion) {
                 if (!SetWindowRgn(videoHost_, region, TRUE)) {
                     DeleteObject(region);
+                } else {
+                    videoHostHasGpuOverlayRegion_ = gpuFullscreenUiOverlay;
                 }
             } else {
                 DeleteObject(region);
             }
         } else {
             SetWindowRgn(videoHost_, nullptr, TRUE);
+            videoHostHasGpuOverlayRegion_ = false;
         }
         if (!wasVisible) {
             ShowWindow(videoHost_, SW_SHOW);
@@ -950,6 +965,7 @@ void MainWindow::UpdateVideoHost() {
         if (!RectEquals(lastVideoHostBounds_, empty)) {
             lastVideoHostBounds_ = empty;
         }
+        videoHostHasGpuOverlayRegion_ = false;
     }
     QueueGpuFullscreenUiOverlay();
     UpdateBufferingOverlay();
@@ -1579,6 +1595,71 @@ void MainWindow::UpdateHdrToneCurveFloatingLayout() {
                                  hdrToneCurveExpandedEditor_.bottom - Scale(48));
 }
 
+RECT MainWindow::SubtitleMenuToggleRect() const {
+    if (!fullscreen_ ||
+        RectWidth(subtitleMenu_) <= 0 ||
+        RectHeight(subtitleMenu_) <= 0) {
+        return RECT{};
+    }
+
+    RECT anchor{};
+    for (const auto& button : buttons_) {
+        if (button.command == Command::SubtitleMenu) {
+            anchor = button.bounds;
+            break;
+        }
+    }
+    if ((RectWidth(anchor) <= 0 || RectHeight(anchor) <= 0) &&
+        webUiSubtitleGeometryValid_) {
+        anchor = webUiSubtitleAnchor_;
+    }
+
+    RECT toggle{};
+    if (!IntersectRect(&toggle, &anchor, &subtitleMenu_)) {
+        return RECT{};
+    }
+    return toggle;
+}
+
+RECT MainWindow::SubtitleMenuFooterRect() const {
+    const RECT toggle = SubtitleMenuToggleRect();
+    if (RectWidth(toggle) <= 0 || RectHeight(toggle) <= 0) {
+        return RECT{};
+    }
+    return MakeRect(subtitleMenu_.left,
+                    std::clamp(static_cast<int>(toggle.top),
+                               static_cast<int>(subtitleMenu_.top),
+                               static_cast<int>(subtitleMenu_.bottom)),
+                    subtitleMenu_.right,
+                    subtitleMenu_.bottom);
+}
+
+int MainWindow::SubtitleMenuStyleRowHeight() const {
+    const int defaultHeight = Scale(48);
+    if (subtitleMenuPage_ != SubtitleMenuPage::Subtitles) {
+        return defaultHeight;
+    }
+
+    const RECT footer = SubtitleMenuFooterRect();
+    if (RectHeight(footer) <= 0) {
+        return defaultHeight;
+    }
+
+    const int count = std::max(1, static_cast<int>(subtitleMenuTracks_.size()));
+    const int visibleCount = subtitleMenuVisibleItemCount_ > 0
+                                 ? std::clamp(subtitleMenuVisibleItemCount_, 1, count)
+                                 : count;
+    const int rowsTop = subtitleMenu_.top +
+                        Scale(62) +
+                        Scale(8) +
+                        Scale(42) * visibleCount +
+                        Scale(6) +
+                        Scale(56) +
+                        Scale(44);
+    const int available = std::max(0, static_cast<int>(footer.top) - rowsTop);
+    return std::clamp(available / 3, Scale(36), defaultHeight);
+}
+
 void MainWindow::UpdateSubtitleMenuLayout() {
     subtitleMenu_ = RECT{};
     if (subtitleMenuTarget_ <= 0.0 && subtitleMenuAmount_ <= 0.001) {
@@ -1599,7 +1680,51 @@ void MainWindow::UpdateSubtitleMenuLayout() {
     }
 
     if (webUiActive_ && webUiSubtitleGeometryValid_) {
-        subtitleMenu_ = webUiSubtitlePopover_;
+        if (fullscreen_) {
+            RECT client{};
+            GetClientRect(hwnd_, &client);
+            const int width = RectWidth(webUiSubtitlePopover_);
+            const int height = RectHeight(webUiSubtitlePopover_);
+            // The GPU transport is slightly higher than the WebUI transport.
+            // Preserve the button edge as the invariant and only clamp at the
+            // actual client boundary; applying the WebUI's decorative margin
+            // here moves the footer below the native button again.
+            const int minLeft = client.left;
+            const int maxLeft = std::max(minLeft, static_cast<int>(client.right) - width);
+            const int minTop = client.top;
+            const int maxTop = std::max(minTop, static_cast<int>(client.bottom) - height);
+            const int left = std::clamp(static_cast<int>(anchor.right) - width, minLeft, maxLeft);
+            const int top = std::clamp(static_cast<int>(anchor.bottom) - height, minTop, maxTop);
+            subtitleMenu_ = MakeRect(left, top, left + width, top + height);
+        } else {
+            subtitleMenu_ = webUiSubtitlePopover_;
+        }
+        if (fullscreen_) {
+            const int contentBottom = std::clamp(static_cast<int>(anchor.top),
+                                                 static_cast<int>(subtitleMenu_.top),
+                                                 static_cast<int>(subtitleMenu_.bottom));
+            const int contentHeight = std::max(0, contentBottom - static_cast<int>(subtitleMenu_.top));
+            const int itemHeight = Scale(42);
+            const int audioPassthroughHeight = Scale(64);
+            int count = 0;
+            int fixedHeight = Scale(62) + Scale(8);
+            if (subtitleMenuPage_ == SubtitleMenuPage::Audio) {
+                count = std::max(1, static_cast<int>(audioMenuTracks_.size()));
+                fixedHeight += audioPassthroughHeight;
+            } else if (subtitleMenuPage_ == SubtitleMenuPage::Subtitles) {
+                count = std::max(1, static_cast<int>(subtitleMenuTracks_.size()));
+                fixedHeight += Scale(6) + Scale(56) + Scale(44) + Scale(36) * 3;
+            }
+            if (count > 0) {
+                const int rowsBySpace = std::max(1, (contentHeight - fixedHeight) / itemHeight);
+                subtitleMenuVisibleItemCount_ = std::clamp(std::min(count, rowsBySpace), 1, count);
+                subtitleMenuScrollOffset_ = std::clamp(subtitleMenuScrollOffset_,
+                                                       0,
+                                                       std::max(0, count - subtitleMenuVisibleItemCount_));
+            } else {
+                subtitleMenuVisibleItemCount_ = 0;
+            }
+        }
         return;
     }
 
@@ -1635,13 +1760,14 @@ void MainWindow::UpdateSubtitleMenuLayout() {
     const int delayHeight = Scale(56);
     const int actionHeight = Scale(44);
     const int styleHeight = Scale(48);
+    const int audioPassthroughHeight = Scale(64);
     const int desiredPanelWidth = Scale(366);
     int itemCount = 0;
     int fixedPanelHeight = headerHeight;
     int maxVisibleRows = 0;
     if (subtitleMenuPage_ == SubtitleMenuPage::Audio) {
         itemCount = std::max(1, static_cast<int>(audioMenuTracks_.size()));
-        fixedPanelHeight = headerHeight + listGap + listBottomGap;
+        fixedPanelHeight = headerHeight + listGap + audioPassthroughHeight + listBottomGap;
         maxVisibleRows = 7;
     } else if (subtitleMenuPage_ == SubtitleMenuPage::Subtitles) {
         itemCount = std::max(1, static_cast<int>(subtitleMenuTracks_.size()));

@@ -40,9 +40,9 @@ enum class WasapiRuntimeState {
     Ended,
 };
 
-// WASAPI shared-mode PCM audio player with in-process FFmpeg audio decode and
-// swresample. Owns its own playback clock; PlaybackClock() is the master clock
-// consumed by the native video scheduler for A/V sync.
+// WASAPI audio player. It uses shared-mode PCM with in-process FFmpeg decode
+// and swresample by default, or exclusive IEC 61937 bitstream output when the
+// selected endpoint accepts the encoded format. Owns the A/V master clock.
 class WasapiAudioPlayer {
 public:
     WasapiAudioPlayer() = default;
@@ -55,7 +55,8 @@ public:
     bool Start(const std::filesystem::path& mediaPath,
                std::chrono::milliseconds startPosition,
                double volume,
-               int selectedAudioTrackIndex = anvil::playback::kAudioTrackAuto);
+               int selectedAudioTrackIndex = anvil::playback::kAudioTrackAuto,
+               bool preferPassthrough = false);
 
     bool StartPacketStream(const std::filesystem::path& mediaPath,
                            const AVCodecParameters* codecParameters,
@@ -63,7 +64,8 @@ public:
                            std::chrono::milliseconds startPosition,
                            double volume,
                            int streamIndex,
-                           uint64_t startGeneration);
+                           uint64_t startGeneration,
+                           bool preferPassthrough = false);
 
     bool QueuePacket(const AVPacket* packet);
     void ResetPacketStream(std::chrono::milliseconds position);
@@ -98,6 +100,10 @@ public:
     }
 
     std::wstring LastStatus() const;
+    bool PassthroughRequested() const { return passthroughRequested_.load(); }
+    bool IsPassthroughActive() const { return passthroughActive_.load(); }
+    std::wstring PassthroughReason() const;
+    std::wstring PassthroughCodec() const;
 
     // Returns the audio playback position, advancing at the current playback rate.
     std::optional<std::chrono::milliseconds> PlaybackClock() const;
@@ -139,7 +145,9 @@ private:
         UINT32 sampleRate = 0;
         UINT32 channels = 0;
         UINT32 blockAlign = 0;
+        UINT32 bufferFrameCount = 0;
         AVSampleFormat sampleFormat = AV_SAMPLE_FMT_NONE;
+        bool bitstream = false;
         std::wstring description;
     };
 
@@ -177,6 +185,13 @@ private:
                           Microsoft::WRL::ComPtr<IAudioRenderClient>& renderClient,
                           WasapiFormat& outputFormat,
                           UINT32& bufferFrameCount) const;
+    bool InitializeBitstreamWasapi(const AVCodecParameters* codecParameters,
+                                   Microsoft::WRL::ComPtr<IAudioClient>& audioClient,
+                                   Microsoft::WRL::ComPtr<IAudioRenderClient>& renderClient,
+                                   WasapiFormat& outputFormat,
+                                   UINT32& bufferFrameCount,
+                                   HANDLE eventHandle,
+                                   std::wstring& failureReason) const;
 
     bool DescribeMixFormat(const WAVEFORMATEX* format, WasapiFormat& output) const;
 
@@ -219,6 +234,17 @@ private:
                   UINT32 frames,
                   uint64_t& submittedFrames,
                   bool& audioClientStarted);
+    bool WriteBitstream(IAudioRenderClient* renderClient,
+                        IAudioClient* audioClient,
+                        const WasapiFormat& outputFormat,
+                        HANDLE eventHandle,
+                        std::vector<uint8_t>& pending,
+                        std::size_t& pendingOffset,
+                        const uint8_t* data,
+                        std::size_t bytes,
+                        bool flush,
+                        uint64_t& submittedFrames,
+                        bool& audioClientStarted);
 
     void ApplyVolume(std::vector<uint8_t>& pcm, AVSampleFormat format) const;
     bool ShouldDropSeekPreroll(const AVFrame* frame, AVRational timeBase, const WasapiFormat& outputFormat) const;
@@ -243,6 +269,7 @@ private:
 
     void LogError(const std::wstring& message) const;
     void LogInfo(const std::wstring& message) const;
+    void SetPassthroughRuntime(bool active, std::wstring reason, std::wstring codec = {});
 
     std::filesystem::path path_;
     std::chrono::milliseconds startPosition_{0};
@@ -253,6 +280,8 @@ private:
     LogSinkPtr logSink_;
     std::atomic<double> volume_{1.0};
     std::atomic<double> playbackRate_{1.0};
+    std::atomic_bool passthroughRequested_{false};
+    std::atomic_bool passthroughActive_{false};
     std::atomic_bool stopping_{false};
     std::atomic_bool running_{false};
     std::atomic<WasapiRuntimeState> runtimeState_{WasapiRuntimeState::Stopped};
@@ -274,6 +303,8 @@ private:
     bool startResolved_ = false;
     bool startSucceeded_ = false;
     std::wstring lastStatus_ = L"wasapi shared pcm";
+    std::wstring passthroughReason_ = L"disabled";
+    std::wstring passthroughCodec_;
     mutable std::mutex clockMutex_;
     bool clockValid_ = false;
     bool clockRunning_ = false;

@@ -49,6 +49,45 @@ constexpr std::size_t kMaxLibraryJobs = 16;
 constexpr std::size_t kMaxLibraryResults = kMaxLibraryOperations * 2;
 constexpr std::size_t kMaxLibraryRetiredPayloads = 32;
 constexpr wchar_t kVideoSettingsRegistryPath[] = L"Software\\AnvilPlayer\\Video";
+constexpr wchar_t kAudioSettingsRegistryPath[] = L"Software\\AnvilPlayer\\Audio";
+
+bool LoadAudioPassthroughSetting(const bool fallback) {
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    if (RegGetValueW(HKEY_CURRENT_USER,
+                     kAudioSettingsRegistryPath,
+                     L"PassthroughEnabled",
+                     RRF_RT_REG_DWORD,
+                     nullptr,
+                     &value,
+                     &size) != ERROR_SUCCESS) {
+        return fallback;
+    }
+    return value != 0;
+}
+
+void SaveAudioPassthroughSetting(const bool enabled) {
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER,
+                        kAudioSettingsRegistryPath,
+                        0,
+                        nullptr,
+                        REG_OPTION_NON_VOLATILE,
+                        KEY_SET_VALUE,
+                        nullptr,
+                        &key,
+                        nullptr) != ERROR_SUCCESS) {
+        return;
+    }
+    const DWORD value = enabled ? 1u : 0u;
+    RegSetValueExW(key,
+                   L"PassthroughEnabled",
+                   0,
+                   REG_DWORD,
+                   reinterpret_cast<const BYTE*>(&value),
+                   sizeof(value));
+    RegCloseKey(key);
+}
 
 bool LoadVideoPassthroughSetting(const wchar_t* name, const bool fallback) {
     DWORD value = 0;
@@ -885,6 +924,10 @@ void LibraryWindow::SetRefreshRatePreferencesChangedRequest(std::function<void()
 
 void LibraryWindow::SetVideoPassthroughPreferencesChangedRequest(std::function<void()> callback) {
     videoPassthroughPreferencesChangedRequest_ = std::move(callback);
+}
+
+void LibraryWindow::SetAudioPassthroughPreferencesChangedRequest(std::function<void()> callback) {
+    audioPassthroughPreferencesChangedRequest_ = std::move(callback);
 }
 
 void LibraryWindow::SetAllowInsecureCertificatesRequest(std::function<void(bool)> callback) {
@@ -1724,7 +1767,7 @@ void LibraryWindow::HandleWebUiMessage(const std::wstring_view message) {
         DisplayRefreshRateController::SaveMaximumMultipleEnabled(MessageContains(message, L"\"enabled\":true"));
         if (refreshRatePreferencesChangedRequest_) refreshRatePreferencesChangedRequest_();
     } else if (MessageContains(message, L"\"command\":\"requestGlobalVideoPassthroughSettings\"")) {
-        const bool displayMetadata = LoadVideoPassthroughSetting(L"DisplayMetadataPassthrough", true);
+        const bool displayMetadata = LoadVideoPassthroughSetting(L"DisplayMetadataPassthrough", false);
         const bool autoDisplayFormat = LoadVideoPassthroughSetting(L"AutoDisplayFormat", false);
         const bool windowsHdrEnabled = anvil::playback::CapabilityDetector::IsHdrEnabledNow();
         const int displayPeakBrightnessNits = LoadVideoDwordSetting(L"DisplayPeakBrightnessNits", 0);
@@ -1773,6 +1816,13 @@ void LibraryWindow::HandleWebUiMessage(const std::wstring_view message) {
         }
         SaveVideoPassthroughSetting(L"DolbyVisionSystemPipelineExperimental", enabled);
         if (videoPassthroughPreferencesChangedRequest_) videoPassthroughPreferencesChangedRequest_();
+    } else if (MessageContains(message, L"\"command\":\"requestGlobalAudioPassthroughSettings\"")) {
+        PostScanResult(L"{\"type\":\"globalAudioPassthroughSettings\",\"enabled\":" +
+                       std::wstring(LoadAudioPassthroughSetting(false) ? L"true" : L"false") +
+                       L"}");
+    } else if (MessageContains(message, L"\"command\":\"setGlobalAudioPassthrough\"")) {
+        SaveAudioPassthroughSetting(MessageContains(message, L"\"enabled\":true"));
+        if (audioPassthroughPreferencesChangedRequest_) audioPassthroughPreferencesChangedRequest_();
     } else if (MessageContains(message, L"\"command\":\"setUiLanguage\"")) {
         DisplayRefreshRateController::SaveUiLanguage(ReadJsonString(message, L"language").value_or(L"zh"));
         if (uiLanguageChangedRequest_) uiLanguageChangedRequest_();

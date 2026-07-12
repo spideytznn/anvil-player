@@ -23,6 +23,14 @@ bool IsBitstreamCandidate(const std::wstring& codec) {
            codec == L"DTS";
 }
 
+bool IsBitstreamEnabled(const std::wstring& codec, const AudioSettings& settings) {
+    if (codec == L"AC-3") return settings.ac3Passthrough;
+    if (codec == L"E-AC-3") return settings.eac3Passthrough;
+    if (codec == L"TrueHD") return settings.trueHdPassthrough;
+    if (codec == L"DTS") return settings.dtsPassthrough || settings.dtsHdPassthrough;
+    return false;
+}
+
 std::wstring ChooseVideoDecoder(const MediaDescriptor& media, const VideoSettings& settings, std::wstring& reason) {
     if (!media.hasVideo) {
         reason = L"no_video_stream";
@@ -86,9 +94,8 @@ std::wstring ChooseAudioOutput(const MediaDescriptor& media, const AudioSettings
         reason = L"no_audio_stream";
         return L"none";
     }
-    const bool wantsPassthrough =
-        settings.outputMode == AudioOutputMode::Passthrough ||
-        (settings.outputMode == AudioOutputMode::Auto && settings.wasapiMode == WasapiMode::Exclusive && IsBitstreamCandidate(media.audioCodec));
+    const bool wantsPassthrough = settings.passthroughPreferred ||
+                                  settings.outputMode == AudioOutputMode::Passthrough;
 
     if (!wantsPassthrough) {
         reason = L"default_pcm_path";
@@ -96,7 +103,12 @@ std::wstring ChooseAudioOutput(const MediaDescriptor& media, const AudioSettings
     }
 
     if (!IsBitstreamCandidate(media.audioCodec)) {
-        reason = L"codec_not_bitstream_candidate";
+        reason = L"codec_not_bitstream_candidate_fallback_pcm";
+        return L"wasapi_shared_pcm";
+    }
+
+    if (!IsBitstreamEnabled(media.audioCodec, settings)) {
+        reason = L"codec_passthrough_disabled_fallback_pcm";
         return L"wasapi_shared_pcm";
     }
 

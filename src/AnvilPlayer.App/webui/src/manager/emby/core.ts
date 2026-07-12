@@ -124,10 +124,12 @@ export interface EmbyMediaSource {
 
 export interface EmbyItem {
   Id: string
+  PlaylistItemId?: string
   Name?: string
   OriginalTitle?: string
   SortName?: string
   Type?: string
+  MediaType?: string
   DateCreated?: string
   ProductionYear?: number
   RunTimeTicks?: number | null

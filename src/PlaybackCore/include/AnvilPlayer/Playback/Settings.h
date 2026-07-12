@@ -46,7 +46,7 @@ struct VideoSettings {
     // HDR swap chain. Color-space selection remains independent so disabling
     // this switch never silently turns HDR video into SDR. HDR10+ content uses
     // app-side ST 2094-40 tone mapping while passthrough is disabled.
-    bool displayMetadataPassthrough = true;
+    bool displayMetadataPassthrough = false;
     // Opt-in Windows MediaEngine + Dolby renderer-extension presentation.
     // The default remains the native FFmpeg/libplacebo RPU path.
     bool dolbyVisionSystemPipelineExperimental = false;
@@ -73,6 +73,10 @@ struct AudioSettings {
     AudioOutputMode outputMode = AudioOutputMode::Auto;
     WasapiMode wasapiMode = WasapiMode::Shared;
     int selectedTrackIndex = kAudioTrackAuto;
+    // Prefer encoded IEC 61937 output for the current media. Unsupported
+    // codecs, endpoint negotiation failures, and runtime failures fall back
+    // to shared-mode PCM while preserving the user's preference.
+    bool passthroughPreferred = false;
     bool ac3Passthrough = true;
     bool eac3Passthrough = true;
     bool trueHdPassthrough = true;

@@ -86,6 +86,146 @@ export interface EmbySearchOptions {
   limit?: number
 }
 
+export interface EmbyPlaylistSnapshot {
+  id: string
+  name: string
+  items: MediaItem[]
+  entryIdsByItemId: Record<string, string>
+}
+
+interface EmbyPlaylistCreationResult {
+  Id?: string
+}
+
+const EMBY_USER_COLLECTION_PAGE_SIZE = 500
+
+export async function setEmbyFavorite(
+  session: EmbySession,
+  itemId: string,
+  favorite: boolean
+): Promise<void> {
+  await fetchEmpty(
+    apiUrl(session.apiBaseUrl, `/Users/${session.userId}/FavoriteItems/${itemId}`),
+    { method: favorite ? 'POST' : 'DELETE', headers: authHeadersForSession(session) },
+    favorite ? '收藏 Emby 条目' : '取消收藏 Emby 条目'
+  )
+}
+
+export async function listEmbyFavoriteItems(session: EmbySession): Promise<MediaItem[]> {
+  const sourceId = sourceIdForSession(session)
+  const items: EmbyItem[] = []
+  let startIndex = 0
+  while (true) {
+    const response = await fetchJson<EmbyItemsResponse>(
+      apiUrl(session.apiBaseUrl, `/Users/${session.userId}/Items`, {
+        Recursive: true,
+        IsFavorite: true,
+        IncludeItemTypes: 'BoxSet,Movie,Series,Video,Episode',
+        Fields: EMBY_ITEM_FIELDS,
+        StartIndex: startIndex,
+        Limit: EMBY_USER_COLLECTION_PAGE_SIZE,
+        SortBy: 'SortName',
+        SortOrder: 'Ascending'
+      }),
+      { method: 'GET', headers: authHeadersForSession(session) },
+      '读取 Emby 收藏'
+    )
+    const page = response.Items ?? []
+    items.push(...page)
+    startIndex += page.length
+    if (!page.length || page.length < EMBY_USER_COLLECTION_PAGE_SIZE ||
+        (response.TotalRecordCount !== undefined && startIndex >= response.TotalRecordCount)) break
+  }
+  return items.map((item) => mapItem(session, sourceId, item))
+}
+
+export async function listEmbyPlaylists(session: EmbySession): Promise<EmbyPlaylistSnapshot[]> {
+  const sourceId = sourceIdForSession(session)
+  const response = await fetchJson<EmbyItemsResponse>(
+    apiUrl(session.apiBaseUrl, `/Users/${session.userId}/Items`, {
+      Recursive: true,
+      IncludeItemTypes: 'Playlist',
+      Fields: 'PrimaryImageAspectRatio,DateCreated,UserData',
+      SortBy: 'SortName',
+      SortOrder: 'Ascending',
+      Limit: EMBY_USER_COLLECTION_PAGE_SIZE
+    }),
+    { method: 'GET', headers: authHeadersForSession(session) },
+    '读取 Emby 片单'
+  )
+
+  const videoPlaylists = (response.Items ?? []).filter((playlist) =>
+    !playlist.MediaType || playlist.MediaType.toLowerCase() === 'video'
+  )
+  return await Promise.all(videoPlaylists.map(async (playlist): Promise<EmbyPlaylistSnapshot> => {
+    const playlistItems = await fetchJson<EmbyItemsResponse>(
+      apiUrl(session.apiBaseUrl, `/Playlists/${playlist.Id}/Items`, {
+        UserId: session.userId,
+        Fields: EMBY_ITEM_FIELDS,
+        Limit: 10000
+      }),
+      { method: 'GET', headers: authHeadersForSession(session) },
+      `读取 Emby 片单“${playlist.Name ?? ''}”`
+    )
+    const rows = playlistItems.Items ?? []
+    return {
+      id: playlist.Id,
+      name: playlist.Name?.trim() || '未命名片单',
+      items: rows.map((item) => mapItem(session, sourceId, item)),
+      entryIdsByItemId: Object.fromEntries(rows.flatMap((item) =>
+        item.PlaylistItemId ? [[item.Id, item.PlaylistItemId]] : []
+      ))
+    }
+  }))
+}
+
+export async function createEmbyPlaylist(
+  session: EmbySession,
+  name: string,
+  itemId: string
+): Promise<string> {
+  const result = await fetchJson<EmbyPlaylistCreationResult>(
+    apiUrl(session.apiBaseUrl, '/Playlists', {
+      UserId: session.userId,
+      Name: name,
+      Ids: itemId
+    }),
+    { method: 'POST', headers: authHeadersForSession(session) },
+    '创建 Emby 片单'
+  )
+  if (!result.Id) throw new Error('创建 Emby 片单失败：服务器未返回片单 ID')
+  return result.Id
+}
+
+export async function addItemToEmbyPlaylist(
+  session: EmbySession,
+  playlistId: string,
+  itemId: string
+): Promise<void> {
+  await fetchEmpty(
+    apiUrl(session.apiBaseUrl, `/Playlists/${playlistId}/Items`, {
+      UserId: session.userId,
+      Ids: itemId
+    }),
+    { method: 'POST', headers: authHeadersForSession(session) },
+    '加入 Emby 片单'
+  )
+}
+
+export async function removeItemFromEmbyPlaylist(
+  session: EmbySession,
+  playlistId: string,
+  entryId: string
+): Promise<void> {
+  await fetchEmpty(
+    apiUrl(session.apiBaseUrl, `/Playlists/${playlistId}/Items`, {
+      EntryIds: entryId
+    }),
+    { method: 'DELETE', headers: authHeadersForSession(session) },
+    '移出 Emby 片单'
+  )
+}
+
 const EMBY_LIST_PAGE_SIZE = 200
 
 export interface EmbyPlaybackTarget {

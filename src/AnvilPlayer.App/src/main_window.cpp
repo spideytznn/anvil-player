@@ -345,6 +345,22 @@ std::wstring HdrToneCurveJson(const anvil::playback::VideoSettings& settings) {
 }
 
 constexpr wchar_t kVideoSettingsRegistryPath[] = L"Software\\AnvilPlayer\\Video";
+constexpr wchar_t kAudioSettingsRegistryPath[] = L"Software\\AnvilPlayer\\Audio";
+
+std::optional<bool> LoadAudioPassthroughSetting() {
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    if (RegGetValueW(HKEY_CURRENT_USER,
+                     kAudioSettingsRegistryPath,
+                     L"PassthroughEnabled",
+                     RRF_RT_REG_DWORD,
+                     nullptr,
+                     &value,
+                     &size) != ERROR_SUCCESS) {
+        return std::nullopt;
+    }
+    return value != 0;
+}
 
 std::optional<bool> LoadVideoBooleanSetting(const wchar_t* name) {
     DWORD value = 0;
@@ -509,6 +525,7 @@ MainWindow::MainWindow(std::shared_ptr<anvil::playback::InMemoryLogSink> logSink
     if (const auto value = LoadVideoDwordSetting(L"DisplayPeakBrightnessNits")) {
         settings.video.displayPeakBrightnessNits = *value == 0 ? 0 : std::clamp(*value, 100, 10000);
     }
+    settings.audio.passthroughPreferred = LoadAudioPassthroughSetting().value_or(false);
     controller_.ApplySettings(settings);
 }
 
@@ -912,6 +929,25 @@ std::wstring MainWindow::BuildWebUiStateJson() const {
     json << L"\"dolbyVisionMedia\":" << (dolbyVisionMedia ? L"true" : L"false") << L",";
     json << L"\"cmv4Available\":" << (cmv4Available ? L"true" : L"false") << L",";
     json << L"\"cmv4Enabled\":" << (cmv4Enabled ? L"true" : L"false") << L",";
+    const bool audioPassthroughRequested = settings.audio.passthroughPreferred;
+    const bool audioPassthroughActive = audioPlayer_.IsPassthroughActive();
+    std::wstring audioPassthroughReason = audioPassthroughRequested
+                                              ? audioPlayer_.PassthroughReason()
+                                              : L"disabled";
+    if (audioPassthroughRequested && (!snapshot.media.has_value() || !snapshot.media->hasAudio)) {
+        audioPassthroughReason = L"no_audio";
+    } else if (audioPassthroughRequested &&
+               !audioPlayer_.IsRunning() &&
+               (snapshot.state == PlaybackState::Ready ||
+                snapshot.state == PlaybackState::Paused ||
+                snapshot.state == PlaybackState::Stopped)) {
+        audioPassthroughReason = L"pending";
+    }
+    json << L"\"audioPassthroughRequested\":" << (audioPassthroughRequested ? L"true" : L"false") << L",";
+    json << L"\"audioPassthroughActive\":" << (audioPassthroughActive ? L"true" : L"false") << L",";
+    json << L"\"audioPassthroughReason\":\"" << JsonEscape(audioPassthroughReason) << L"\",";
+    json << L"\"audioPassthroughCodec\":\"" << JsonEscape(audioPlayer_.PassthroughCodec()) << L"\",";
+    json << L"\"audioPassthroughOutput\":\"" << JsonEscape(audioPlayer_.LastStatus()) << L"\",";
     json << L"\"audioSelectedTrack\":" << settings.audio.selectedTrackIndex << L",";
     json << L"\"subtitleSelectedTrack\":" << settings.subtitles.selectedTrackIndex << L",";
     json << L"\"subtitleDelayMs\":" << settings.subtitles.subtitleDelayMs << L",";
@@ -1148,6 +1184,8 @@ void MainWindow::HandleWebUiMessage(const std::wstring_view message) {
         SetDisplayMetadataPassthrough(MessageContains(message, L"\"enabled\":true"));
     } else if (MessageContains(message, L"\"command\":\"setDolbyVisionSystemPipelineExperimental\"")) {
         SetDolbyVisionSystemPipelineExperimental(MessageContains(message, L"\"enabled\":true"));
+    } else if (MessageContains(message, L"\"command\":\"setCurrentAudioPassthrough\"")) {
+        SetCurrentAudioPassthrough(MessageContains(message, L"\"enabled\":true"));
     } else if (MessageContains(message, L"\"command\":\"setAudioTrack\"")) {
         if (const auto index = ReadJsonNumber(message, L"index")) {
             ApplyAudioSelection(static_cast<int>(std::round(*index)));
@@ -2531,6 +2569,7 @@ void MainWindow::SetVolumeSliderHover(const bool hovered) {
 
 void MainWindow::UpdateUiAnimations() {
     const auto now = std::chrono::steady_clock::now();
+    const bool gpuFullscreenUiOverlay = UsesGpuFullscreenUiOverlay();
     const RECT previousVideoSurface = videoSurface_;
     const RECT previousInspector = inspector_;
     const double previousInspectorCollapseAmount = inspectorCollapseAmount_;
@@ -2633,7 +2672,9 @@ void MainWindow::UpdateUiAnimations() {
     const bool volumeHoverValueChanged = std::abs(volumeHoverAmount_ - previousVolumeHoverAmount) > 0.0001;
     const bool scrollbarFadeActive = ScrollbarFadeActive(now);
 
-    if (sidebarValueChanged || fullscreenTransportValueChanged || subtitleMenuValueChanged) {
+    if (sidebarValueChanged ||
+        fullscreenTransportValueChanged ||
+        (subtitleMenuValueChanged && (!gpuFullscreenUiOverlay || subtitleMenuComplete))) {
         MarkLayoutDirty();
         EnsureLayout();
     }
@@ -2667,10 +2708,21 @@ void MainWindow::UpdateUiAnimations() {
         InvalidateFullscreenOverlay();
     }
     if (subtitleMenuValueChanged) {
-        UpdateSubtitleMenuOverlay();
-        InvalidateTransportArea();
-        InvalidateFullscreenOverlay();
-        InvalidateRect(hwnd_, nullptr, FALSE);
+        if (gpuFullscreenUiOverlay) {
+            UpdateGpuFullscreenSubtitleMenuPresentation();
+            if (subtitleMenuComplete && subtitleMenuTarget_ <= 0.001) {
+                QueueGpuFullscreenSubtitleMenuOverlay();
+                // The transport subtitle button is intentionally omitted
+                // while the menu is layered over it. Restore it once the
+                // closing animation has completely vacated the footer.
+                InvalidateTransportArea();
+            }
+        } else {
+            UpdateSubtitleMenuOverlay();
+            InvalidateTransportArea();
+            InvalidateFullscreenOverlay();
+            InvalidateRect(hwnd_, nullptr, FALSE);
+        }
     }
     if (scrollbarFadeActive) {
         InvalidateTransportArea();
@@ -2735,19 +2787,19 @@ void MainWindow::SetSubtitleMenuTarget(const bool visible) {
 
     subtitleMenuOpen_ = visible || subtitleMenuAmount_ > 0.001;
     if (UsesGpuFullscreenUiOverlay()) {
-        subtitleMenuOpen_ = visible;
-        subtitleMenuAmount_ = target;
-        subtitleMenuStartAmount_ = target;
+        subtitleMenuStartAmount_ = subtitleMenuAmount_;
         subtitleMenuTarget_ = target;
+        subtitleMenuAnimationStartedAt_ = std::chrono::steady_clock::now();
         if (!visible) {
             hoveredSubtitleMenuItem_ = -1;
         }
+        StartUiAnimationTimer();
         MarkLayoutDirty();
         EnsureLayout();
         UpdateVideoHost();
         UpdateSubtitleMenuOverlay();
         InvalidateTransportArea();
-        InvalidateFullscreenOverlay();
+        QueueGpuFullscreenSubtitleMenuOverlay(true);
         InvalidateRect(hwnd_, nullptr, FALSE);
         PostWebUiState();
         return;
@@ -3371,6 +3423,7 @@ void MainWindow::InvalidateTransportArea() {
 }
 
 void MainWindow::InvalidateFullscreenOverlay() {
+    QueueGpuFullscreenSubtitleMenuOverlay();
     if (subtitleMenuOverlay_ && IsWindowVisible(subtitleMenuOverlay_)) {
         InvalidateRect(subtitleMenuOverlay_, nullptr, FALSE);
     }
@@ -3744,7 +3797,7 @@ void MainWindow::SetAutomaticDisplayFormat(const bool enabled) {
         settings.video.dolbyVisionSystemPipelineExperimental = true;
     } else {
         settings.video.displayMetadataPassthrough =
-            LoadVideoBooleanSetting(L"DisplayMetadataPassthrough").value_or(true);
+            LoadVideoBooleanSetting(L"DisplayMetadataPassthrough").value_or(false);
         settings.video.dolbyVisionSystemPipelineExperimental =
             LoadVideoBooleanSetting(L"DolbyVisionSystemPipelineExperimental").value_or(false);
     }
@@ -4479,7 +4532,8 @@ bool MainWindow::StartRuntime(const PlaybackSessionSnapshot& snapshot,
         audioStarted = audioPlayer_.Start(snapshot.media->path,
                                           snapshot.position,
                                           snapshot.volume,
-                                          runtimeSettings.audio.selectedTrackIndex);
+                                          runtimeSettings.audio.selectedTrackIndex,
+                                          runtimeSettings.audio.passthroughPreferred);
     }
 
     const LogLevel level = videoStarted && audioStarted ? (restart ? LogLevel::Debug : LogLevel::Info) : LogLevel::Error;
@@ -4679,7 +4733,11 @@ bool MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
         const uint64_t audioStartGeneration = audioPlayer_.ArmPendingStart(snapshot.position);
         audioPacketSink.selectedTrackIndex = runtimeSettings.audio.selectedTrackIndex;
         audioPacketSink.start =
-            [this, path = snapshot.media->path, volume = snapshot.volume, audioStartGeneration](
+            [this,
+             path = snapshot.media->path,
+             volume = snapshot.volume,
+             audioStartGeneration,
+             preferPassthrough = runtimeSettings.audio.passthroughPreferred](
                 const AVCodecParameters* codecParameters,
                 const AVRational timeBase,
                 const std::chrono::milliseconds startPosition,
@@ -4690,7 +4748,8 @@ bool MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
                                                       startPosition,
                                                       volume,
                                                       streamIndex,
-                                                      audioStartGeneration);
+                                                      audioStartGeneration,
+                                                      preferPassthrough);
             };
         audioPacketSink.pushPacket = [this](const AVPacket* packet) {
             return audioPlayer_.QueuePacket(packet);
@@ -4771,7 +4830,8 @@ bool MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
             audioStarted = audioPlayer_.Start(snapshot.media->path,
                                               snapshot.position,
                                               snapshot.volume,
-                                              runtimeSettings.audio.selectedTrackIndex);
+                                              runtimeSettings.audio.selectedTrackIndex,
+                                              runtimeSettings.audio.passthroughPreferred);
         }
     }
 
@@ -4861,7 +4921,8 @@ bool MainWindow::SeekNativeRuntime(const PlaybackSessionSnapshot& snapshot) {
             audioSeeked = audioPlayer_.Start(snapshot.media->path,
                                              snapshot.position,
                                              snapshot.volume,
-                                             runtimeSettings.audio.selectedTrackIndex);
+                                             runtimeSettings.audio.selectedTrackIndex,
+                                             runtimeSettings.audio.passthroughPreferred);
         }
     } else {
         nativeSeekPrerollHoldingAudio_ = false;
@@ -5068,6 +5129,12 @@ void MainWindow::OpenPath(const std::filesystem::path& path, const bool autoplay
     refreshRateSyncOverridden_ = false;
     refreshRateMaximumMultipleOverridden_ = false;
     refreshRateSyncUnavailable_ = false;
+    audioPassthroughOverridden_ = false;
+    {
+        auto settings = controller_.Settings();
+        settings.audio.passthroughPreferred = LoadAudioPassthroughSetting().value_or(false);
+        controller_.ApplySettings(settings);
+    }
     ClearDeferredRuntimeStart();
     deferredPausedFrameRefresh_ = false;
     deferredPausedFrameRefreshForceRestart_ = false;
@@ -5534,7 +5601,8 @@ void MainWindow::StartPlayback() {
                     audioStarted = audioPlayer_.Start(snapshot.media->path,
                                                       snapshot.position,
                                                       snapshot.volume,
-                                                      settings.audio.selectedTrackIndex);
+                                                      settings.audio.selectedTrackIndex,
+                                                      settings.audio.passthroughPreferred);
                 }
                 LogApp(audioStarted ? LogLevel::Debug : LogLevel::Warning,
                        L"native paused runtime resume audio=" + std::wstring(audioStarted ? L"true" : L"false"));
@@ -5889,7 +5957,7 @@ void MainWindow::ApplyGlobalRefreshRatePreferences() {
 
 void MainWindow::ApplyGlobalVideoPassthroughPreferences() {
     const bool autoDisplayFormat = LoadVideoBooleanSetting(L"AutoDisplayFormat").value_or(false);
-    const bool displayMetadata = LoadVideoBooleanSetting(L"DisplayMetadataPassthrough").value_or(true);
+    const bool displayMetadata = LoadVideoBooleanSetting(L"DisplayMetadataPassthrough").value_or(false);
     const bool dolbySystemPipeline =
         LoadVideoBooleanSetting(L"DolbyVisionSystemPipelineExperimental").value_or(false);
     const int displayPeakBrightnessNits =
@@ -5900,6 +5968,20 @@ void MainWindow::ApplyGlobalVideoPassthroughPreferences() {
         SetDolbyVisionSystemPipelineExperimental(dolbySystemPipeline);
     }
     SetDisplayPeakBrightnessNits(displayPeakBrightnessNits);
+}
+
+void MainWindow::ApplyGlobalAudioPassthroughPreferences() {
+    const bool enabled = LoadAudioPassthroughSetting().value_or(false);
+    const auto snapshot = controller_.Snapshot();
+    if (!audioPassthroughOverridden_ && !snapshot.media.has_value()) {
+        auto settings = controller_.Settings();
+        settings.audio.passthroughPreferred = enabled;
+        controller_.ApplySettings(settings);
+    }
+    LogApp(LogLevel::Info,
+           L"audio passthrough global_default=" + std::wstring(enabled ? L"preferred" : L"disabled") +
+               (snapshot.media.has_value() ? L" applies_to=next_media" : L" applies_to=current_empty_session"));
+    PostWebUiState(true);
 }
 
 }  // namespace anvil::app

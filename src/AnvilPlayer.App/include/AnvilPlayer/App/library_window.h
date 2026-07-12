@@ -46,6 +46,7 @@ public:
     void SetUiLanguageChangedRequest(std::function<void()> callback);
     void SetRefreshRatePreferencesChangedRequest(std::function<void()> callback);
     void SetVideoPassthroughPreferencesChangedRequest(std::function<void()> callback);
+    void SetAudioPassthroughPreferencesChangedRequest(std::function<void()> callback);
     // Relays a serialized Emby playback report (from the library WebView) to
     // the player window so it can report progress despite separate storage.
     void SetEmbyPlaybackReportRelay(std::function<void(const std::wstring&)> callback);
@@ -109,6 +110,7 @@ private:
     std::function<void()> uiLanguageChangedRequest_;
     std::function<void()> refreshRatePreferencesChangedRequest_;
     std::function<void()> videoPassthroughPreferencesChangedRequest_;
+    std::function<void()> audioPassthroughPreferencesChangedRequest_;
     std::function<void(bool)> allowInsecureCertificatesRequest_;
     std::function<void()> focusPlayerRequest_;
     std::function<void(const std::wstring&)> embyPlaybackReportRelay_;

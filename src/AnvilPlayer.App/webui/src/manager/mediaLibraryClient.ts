@@ -431,7 +431,8 @@ export function createEmptyLibraryClient(): MediaLibraryClient {
     },
 
     async listItems(query) {
-      const queryItems = query.navKey.startsWith('source:')
+      const includesUserCollections = query.navKey === 'favorites' || query.navKey === 'playlist'
+      const queryItems = query.navKey.startsWith('source:') || includesUserCollections
         ? items.filter((item) => !isHidden(item))
         : localLibraryItems(items.filter((item) => !isHidden(item)), sources)
       return sortItems(

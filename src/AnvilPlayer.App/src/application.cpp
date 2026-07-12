@@ -120,6 +120,9 @@ bool Application::Initialize(HINSTANCE instance, int commandShow, const AppArgum
     library_->SetVideoPassthroughPreferencesChangedRequest([this] {
         if (player_) player_->ApplyGlobalVideoPassthroughPreferences();
     });
+    library_->SetAudioPassthroughPreferencesChangedRequest([this] {
+        if (player_) player_->ApplyGlobalAudioPassthroughPreferences();
+    });
     library_->SetEmbyPlaybackReportRelay([this](const std::wstring& reportJson) {
         RelayEmbyPlaybackReport(reportJson);
     });
@@ -173,6 +176,7 @@ void Application::EnsurePlayerWindow() {
         return;
     }
     player_->ApplyGlobalRefreshRatePreferences();
+    player_->ApplyGlobalAudioPassthroughPreferences();
     player_->Show(SW_SHOWNORMAL);
     // Note: a buffered Emby report (if any) is delivered/retried by the timer
     // started in RelayEmbyPlaybackReport; nothing extra needed here.

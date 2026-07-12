@@ -19,6 +19,7 @@
 
 #include <wrl/client.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -129,6 +130,14 @@ public:
     void ConfigureSubtitleSettings(const anvil::playback::SubtitleSettings& settings);
     void ConfigureUiOverlay(std::shared_ptr<const D3D11UiOverlayBitmap> overlay,
                             bool requestImmediatePresent);
+    void ConfigureUiMenuOverlay(std::shared_ptr<const D3D11UiOverlayBitmap> overlay,
+                                bool requestImmediatePresent);
+    void ConfigureUiMenuOverlayPresentation(int destinationX,
+                                            int destinationY,
+                                            int displayWidth,
+                                            int displayHeight,
+                                            float opacity,
+                                            bool requestImmediatePresent);
 
     void OnResize();
 
@@ -162,6 +171,32 @@ private:
         std::shared_ptr<const D3D11UiOverlayBitmap> overlay;
         bool requestImmediatePresent = false;
     };
+
+    struct PendingUiOverlayPresentation {
+        int destinationX = 0;
+        int destinationY = 0;
+        int displayWidth = 0;
+        int displayHeight = 0;
+        float opacity = 1.0f;
+        bool requestImmediatePresent = false;
+    };
+
+    struct UiOverlaySlot {
+        Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> srv;
+        std::shared_ptr<const D3D11UiOverlayBitmap> active;
+        std::shared_ptr<const D3D11UiOverlayBitmap> uploaded;
+        int destinationX = 0;
+        int destinationY = 0;
+        int displayWidth = 0;
+        int displayHeight = 0;
+        float opacity = 1.0f;
+        bool logged = false;
+    };
+
+    static constexpr std::size_t kTransportUiOverlaySlot = 0;
+    static constexpr std::size_t kMenuUiOverlaySlot = 1;
+    static constexpr std::size_t kUiOverlaySlotCount = 2;
 
     void RenderThreadMain();
     void StopRenderThread();
@@ -211,7 +246,8 @@ private:
     bool UpdateSubtitleOverlay(const NativeVideoFrame& frame, const D3D11_VIEWPORT& videoViewport);
     void DrawSubtitleOverlay();
     bool DrawSubtitleBitmapOverlays(const NativeVideoFrame& frame, const D3D11_VIEWPORT& videoViewport);
-    bool UpdateUiOverlayTexture();
+    bool UpdateUiOverlayTexture(std::size_t slotIndex);
+    bool DrawUiOverlaySlot(std::size_t slotIndex);
     bool DrawUiOverlay();
     void ReleaseAll();
     void LogHardwareTextureFailureOnce(const std::wstring& message);
@@ -276,7 +312,8 @@ private:
     UINT pendingResizeHeight_ = 1;
     std::optional<PendingColorPipeline> pendingColorPipeline_;
     std::optional<anvil::playback::SubtitleSettings> pendingSubtitleSettings_;
-    std::optional<PendingUiOverlay> pendingUiOverlay_;
+    std::array<std::optional<PendingUiOverlay>, kUiOverlaySlotCount> pendingUiOverlays_;
+    std::optional<PendingUiOverlayPresentation> pendingUiMenuOverlayPresentation_;
     std::optional<bool> pendingDiagnosticsEnabled_;
     bool pendingResetStats_ = false;
     bool pendingClear_ = false;
@@ -349,10 +386,7 @@ private:
     int enhancementYuvTextureH_ = 0;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> subtitleTexture_;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> subtitleSrv_;
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> uiOverlayTexture_;
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> uiOverlaySrv_;
-    std::shared_ptr<const D3D11UiOverlayBitmap> activeUiOverlay_;
-    std::shared_ptr<const D3D11UiOverlayBitmap> uploadedUiOverlay_;
+    std::array<UiOverlaySlot, kUiOverlaySlotCount> uiOverlaySlots_;
     std::vector<HardwareSrvCacheEntry> hardwareSrvCache_;
     std::vector<SubtitleTextureCacheEntry> subtitleTextureCache_;
     D3D11_VIEWPORT viewport_{};
@@ -389,7 +423,6 @@ private:
     bool hdr10PlusMetadataLogged_ = false;
     bool felOverlayLogged_ = false;
     bool subtitleBitmapOverlayLogged_ = false;
-    bool uiOverlayLogged_ = false;
     uint64_t subtitleDrawFrame_ = 0;
     bool doviEnabledLastFrame_ = false;  // tracks DV state to skip non-DV updates
     std::wstring activePipelineLabel_;

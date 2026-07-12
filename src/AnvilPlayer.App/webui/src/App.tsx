@@ -145,6 +145,17 @@ const en = {
   subtitles: 'Subtitles',
   subtitleTracks: 'Subtitle tracks',
   audioTracks: 'Audio tracks',
+  audioPassthrough: 'Audio passthrough',
+  audioPassthroughActive: 'Passthrough active',
+  audioPassthroughPending: 'Will be negotiated when playback starts',
+  audioPassthroughPcm: 'Fallback to PCM',
+  audioPassthroughVolume: 'Volume is controlled by the TV or receiver',
+  audioPassthroughUnsupportedCodec: 'The current codec cannot be passed through',
+  audioPassthroughUnsupportedDevice: 'The output device does not accept this format',
+  audioPassthroughExclusiveBusy: 'Exclusive audio is unavailable',
+  audioPassthroughRateUnsupported: 'Passthrough requires 1.0x playback',
+  audioPassthroughFailed: 'Passthrough unavailable',
+  audioPassthroughRuntimeFailed: 'Passthrough output was interrupted',
   danmaku: 'Danmaku',
   addSubtitleFile: 'Add subtitle file...',
   addDanmakuFile: 'Add danmaku file...',
@@ -256,6 +267,17 @@ const zh: Record<keyof typeof en, string> = {
   subtitles: '字幕',
   subtitleTracks: '字幕轨',
   audioTracks: '音轨',
+  audioPassthrough: '音频直通',
+  audioPassthroughActive: '正在直通',
+  audioPassthroughPending: '播放时将自动协商',
+  audioPassthroughPcm: '已回退 PCM',
+  audioPassthroughVolume: '音量由电视或功放控制',
+  audioPassthroughUnsupportedCodec: '当前音频格式不支持直通',
+  audioPassthroughUnsupportedDevice: '输出设备不接受此音频格式',
+  audioPassthroughExclusiveBusy: '无法使用独占音频',
+  audioPassthroughRateUnsupported: '直通仅支持 1.0 倍速',
+  audioPassthroughFailed: '直通不可用',
+  audioPassthroughRuntimeFailed: '直通输出已中断',
   danmaku: '弹幕',
   addSubtitleFile: '添加字幕文件...',
   addDanmakuFile: '添加弹幕文件...',
@@ -605,6 +627,25 @@ function rectSnapshotFromElement(element: HTMLElement | null): RectSnapshot {
     width: rect.width,
     height: rect.height
   }
+}
+
+function audioPassthroughStatus(state: PlayerState, t: Copy): string {
+  if (!state.audioPassthroughRequested) return t.off
+  if (state.audioPassthroughActive) {
+    return state.audioPassthroughCodec
+      ? `${t.audioPassthroughActive} · ${state.audioPassthroughCodec}`
+      : t.audioPassthroughActive
+  }
+  if (state.audioPassthroughReason === 'pending' || state.audioPassthroughReason === 'negotiating') {
+    return t.audioPassthroughPending
+  }
+  let reason = t.audioPassthroughFailed
+  if (state.audioPassthroughReason === 'unsupported_codec') reason = t.audioPassthroughUnsupportedCodec
+  else if (state.audioPassthroughReason === 'endpoint_format_unsupported') reason = t.audioPassthroughUnsupportedDevice
+  else if (state.audioPassthroughReason === 'exclusive_mode_unavailable') reason = t.audioPassthroughExclusiveBusy
+  else if (state.audioPassthroughReason === 'playback_rate_unsupported') reason = t.audioPassthroughRateUnsupported
+  else if (state.audioPassthroughReason === 'runtime_write_failed' || state.audioPassthroughReason === 'runtime_failed') reason = t.audioPassthroughRuntimeFailed
+  return `${t.audioPassthroughPcm} · ${reason}`
 }
 
 function useLocalPlaybackReporting(state: PlayerState): void {
@@ -1744,6 +1785,25 @@ function SubtitlePopover({
           {activePanel === 'audio' && (
             <div className="subtitle-page">
               <section className="subtitle-section">
+                <button
+                  className={`menu-action-row audio-passthrough-toggle ${state.audioPassthroughRequested ? 'is-selected' : ''}`}
+                  type="button"
+                  disabled={!state.hasAudio}
+                  onClick={() => postNativeCommand({
+                    type: 'command',
+                    command: 'setCurrentAudioPassthrough',
+                    enabled: !state.audioPassthroughRequested
+                  })}
+                >
+                  <span>{t.audioPassthrough}</span>
+                  <strong>{state.audioPassthroughRequested ? t.on : t.off}</strong>
+                </button>
+                <small className={`audio-passthrough-status ${state.audioPassthroughActive ? 'is-active' : ''}`}>
+                  {audioPassthroughStatus(state, t)}
+                </small>
+              </section>
+
+              <section className="subtitle-section">
                 <div className="control-title">{t.audioTracks}</div>
                 <TrackList
                   tracks={state.audioTracks}
@@ -1763,9 +1823,13 @@ function SubtitlePopover({
                     max={100}
                     step={1}
                     value={clamp(Math.round(state.volume * 100), 0, 100)}
+                    disabled={state.audioPassthroughActive}
                     onChange={(event) => postNativeCommand({ type: 'command', command: 'setVolume', volume: Number(event.currentTarget.value) / 100 })}
                   />
                 </RangeControl>
+                {state.audioPassthroughActive && (
+                  <small className="audio-passthrough-status is-active">{t.audioPassthroughVolume}</small>
+                )}
               </section>
             </div>
           )}
@@ -1971,6 +2035,7 @@ function Transport({
                 min={0}
                 max={100}
                 value={volumePercent}
+                disabled={state.audioPassthroughActive}
                 onPointerDown={() => setVolumeDragging(true)}
                 onPointerUp={() => setVolumeDragging(false)}
                 onPointerCancel={() => setVolumeDragging(false)}

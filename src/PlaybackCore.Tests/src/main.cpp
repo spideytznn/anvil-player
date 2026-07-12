@@ -512,9 +512,34 @@ void TestDolbyVisionPlaybackPlanPrefersSystemExtensions() {
 
 void TestDisplayMetadataPassthroughDefaults() {
     const auto settings = anvil::playback::MakeDefaultSettings();
-    assert(settings.video.displayMetadataPassthrough);
+    assert(!settings.video.displayMetadataPassthrough);
     assert(!settings.video.dolbyVisionSystemPipelineExperimental);
+    // Zero means auto: use the player window's current monitor peak and let
+    // the renderer fall back to 1000 nits only when Windows reports none.
     assert(settings.video.displayPeakBrightnessNits == 0);
+}
+
+void TestAudioPassthroughPlanningFallsBackToPcm() {
+    anvil::playback::MediaDescriptor media;
+    media.hasAudio = true;
+    media.audioCodec = L"AC-3";
+    auto settings = anvil::playback::MakeDefaultSettings();
+    anvil::playback::CapabilityReport capabilities;
+
+    auto plan = anvil::playback::PlaybackPlanner::Build(media, settings, capabilities);
+    assert(plan.audioOutput == L"wasapi_shared_pcm");
+
+    settings.audio.passthroughPreferred = true;
+    for (const std::wstring codec : {L"AC-3", L"E-AC-3", L"TrueHD", L"DTS"}) {
+        media.audioCodec = codec;
+        plan = anvil::playback::PlaybackPlanner::Build(media, settings, capabilities);
+        assert(plan.audioOutput == L"wasapi_exclusive_bitstream");
+    }
+
+    media.audioCodec = L"AAC";
+    plan = anvil::playback::PlaybackPlanner::Build(media, settings, capabilities);
+    assert(plan.audioOutput == L"wasapi_shared_pcm");
+    assert(plan.audioReason == L"codec_not_bitstream_candidate_fallback_pcm");
 }
 
 void TestHdr10PlusFrameMetadataExtraction() {
@@ -593,6 +618,7 @@ int main() {
     TestHdrPlaybackPlanUsesStructuredColorMetadata();
     TestDolbyVisionPlaybackPlanPrefersSystemExtensions();
     TestDisplayMetadataPassthroughDefaults();
+    TestAudioPassthroughPlanningFallsBackToPcm();
     TestHdr10PlusFrameMetadataExtraction();
     std::cout << "PlaybackCore tests passed\n";
     return 0;

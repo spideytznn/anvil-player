@@ -4,6 +4,11 @@
 
 #include <ksmedia.h>
 
+extern "C" {
+#include <libavformat/avio.h>
+#include <libavutil/opt.h>
+}
+
 #include <algorithm>
 #include <cmath>
 #include <cwctype>
@@ -57,6 +62,138 @@ bool IsNetworkMediaPath(const std::filesystem::path& path) {
            value.rfind(L"https://", 0) == 0;
 }
 
+std::wstring PassthroughCodecName(const AVCodecParameters* parameters) {
+    if (!parameters) return {};
+    switch (parameters->codec_id) {
+    case AV_CODEC_ID_AC3: return L"AC-3";
+    case AV_CODEC_ID_EAC3: return L"E-AC-3";
+    case AV_CODEC_ID_TRUEHD: return L"TrueHD";
+    case AV_CODEC_ID_DTS:
+        return parameters->profile == AV_PROFILE_DTS_HD_HRA ||
+                       parameters->profile == AV_PROFILE_DTS_HD_MA ||
+                       parameters->profile == AV_PROFILE_DTS_HD_MA_X ||
+                       parameters->profile == AV_PROFILE_DTS_HD_MA_X_IMAX
+                   ? L"DTS-HD"
+                   : L"DTS";
+    default: return {};
+    }
+}
+
+struct SpdifPacketizer {
+    ~SpdifPacketizer() { Close(); }
+
+    bool Open(const AVCodecParameters* parameters, const AVRational timeBase, std::wstring& error) {
+        Close();
+        if (!parameters) {
+            error = L"missing codec parameters";
+            return false;
+        }
+        int result = avformat_alloc_output_context2(&context, nullptr, "spdif", nullptr);
+        if (result < 0 || !context) {
+            error = L"FFmpeg spdif muxer unavailable";
+            return false;
+        }
+        stream = avformat_new_stream(context, nullptr);
+        if (!stream) {
+            error = L"FFmpeg spdif stream allocation failed";
+            Close();
+            return false;
+        }
+        result = avcodec_parameters_copy(stream->codecpar, parameters);
+        if (result < 0) {
+            error = L"FFmpeg spdif codec copy failed";
+            Close();
+            return false;
+        }
+        stream->codecpar->codec_tag = 0;
+        stream->time_base = timeBase.num > 0 && timeBase.den > 0 ? timeBase : AVRational{1, 48000};
+        if (parameters->codec_id == AV_CODEC_ID_DTS &&
+            (parameters->profile == AV_PROFILE_DTS_HD_HRA ||
+             parameters->profile == AV_PROFILE_DTS_HD_MA ||
+             parameters->profile == AV_PROFILE_DTS_HD_MA_X ||
+             parameters->profile == AV_PROFILE_DTS_HD_MA_X_IMAX)) {
+            // FFmpeg otherwise strips the HD extension and emits only DTS
+            // core. 768 kHz is the IEC 60958 frame rate of an HBR 8-channel
+            // 192 kHz carrier.
+            av_opt_set_int(context->priv_data, "dtshd_rate", 768000, 0);
+            av_opt_set_int(context->priv_data, "dtshd_fallback_time", -1, 0);
+        }
+
+        constexpr int kIoBufferSize = 32768;
+        unsigned char* ioBuffer = static_cast<unsigned char*>(av_malloc(kIoBufferSize));
+        if (!ioBuffer) {
+            error = L"FFmpeg spdif IO allocation failed";
+            Close();
+            return false;
+        }
+        io = avio_alloc_context(ioBuffer, kIoBufferSize, 1, this, nullptr, &Write, nullptr);
+        if (!io) {
+            av_free(ioBuffer);
+            error = L"FFmpeg spdif IO context failed";
+            Close();
+            return false;
+        }
+        context->pb = io;
+        context->flags |= AVFMT_FLAG_CUSTOM_IO;
+        result = avformat_write_header(context, nullptr);
+        if (result < 0) {
+            error = L"FFmpeg spdif header failed";
+            Close();
+            return false;
+        }
+        headerWritten = true;
+        bytes.clear();
+        return true;
+    }
+
+    bool Packetize(const AVPacket* source, std::vector<uint8_t>& output, std::wstring& error) {
+        output.clear();
+        if (!context || !source) return false;
+        AVPacket* packet = av_packet_clone(source);
+        if (!packet) {
+            error = L"FFmpeg spdif packet clone failed";
+            return false;
+        }
+        packet->stream_index = stream->index;
+        bytes.clear();
+        const int result = av_write_frame(context, packet);
+        av_packet_free(&packet);
+        avio_flush(io);
+        if (result < 0) {
+            error = L"FFmpeg spdif packetization failed";
+            return false;
+        }
+        output.swap(bytes);
+        return true;
+    }
+
+    void Close() {
+        if (context && headerWritten) av_write_trailer(context);
+        headerWritten = false;
+        if (io) {
+            av_freep(&io->buffer);
+            avio_context_free(&io);
+        }
+        if (context) avformat_free_context(context);
+        context = nullptr;
+        stream = nullptr;
+        bytes.clear();
+    }
+
+    static int Write(void* opaque, const uint8_t* data, const int size) {
+        if (!opaque || !data || size <= 0) return AVERROR(EINVAL);
+        auto& self = *static_cast<SpdifPacketizer*>(opaque);
+        self.bytes.insert(self.bytes.end(), data, data + size);
+        return size;
+    }
+
+    AVFormatContext* context = nullptr;
+    AVStream* stream = nullptr;
+    AVIOContext* io = nullptr;
+    bool headerWritten = false;
+    std::vector<uint8_t> bytes;
+};
+
 }  // namespace
 
 WasapiAudioPlayer::~WasapiAudioPlayer() {
@@ -70,7 +207,8 @@ void WasapiAudioPlayer::SetLogSink(LogSinkPtr logSink) {
 bool WasapiAudioPlayer::Start(const std::filesystem::path& mediaPath,
                               const std::chrono::milliseconds startPosition,
                               const double volume,
-                              const int selectedAudioTrackIndex) {
+                              const int selectedAudioTrackIndex,
+                              const bool preferPassthrough) {
     if (!PrepareWorkerForStart()) {
         return false;
     }
@@ -82,6 +220,8 @@ bool WasapiAudioPlayer::Start(const std::filesystem::path& mediaPath,
     startPosition_ = startPosition;
     selectedAudioTrackIndex_ = selectedAudioTrackIndex;
     volume_.store(std::clamp(volume, 0.0, 1.0));
+    passthroughRequested_.store(preferPassthrough);
+    SetPassthroughRuntime(false, preferPassthrough ? L"negotiating" : L"disabled");
     paused_.store(false);
     pausePositionMs_.store(startPosition.count());
     pendingSeekMs_.store(-1);
@@ -91,7 +231,9 @@ bool WasapiAudioPlayer::Start(const std::filesystem::path& mediaPath,
         std::scoped_lock lock(stateMutex_);
         startResolved_ = false;
         startSucceeded_ = false;
-        lastStatus_ = L"wasapi shared pcm initializing";
+        lastStatus_ = preferPassthrough
+                          ? L"wasapi exclusive bitstream initializing"
+                          : L"wasapi shared pcm initializing";
     }
 
     {
@@ -122,7 +264,8 @@ bool WasapiAudioPlayer::StartPacketStream(const std::filesystem::path& mediaPath
                                           const std::chrono::milliseconds startPosition,
                                           const double volume,
                                           const int streamIndex,
-                                          const uint64_t startGeneration) {
+                                          const uint64_t startGeneration,
+                                          const bool preferPassthrough) {
     const auto failCurrentStart = [this, startGeneration](const std::wstring& status) {
         FailPendingStart(startGeneration, status);
         return false;
@@ -171,6 +314,8 @@ bool WasapiAudioPlayer::StartPacketStream(const std::filesystem::path& mediaPath
         packetStreamIndex_ = streamIndex;
         packetTimeBase_ = timeBase;
         volume_.store(std::clamp(volume, 0.0, 1.0));
+        passthroughRequested_.store(preferPassthrough);
+        SetPassthroughRuntime(false, preferPassthrough ? L"negotiating" : L"disabled");
         packetInputMode_.store(true);
         packetStreamEof_.store(false);
         pendingSeekMs_.store(-1);
@@ -184,7 +329,9 @@ bool WasapiAudioPlayer::StartPacketStream(const std::filesystem::path& mediaPath
             std::scoped_lock stateLock(stateMutex_);
             startResolved_ = false;
             startSucceeded_ = false;
-            lastStatus_ = L"wasapi packet pcm initializing";
+            lastStatus_ = preferPassthrough
+                              ? L"wasapi packet bitstream initializing"
+                              : L"wasapi packet pcm initializing";
         }
         running_.store(true);
         workerFinished_.store(false);
@@ -530,6 +677,7 @@ void WasapiAudioPlayer::PlaybackLoop(const uint64_t workerGeneration) {
     AVFrame* frame = nullptr;
     SwrContext* swrCtx = nullptr;
     bool audioClientStarted = false;
+    HANDLE bitstreamEvent = nullptr;
     int audioStreamIndex = -1;
     Microsoft::WRL::ComPtr<IAudioClient> audioClient;
     Microsoft::WRL::ComPtr<IAudioRenderClient> renderClient;
@@ -552,10 +700,55 @@ void WasapiAudioPlayer::PlaybackLoop(const uint64_t workerGeneration) {
         if (packet) av_packet_free(&packet);
         if (codecCtx) avcodec_free_context(&codecCtx);
         if (formatCtx) avformat_close_input(&formatCtx);
+        if (bitstreamEvent) {
+            CloseHandle(bitstreamEvent);
+            bitstreamEvent = nullptr;
+        }
+        if (outputFormat.bitstream && PassthroughReason() == L"active") {
+            SetPassthroughRuntime(false,
+                                  stopping_.load() ? L"stopped" : L"ended",
+                                  PassthroughCodec());
+        }
         running_.store(false);
     };
 
     const bool packetInput = packetInputMode_.load();
+
+    auto releaseAudioOutput = [&]() {
+        if (audioClientStarted && audioClient) {
+            audioClient->Stop();
+        }
+        audioClientStarted = false;
+        SetPlaybackClockRunning(false);
+        renderClient.Reset();
+        audioClient.Reset();
+        outputFormat = {};
+        submittedFrames = 0;
+        if (bitstreamEvent) {
+            CloseHandle(bitstreamEvent);
+            bitstreamEvent = nullptr;
+        }
+    };
+
+    auto preparePcmFallback = [&](std::wstring reason,
+                                  const std::wstring& codec,
+                                  const bool preservePlaybackPosition) {
+        if (preservePlaybackPosition) {
+            if (const auto position = PlaybackClock()) {
+                startPosition_ = std::max(*position, std::chrono::milliseconds{0});
+            }
+        }
+        releaseAudioOutput();
+        ResetPlaybackClock(startPosition_);
+        SetPassthroughRuntime(false, reason, codec);
+        {
+            std::scoped_lock lock(stateMutex_);
+            lastStatus_ = L"wasapi shared pcm fallback initializing";
+        }
+        LogInfo(L"audio passthrough fallback=shared_pcm reason=" + reason +
+                (codec.empty() ? L"" : L" codec=" + codec) +
+                L" position=" + FormatTimecode(startPosition_));
+    };
 
     do {
         if (stopping_.load()) {
@@ -635,6 +828,229 @@ void WasapiAudioPlayer::PlaybackLoop(const uint64_t workerGeneration) {
             audioTimeBase = audioStream->time_base;
             inputCodecParameters = audioStream->codecpar;
         }
+
+        bool useBitstream = false;
+        if (passthroughRequested_.load()) {
+            const std::wstring codecName = PassthroughCodecName(inputCodecParameters);
+            if (codecName.empty()) {
+                preparePcmFallback(L"unsupported_codec", codecName, false);
+            } else if (std::abs(playbackRate_.load() - 1.0) > 0.001) {
+                preparePcmFallback(L"playback_rate_unsupported", codecName, false);
+            } else {
+                UINT32 bitstreamBufferFrames = 0;
+                std::wstring failureReason;
+                bitstreamEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                if (!bitstreamEvent) {
+                    preparePcmFallback(L"event_creation_failed", codecName, false);
+                }
+                if (bitstreamEvent &&
+                    InitializeBitstreamWasapi(inputCodecParameters,
+                                              audioClient,
+                                              renderClient,
+                                              outputFormat,
+                                              bitstreamBufferFrames,
+                                              bitstreamEvent,
+                                              failureReason)) {
+                    useBitstream = true;
+                    SetPassthroughRuntime(true, L"active", codecName);
+                    LogInfo(L"audio passthrough active codec=" + codecName +
+                            L" carrier=" + std::to_wstring(outputFormat.sampleRate) + L"Hz/" +
+                            std::to_wstring(outputFormat.channels) + L"ch");
+                } else if (bitstreamEvent) {
+                    preparePcmFallback(failureReason.empty() ? L"initialization_failed" : failureReason,
+                                       codecName,
+                                       false);
+                }
+            }
+        } else {
+            SetPassthroughRuntime(false, L"disabled");
+        }
+
+        if (useBitstream) {
+            SpdifPacketizer packetizer;
+            std::wstring packetizerError;
+            if (!packetizer.Open(inputCodecParameters, audioTimeBase, packetizerError)) {
+                LogError(packetizerError);
+                preparePcmFallback(L"packetizer_initialization_failed",
+                                   PassthroughCodecName(inputCodecParameters),
+                                   false);
+            } else {
+                bool fallbackToPcm = false;
+                std::wstring fallbackReason;
+                if (!packetInput) {
+                    packet = av_packet_alloc();
+                    if (!packet) {
+                        LogError(L"bitstream packet allocation failed");
+                        fallbackToPcm = true;
+                        fallbackReason = L"packet_allocation_failed";
+                    }
+                    const bool skipNetworkNearStartSeek = networkSource && startPosition_ < std::chrono::seconds{1};
+                    if (!fallbackToPcm && startPosition_.count() > 0 && !skipNetworkNearStartSeek) {
+                        const int64_t target = static_cast<int64_t>(startPosition_.count()) * AV_TIME_BASE / 1000;
+                        const int seekError = av_seek_frame(formatCtx, -1, target, AVSEEK_FLAG_BACKWARD);
+                        if (seekError < 0) LogInfo(L"bitstream initial seek failed: " + FfmpegErrorString(seekError));
+                    }
+                }
+                {
+                    std::scoped_lock lock(stateMutex_);
+                    lastStatus_ = outputFormat.description;
+                }
+                SetPlaybackClockRunning(false);
+                std::vector<uint8_t> pendingBitstream;
+                std::size_t pendingBitstreamOffset = 0;
+                bool startSignaled = false;
+
+                while (!fallbackToPcm && !stopping_.load()) {
+                    if (!HandlePause(audioClient.Get(), outputFormat, submittedFrames, audioClientStarted)) break;
+
+                    if (const auto target = TakePendingSeek()) {
+                        startPosition_ = *target;
+                        if (audioClientStarted) {
+                            audioClient->Stop();
+                            audioClient->Reset();
+                            audioClientStarted = false;
+                        }
+                        submittedFrames = 0;
+                        pendingBitstream.clear();
+                        pendingBitstreamOffset = 0;
+                        if (packetInput) {
+                            std::scoped_lock lock(packetMutex_);
+                            ClearPacketQueueLocked();
+                            packetStreamEof_.store(false);
+                            packetCv_.notify_all();
+                        } else {
+                            const int64_t seekTarget = static_cast<int64_t>(target->count()) * AV_TIME_BASE / 1000;
+                            int seekError = av_seek_frame(formatCtx, -1, seekTarget, AVSEEK_FLAG_BACKWARD);
+                            if (seekError < 0) {
+                                seekError = avformat_seek_file(formatCtx, -1, INT64_MIN, seekTarget, INT64_MAX, 0);
+                            }
+                            if (seekError < 0) {
+                                LogError(L"bitstream seek failed: " + FfmpegErrorString(seekError));
+                                fallbackToPcm = true;
+                                fallbackReason = L"bitstream_seek_failed";
+                                break;
+                            }
+                            avformat_flush(formatCtx);
+                        }
+                        if (!packetizer.Open(inputCodecParameters, audioTimeBase, packetizerError)) {
+                            LogError(L"bitstream packetizer reset failed: " + packetizerError);
+                            fallbackToPcm = true;
+                            fallbackReason = L"packetizer_failed";
+                            break;
+                        }
+                        ResetPlaybackClock(*target);
+                        SetPlaybackClockRunning(false);
+                    }
+
+                    AVPacket* sourcePacket = nullptr;
+                    bool ownedPacket = false;
+                    if (packetInput) {
+                        sourcePacket = TakeQueuedPacket();
+                        ownedPacket = true;
+                        if (!sourcePacket) {
+                            if (packetStreamEof_.load()) {
+                                if (!WriteBitstream(renderClient.Get(),
+                                                    audioClient.Get(),
+                                                    outputFormat,
+                                                    bitstreamEvent,
+                                                    pendingBitstream,
+                                                    pendingBitstreamOffset,
+                                                    nullptr,
+                                                    0,
+                                                    true,
+                                                    submittedFrames,
+                                                    audioClientStarted)) {
+                                    fallbackToPcm = true;
+                                    fallbackReason = L"runtime_write_failed";
+                                }
+                                if (audioClientStarted && !startSignaled) {
+                                    SignalStart(true, workerGeneration);
+                                    startSignaled = true;
+                                }
+                                break;
+                            }
+                            continue;
+                        }
+                    } else {
+                        const int readResult = av_read_frame(formatCtx, packet);
+                        if (readResult < 0) {
+                            if (!WriteBitstream(renderClient.Get(),
+                                                audioClient.Get(),
+                                                outputFormat,
+                                                bitstreamEvent,
+                                                pendingBitstream,
+                                                pendingBitstreamOffset,
+                                                nullptr,
+                                                0,
+                                                true,
+                                                submittedFrames,
+                                                audioClientStarted)) {
+                                fallbackToPcm = true;
+                                fallbackReason = L"runtime_write_failed";
+                            }
+                            if (audioClientStarted && !startSignaled) {
+                                SignalStart(true, workerGeneration);
+                                startSignaled = true;
+                            }
+                            break;
+                        }
+                        if (packet->stream_index != audioStreamIndex) {
+                            av_packet_unref(packet);
+                            continue;
+                        }
+                        sourcePacket = packet;
+                    }
+
+                    std::vector<uint8_t> burst;
+                    const bool packetized = packetizer.Packetize(sourcePacket, burst, packetizerError);
+                    if (ownedPacket) av_packet_free(&sourcePacket);
+                    else av_packet_unref(packet);
+                    if (!packetized) {
+                        LogError(packetizerError);
+                        fallbackToPcm = true;
+                        fallbackReason = L"packetizer_failed";
+                        break;
+                    }
+                    if (burst.empty()) continue;
+                    if (burst.size() % outputFormat.blockAlign != 0) {
+                        LogError(L"IEC 61937 burst is not carrier-frame aligned bytes=" +
+                                 std::to_wstring(burst.size()));
+                        fallbackToPcm = true;
+                        fallbackReason = L"unaligned_iec61937_burst";
+                        break;
+                    }
+                    if (!WriteBitstream(renderClient.Get(),
+                                        audioClient.Get(),
+                                        outputFormat,
+                                        bitstreamEvent,
+                                        pendingBitstream,
+                                        pendingBitstreamOffset,
+                                        burst.data(),
+                                        burst.size(),
+                                        false,
+                                        submittedFrames,
+                                        audioClientStarted)) {
+                        fallbackToPcm = true;
+                        fallbackReason = L"runtime_write_failed";
+                        break;
+                    }
+                    if (audioClientStarted && !startSignaled) {
+                        SignalStart(true, workerGeneration);
+                        startSignaled = true;
+                    }
+                }
+                if (!fallbackToPcm) {
+                    break;
+                }
+                if (packet) {
+                    av_packet_free(&packet);
+                }
+                preparePcmFallback(fallbackReason.empty() ? L"runtime_failed" : fallbackReason,
+                                   PassthroughCodecName(inputCodecParameters),
+                                   audioClientStarted);
+            }
+        }
+
         const AVCodec* codec = avcodec_find_decoder(inputCodecParameters->codec_id);
         if (!codec) {
             LogError(L"avcodec_find_decoder failed");
@@ -838,6 +1254,16 @@ void WasapiAudioPlayer::PlaybackLoop(const uint64_t workerGeneration) {
     workerFinished_.store(true);
 }
 
+std::wstring WasapiAudioPlayer::PassthroughReason() const {
+    std::scoped_lock lock(stateMutex_);
+    return passthroughReason_;
+}
+
+std::wstring WasapiAudioPlayer::PassthroughCodec() const {
+    std::scoped_lock lock(stateMutex_);
+    return passthroughCodec_;
+}
+
 std::optional<std::chrono::milliseconds> WasapiAudioPlayer::TakePendingSeek() {
     const int64_t ms = pendingSeekMs_.exchange(-1);
     if (ms < 0) {
@@ -881,6 +1307,11 @@ bool WasapiAudioPlayer::HandlePause(IAudioClient* audioClient,
     }
     if (!audioClient) {
         return false;
+    }
+    if (outputFormat.bitstream) {
+        // Exclusive event-driven output must be primed with one complete
+        // endpoint buffer before Start. WriteBitstream performs that priming.
+        return true;
     }
 
     const HRESULT hr = audioClient->Start();
@@ -1064,6 +1495,189 @@ bool WasapiAudioPlayer::InitializeWasapi(Microsoft::WRL::ComPtr<IAudioClient>& a
         LogError(L"IAudioClient::GetService(IAudioRenderClient) failed hr=0x" + HexHr(hr));
         return false;
     }
+    return true;
+}
+
+bool WasapiAudioPlayer::InitializeBitstreamWasapi(
+    const AVCodecParameters* codecParameters,
+    Microsoft::WRL::ComPtr<IAudioClient>& audioClient,
+    Microsoft::WRL::ComPtr<IAudioRenderClient>& renderClient,
+    WasapiFormat& outputFormat,
+    UINT32& bufferFrameCount,
+    HANDLE eventHandle,
+    std::wstring& failureReason) const {
+    const std::wstring codecName = PassthroughCodecName(codecParameters);
+    if (codecName.empty()) {
+        failureReason = L"unsupported_codec";
+        return false;
+    }
+
+    const bool highBitRate = codecParameters->codec_id == AV_CODEC_ID_TRUEHD || codecName == L"DTS-HD";
+    const UINT32 encodedRate = codecParameters->sample_rate > 0
+                                   ? static_cast<UINT32>(codecParameters->sample_rate)
+                                   : 48000u;
+    const UINT32 encodedChannels = codecParameters->ch_layout.nb_channels > 0
+                                       ? static_cast<UINT32>(codecParameters->ch_layout.nb_channels)
+                                       : 6u;
+    UINT32 carrierRate = encodedRate;
+    UINT32 carrierChannels = 2;
+    GUID subFormat = KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL;
+    if (codecParameters->codec_id == AV_CODEC_ID_EAC3) {
+        carrierRate = encodedRate % 44100u == 0 ? 176400u : 192000u;
+        subFormat = KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL_PLUS;
+    } else if (codecParameters->codec_id == AV_CODEC_ID_TRUEHD) {
+        carrierRate = encodedRate % 44100u == 0 ? 176400u : 192000u;
+        carrierChannels = 8;
+        subFormat = KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MLP;
+    } else if (codecParameters->codec_id == AV_CODEC_ID_DTS) {
+        if (highBitRate) {
+            carrierRate = encodedRate % 44100u == 0 ? 176400u : 192000u;
+            carrierChannels = 8;
+            subFormat = KSDATAFORMAT_SUBTYPE_IEC61937_DTS_HD;
+        } else {
+            subFormat = KSDATAFORMAT_SUBTYPE_IEC61937_DTS;
+        }
+    }
+
+    WAVEFORMATEXTENSIBLE_IEC61937 format{};
+    format.FormatExt.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+    format.FormatExt.Format.nChannels = static_cast<WORD>(carrierChannels);
+    format.FormatExt.Format.nSamplesPerSec = carrierRate;
+    format.FormatExt.Format.wBitsPerSample = 16;
+    format.FormatExt.Format.nBlockAlign = static_cast<WORD>(carrierChannels * sizeof(int16_t));
+    format.FormatExt.Format.nAvgBytesPerSec = carrierRate * format.FormatExt.Format.nBlockAlign;
+    // The base WAVEFORMATEXTENSIBLE size is the most broadly compatible form
+    // used by mature WASAPI sinks. The IEC fields remain populated for drivers
+    // that inspect the extended structure.
+    format.FormatExt.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+    format.FormatExt.Samples.wValidBitsPerSample = 16;
+    format.FormatExt.dwChannelMask = carrierChannels == 8
+                                         ? KSAUDIO_SPEAKER_7POINT1_SURROUND
+                                         : KSAUDIO_SPEAKER_STEREO;
+    format.FormatExt.SubFormat = subFormat;
+    format.dwEncodedSamplesPerSec = encodedRate;
+    format.dwEncodedChannelCount = encodedChannels;
+    format.dwAverageBytesPerSec = codecParameters->bit_rate > 0
+                                      ? static_cast<DWORD>(codecParameters->bit_rate / 8)
+                                      : 0;
+
+    Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator));
+    if (FAILED(hr)) {
+        failureReason = L"endpoint_enumerator_failed";
+        return false;
+    }
+    Microsoft::WRL::ComPtr<IMMDevice> device;
+    hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+    if (FAILED(hr)) {
+        failureReason = L"endpoint_unavailable";
+        return false;
+    }
+    const auto activateClient = [&]() -> HRESULT {
+        audioClient.Reset();
+        return device->Activate(__uuidof(IAudioClient),
+                                CLSCTX_ALL,
+                                nullptr,
+                                reinterpret_cast<void**>(audioClient.GetAddressOf()));
+    };
+    hr = activateClient();
+    if (FAILED(hr)) {
+        failureReason = L"endpoint_activation_failed";
+        return false;
+    }
+    hr = audioClient->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE,
+                                        &format.FormatExt.Format,
+                                        nullptr);
+    if (hr != S_OK) {
+        failureReason = L"endpoint_format_unsupported";
+        LogInfo(L"bitstream format unsupported codec=" + codecName + L" hr=0x" + HexHr(hr));
+        audioClient.Reset();
+        return false;
+    }
+
+    REFERENCE_TIME defaultPeriod = 0;
+    hr = audioClient->GetDevicePeriod(&defaultPeriod, nullptr);
+    if (FAILED(hr)) {
+        failureReason = L"endpoint_period_failed";
+        audioClient.Reset();
+        return false;
+    }
+    if (defaultPeriod <= 0) {
+        failureReason = L"endpoint_period_invalid";
+        audioClient.Reset();
+        return false;
+    }
+    constexpr REFERENCE_TIME kPassthroughTargetPeriod = 500000;  // 50 ms.
+    const REFERENCE_TIME periodMultiplier =
+        std::max<REFERENCE_TIME>(1, (kPassthroughTargetPeriod + defaultPeriod - 1) / defaultPeriod);
+    REFERENCE_TIME period = periodMultiplier * defaultPeriod;
+    bool reactivate = false;
+    do {
+        if (reactivate) {
+            hr = activateClient();
+            if (FAILED(hr)) break;
+            reactivate = false;
+        }
+        hr = audioClient->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE,
+                                     AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_NOPERSIST,
+                                     period,
+                                     period,
+                                     &format.FormatExt.Format,
+                                     nullptr);
+        if (hr == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED) {
+            UINT32 alignedFrames = 0;
+            if (FAILED(audioClient->GetBufferSize(&alignedFrames)) || alignedFrames == 0) break;
+            period = static_cast<REFERENCE_TIME>(
+                (10000000.0 * static_cast<double>(alignedFrames) / static_cast<double>(carrierRate)) + 0.5);
+            reactivate = true;
+            continue;
+        }
+        if ((hr == AUDCLNT_E_BUFFER_SIZE_ERROR ||
+             hr == AUDCLNT_E_INVALID_DEVICE_PERIOD ||
+             hr == E_OUTOFMEMORY) &&
+            period > defaultPeriod) {
+            period -= defaultPeriod;
+            continue;
+        }
+        break;
+    } while (period >= defaultPeriod);
+    if (FAILED(hr)) {
+        failureReason = hr == AUDCLNT_E_DEVICE_IN_USE ? L"exclusive_mode_unavailable" : L"exclusive_initialize_failed";
+        LogError(L"bitstream initialize failed codec=" + codecName + L" hr=0x" + HexHr(hr));
+        audioClient.Reset();
+        return false;
+    }
+    hr = audioClient->GetBufferSize(&bufferFrameCount);
+    if (FAILED(hr)) {
+        failureReason = L"exclusive_buffer_failed";
+        audioClient.Reset();
+        return false;
+    }
+    hr = audioClient->SetEventHandle(eventHandle);
+    if (FAILED(hr)) {
+        failureReason = L"exclusive_event_handle_failed";
+        audioClient.Reset();
+        return false;
+    }
+    hr = audioClient->GetService(IID_PPV_ARGS(&renderClient));
+    if (FAILED(hr)) {
+        failureReason = L"exclusive_render_client_failed";
+        audioClient.Reset();
+        return false;
+    }
+
+    outputFormat.sampleRate = carrierRate;
+    outputFormat.channels = carrierChannels;
+    outputFormat.blockAlign = format.FormatExt.Format.nBlockAlign;
+    outputFormat.bufferFrameCount = bufferFrameCount;
+    outputFormat.sampleFormat = AV_SAMPLE_FMT_NONE;
+    outputFormat.bitstream = true;
+    outputFormat.description = L"wasapi exclusive bitstream " + codecName;
+    LogInfo(L"bitstream endpoint initialized codec=" + codecName +
+            L" buffer_frames=" + std::to_wstring(bufferFrameCount) +
+            L" frame_bytes=" + std::to_wstring(outputFormat.blockAlign) +
+            L" period_ms=" + std::to_wstring(static_cast<double>(period) / 10000.0));
+    failureReason = L"active";
     return true;
 }
 
@@ -1359,6 +1973,95 @@ bool WasapiAudioPlayer::WritePcm(IAudioRenderClient* renderClient,
     return !stopping_.load();
 }
 
+bool WasapiAudioPlayer::WriteBitstream(IAudioRenderClient* renderClient,
+                                       IAudioClient* audioClient,
+                                       const WasapiFormat& outputFormat,
+                                       HANDLE eventHandle,
+                                       std::vector<uint8_t>& pending,
+                                       std::size_t& pendingOffset,
+                                       const uint8_t* data,
+                                       const std::size_t bytes,
+                                       const bool flush,
+                                       uint64_t& submittedFrames,
+                                       bool& audioClientStarted) {
+    if (!renderClient || !audioClient || !eventHandle ||
+        outputFormat.bufferFrameCount == 0 || outputFormat.blockAlign == 0) {
+        LogError(L"bitstream writer is not initialized");
+        return false;
+    }
+    if (data && bytes > 0) pending.insert(pending.end(), data, data + bytes);
+
+    const std::size_t bufferBytes = static_cast<std::size_t>(outputFormat.bufferFrameCount) *
+                                    static_cast<std::size_t>(outputFormat.blockAlign);
+    while (!stopping_.load()) {
+        std::size_t availableBytes = pending.size() - pendingOffset;
+        if (availableBytes < bufferBytes) {
+            if (!flush || availableBytes == 0) break;
+            pending.resize(pendingOffset + bufferBytes, 0);
+            availableBytes = bufferBytes;
+        }
+
+        if (audioClientStarted) {
+            DWORD waitedMs = 0;
+            while (!stopping_.load() && !paused_.load() && !HasPendingSeek()) {
+                const DWORD waitResult = WaitForSingleObject(eventHandle, 20);
+                if (waitResult == WAIT_OBJECT_0) break;
+                if (waitResult == WAIT_FAILED) {
+                    LogError(L"bitstream endpoint event wait failed win32=" +
+                             std::to_wstring(GetLastError()));
+                    return false;
+                }
+                waitedMs += 20;
+                if (waitedMs >= 1100) {
+                    LogError(L"bitstream endpoint buffer timed out");
+                    return false;
+                }
+            }
+            if (stopping_.load()) return false;
+            if (paused_.load() || HasPendingSeek()) return true;
+        }
+
+        BYTE* buffer = nullptr;
+        HRESULT hr = renderClient->GetBuffer(outputFormat.bufferFrameCount, &buffer);
+        if (FAILED(hr)) {
+            LogError(L"bitstream GetBuffer failed hr=0x" + HexHr(hr) +
+                     L" requested_frames=" + std::to_wstring(outputFormat.bufferFrameCount) +
+                     L" pending_bytes=" + std::to_wstring(availableBytes) +
+                     L" frame_bytes=" + std::to_wstring(outputFormat.blockAlign));
+            return false;
+        }
+        std::memcpy(buffer, pending.data() + pendingOffset, bufferBytes);
+        hr = renderClient->ReleaseBuffer(outputFormat.bufferFrameCount, 0);
+        if (FAILED(hr)) {
+            LogError(L"bitstream ReleaseBuffer failed hr=0x" + HexHr(hr) +
+                     L" frames=" + std::to_wstring(outputFormat.bufferFrameCount));
+            return false;
+        }
+
+        pendingOffset += bufferBytes;
+        submittedFrames += outputFormat.bufferFrameCount;
+        if (!audioClientStarted) {
+            hr = audioClient->Start();
+            if (FAILED(hr)) {
+                LogError(L"bitstream IAudioClient::Start failed hr=0x" + HexHr(hr));
+                return false;
+            }
+            audioClientStarted = true;
+            SetPlaybackClockRunning(true);
+        }
+        UpdatePlaybackClock(outputFormat, submittedFrames, outputFormat.bufferFrameCount);
+
+        if (pendingOffset == pending.size()) {
+            pending.clear();
+            pendingOffset = 0;
+        } else if (pendingOffset >= 1024 * 1024) {
+            pending.erase(pending.begin(), pending.begin() + static_cast<std::ptrdiff_t>(pendingOffset));
+            pendingOffset = 0;
+        }
+    }
+    return !stopping_.load();
+}
+
 void WasapiAudioPlayer::ApplyVolume(std::vector<uint8_t>& pcm, const AVSampleFormat format) const {
     const double volume = volume_.load();
     if (std::abs(volume - 1.0) < 0.0001) {
@@ -1553,6 +2256,15 @@ void WasapiAudioPlayer::LogInfo(const std::wstring& message) const {
         logSink_->Write(LogLevel::Debug, L"wasapi", message);
     }
     OutputDebugStringW((L"[wasapi] " + message + L"\n").c_str());
+}
+
+void WasapiAudioPlayer::SetPassthroughRuntime(const bool active,
+                                              std::wstring reason,
+                                              std::wstring codec) {
+    passthroughActive_.store(active);
+    std::scoped_lock lock(stateMutex_);
+    passthroughReason_ = std::move(reason);
+    passthroughCodec_ = std::move(codec);
 }
 
 }  // namespace anvil::app
