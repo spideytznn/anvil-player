@@ -1149,6 +1149,7 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
     ioInterruptAfterSteadyMs_.store(0);
     activeTimelineSerial_.store(1);
     interruptReturnCount_.store(0);
+    hdr10PlusDetected_.store(false);
     playbackPaused_.store(false);
     pausedPositionMs_.store(startPosition.count());
     seekFastResumeFramesRemaining_.store(0);
@@ -4241,6 +4242,12 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
         queued.height = srcH;
         queued.color = MergeFrameColorMetadata(frame, streamColorMetadata_);
         queued.hdr10PlusPayload = ExtractHdr10PlusPayload(frame);
+        queued.hdr10Plus = ExtractHdr10PlusMetadata(frame);
+        if (queued.hdr10Plus) {
+            hdr10PlusDetected_.store(true);
+            queued.dynamicMetadataPath = L"hdr10plus_st2094_40";
+            queued.dynamicMetadataDetails = Hdr10PlusFrameSummary(queued.hdr10Plus.get());
+        }
         queued.dolbyVisionRpu = ExtractDolbyVisionRpu(frame);
         queued.dovi = dolbyVisionStream_ ? ExtractFrameDolbyVisionMetadata(frame) : nullptr;
         if (queued.dovi && queued.dovi->valid) {
@@ -4351,6 +4358,12 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
     queued.bgra = std::move(pixels);
     queued.color = MergeFrameColorMetadata(frame, streamColorMetadata_);
     queued.hdr10PlusPayload = ExtractHdr10PlusPayload(frame);
+    queued.hdr10Plus = ExtractHdr10PlusMetadata(frame);
+    if (queued.hdr10Plus) {
+        hdr10PlusDetected_.store(true);
+        queued.dynamicMetadataPath = L"hdr10plus_st2094_40";
+        queued.dynamicMetadataDetails = Hdr10PlusFrameSummary(queued.hdr10Plus.get());
+    }
     queued.dolbyVisionRpu = ExtractDolbyVisionRpu(frame);
     if (dolbyVisionStream_) {
         queued.dovi = ExtractFrameDolbyVisionMetadata(frame);
@@ -4448,6 +4461,12 @@ bool FfmpegVideoDecoder::TryBuildD3DTextureFrame(AVFrame* frame, std::chrono::mi
     out.softwareFormat = HardwareFrameSoftwareFormat(frame);
     out.color = MergeFrameColorMetadata(frame, streamColorMetadata_);
     out.hdr10PlusPayload = ExtractHdr10PlusPayload(frame);
+    out.hdr10Plus = ExtractHdr10PlusMetadata(frame);
+    if (out.hdr10Plus) {
+        hdr10PlusDetected_.store(true);
+        out.dynamicMetadataPath = L"hdr10plus_st2094_40";
+        out.dynamicMetadataDetails = Hdr10PlusFrameSummary(out.hdr10Plus.get());
+    }
     out.dolbyVisionRpu = ExtractDolbyVisionRpu(frame);
     if (dolbyVisionStream_) {
         out.dovi = ExtractFrameDolbyVisionMetadata(frame);

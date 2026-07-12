@@ -2029,6 +2029,10 @@ const settingsCopy: Record<UiLanguage, {
   autoDisplayFormatCaption: string
   displayMetadataPassthrough: string
   displayMetadataPassthroughCaption: string
+  hdrDisplayPeak: string
+  hdrDisplayPeakCaption: string
+  automatic: string
+  nits: string
   dolbyVisionSystemPipelineExperimental: string
   dolbyVisionSystemPipelineExperimentalCaption: string
   refreshRateSync: string
@@ -2078,6 +2082,10 @@ const settingsCopy: Record<UiLanguage, {
     autoDisplayFormatCaption: '根据片源自动切换 Windows 与播放器 HDR，播放结束后恢复原始显示状态。',
     displayMetadataPassthrough: '显示元数据直通',
     displayMetadataPassthroughCaption: '向电视传递 HDR 母版色域、MaxCLL 和 MaxFALL 元数据。',
+    hdrDisplayPeak: 'HDR 显示峰值',
+    hdrDisplayPeakCaption: '全局默认。自动读取 Windows 当前显示器峰值，读取失败时使用 1000 尼特。直通开启时由显示设备负责。',
+    automatic: '自动',
+    nits: '尼特',
     dolbyVisionSystemPipelineExperimental: '杜比视界直通（实验性）',
     dolbyVisionSystemPipelineExperimentalCaption: '强制杜比视界片源使用 Windows MediaEngine 与 Dolby Vision Extensions；默认关闭。',
     refreshRateSync: '智能刷新率同步',
@@ -2127,6 +2135,10 @@ const settingsCopy: Record<UiLanguage, {
     autoDisplayFormatCaption: 'Switch Windows and player HDR for the current media, then restore the original display state.',
     displayMetadataPassthrough: 'Display metadata passthrough',
     displayMetadataPassthroughCaption: 'Pass HDR mastering primaries, MaxCLL, and MaxFALL metadata to the TV.',
+    hdrDisplayPeak: 'HDR display peak',
+    hdrDisplayPeakCaption: 'Global default. Auto reads the current Windows display and falls back to 1000 nits. Passthrough delegates this work to the display.',
+    automatic: 'Auto',
+    nits: 'nits',
     dolbyVisionSystemPipelineExperimental: 'Dolby Vision passthrough (experimental)',
     dolbyVisionSystemPipelineExperimentalCaption: 'Force Dolby Vision sources through Windows MediaEngine and Dolby Vision Extensions. Disabled by default.',
     refreshRateSync: 'Smart refresh-rate sync',
@@ -2178,10 +2190,12 @@ function LibrarySettingsPage(props: {
   refreshRateMaximumMultiple: boolean
   onRefreshRateMaximumMultipleChange: (enabled: boolean) => void
   displayMetadataPassthrough: boolean
+  displayPeakBrightnessNits: number
   autoDisplayFormat: boolean
   dolbyVisionSystemPipelineExperimental: boolean
   windowsHdrEnabled: boolean
   onDisplayMetadataPassthroughChange: (enabled: boolean) => void
+  onDisplayPeakBrightnessChange: (peakNits: number) => void
   onAutoDisplayFormatChange: (enabled: boolean) => void
   onDolbyVisionSystemPipelineExperimentalChange: (enabled: boolean) => void
 }): JSX.Element {
@@ -2199,6 +2213,12 @@ function LibrarySettingsPage(props: {
     { value: 'apiKey', label: t.apiKey },
     { value: 'readToken', label: t.readToken }
   ]
+  const peakPassthroughActive = props.autoDisplayFormat ||
+    props.displayMetadataPassthrough ||
+    props.dolbyVisionSystemPipelineExperimental
+  const displayPeakValue = props.displayPeakBrightnessNits > 0
+    ? Math.max(100, Math.min(10000, props.displayPeakBrightnessNits))
+    : 1000
   const updateTmdbSettings = (patch: Partial<TmdbSettings>): void => {
     props.onTmdbSettingsChange({ ...props.tmdbSettings, ...patch })
   }
@@ -2329,6 +2349,44 @@ function LibrarySettingsPage(props: {
               <button className={!props.autoDisplayFormat ? 'is-selected' : ''} type="button" onClick={() => props.onAutoDisplayFormatChange(false)}>
                 <span>{t.disabled}</span>
               </button>
+            </div>
+          </label>
+          <label className={`library-settings-field library-hdr-peak ${peakPassthroughActive ? 'is-disabled' : ''}`}>
+            <span>{t.hdrDisplayPeak}</span>
+            <small>{t.hdrDisplayPeakCaption}</small>
+            <div className="library-hdr-peak-controls">
+              <button
+                className={props.displayPeakBrightnessNits === 0 ? 'is-selected' : ''}
+                type="button"
+                disabled={peakPassthroughActive}
+                onClick={() => props.onDisplayPeakBrightnessChange(
+                  props.displayPeakBrightnessNits === 0 ? displayPeakValue : 0
+                )}
+              >
+                {t.automatic}
+              </button>
+              <input
+                type="range"
+                min="100"
+                max="4000"
+                step="50"
+                value={Math.min(4000, displayPeakValue)}
+                disabled={peakPassthroughActive || props.displayPeakBrightnessNits === 0}
+                onChange={(event) => props.onDisplayPeakBrightnessChange(Number(event.currentTarget.value))}
+              />
+              <input
+                className="library-hdr-peak-number"
+                type="number"
+                min="100"
+                max="10000"
+                step="50"
+                value={displayPeakValue}
+                disabled={peakPassthroughActive || props.displayPeakBrightnessNits === 0}
+                onChange={(event) => props.onDisplayPeakBrightnessChange(
+                  Math.max(100, Math.min(10000, Number(event.currentTarget.value)))
+                )}
+              />
+              <span>{t.nits}</span>
             </div>
           </label>
           <label className="library-settings-field">
@@ -2479,6 +2537,7 @@ export default function LibraryApp(): JSX.Element {
   const [customTitleBarEnabled, setCustomTitleBarEnabled] = useState(false)
   currentLibraryLanguage = language
   const [displayMetadataPassthrough, setDisplayMetadataPassthrough] = useState(true)
+  const [displayPeakBrightnessNits, setDisplayPeakBrightnessNits] = useState(0)
   const [autoDisplayFormat, setAutoDisplayFormat] = useState(false)
   const [dolbyVisionSystemPipelineExperimental, setDolbyVisionSystemPipelineExperimental] = useState(false)
   const [windowsHdrEnabled, setWindowsHdrEnabled] = useState(false)
@@ -2816,6 +2875,11 @@ export default function LibraryApp(): JSX.Element {
     if (!videoPassthroughSettingsLoaded || autoDisplayFormat) return
     postNativeCommand({ type: 'command', command: 'setGlobalDisplayMetadataPassthrough', enabled: displayMetadataPassthrough })
   }, [displayMetadataPassthrough, videoPassthroughSettingsLoaded, autoDisplayFormat])
+
+  useEffect(() => {
+    if (!videoPassthroughSettingsLoaded) return
+    postNativeCommand({ type: 'command', command: 'setGlobalDisplayPeakBrightness', peakNits: displayPeakBrightnessNits })
+  }, [displayPeakBrightnessNits, videoPassthroughSettingsLoaded])
 
   useEffect(() => {
     if (!videoPassthroughSettingsLoaded || autoDisplayFormat) return
@@ -3161,6 +3225,7 @@ export default function LibraryApp(): JSX.Element {
       } else if (message.type === 'globalVideoPassthroughSettings') {
         setAutoDisplayFormat(message.autoDisplayFormat)
         setDisplayMetadataPassthrough(message.displayMetadataPassthrough)
+        setDisplayPeakBrightnessNits(message.displayPeakBrightnessNits)
         setDolbyVisionSystemPipelineExperimental(message.dolbyVisionSystemPipelineExperimental)
         setWindowsHdrEnabled(message.windowsHdrEnabled)
         setVideoPassthroughSettingsLoaded(true)
@@ -5443,6 +5508,7 @@ export default function LibraryApp(): JSX.Element {
           <LibrarySettingsPage
             language={language}
             displayMetadataPassthrough={displayMetadataPassthrough}
+            displayPeakBrightnessNits={displayPeakBrightnessNits}
             autoDisplayFormat={autoDisplayFormat}
             dolbyVisionSystemPipelineExperimental={dolbyVisionSystemPipelineExperimental}
             windowsHdrEnabled={windowsHdrEnabled}
@@ -5454,6 +5520,7 @@ export default function LibraryApp(): JSX.Element {
             trailerSettings={trailerSettings}
             onLanguageChange={changeInterfaceLanguage}
             onDisplayMetadataPassthroughChange={setDisplayMetadataPassthrough}
+            onDisplayPeakBrightnessChange={setDisplayPeakBrightnessNits}
             onAutoDisplayFormatChange={setAutoDisplayFormat}
             onDolbyVisionSystemPipelineExperimentalChange={setDolbyVisionSystemPipelineExperimental}
             onRefreshRateSyncChange={setRefreshRateSyncEnabled}

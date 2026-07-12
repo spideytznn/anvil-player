@@ -135,6 +135,8 @@ public:
     void SetDiagnosticsEnabled(bool enabled);
     void ResetRenderStats();
     D3D11RenderStats TakeRenderStats();
+    int DetectedDisplayPeakNits() const noexcept;
+    int EffectiveDisplayPeakNits() const noexcept;
     void Render(const NativeVideoFrame& frame);
 
     // Transfers a frame to the bounded, process-lifetime retirement worker.
@@ -191,6 +193,7 @@ private:
     bool BlitHlgFrame();
     void SelectCompositionSwapChain(bool hlg);
     bool UpdateColorPipeline(const NativeVideoFrame& frame);
+    void RefreshDisplayPeakNits();
     void UpdateDoviConstants(const NativeVideoFrame& frame);
     bool ApplySwapChainColorSpace(DXGI_COLOR_SPACE_TYPE colorSpace,
                                   const anvil::playback::VideoColorMetadata& color,
@@ -363,6 +366,9 @@ private:
     anvil::playback::SubtitleSettings subtitleSettings_;
     anvil::playback::DisplayCapabilities displayCapabilities_;
     anvil::playback::VideoColorMetadata mediaColor_;
+    HMONITOR displayPeakMonitor_ = nullptr;
+    std::atomic<int> detectedDisplayPeakNits_{0};
+    std::atomic<int> effectiveDisplayPeakNits_{1000};
     std::wstring activeSubtitleText_;
     std::wstring activeSubtitleBitmapKey_;
     RECT activeSubtitleViewport_{};

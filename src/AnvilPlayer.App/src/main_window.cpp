@@ -361,6 +361,21 @@ std::optional<bool> LoadVideoBooleanSetting(const wchar_t* name) {
     return value != 0;
 }
 
+std::optional<int> LoadVideoDwordSetting(const wchar_t* name) {
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    if (RegGetValueW(HKEY_CURRENT_USER,
+                     kVideoSettingsRegistryPath,
+                     name,
+                     RRF_RT_REG_DWORD,
+                     nullptr,
+                     &value,
+                     &size) != ERROR_SUCCESS) {
+        return std::nullopt;
+    }
+    return static_cast<int>(std::min<DWORD>(value, 10000u));
+}
+
 void SaveVideoBooleanSetting(const wchar_t* name, const bool enabled) {
     HKEY key = nullptr;
     if (RegCreateKeyExW(HKEY_CURRENT_USER,
@@ -375,6 +390,29 @@ void SaveVideoBooleanSetting(const wchar_t* name, const bool enabled) {
         return;
     }
     const DWORD value = enabled ? 1u : 0u;
+    RegSetValueExW(key,
+                   name,
+                   0,
+                   REG_DWORD,
+                   reinterpret_cast<const BYTE*>(&value),
+                   sizeof(value));
+    RegCloseKey(key);
+}
+
+void SaveVideoDwordSetting(const wchar_t* name, const int setting) {
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER,
+                        kVideoSettingsRegistryPath,
+                        0,
+                        nullptr,
+                        REG_OPTION_NON_VOLATILE,
+                        KEY_SET_VALUE,
+                        nullptr,
+                        &key,
+                        nullptr) != ERROR_SUCCESS) {
+        return;
+    }
+    const DWORD value = static_cast<DWORD>(std::clamp(setting, 0, 10000));
     RegSetValueExW(key,
                    name,
                    0,
@@ -467,6 +505,9 @@ MainWindow::MainWindow(std::shared_ptr<anvil::playback::InMemoryLogSink> logSink
     if (const auto value = LoadVideoBooleanSetting(L"DolbyVisionSystemPipelineExperimental")) {
         settings.video.dolbyVisionSystemPipelineExperimental =
             *value && anvil::playback::CapabilityDetector::IsHdrEnabledNow();
+    }
+    if (const auto value = LoadVideoDwordSetting(L"DisplayPeakBrightnessNits")) {
+        settings.video.displayPeakBrightnessNits = *value == 0 ? 0 : std::clamp(*value, 100, 10000);
     }
     controller_.ApplySettings(settings);
 }
@@ -753,6 +794,12 @@ std::wstring MainWindow::BuildWebUiStateJson() const {
     const auto snapshot = controller_.Snapshot();
     const auto settings = controller_.Settings();
     const auto capabilities = anvil::playback::CapabilityDetector::CollectBasic();
+    const int detectedDisplayPeakNits = d3dRenderer_
+                                            ? d3dRenderer_->DetectedDisplayPeakNits()
+                                            : std::max(0, capabilities.display.reportedPeakBrightnessNits);
+    const int effectiveDisplayPeakNits = settings.video.displayPeakBrightnessNits > 0
+                                             ? settings.video.displayPeakBrightnessNits
+                                             : (detectedDisplayPeakNits > 0 ? detectedDisplayPeakNits : 1000);
 
     std::wstring playbackState = ToDisplayString(snapshot.state);
     if (!snapshot.media.has_value()) {
@@ -844,12 +891,17 @@ std::wstring MainWindow::BuildWebUiStateJson() const {
     json << L"\"hdrOutputLocked\":"
          << ((settings.video.autoDisplayFormat ||
               (windowsHdrEnabled && (settings.video.displayMetadataPassthrough ||
-                                    settings.video.dolbyVisionSystemPipelineExperimental))
+                                    (dolbyVisionMedia && settings.video.dolbyVisionSystemPipelineExperimental)))
              )
                  ? L"true"
                  : L"false")
          << L",";
     json << L"\"windowsHdrEnabled\":" << (windowsHdrEnabled ? L"true" : L"false") << L",";
+    json << L"\"hdrDisplayPeakAutomatic\":"
+         << (settings.video.displayPeakBrightnessNits == 0 ? L"true" : L"false") << L",";
+    json << L"\"hdrDisplayPeakConfiguredNits\":" << settings.video.displayPeakBrightnessNits << L",";
+    json << L"\"hdrDisplayPeakDetectedNits\":" << detectedDisplayPeakNits << L",";
+    json << L"\"hdrDisplayPeakEffectiveNits\":" << effectiveDisplayPeakNits << L",";
     json << L"\"autoDisplayFormat\":" << (settings.video.autoDisplayFormat ? L"true" : L"false") << L",";
     json << L"\"displayMetadataPassthrough\":" << (settings.video.displayMetadataPassthrough ? L"true" : L"false") << L",";
     json << L"\"dolbyVisionSystemPipelineExperimental\":"
@@ -1088,6 +1140,10 @@ void MainWindow::HandleWebUiMessage(const std::wstring_view message) {
         Execute(Command::ToggleDolbyVisionCmv4Approx);
     } else if (MessageContains(message, L"\"command\":\"setAutoDisplayFormat\"")) {
         SetAutomaticDisplayFormat(MessageContains(message, L"\"enabled\":true"));
+    } else if (MessageContains(message, L"\"command\":\"setDisplayPeakBrightness\"")) {
+        if (const auto peakNits = ReadJsonNumber(message, L"peakNits")) {
+            SetDisplayPeakBrightnessNits(static_cast<int>(std::round(*peakNits)));
+        }
     } else if (MessageContains(message, L"\"command\":\"setDisplayMetadataPassthrough\"")) {
         SetDisplayMetadataPassthrough(MessageContains(message, L"\"enabled\":true"));
     } else if (MessageContains(message, L"\"command\":\"setDolbyVisionSystemPipelineExperimental\"")) {
@@ -3070,6 +3126,9 @@ void MainWindow::OnPlaybackTimerTick() {
     // the top-level window.
     RegisterMediaDropTarget();
     PollPlaybackSupervisorCompletion();
+    if (hdrToneCurveExpanded_ && CurrentMediaIsHdr10Plus()) {
+        HideHdrToneCurveWindow();
+    }
     {
         auto settings = controller_.Settings();
         if (settings.video.displayMetadataPassthrough &&
@@ -3349,6 +3408,14 @@ bool MainWindow::CurrentMediaHasHdrControls() const {
            MediaHasHdrSignal(controller_.Snapshot().media);
 }
 
+bool MainWindow::CurrentMediaIsHdr10Plus() const {
+    const auto media = controller_.Snapshot().media;
+    if (media.has_value() && ContainsInsensitive(media->hdrFormat, L"HDR10+")) {
+        return true;
+    }
+    return nativeVideoDecoder_ && nativeVideoDecoder_->Hdr10PlusDetected();
+}
+
 bool MainWindow::CurrentMediaHasCmv4Control() const {
     const auto settings = controller_.Settings();
     return !settings.video.dolbyVisionSystemPipelineExperimental &&
@@ -3365,7 +3432,8 @@ bool MainWindow::HdrToneCurveAvailable(const anvil::playback::PlayerSettings& se
         settings.video.displayMetadataPassthrough ||
         !CurrentMediaHasHdrControls() ||
         !settings.video.dolbyVisionHdrOutput ||
-        MediaIsDolbyVision(controller_.Snapshot().media)) {
+        MediaIsDolbyVision(controller_.Snapshot().media) ||
+        CurrentMediaIsHdr10Plus()) {
         return false;
     }
     return true;
@@ -3666,6 +3734,7 @@ void MainWindow::SetAutomaticDisplayFormat(const bool enabled) {
     if (settings.video.autoDisplayFormat == enabled) {
         return;
     }
+    const bool systemPipelineWasEnabled = settings.video.dolbyVisionSystemPipelineExperimental;
     if (!enabled) {
         RestoreAutomaticDisplayFormat();
     }
@@ -3681,17 +3750,47 @@ void MainWindow::SetAutomaticDisplayFormat(const bool enabled) {
     }
     controller_.ApplySettings(settings);
     SaveVideoBooleanSetting(L"AutoDisplayFormat", enabled);
-    if (enabled && controller_.Snapshot().media.has_value()) {
-        ApplyAutomaticDisplayFormatForCurrentMedia();
+    const auto snapshot = controller_.Snapshot();
+    if (snapshot.media.has_value()) {
+        if (enabled) {
+            ApplyAutomaticDisplayFormatForCurrentMedia();
+        }
+        // Auto mode selects the system Dolby pipeline and disables CMv4.
+        // Recompute both defaults when leaving auto mode as well, otherwise
+        // the restored native pipeline inherits CMv4=off from auto mode.
         ApplyDefaultHdrControlsForCurrentMedia();
     }
-    const auto snapshot = controller_.Snapshot();
+    if (!enabled && systemPipelineWasEnabled &&
+        !controller_.Settings().video.dolbyVisionSystemPipelineExperimental) {
+        systemDolbyVisionFallbackForCurrentMedia_ = false;
+    }
     if (snapshot.media.has_value() && snapshot.media->hasVideo) {
         ScheduleNativeColorSettingsRefresh(true);
     }
     MarkLayoutDirty();
     EnsureLayout();
     PostWebUiState();
+}
+
+void MainWindow::SetDisplayPeakBrightnessNits(const int peakNits) {
+    const int normalized = peakNits <= 0 ? 0 : std::clamp(peakNits, 100, 10000);
+    auto settings = controller_.Settings();
+    if (settings.video.displayPeakBrightnessNits == normalized) {
+        return;
+    }
+    settings.video.displayPeakBrightnessNits = normalized;
+    controller_.ApplySettings(settings);
+    SaveVideoDwordSetting(L"DisplayPeakBrightnessNits", normalized);
+
+    const auto snapshot = controller_.Snapshot();
+    if (snapshot.media.has_value() && snapshot.media->hasVideo) {
+        ApplyNativeColorSettingsLive(snapshot);
+    }
+    LogApp(LogLevel::Info,
+           normalized == 0
+               ? L"hdr display peak setting=auto"
+               : L"hdr display peak setting=manual peak=" + std::to_wstring(normalized) + L" nits");
+    PostWebUiState(true);
 }
 
 void MainWindow::OpenFileDialog() {
@@ -5793,11 +5892,14 @@ void MainWindow::ApplyGlobalVideoPassthroughPreferences() {
     const bool displayMetadata = LoadVideoBooleanSetting(L"DisplayMetadataPassthrough").value_or(true);
     const bool dolbySystemPipeline =
         LoadVideoBooleanSetting(L"DolbyVisionSystemPipelineExperimental").value_or(false);
+    const int displayPeakBrightnessNits =
+        LoadVideoDwordSetting(L"DisplayPeakBrightnessNits").value_or(0);
     SetAutomaticDisplayFormat(autoDisplayFormat);
     if (!autoDisplayFormat) {
         SetDisplayMetadataPassthrough(displayMetadata);
         SetDolbyVisionSystemPipelineExperimental(dolbySystemPipeline);
     }
+    SetDisplayPeakBrightnessNits(displayPeakBrightnessNits);
 }
 
 }  // namespace anvil::app

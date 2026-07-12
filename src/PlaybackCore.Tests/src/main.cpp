@@ -3,7 +3,13 @@
 
 #include "AnvilPlayer/Playback/PlayerController.h"
 #include "AnvilPlayer/Playback/PlaybackPlan.h"
+#include "AnvilPlayer/App/color_metadata_util.h"
 #include "AnvilPlayer/App/video_texture_sampling_math.h"
+
+extern "C" {
+#include <libavutil/frame.h>
+#include <libavutil/hdr_dynamic_metadata.h>
+}
 
 #include <algorithm>
 #include <atomic>
@@ -508,6 +514,62 @@ void TestDisplayMetadataPassthroughDefaults() {
     const auto settings = anvil::playback::MakeDefaultSettings();
     assert(settings.video.displayMetadataPassthrough);
     assert(!settings.video.dolbyVisionSystemPipelineExperimental);
+    assert(settings.video.displayPeakBrightnessNits == 0);
+}
+
+void TestHdr10PlusFrameMetadataExtraction() {
+    AVFrame* frame = av_frame_alloc();
+    assert(frame);
+    AVDynamicHDRPlus* source = av_dynamic_hdr_plus_create_side_data(frame);
+    assert(source);
+    source->itu_t_t35_country_code = 0xB5;
+    source->application_version = 0;
+    source->num_windows = 1;
+    source->targeted_system_display_maximum_luminance = AVRational{1000, 1};
+
+    auto& transform = source->params[0];
+    transform.maxscl[0] = AVRational{1, 10};
+    transform.maxscl[1] = AVRational{8, 100};
+    transform.maxscl[2] = AVRational{6, 100};
+    transform.average_maxrgb = AVRational{3, 100};
+    transform.tone_mapping_flag = 1;
+    transform.knee_point_x = AVRational{1, 4};
+    transform.knee_point_y = AVRational{3, 4};
+    transform.num_bezier_curve_anchors = 2;
+    transform.bezier_curve_anchors[0] = AVRational{2, 5};
+    transform.bezier_curve_anchors[1] = AVRational{4, 5};
+    transform.color_saturation_mapping_flag = 1;
+    transform.color_saturation_weight = AVRational{9, 8};
+
+    const auto metadata = anvil::app::ExtractHdr10PlusMetadata(frame);
+    assert(metadata);
+    assert(metadata->valid);
+    assert(metadata->numWindows == 1);
+    assert(metadata->anchorCount == 2);
+    AssertNear(metadata->targetedPeakNits, 1000.0f);
+    assert(std::abs(metadata->sourcePeakNits - 1000.0f) < 0.01f);
+    assert(std::abs(metadata->averageMaxRgbNits - 300.0f) < 0.01f);
+    AssertNear(metadata->kneePointX, 0.25f);
+    AssertNear(metadata->kneePointY, 0.75f);
+    AssertNear(metadata->bezierAnchors[0], 0.4f);
+    AssertNear(metadata->bezierAnchors[1], 0.8f);
+    AssertNear(metadata->saturationWeight, 1.125f);
+
+    transform.tone_mapping_flag = 0;
+    const auto generated = anvil::app::ExtractHdr10PlusMetadata(frame);
+    assert(generated);
+    assert(generated->valid);
+    assert(!generated->toneMappingPresent);
+    assert(generated->anchorCount == 0);
+
+    transform.maxscl[0] = AVRational{0, 1};
+    transform.maxscl[1] = AVRational{0, 1};
+    transform.maxscl[2] = AVRational{0, 1};
+    transform.num_distribution_maxrgb_percentiles = 0;
+    const auto unavailable = anvil::app::ExtractHdr10PlusMetadata(frame);
+    assert(unavailable);
+    assert(!unavailable->valid);
+    av_frame_free(&frame);
 }
 
 }  // namespace
@@ -531,6 +593,7 @@ int main() {
     TestHdrPlaybackPlanUsesStructuredColorMetadata();
     TestDolbyVisionPlaybackPlanPrefersSystemExtensions();
     TestDisplayMetadataPassthroughDefaults();
+    TestHdr10PlusFrameMetadataExtraction();
     std::cout << "PlaybackCore tests passed\n";
     return 0;
 }

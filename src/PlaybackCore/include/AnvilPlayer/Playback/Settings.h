@@ -44,7 +44,8 @@ struct VideoSettings {
     DolbyVisionMode dolbyVision = DolbyVisionMode::FallbackOnly;
     // Pass source mastering-display and content-light metadata to the active
     // HDR swap chain. Color-space selection remains independent so disabling
-    // this switch never silently turns HDR video into SDR.
+    // this switch never silently turns HDR video into SDR. HDR10+ content uses
+    // app-side ST 2094-40 tone mapping while passthrough is disabled.
     bool displayMetadataPassthrough = true;
     // Opt-in Windows MediaEngine + Dolby renderer-extension presentation.
     // The default remains the native FFmpeg/libplacebo RPU path.
@@ -57,6 +58,12 @@ struct VideoSettings {
     // Dolby Vision creative trims and enhancement-layer processing are always
     // enabled for supported software presentation paths.
     bool dolbyVisionCmv4Approx = true;
+    // Target peak of the physical HDR display. Zero selects the peak reported
+    // by Windows for the monitor containing the player; invalid/missing OS
+    // data falls back to 1000 nits in the renderer.
+    int displayPeakBrightnessNits = 0;
+    // Output peak of the optional user-authored HDR curve. This is separate
+    // from the physical display target above.
     int peakBrightnessNits = 1000;
     std::array<HdrToneCurvePoint, kHdrToneCurvePointCount> hdrToneCurve = kDefaultHdrToneCurve;
 };

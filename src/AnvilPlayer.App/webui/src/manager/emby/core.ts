@@ -4,7 +4,7 @@
 // into the monolith.
 
 export const CLIENT_NAME = 'Anvil Player'
-export const CLIENT_VERSION = '0.1.0'
+export const CLIENT_VERSION = '1.0.0'
 export const DEVICE_NAME = 'Anvil Library'
 export const DEVICE_ID_KEY = 'anvil-player.emby.device-id'
 export const PLAYBACK_REPORT_STORAGE_KEY = 'anvil-player.emby.playback-report.v1'

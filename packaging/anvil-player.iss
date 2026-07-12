@@ -1,6 +1,8 @@
 #define AppName "Anvil Player"
 #define AppPublisher "Anvil"
-#define AppVersion "0.1.0"
+#ifndef AppVersion
+#define AppVersion "1.0"
+#endif
 #define SourceRoot "..\dist\release\staging\AnvilPlayer"
 
 [Setup]

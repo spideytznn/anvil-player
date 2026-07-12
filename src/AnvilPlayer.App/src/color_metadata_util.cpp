@@ -2,6 +2,10 @@
 
 #include "AnvilPlayer/App/string_util.h"
 
+#include <algorithm>
+#include <iomanip>
+#include <sstream>
+
 extern "C" {
 #include <libavcodec/codec_par.h>
 #include <libavutil/frame.h>
@@ -202,6 +206,104 @@ std::shared_ptr<const std::vector<std::uint8_t>> ExtractHdr10PlusPayload(const A
     auto result = std::make_shared<std::vector<std::uint8_t>>(payload, payload + payloadSize);
     av_free(payload);
     return result;
+}
+
+std::shared_ptr<const Hdr10PlusFrameMetadata> ExtractHdr10PlusMetadata(const AVFrame* frame) {
+    const AVFrameSideData* sideData = frame
+                                          ? av_frame_get_side_data(frame, AV_FRAME_DATA_DYNAMIC_HDR_PLUS)
+                                          : nullptr;
+    if (!sideData || !sideData->data || sideData->size < sizeof(AVDynamicHDRPlus)) return {};
+
+    const auto* source = reinterpret_cast<const AVDynamicHDRPlus*>(sideData->data);
+    if (source->num_windows == 0 || source->num_windows > 3) return {};
+
+    const AVHDRPlusColorTransformParams& transform = source->params[0];
+    auto metadata = std::make_shared<Hdr10PlusFrameMetadata>();
+    metadata->applicationVersion = source->application_version;
+    metadata->numWindows = source->num_windows;
+    metadata->targetedPeakNits = static_cast<float>(RationalToDouble(
+        source->targeted_system_display_maximum_luminance));
+    const double maxSclRed = RationalToDouble(transform.maxscl[0]);
+    const double maxSclGreen = RationalToDouble(transform.maxscl[1]);
+    const double maxSclBlue = RationalToDouble(transform.maxscl[2]);
+    double maxRgb = std::max({maxSclRed, maxSclGreen, maxSclBlue});
+    double normalizedSourcePeak = 0.0;
+    if (maxRgb > 0.0) {
+        // SMPTE ST 2094-40 Annex B defines SMC as max(MaxSCL). Per-channel
+        // luma weighting underestimates saturated highlights and can make the
+        // display adaptation believe a scene is much dimmer than it is.
+        normalizedSourcePeak = maxRgb;
+        metadata->averageMaxRgbNits = static_cast<float>(
+            std::max(0.0, RationalToDouble(transform.average_maxrgb)) * 10000.0);
+    } else {
+        for (std::size_t index = 0;
+             index < std::min<std::uint8_t>(transform.num_distribution_maxrgb_percentiles, 15);
+             ++index) {
+            maxRgb = std::max(maxRgb, RationalToDouble(transform.distribution_maxrgb[index].percentile));
+        }
+        normalizedSourcePeak = maxRgb;
+        metadata->averageMaxRgbNits = static_cast<float>(
+            std::max(0.0, RationalToDouble(transform.average_maxrgb)) * 10000.0);
+    }
+    metadata->sourcePeakNits = static_cast<float>(
+        std::clamp(normalizedSourcePeak * 10000.0, 0.0, 10000.0));
+    metadata->toneMappingPresent = transform.tone_mapping_flag != 0;
+    metadata->kneePointX = static_cast<float>(RationalToDouble(transform.knee_point_x));
+    metadata->kneePointY = static_cast<float>(RationalToDouble(transform.knee_point_y));
+    metadata->anchorCount = std::min<std::uint8_t>(transform.num_bezier_curve_anchors, 15);
+    for (std::size_t index = 0; index < metadata->anchorCount; ++index) {
+        metadata->bezierAnchors[index] = static_cast<float>(
+            std::clamp(RationalToDouble(transform.bezier_curve_anchors[index]), 0.0, 1.0));
+    }
+    if (transform.color_saturation_mapping_flag != 0) {
+        metadata->saturationWeight = static_cast<float>(
+            std::clamp(RationalToDouble(transform.color_saturation_weight), 0.0, 7.875));
+    }
+
+    const bool validExplicitCurve = metadata->toneMappingPresent &&
+                                    metadata->kneePointX > 0.0f && metadata->kneePointX < 1.0f &&
+                                    metadata->kneePointY > 0.0f && metadata->kneePointY < 1.0f;
+    const bool validPeaks = metadata->targetedPeakNits > 0.0f && metadata->sourcePeakNits > 0.0f;
+    if (!validExplicitCurve && validPeaks) {
+        // ST 2094-40 permits scene statistics without an authored curve. Use
+        // a two-segment curve that is linear through half of the target range,
+        // then compresses smoothly to the scene peak. When the authored target
+        // exceeds the scene peak this reduces to an identity mapping.
+        metadata->targetedPeakNits = std::min(metadata->targetedPeakNits, metadata->sourcePeakNits);
+        metadata->kneePointX = std::clamp(
+            0.5f * metadata->targetedPeakNits / metadata->sourcePeakNits,
+            0.0001f,
+            0.5f);
+        metadata->kneePointY = 0.5f;
+        metadata->anchorCount = 0;
+    }
+    metadata->valid = source->application_version <= 1 && validPeaks &&
+                      metadata->kneePointX > 0.0f && metadata->kneePointX < 1.0f &&
+                      metadata->kneePointY > 0.0f && metadata->kneePointY < 1.0f;
+
+    std::uint64_t hash = 1469598103934665603ull;
+    for (std::size_t index = 0; index < sideData->size; ++index) {
+        hash ^= sideData->data[index];
+        hash *= 1099511628211ull;
+    }
+    metadata->fingerprint = hash;
+    return metadata;
+}
+
+std::wstring Hdr10PlusFrameSummary(const Hdr10PlusFrameMetadata* metadata) {
+    if (!metadata) return L"metadata=missing";
+    std::wostringstream stream;
+    stream << std::fixed << std::setprecision(1)
+           << L"windows=" << static_cast<unsigned>(metadata->numWindows)
+           << L" source_peak=" << metadata->sourcePeakNits
+           << L" target_peak=" << metadata->targetedPeakNits
+           << std::setprecision(4)
+           << L" knee=" << metadata->kneePointX << L"," << metadata->kneePointY
+           << L" anchors=" << static_cast<unsigned>(metadata->anchorCount)
+           << L" curve=" << (metadata->valid
+                                  ? (metadata->toneMappingPresent ? L"authored" : L"generated")
+                                  : L"unavailable");
+    return stream.str();
 }
 
 std::shared_ptr<const std::vector<std::uint8_t>> ExtractDolbyVisionRpu(const AVFrame* frame) {

@@ -32,7 +32,8 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ItemDefinitionGroup>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(SolutionDir)src\PlaybackCore\include;$(SolutionDir)src\AnvilPlayer.App\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(SolutionDir)src\PlaybackCore\include;$(SolutionDir)src\AnvilPlayer.App\include;$(SolutionDir)third_party\ffmpeg\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -45,6 +46,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="..\AnvilPlayer.App\src\color_metadata_util.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\PlaybackCore\PlaybackCore.vcxproj">

@@ -422,6 +422,11 @@ std::wstring DetectHdrFormat(const AVCodecParameters* parameters, const VideoCol
     if (!dovi.empty()) {
         return dovi;
     }
+    for (int index = 0; parameters->coded_side_data && index < parameters->nb_coded_side_data; ++index) {
+        if (parameters->coded_side_data[index].type == AV_PKT_DATA_DYNAMIC_HDR10_PLUS) {
+            return L"HDR10+ / PQ";
+        }
+    }
     if (color.transfer == VideoTransferCharacteristic::Pq) {
         if (color.primaries == VideoColorPrimaries::Bt2020) {
             return color.contentLight.hasValues || color.masteringDisplay.hasLuminance ? L"HDR10 / PQ" : L"PQ HDR";

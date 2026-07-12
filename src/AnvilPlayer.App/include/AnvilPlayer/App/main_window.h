@@ -161,6 +161,7 @@ private:
     const anvil::playback::CapabilityReport& CachedCapabilities();
     void RenderPlaybackTick(const anvil::playback::PlaybackSessionSnapshot& snapshot, bool forceRefresh = true);
     bool CurrentMediaHasHdrControls() const;
+    bool CurrentMediaIsHdr10Plus() const;
     bool CurrentMediaHasCmv4Control() const;
     bool CurrentCmv4ControlEnabled(const anvil::playback::PlayerSettings& settings) const;
     bool HdrToneCurveAvailable(const anvil::playback::PlayerSettings& settings) const;
@@ -355,6 +356,7 @@ private:
     void ToggleDolbyVisionHdrOutput();
     void ToggleDolbyVisionCmv4Approx();
     void SetDisplayMetadataPassthrough(bool enabled);
+    void SetDisplayPeakBrightnessNits(int peakNits);
     void SetDolbyVisionSystemPipelineExperimental(bool enabled);
     void ToggleFullscreen();
     void SetRefreshRateSyncEnabled(bool enabled);

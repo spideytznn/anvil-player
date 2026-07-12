@@ -23,6 +23,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -64,6 +65,21 @@ bool LoadVideoPassthroughSetting(const wchar_t* name, const bool fallback) {
     return value != 0;
 }
 
+int LoadVideoDwordSetting(const wchar_t* name, const int fallback) {
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    if (RegGetValueW(HKEY_CURRENT_USER,
+                     kVideoSettingsRegistryPath,
+                     name,
+                     RRF_RT_REG_DWORD,
+                     nullptr,
+                     &value,
+                     &size) != ERROR_SUCCESS) {
+        return fallback;
+    }
+    return static_cast<int>(std::min<DWORD>(value, 10000u));
+}
+
 void SaveVideoPassthroughSetting(const wchar_t* name, const bool enabled) {
     HKEY key = nullptr;
     if (RegCreateKeyExW(HKEY_CURRENT_USER,
@@ -78,6 +94,29 @@ void SaveVideoPassthroughSetting(const wchar_t* name, const bool enabled) {
         return;
     }
     const DWORD value = enabled ? 1u : 0u;
+    RegSetValueExW(key,
+                   name,
+                   0,
+                   REG_DWORD,
+                   reinterpret_cast<const BYTE*>(&value),
+                   sizeof(value));
+    RegCloseKey(key);
+}
+
+void SaveVideoDwordSetting(const wchar_t* name, const int setting) {
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER,
+                        kVideoSettingsRegistryPath,
+                        0,
+                        nullptr,
+                        REG_OPTION_NON_VOLATILE,
+                        KEY_SET_VALUE,
+                        nullptr,
+                        &key,
+                        nullptr) != ERROR_SUCCESS) {
+        return;
+    }
+    const DWORD value = static_cast<DWORD>(std::clamp(setting, 0, 10000));
     RegSetValueExW(key,
                    name,
                    0,
@@ -1688,6 +1727,7 @@ void LibraryWindow::HandleWebUiMessage(const std::wstring_view message) {
         const bool displayMetadata = LoadVideoPassthroughSetting(L"DisplayMetadataPassthrough", true);
         const bool autoDisplayFormat = LoadVideoPassthroughSetting(L"AutoDisplayFormat", false);
         const bool windowsHdrEnabled = anvil::playback::CapabilityDetector::IsHdrEnabledNow();
+        const int displayPeakBrightnessNits = LoadVideoDwordSetting(L"DisplayPeakBrightnessNits", 0);
         const bool dolbySystemPipeline =
             windowsHdrEnabled &&
             LoadVideoPassthroughSetting(L"DolbyVisionSystemPipelineExperimental", false);
@@ -1699,6 +1739,8 @@ void LibraryWindow::HandleWebUiMessage(const std::wstring_view message) {
                        std::wstring((autoDisplayFormat || dolbySystemPipeline) ? L"true" : L"false") +
                        L",\"windowsHdrEnabled\":" +
                        std::wstring(windowsHdrEnabled ? L"true" : L"false") +
+                       L",\"displayPeakBrightnessNits\":" +
+                       std::to_wstring(displayPeakBrightnessNits) +
                        L"}");
     } else if (MessageContains(message, L"\"command\":\"setGlobalAutoDisplayFormat\"")) {
         SaveVideoPassthroughSetting(L"AutoDisplayFormat",
@@ -1714,6 +1756,13 @@ void LibraryWindow::HandleWebUiMessage(const std::wstring_view message) {
         SaveVideoPassthroughSetting(L"DisplayMetadataPassthrough",
                                     MessageContains(message, L"\"enabled\":true"));
         if (videoPassthroughPreferencesChangedRequest_) videoPassthroughPreferencesChangedRequest_();
+    } else if (MessageContains(message, L"\"command\":\"setGlobalDisplayPeakBrightness\"")) {
+        if (const auto peakNits = ReadJsonNumber(message, L"peakNits")) {
+            const int requested = static_cast<int>(std::round(*peakNits));
+            const int normalized = requested <= 0 ? 0 : std::clamp(requested, 100, 10000);
+            SaveVideoDwordSetting(L"DisplayPeakBrightnessNits", normalized);
+            if (videoPassthroughPreferencesChangedRequest_) videoPassthroughPreferencesChangedRequest_();
+        }
     } else if (MessageContains(message, L"\"command\":\"setGlobalDolbyVisionSystemPipelineExperimental\"")) {
         if (LoadVideoPassthroughSetting(L"AutoDisplayFormat", false)) {
             return;

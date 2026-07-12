@@ -30,6 +30,10 @@ export interface PlayerState {
   hdrOutput: boolean
   hdrOutputLocked: boolean
   windowsHdrEnabled: boolean
+  hdrDisplayPeakAutomatic: boolean
+  hdrDisplayPeakConfiguredNits: number
+  hdrDisplayPeakDetectedNits: number
+  hdrDisplayPeakEffectiveNits: number
   autoDisplayFormat: boolean
   displayMetadataPassthrough: boolean
   dolbyVisionSystemPipelineExperimental: boolean
@@ -190,7 +194,7 @@ export type NativeMessage =
   | MediaDetailsProbed
   | MediaDetailsProbeFailed
   | { type: 'windowChrome'; customTitleBar: boolean }
-  | { type: 'globalVideoPassthroughSettings'; autoDisplayFormat: boolean; displayMetadataPassthrough: boolean; dolbyVisionSystemPipelineExperimental: boolean; windowsHdrEnabled: boolean }
+  | { type: 'globalVideoPassthroughSettings'; autoDisplayFormat: boolean; displayMetadataPassthrough: boolean; dolbyVisionSystemPipelineExperimental: boolean; windowsHdrEnabled: boolean; displayPeakBrightnessNits: number }
   | { type: 'deliverEmbyPlaybackReport'; report: unknown }
   | { type: 'command'; command: 'localPlaybackProgress'; path: string; positionMs: number; durationMs: number; playbackState: string }
   | { type: 'bilibiliTrailerSearchCompleted'; requestId: string; response: unknown }
@@ -249,6 +253,7 @@ export type NativeCommand =
   | { type: 'command'; command: 'requestGlobalVideoPassthroughSettings' }
   | { type: 'command'; command: 'setGlobalAutoDisplayFormat'; enabled: boolean }
   | { type: 'command'; command: 'setGlobalDisplayMetadataPassthrough'; enabled: boolean }
+  | { type: 'command'; command: 'setGlobalDisplayPeakBrightness'; peakNits: number }
   | { type: 'command'; command: 'setGlobalDolbyVisionSystemPipelineExperimental'; enabled: boolean }
   | { type: 'command'; command: 'setUiLanguage'; language: 'en' | 'zh' }
   | { type: 'command'; command: 'showFullscreenTransport' }
@@ -263,6 +268,7 @@ export type NativeCommand =
   | { type: 'command'; command: 'toggleHdr' }
   | { type: 'command'; command: 'toggleCmv4' }
   | { type: 'command'; command: 'setAutoDisplayFormat'; enabled: boolean }
+  | { type: 'command'; command: 'setDisplayPeakBrightness'; peakNits: number }
   | { type: 'command'; command: 'setDisplayMetadataPassthrough'; enabled: boolean }
   | { type: 'command'; command: 'setDolbyVisionSystemPipelineExperimental'; enabled: boolean }
   | { type: 'command'; command: 'setAudioTrack'; index: number }
@@ -357,6 +363,10 @@ export const EMPTY_STATE: PlayerState = {
   hdrOutput: false,
   hdrOutputLocked: false,
   windowsHdrEnabled: false,
+  hdrDisplayPeakAutomatic: true,
+  hdrDisplayPeakConfiguredNits: 0,
+  hdrDisplayPeakDetectedNits: 0,
+  hdrDisplayPeakEffectiveNits: 1000,
   autoDisplayFormat: false,
   displayMetadataPassthrough: true,
   dolbyVisionSystemPipelineExperimental: false,

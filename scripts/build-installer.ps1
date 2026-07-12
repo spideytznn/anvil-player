@@ -1,6 +1,7 @@
 param(
     [string]$Configuration = 'Release',
-    [string]$Platform = 'x64'
+    [string]$Platform = 'x64',
+    [string]$Version = '1.0'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -157,12 +158,12 @@ Copy-Item -LiteralPath (Join-Path $root 'third_party\webview2\NOTICE.txt') -Dest
 
 New-Item -ItemType Directory -Force -Path $distDir | Out-Null
 Write-Host "Compiling Inno Setup installer..."
-& $iscc (Join-Path $root 'packaging\anvil-player.iss')
+& $iscc "/DAppVersion=$Version" (Join-Path $root 'packaging\anvil-player.iss')
 if ($LASTEXITCODE -ne 0) {
     throw "ISCC failed with exit code $LASTEXITCODE"
 }
 
-$installer = Join-Path $distDir 'AnvilPlayer-0.1.0-x64-Setup.exe'
+$installer = Join-Path $distDir "AnvilPlayer-$Version-x64-Setup.exe"
 if (!(Test-Path -LiteralPath $installer)) {
     throw "Installer was not produced: $installer"
 }

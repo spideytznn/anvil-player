@@ -1,5 +1,6 @@
 #pragma once
 
+#include "AnvilPlayer/App/color_metadata_util.h"
 #include "AnvilPlayer/App/log_sink_ptr.h"
 #include "AnvilPlayer/App/video_texture_sampling_math.h"
 #include "AnvilPlayer/Playback/DolbyVisionMetadata.h"
@@ -101,6 +102,9 @@ struct NativeVideoFrame {
     AVPixelFormat softwareFormat = AV_PIX_FMT_NONE;
     anvil::playback::VideoColorMetadata color;
     std::shared_ptr<const std::vector<std::uint8_t>> hdr10PlusPayload;
+    // Parsed SMPTE ST 2094-40 metadata used for app-side per-frame tone mapping
+    // when display metadata passthrough is disabled.
+    std::shared_ptr<const Hdr10PlusFrameMetadata> hdr10Plus;
     // Original Dolby Vision RPU NAL unit for the Windows renderer-effect MFT.
     // FFmpeg preserves NAL emulation-prevention bytes in this side data.
     std::shared_ptr<const std::vector<std::uint8_t>> dolbyVisionRpu;
@@ -250,6 +254,10 @@ public:
 
     bool OneShotFrame() const {
         return oneShotFrame_;
+    }
+
+    bool Hdr10PlusDetected() const {
+        return hdr10PlusDetected_.load();
     }
 
     bool LatestFrame(NativeVideoFrame& frame) const;
@@ -639,6 +647,7 @@ private:
     mutable NativeVideoQueueStats lastStatsSnapshot_;
     std::atomic_bool stopping_{false};
     std::atomic_bool running_{false};
+    std::atomic_bool hdr10PlusDetected_{false};
     std::atomic<HWND> notificationWindow_{nullptr};
     std::atomic_uint notificationMessage_{0};
     std::atomic_uint failureMessage_{0};

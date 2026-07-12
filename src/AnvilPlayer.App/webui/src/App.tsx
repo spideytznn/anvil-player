@@ -102,6 +102,9 @@ const en = {
   hdrOutput: 'HDR output',
   autoDisplayFormat: 'Automatically match display format',
   autoDisplayFormatHint: 'Switch Windows and player HDR output for the current video, then restore the original display state.',
+  hdrDisplayPeak: 'HDR display peak',
+  hdrDisplayPeakHint: 'Used by every app-side HDR mapping path. Auto reads the current Windows display; unavailable data falls back to 1000 nits.',
+  detectedPeak: 'Windows detected',
   displayMetadataPassthrough: 'Display metadata passthrough',
   displayMetadataPassthroughHint: 'Pass HDR mastering display, MaxCLL, and MaxFALL metadata to the display.',
   dolbyVisionSystemPipelineExperimental: 'Dolby Vision passthrough (experimental)',
@@ -210,6 +213,9 @@ const zh: Record<keyof typeof en, string> = {
   hdrOutput: 'HDR 输出',
   autoDisplayFormat: '自动匹配显示格式',
   autoDisplayFormatHint: '根据当前视频切换 Windows 和播放器 HDR 输出，播放结束后恢复原始显示状态。',
+  hdrDisplayPeak: 'HDR 显示峰值',
+  hdrDisplayPeakHint: '用于所有由播放器处理的 HDR 映射。自动读取当前 Windows 显示器，读取不到时回退到 1000 尼特。',
+  detectedPeak: 'Windows 检测值',
   displayMetadataPassthrough: '显示元数据直通',
   displayMetadataPassthroughHint: '向显示设备传递 HDR 母版色域、MaxCLL 与 MaxFALL 元数据。',
   dolbyVisionSystemPipelineExperimental: '杜比视界直通（实验性）',
@@ -1139,6 +1145,76 @@ function PassthroughSetting({
   )
 }
 
+function HdrDisplayPeakSetting({ state, t }: { state: PlayerState; t: Copy }): JSX.Element {
+  const passthroughActive = state.displayMetadataPassthrough ||
+    (state.dolbyVisionMedia && state.dolbyVisionSystemPipelineExperimental)
+  const manualValue = Math.max(100, Math.min(10000,
+    state.hdrDisplayPeakAutomatic ? state.hdrDisplayPeakEffectiveNits : state.hdrDisplayPeakConfiguredNits))
+  const detectedLabel = state.hdrDisplayPeakDetectedNits > 0
+    ? `${t.detectedPeak}: ${formatNits(state.hdrDisplayPeakDetectedNits, t)}`
+    : `${t.detectedPeak}: ${t.unavailable} · ${formatNits(1000, t)}`
+
+  const setPeak = (peakNits: number) => {
+    postNativeCommand({
+      type: 'command',
+      command: 'setDisplayPeakBrightness',
+      peakNits: Math.max(100, Math.min(10000, Math.round(peakNits)))
+    })
+  }
+
+  return (
+    <div className={`hdr-display-peak-setting ${passthroughActive ? 'is-disabled' : ''}`}>
+      <div className="hdr-display-peak-header">
+        <div>
+          <strong>{t.hdrDisplayPeak}</strong>
+          <small>{t.hdrDisplayPeakHint}</small>
+          <small>{detectedLabel}</small>
+        </div>
+        <button
+          className={`peak-auto-button ${state.hdrDisplayPeakAutomatic ? 'is-active' : ''}`}
+          type="button"
+          disabled={passthroughActive}
+          aria-pressed={state.hdrDisplayPeakAutomatic}
+          onClick={() => postNativeCommand({
+            type: 'command',
+            command: 'setDisplayPeakBrightness',
+            peakNits: state.hdrDisplayPeakAutomatic ? manualValue : 0
+          })}
+        >
+          {t.auto}
+        </button>
+      </div>
+      <div className={`hdr-display-peak-controls ${state.hdrDisplayPeakAutomatic || passthroughActive ? 'is-disabled' : ''}`}>
+        <input
+          type="range"
+          min="100"
+          max="4000"
+          step="50"
+          value={Math.min(4000, manualValue)}
+          disabled={state.hdrDisplayPeakAutomatic || passthroughActive}
+          aria-label={t.hdrDisplayPeak}
+          onChange={(event) => setPeak(Number(event.currentTarget.value))}
+        />
+        <input
+          className="hdr-display-peak-number"
+          type="number"
+          min="100"
+          max="10000"
+          step="50"
+          value={manualValue}
+          disabled={state.hdrDisplayPeakAutomatic || passthroughActive}
+          onChange={(event) => setPeak(Number(event.currentTarget.value))}
+        />
+        <span>{t.nits}</span>
+      </div>
+      <div className="hdr-display-peak-effective">
+        <span>{state.hdrDisplayPeakAutomatic ? t.auto : t.peak}</span>
+        <strong>{formatNits(state.hdrDisplayPeakEffectiveNits, t)}</strong>
+      </div>
+    </div>
+  )
+}
+
 function TopBar({ state, t }: { state: PlayerState; t: Copy }): JSX.Element {
   return (
     <header className="topbar line-panel">
@@ -1303,6 +1379,7 @@ function InspectorContent({
           onChange={(enabled) => postNativeCommand({ type: 'command', command: 'setAutoDisplayFormat', enabled })}
           t={t}
         />
+        <HdrDisplayPeakSetting state={state} t={t} />
         <HdrCurveEditor state={state} t={t} />
         {!state.dolbyVisionMedia && (
           <PassthroughSetting
@@ -1314,15 +1391,17 @@ function InspectorContent({
             t={t}
           />
         )}
-        <PassthroughSetting
-          label={t.dolbyVisionSystemPipelineExperimental}
-          hint={t.dolbyVisionSystemPipelineExperimentalHint}
-          enabled={state.dolbyVisionSystemPipelineExperimental}
-          available={state.dolbyVisionSystemPipelineAvailable && !state.autoDisplayFormat}
-          unavailableHint={t.dolbyVisionSystemPipelineUnavailable}
-          onChange={(enabled) => postNativeCommand({ type: 'command', command: 'setDolbyVisionSystemPipelineExperimental', enabled })}
-          t={t}
-        />
+        {state.dolbyVisionMedia && (
+          <PassthroughSetting
+            label={t.dolbyVisionSystemPipelineExperimental}
+            hint={t.dolbyVisionSystemPipelineExperimentalHint}
+            enabled={state.dolbyVisionSystemPipelineExperimental}
+            available={state.dolbyVisionSystemPipelineAvailable && !state.autoDisplayFormat}
+            unavailableHint={t.dolbyVisionSystemPipelineUnavailable}
+            onChange={(enabled) => postNativeCommand({ type: 'command', command: 'setDolbyVisionSystemPipelineExperimental', enabled })}
+            t={t}
+          />
+        )}
         <div className="refresh-rate-setting">
           <div>
             <strong>{t.refreshRateSync}</strong>

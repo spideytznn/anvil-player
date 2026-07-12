@@ -1925,6 +1925,59 @@
   opacity: 0.72;
 }
 
+.library-hdr-peak {
+  grid-column: 1 / -1;
+  padding: 10px 0;
+  transition: opacity 160ms ease;
+}
+
+.library-hdr-peak.is-disabled {
+  opacity: 0.48;
+}
+
+.library-hdr-peak-controls {
+  display: grid;
+  grid-template-columns: 74px minmax(120px, 1fr) 76px auto;
+  align-items: center;
+  gap: 8px;
+  color: var(--library-muted);
+  font-size: 11px;
+}
+
+.library-hdr-peak-controls button {
+  height: 32px;
+  border: 1px solid var(--library-line);
+  border-radius: 7px;
+  background: rgba(2, 5, 9, 0.78);
+  color: var(--library-muted);
+  font-size: 11px;
+  font-weight: 750;
+}
+
+.library-hdr-peak-controls button.is-selected {
+  border-color: var(--accent);
+  background: var(--panel-raised);
+  color: var(--library-text);
+}
+
+.library-hdr-peak-controls button:disabled {
+  cursor: default;
+}
+
+.library-settings-field .library-hdr-peak-controls input[type='range'] {
+  height: 24px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  accent-color: var(--accent);
+}
+
+.library-settings-field .library-hdr-peak-number {
+  height: 32px;
+  padding: 0 8px;
+  text-align: right;
+}
+
 .library-settings-row {
   display: grid;
   grid-template-columns: 96px minmax(0, 1fr);
