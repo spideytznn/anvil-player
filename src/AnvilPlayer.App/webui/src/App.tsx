@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent, type ReactNode, type Ref } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent, type ReactNode, type Ref } from 'react'
 import {
   Captions,
   ChevronLeft,
@@ -2095,20 +2095,20 @@ export default function App(): JSX.Element {
   useEmbyPlaybackReporting(state)
   useLocalPlaybackReporting(state)
 
-  const captureSubtitleAnchor = (): RectSnapshot => {
+  const captureSubtitleAnchor = useCallback((): RectSnapshot => {
     const element = subtitleButtonRef.current
     const anchor = rectSnapshotFromElement(element)
     setSubtitleAnchor(anchor)
     setSubtitleAnchorReady(Boolean(element))
     return anchor
-  }
+  }, [])
 
-  const syncSubtitleAnchor = (): void => {
+  const syncSubtitleAnchor = useCallback((): void => {
     const anchor = captureSubtitleAnchor()
     if (subtitleButtonRef.current) {
       postSubtitleGeometry(anchor)
     }
-  }
+  }, [captureSubtitleAnchor])
 
   useEffect(() => {
     applyAppearanceSettings()
@@ -2150,11 +2150,11 @@ export default function App(): JSX.Element {
     updateAnchor()
     window.addEventListener('resize', updateAnchor)
     return () => window.removeEventListener('resize', updateAnchor)
-  }, [state.fullscreen])
+  }, [state.fullscreen, syncSubtitleAnchor])
 
   useLayoutEffect(() => {
     syncSubtitleAnchor()
-  }, [state.fullscreen, state.fullscreenTransportVisible, state.sidebarCollapsed, subtitleVisualActive])
+  }, [state.fullscreen, state.fullscreenTransportVisible, state.sidebarCollapsed, subtitleVisualActive, syncSubtitleAnchor])
 
   useEffect(() => {
     const firstFrame = window.requestAnimationFrame(syncSubtitleAnchor)
@@ -2167,7 +2167,7 @@ export default function App(): JSX.Element {
       window.cancelAnimationFrame(secondFrame)
       window.clearTimeout(settleTimer)
     }
-  }, [state.fullscreen, state.fullscreenTransportVisible, state.sidebarCollapsed, subtitleVisualActive])
+  }, [state.fullscreen, state.fullscreenTransportVisible, state.sidebarCollapsed, subtitleVisualActive, syncSubtitleAnchor])
 
   useEffect(() => {
     const updateTransportGeometry = (): void => {
@@ -2198,7 +2198,7 @@ export default function App(): JSX.Element {
     } else {
       setSubtitlePopoverOpen(false)
     }
-  }, [state.subtitleMenuOpen])
+  }, [state.subtitleMenuOpen, syncSubtitleAnchor])
 
   useEffect(() => {
     if (subtitlePopoverOpen) {

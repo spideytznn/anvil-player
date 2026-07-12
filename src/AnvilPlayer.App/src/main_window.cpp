@@ -60,6 +60,8 @@ constexpr int kFullscreenTransportActivationHeight = 110;
 constexpr std::size_t kMaxRecentMedia = 12;
 constexpr std::size_t kMaxInspectorFolderEntries = 256;
 constexpr unsigned int kMaxRuntimeStopWorkerStartFailures = 3;
+constexpr unsigned int kMaxRendererDeviceRecoveryAttempts = 3;
+constexpr auto kRendererDeviceRecoveryWindow = std::chrono::seconds{30};
 constexpr auto kRecentMediaSaveCoalesceDelay = std::chrono::milliseconds{150};
 constexpr UINT kRecentMediaLoadCompleteMessage = WM_APP + 14;
 
@@ -1864,6 +1866,12 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
         CompleteRendererInitialization(static_cast<D3D11RendererState>(lParam));
         return 0;
     }
+    case kRenderDeviceLostMessage:
+        if (static_cast<uint64_t>(wParam) != windowLifetimeCookie_) {
+            return 0;
+        }
+        HandleRendererDeviceLost(static_cast<HRESULT>(lParam));
+        return 0;
     case WM_DPICHANGED:
         dpi_ = HIWORD(wParam);
         if (auto* suggested = reinterpret_cast<RECT*>(lParam)) {
@@ -4196,6 +4204,66 @@ void MainWindow::CompleteRendererInitialization(const D3D11RendererState state) 
     }
 }
 
+void MainWindow::HandleRendererDeviceLost(const HRESULT reason) {
+    if (closePending_ || rendererDeviceRecoveryPending_) {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (lastRendererDeviceLossAt_.time_since_epoch().count() == 0 ||
+        now - lastRendererDeviceLossAt_ > kRendererDeviceRecoveryWindow) {
+        rendererDeviceRecoveryAttempts_ = 0;
+    }
+    lastRendererDeviceLossAt_ = now;
+    ++rendererDeviceRecoveryAttempts_;
+    LogApp(LogLevel::Warning,
+           L"d3d device lost reason=0x" + HexHr(reason) +
+               L" recovery_attempt=" + std::to_wstring(rendererDeviceRecoveryAttempts_));
+
+    if (rendererDeviceRecoveryAttempts_ > kMaxRendererDeviceRecoveryAttempts) {
+        LogApp(LogLevel::Error, L"d3d device recovery retry limit reached");
+        FailPlaybackRuntime(L"The graphics device was repeatedly reset");
+        return;
+    }
+
+    rendererDeviceRecoveryPending_ = true;
+    videoHostReady_ = false;
+    videoHostInitializationFailureHandled_ = false;
+    const auto snapshot = controller_.Snapshot();
+    if (snapshot.state == PlaybackState::Playing) {
+        QueueDeferredRuntimeStart(true, true);
+    } else if (snapshot.state == PlaybackState::Paused &&
+               snapshot.media.has_value() && snapshot.media->hasVideo) {
+        QueuePausedNativeFrameRefresh(true);
+    }
+    StopRuntimeAsync(true);
+}
+
+bool MainWindow::RecreateRendererAfterDeviceLoss() {
+    if (!rendererDeviceRecoveryPending_) {
+        return true;
+    }
+    if (d3dRenderer_ && !d3dRenderer_->IsStopped()) {
+        LogApp(LogLevel::Debug, L"d3d device recovery waiting for render worker shutdown");
+        return false;
+    }
+
+    auto sink = controller_.LogSink();
+    d3dRenderer_.reset();
+    d3dRenderer_.emplace(sink);
+    d3dRenderer_->SetDiagnosticsEnabled(sink->MinimumLevel() == LogLevel::Debug);
+    videoHostReady_ = false;
+    videoHostInitializationFailureHandled_ = false;
+    rendererDeviceRecoveryPending_ = false;
+    EnsureVideoHost();
+    const bool accepted = d3dRenderer_->State() == D3D11RendererState::Initializing ||
+                          d3dRenderer_->State() == D3D11RendererState::Ready;
+    LogApp(accepted ? LogLevel::Info : LogLevel::Error,
+           L"d3d device recovery renderer_recreate=" +
+               std::wstring(accepted ? L"accepted" : L"failed"));
+    return accepted;
+}
+
 void MainWindow::BeginClose() {
     if (closePending_) {
         return;
@@ -4363,6 +4431,10 @@ void MainWindow::RequestRuntimeStart(const bool restart, const bool waitForPrero
 }
 
 void MainWindow::ContinueRuntimeAfterAsyncStop() {
+    if (rendererDeviceRecoveryPending_ && !RecreateRendererAfterDeviceLoss()) {
+        FailPlaybackRuntime(L"Failed to recreate the graphics device");
+        return;
+    }
     const bool startRequested = deferredRuntimeStart_;
     bool restart = deferredRuntimeRestart_;
     const bool waitForPreroll = deferredRuntimeWaitForPreroll_;
@@ -4621,7 +4693,8 @@ void MainWindow::EnsureVideoHost() {
     if (!d3dRenderer_->BeginInitialize(videoHost_,
                                        hwnd_,
                                        kRenderInitializationCompleteMessage,
-                                       windowLifetimeCookie_)) {
+                                       windowLifetimeCookie_,
+                                       kRenderDeviceLostMessage)) {
         LogApp(LogLevel::Error, L"native d3d renderer worker failed to start");
         ShowWindow(videoHost_, SW_HIDE);
         return;

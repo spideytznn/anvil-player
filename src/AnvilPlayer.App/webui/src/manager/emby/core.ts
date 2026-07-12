@@ -254,6 +254,7 @@ export async function fetchJson<T>(url: string, init: RequestInit, label: string
       }
     })
   } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error
     const networkMessage = error instanceof Error ? error.message : 'network error'
     if (/failed to fetch/i.test(networkMessage)) {
       throw new Error(`${label}失败：无法访问 Emby 服务器。请确认地址能在本机浏览器打开，并重启 Anvil Player 后再试`)
@@ -284,6 +285,7 @@ export async function fetchEmpty(url: string, init: RequestInit, label: string):
       }
     })
   } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error
     const networkMessage = error instanceof Error ? error.message : 'network error'
     throw new Error(`${label} failed: ${networkMessage}`)
   }
@@ -299,7 +301,7 @@ export async function fetchEmpty(url: string, init: RequestInit, label: string):
   }
 }
 
-export async function resolveApiBase(serverUrl: string): Promise<{ apiBaseUrl: string; publicInfo: EmbyPublicInfo }> {
+export async function resolveApiBase(serverUrl: string, signal?: AbortSignal): Promise<{ apiBaseUrl: string; publicInfo: EmbyPublicInfo }> {
   const normalized = normalizeServerUrl(serverUrl)
   const candidates = normalized.toLowerCase().endsWith('/emby')
     ? [normalized]
@@ -310,11 +312,12 @@ export async function resolveApiBase(serverUrl: string): Promise<{ apiBaseUrl: s
     try {
       const publicInfo = await fetchJson<EmbyPublicInfo>(
         apiUrl(candidate, '/System/Info/Public'),
-        { method: 'GET' },
+        { method: 'GET', signal },
         '读取服务器信息'
       )
       return { apiBaseUrl: candidate, publicInfo }
     } catch (error) {
+      signal?.throwIfAborted()
       lastError = error
     }
   }

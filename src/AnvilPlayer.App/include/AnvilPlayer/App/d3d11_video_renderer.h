@@ -105,7 +105,8 @@ public:
     bool BeginInitialize(HWND host,
                          HWND completionWindow,
                          UINT completionMessage,
-                         uint64_t completionCookie);
+                         uint64_t completionCookie,
+                         UINT deviceLostMessage = 0);
 
     // Compatibility entry point for callers that do not need a completion
     // message. This is equally non-blocking; poll State()/IsReady() before
@@ -239,6 +240,7 @@ private:
     bool ConfigureFramePacing();
     void WaitForFrameLatencyObject(bool collectStats);
     bool PresentFrame(UINT syncInterval, bool collectStats, std::chrono::steady_clock::time_point stageStart);
+    bool DetectDeviceLoss(HRESULT failure, const wchar_t* operation);
     bool UpdateHardwareTexture(const NativeVideoFrame& frame);
     void UpdateTexture(const NativeVideoFrame& frame);
     bool UpdateYuvTexture(const NativeVideoFrame& frame);
@@ -294,11 +296,16 @@ private:
     std::atomic<bool> stopped_{true};
     std::atomic<D3D11RendererState> state_{D3D11RendererState::Stopped};
     std::atomic<ID3D11Device*> publishedDevice_{nullptr};
+    std::atomic_bool deviceLossDetected_{false};
+    std::atomic_long deviceLossReason_{S_OK};
     UINT initialWidth_ = 1;
     UINT initialHeight_ = 1;
     HWND initializationCompletionWindow_ = nullptr;
     UINT initializationCompletionMessage_ = 0;
     uint64_t initializationCompletionCookie_ = 0;
+    HWND deviceLostNotificationWindow_ = nullptr;
+    UINT deviceLostNotificationMessage_ = 0;
+    uint64_t deviceLostNotificationCookie_ = 0;
     HWND stopCompletionWindow_ = nullptr;
     UINT stopCompletionMessage_ = 0;
     uint64_t stopCompletionCookie_ = 0;

@@ -205,7 +205,12 @@ function requireCredential(settings: TmdbSettings): string {
   return credential
 }
 
-async function tmdbFetch<T>(settings: TmdbSettings, path: string, params: Record<string, string | number | undefined> = {}): Promise<T> {
+async function tmdbFetch<T>(
+  settings: TmdbSettings,
+  path: string,
+  params: Record<string, string | number | undefined> = {},
+  signal?: AbortSignal
+): Promise<T> {
   const credential = requireCredential(settings)
   const url = new URL(`${tmdbApiBaseUrl(settings)}${path}`)
   Object.entries(params).forEach(([key, value]) => {
@@ -216,6 +221,7 @@ async function tmdbFetch<T>(settings: TmdbSettings, path: string, params: Record
   }
 
   const response = await fetch(url.toString(), {
+    signal,
     headers: settings.authMode === 'readToken'
       ? { Authorization: `Bearer ${credential}` }
       : undefined
@@ -329,7 +335,8 @@ function publicCandidate(
 export async function searchTmdbCandidates(
   settings: TmdbSettings,
   item: MediaItem,
-  manualQuery = ''
+  manualQuery = '',
+  signal?: AbortSignal
 ): Promise<TmdbMatchCandidate[]> {
   const expectedType: 'movie' | 'tv' = item.type === 'series' ? 'tv' : 'movie'
   const query = manualQuery.trim() || buildTmdbSearchQueries(item)[0]
@@ -339,7 +346,7 @@ export async function searchTmdbCandidates(
     language: settings.language,
     include_adult: 'false',
     page: 1
-  })
+  }, signal)
   const candidates = (response.results ?? [])
     .filter((result) => result.media_type === 'movie' || result.media_type === 'tv')
     .map((result) => publicCandidate(settings, result, query, itemYear(item), expectedType))
@@ -405,11 +412,11 @@ export function buildTmdbSearchQueries(item: MediaItem): string[] {
   ])).slice(0, 8)
 }
 
-async function findByImdbId(settings: TmdbSettings, imdbId: string, expectedType: 'movie' | 'tv'): Promise<TmdbCandidate | undefined> {
+async function findByImdbId(settings: TmdbSettings, imdbId: string, expectedType: 'movie' | 'tv', signal?: AbortSignal): Promise<TmdbCandidate | undefined> {
   const response = await tmdbFetch<TmdbFindResponse>(settings, `/find/${imdbId}`, {
     external_source: 'imdb_id',
     language: settings.language
-  })
+  }, signal)
   const preferred = expectedType === 'movie' ? response.movie_results?.[0] : response.tv_results?.[0]
   const alternate = expectedType === 'movie' ? response.tv_results?.[0] : response.movie_results?.[0]
   const result = preferred ?? alternate
@@ -417,12 +424,12 @@ async function findByImdbId(settings: TmdbSettings, imdbId: string, expectedType
   return { id: result.id, type: preferred ? expectedType : expectedType === 'movie' ? 'tv' : 'movie' }
 }
 
-async function searchBestCandidate(settings: TmdbSettings, item: MediaItem): Promise<TmdbCandidate> {
+async function searchBestCandidate(settings: TmdbSettings, item: MediaItem, signal?: AbortSignal): Promise<TmdbCandidate> {
   const expectedType: 'movie' | 'tv' = item.type === 'series' ? 'tv' : 'movie'
   const explicitIds = explicitProviderIds(item)
   if (explicitIds.tmdb) return { id: explicitIds.tmdb, type: expectedType }
   if (explicitIds.imdb) {
-    const result = await findByImdbId(settings, explicitIds.imdb, expectedType)
+    const result = await findByImdbId(settings, explicitIds.imdb, expectedType, signal)
     if (result) return result
   }
 
@@ -438,7 +445,7 @@ async function searchBestCandidate(settings: TmdbSettings, item: MediaItem): Pro
       const score = scoreCandidate(scoredResult, query, year, expectedType)
       const key = `${type}:${result.id}`
       if (score > (candidates.get(key)?.score ?? Number.NEGATIVE_INFINITY)) candidates.set(key, { result: scoredResult, score, type })
-    })
+    }, signal)
   }
   const bestScore = (): number => Math.max(Number.NEGATIVE_INFINITY, ...[...candidates.values()].map((candidate) => candidate.score))
 
@@ -450,7 +457,7 @@ async function searchBestCandidate(settings: TmdbSettings, item: MediaItem): Pro
       page: 1,
       primary_release_year: expectedType === 'movie' ? year : undefined,
       first_air_date_year: expectedType === 'tv' ? year : undefined
-    })
+    }, signal)
     addResults(response.results ?? [], query, expectedType)
     if (bestScore() >= 160) break
   }
@@ -462,7 +469,7 @@ async function searchBestCandidate(settings: TmdbSettings, item: MediaItem): Pro
         language: settings.language,
         include_adult: 'false',
         page: 1
-      })
+      }, signal)
       addResults(response.results ?? [], query, expectedType)
       if (bestScore() >= 140) break
     }
@@ -475,7 +482,7 @@ async function searchBestCandidate(settings: TmdbSettings, item: MediaItem): Pro
         language: settings.language,
         include_adult: 'false',
         page: 1
-      })
+      }, signal)
       addResults(response.results ?? [], query, expectedType)
       if (bestScore() >= 140) break
     }
@@ -540,15 +547,17 @@ function mergeVideos(...groups: Array<TmdbVideo[] | undefined>): TmdbVideo[] {
 async function loadTmdbVideos(
   settings: TmdbSettings,
   path: string,
-  appendedVideos: TmdbVideo[] | undefined
+  appendedVideos: TmdbVideo[] | undefined,
+  signal?: AbortSignal
 ): Promise<TmdbVideo[]> {
   let preferredVideos = appendedVideos ?? []
   try {
     const response = await tmdbFetch<TmdbVideosResponse>(settings, `${path}/videos`, {
       language: settings.language
-    })
+    }, signal)
     preferredVideos = mergeVideos(preferredVideos, response.results)
   } catch {
+    signal?.throwIfAborted()
     // Trailer lookup is optional; keep the rest of the scraped metadata usable.
   }
   if (hasTrailer(preferredVideos) || settings.language.toLowerCase() === 'en-us') return preferredVideos
@@ -556,9 +565,10 @@ async function loadTmdbVideos(
   try {
     const fallback = await tmdbFetch<TmdbVideosResponse>(settings, `${path}/videos`, {
       language: 'en-US'
-    })
+    }, signal)
     return mergeVideos(preferredVideos, fallback.results)
   } catch {
+    signal?.throwIfAborted()
     return preferredVideos
   }
 }
@@ -625,14 +635,16 @@ function tvToItem(settings: TmdbSettings, item: MediaItem, details: TmdbTvDetail
 async function addLocalEpisodeMetadata(
   settings: TmdbSettings,
   item: MediaItem,
-  tmdbId: number
+  tmdbId: number,
+  signal?: AbortSignal
 ): Promise<MediaItem> {
   if (!item.seasons?.length) return item
   const seasonNumbers = Array.from(new Set(item.seasons.map((season) => Number(season.index.replace(/^S/i, ''))).filter(Number.isFinite)))
   const seasonDetails = await Promise.all(seasonNumbers.map(async (seasonNumber) => {
     try {
-      return await tmdbFetch<TmdbSeasonDetails>(settings, `/tv/${tmdbId}/season/${seasonNumber}`, { language: settings.language })
+      return await tmdbFetch<TmdbSeasonDetails>(settings, `/tv/${tmdbId}/season/${seasonNumber}`, { language: settings.language }, signal)
     } catch {
+      signal?.throwIfAborted()
       return undefined
     }
   }))
@@ -671,8 +683,8 @@ async function addLocalEpisodeMetadata(
   return { ...item, seasons, episodes: seasons[0]?.episodes ?? item.episodes }
 }
 
-export async function testTmdbConnection(settings: TmdbSettings): Promise<string> {
-  const configuration = await tmdbFetch<TmdbConfigurationResponse>(settings, '/configuration')
+export async function testTmdbConnection(settings: TmdbSettings, signal?: AbortSignal): Promise<string> {
+  const configuration = await tmdbFetch<TmdbConfigurationResponse>(settings, '/configuration', {}, signal)
   const posterSizes = configuration.images?.poster_sizes?.join(', ') || 'unknown'
   return `TMDB 连接成功，海报尺寸：${posterSizes}`
 }
@@ -680,25 +692,26 @@ export async function testTmdbConnection(settings: TmdbSettings): Promise<string
 export async function scrapeTmdbCandidate(
   item: MediaItem,
   settings: TmdbSettings,
-  candidate: Pick<TmdbMatchCandidate, 'id' | 'type' | 'title'>
+  candidate: Pick<TmdbMatchCandidate, 'id' | 'type' | 'title'>,
+  signal?: AbortSignal
 ): Promise<MediaItem> {
   let updatedItem: MediaItem
   if (candidate.type === 'tv') {
     const details = await tmdbFetch<TmdbTvDetails>(settings, `/tv/${candidate.id}`, {
       language: settings.language,
       append_to_response: 'credits,external_ids,videos'
-    })
-    const videos = await loadTmdbVideos(settings, `/tv/${candidate.id}`, details.videos?.results)
+    }, signal)
+    const videos = await loadTmdbVideos(settings, `/tv/${candidate.id}`, details.videos?.results, signal)
     updatedItem = await addLocalEpisodeMetadata(settings, tvToItem(settings, item, {
       ...details,
       videos: { results: videos }
-    }), candidate.id)
+    }), candidate.id, signal)
   } else {
     const details = await tmdbFetch<TmdbMovieDetails>(settings, `/movie/${candidate.id}`, {
       language: settings.language,
       append_to_response: 'credits,external_ids,videos'
-    })
-    const videos = await loadTmdbVideos(settings, `/movie/${candidate.id}`, details.videos?.results)
+    }, signal)
+    const videos = await loadTmdbVideos(settings, `/movie/${candidate.id}`, details.videos?.results, signal)
     updatedItem = movieToItem(settings, item, {
       ...details,
       videos: { results: videos }
@@ -713,24 +726,24 @@ export async function scrapeTmdbCandidate(
 export async function scrapeTmdbItem(
   item: MediaItem,
   settings: TmdbSettings,
-  options: { ignoreSavedMatch?: boolean } = {}
+  options: { ignoreSavedMatch?: boolean; signal?: AbortSignal } = {}
 ): Promise<MediaItem> {
   if (item.metadataLocked && !options.ignoreSavedMatch) return item
   const savedTmdbId = Number(item.externalIds?.tmdb)
   const candidate: TmdbCandidate = !options.ignoreSavedMatch && Number.isFinite(savedTmdbId) && savedTmdbId > 0
     ? { id: savedTmdbId, type: item.type === 'series' ? 'tv' : 'movie' }
-    : await searchBestCandidate(settings, item)
+    : await searchBestCandidate(settings, item, options.signal)
   return await scrapeTmdbCandidate(item, settings, {
     ...candidate,
     title: ''
-  })
+  }, options.signal)
 }
 
-export async function fetchTmdbTrailerUrls(item: MediaItem, settings: TmdbSettings): Promise<string[]> {
+export async function fetchTmdbTrailerUrls(item: MediaItem, settings: TmdbSettings, signal?: AbortSignal): Promise<string[]> {
   const savedTmdbId = Number(item.externalIds?.tmdb)
   const candidate: TmdbCandidate = Number.isFinite(savedTmdbId) && savedTmdbId > 0
     ? { id: savedTmdbId, type: item.type === 'series' ? 'tv' : 'movie' }
-    : await searchBestCandidate(settings, item)
+    : await searchBestCandidate(settings, item, signal)
   const path = candidate.type === 'tv' ? `/tv/${candidate.id}` : `/movie/${candidate.id}`
-  return trailerUrls(await loadTmdbVideos(settings, path, undefined))
+  return trailerUrls(await loadTmdbVideos(settings, path, undefined, signal))
 }

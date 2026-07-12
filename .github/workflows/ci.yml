@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src/AnvilPlayer.App/webui/package-lock.json
+
+      - name: Install Web UI dependencies
+        working-directory: src/AnvilPlayer.App/webui
+        run: npm ci
+
+      - name: Lint Web UI
+        working-directory: src/AnvilPlayer.App/webui
+        run: npm run lint
+
+      - name: Build Web UI
+        working-directory: src/AnvilPlayer.App/webui
+        run: npm run build
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build x64 Debug solution
+        run: msbuild AnvilPlayer.sln /m:1 /p:Configuration=Debug /p:Platform=x64
+
+      - name: Run native tests
+        run: .\x64\Debug\PlaybackCore.Tests.exe

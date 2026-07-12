@@ -21,7 +21,7 @@ export function MetadataMatchDialog(props: MetadataMatchDialogProps): JSX.Elemen
 
   useEffect(() => {
     setQuery(props.item.originalTitle || props.item.title)
-  }, [props.item.id])
+  }, [props.item.id, props.item.originalTitle, props.item.title])
 
   function submit(event: FormEvent): void {
     event.preventDefault()

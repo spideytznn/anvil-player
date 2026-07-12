@@ -878,7 +878,8 @@ bool IsHlgColorSpace(const DXGI_COLOR_SPACE_TYPE colorSpace) {
 bool D3D11VideoRenderer::BeginInitialize(const HWND host,
                                          const HWND completionWindow,
                                          const UINT completionMessage,
-                                         const uint64_t completionCookie) {
+                                         const uint64_t completionCookie,
+                                         const UINT deviceLostMessage) {
     if (!host) {
         state_.store(D3D11RendererState::Failed, std::memory_order_release);
         PostInitializationCompletion(
@@ -906,11 +907,16 @@ bool D3D11VideoRenderer::BeginInitialize(const HWND host,
         initializationCompletionWindow_ = completionWindow;
         initializationCompletionMessage_ = completionMessage;
         initializationCompletionCookie_ = completionCookie;
+        deviceLostNotificationWindow_ = completionWindow;
+        deviceLostNotificationMessage_ = deviceLostMessage;
+        deviceLostNotificationCookie_ = completionCookie;
         stopCompletionWindow_ = nullptr;
         stopCompletionMessage_ = 0;
         stopCompletionCookie_ = 0;
         stopRequested_ = false;
         acceptingCommands_ = true;
+        deviceLossDetected_.store(false, std::memory_order_release);
+        deviceLossReason_.store(S_OK, std::memory_order_release);
         publishedDevice_.store(nullptr, std::memory_order_release);
         stopped_.store(false, std::memory_order_release);
         state_.store(D3D11RendererState::Initializing, std::memory_order_release);
@@ -937,7 +943,7 @@ bool D3D11VideoRenderer::BeginInitialize(const HWND host,
 }
 
 bool D3D11VideoRenderer::Initialize(const HWND host) {
-    return BeginInitialize(host, nullptr, 0, 0);
+    return BeginInitialize(host, nullptr, 0, 0, 0);
 }
 
 D3D11RendererState D3D11VideoRenderer::State() const noexcept {
@@ -1282,7 +1288,12 @@ void D3D11VideoRenderer::ResizeOnRenderThread(const UINT width, const UINT heigh
         LogInfo(L"frame pacing waitable disabled after ResizeBuffers failure");
         hr = swapChain_->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, resizeFlags);
     }
-    if (FAILED(hr)) { LogHr(L"ResizeBuffers", hr); return; }
+    if (FAILED(hr)) {
+        if (!DetectDeviceLoss(hr, L"ResizeBuffers")) {
+            LogHr(L"ResizeBuffers", hr);
+        }
+        return;
+    }
     CreateRenderTarget();
     if (hlgSwapChain_ && !ResizeHlgPresentationResources(width, height)) {
         SelectCompositionSwapChain(false);
@@ -1696,10 +1707,17 @@ void D3D11VideoRenderer::RenderThreadMain() {
     // asynchronous shutdown, not on the window thread that called RequestStop.
     RetireQueuedFrame(shutdownFrame);
     ReleaseAll();
+    if (uninitializeApartment) {
+        CoUninitialize();
+    }
 
     HWND completionWindow = nullptr;
     UINT completionMessage = 0;
     uint64_t completionCookie = 0;
+    HWND deviceLostWindow = nullptr;
+    UINT deviceLostMessage = 0;
+    uint64_t deviceLostCookie = 0;
+    const bool deviceLost = deviceLossDetected_.load(std::memory_order_acquire);
     {
         std::lock_guard lock(commandMutex_);
         completionWindow = stopCompletionWindow_;
@@ -1708,6 +1726,11 @@ void D3D11VideoRenderer::RenderThreadMain() {
         stopCompletionWindow_ = nullptr;
         stopCompletionMessage_ = 0;
         stopCompletionCookie_ = 0;
+        if (deviceLost) {
+            deviceLostWindow = deviceLostNotificationWindow_;
+            deviceLostMessage = deviceLostNotificationMessage_;
+            deviceLostCookie = deviceLostNotificationCookie_;
+        }
         publishedDevice_.store(nullptr, std::memory_order_release);
         state_.store(D3D11RendererState::Stopped, std::memory_order_release);
         stopped_.store(true, std::memory_order_release);
@@ -1718,8 +1741,12 @@ void D3D11VideoRenderer::RenderThreadMain() {
                      static_cast<WPARAM>(completionCookie),
                      0);
     }
-    if (uninitializeApartment) {
-        CoUninitialize();
+    if (deviceLostWindow && deviceLostMessage != 0) {
+        const HRESULT reason = static_cast<HRESULT>(deviceLossReason_.load(std::memory_order_acquire));
+        PostMessageW(deviceLostWindow,
+                     deviceLostMessage,
+                     static_cast<WPARAM>(deviceLostCookie),
+                     static_cast<LPARAM>(reason));
     }
 }
 
@@ -1806,7 +1833,9 @@ bool D3D11VideoRenderer::PresentFrame(const UINT syncInterval,
     }
     const HRESULT presentHr = presentSwapChain->Present(syncInterval, 0);
     if (FAILED(presentHr)) {
-        LogHr(L"Present", presentHr);
+        if (!DetectDeviceLoss(presentHr, L"Present")) {
+            LogHr(L"Present", presentHr);
+        }
     }
 
     if (!collectStats) {
@@ -1829,6 +1858,46 @@ bool D3D11VideoRenderer::PresentFrame(const UINT syncInterval,
         ++renderStats_.frameStatsDisjoint;
     }
     return SUCCEEDED(presentHr);
+}
+
+bool D3D11VideoRenderer::DetectDeviceLoss(const HRESULT failure, const wchar_t* const operation) {
+    const auto isDeviceLoss = [](const HRESULT value) {
+        return value == DXGI_ERROR_DEVICE_REMOVED ||
+               value == DXGI_ERROR_DEVICE_RESET ||
+               value == DXGI_ERROR_DEVICE_HUNG ||
+               value == DXGI_ERROR_DRIVER_INTERNAL_ERROR;
+    };
+
+    HRESULT reason = failure;
+    if (device_) {
+        const HRESULT removedReason = device_->GetDeviceRemovedReason();
+        if (FAILED(removedReason)) {
+            reason = removedReason;
+        }
+    }
+    if (!isDeviceLoss(failure) && !isDeviceLoss(reason)) {
+        return false;
+    }
+    if (deviceLossDetected_.exchange(true, std::memory_order_acq_rel)) {
+        return true;
+    }
+    deviceLossReason_.store(reason, std::memory_order_release);
+
+    {
+        std::lock_guard lock(commandMutex_);
+        acceptingCommands_ = false;
+        stopRequested_ = true;
+        host_.store(nullptr, std::memory_order_release);
+        publishedDevice_.store(nullptr, std::memory_order_release);
+        state_.store(D3D11RendererState::Stopping, std::memory_order_release);
+        pendingResize_ = false;
+        pendingClear_ = false;
+    }
+    LogHr(std::wstring(operation ? operation : L"D3D11 operation") +
+              L" device_lost reason=0x" + HexHr(reason),
+          failure);
+    commandCv_.notify_all();
+    return true;
 }
 
 void D3D11VideoRenderer::Render(const NativeVideoFrame& frame) {
@@ -2089,7 +2158,10 @@ void D3D11VideoRenderer::ClearOnRenderThread() {
     ID3D11RenderTargetView* activeRenderTarget = ActiveRgbRenderTarget();
     context_->OMSetRenderTargets(1, &activeRenderTarget, nullptr);
     context_->ClearRenderTargetView(activeRenderTarget, clearColor);
-    swapChain_->Present(0, 0);
+    const HRESULT presentHr = swapChain_->Present(0, 0);
+    if (FAILED(presentHr) && !DetectDeviceLoss(presentHr, L"Clear Present")) {
+        LogHr(L"Clear Present", presentHr);
+    }
 }
 
 void D3D11VideoRenderer::EnableMultithreadProtection() {
@@ -2500,7 +2572,9 @@ bool D3D11VideoRenderer::BlitHlgFrame() {
     const HRESULT hr = videoContext1_->VideoProcessorBlt(
         hlgVideoProcessor_.Get(), hlgVideoOutputView_.Get(), 0, 1, &stream);
     if (FAILED(hr)) {
-        LogHr(L"HLG VideoProcessorBlt", hr);
+        if (!DetectDeviceLoss(hr, L"HLG VideoProcessorBlt")) {
+            LogHr(L"HLG VideoProcessorBlt", hr);
+        }
         return false;
     }
     return true;
@@ -4180,6 +4254,9 @@ bool D3D11VideoRenderer::ApplySwapChainColorSpace(const DXGI_COLOR_SPACE_TYPE co
 
     hr = swapChain3->SetColorSpace1(colorSpace);
     if (FAILED(hr)) {
+        if (DetectDeviceLoss(hr, L"SetColorSpace1")) {
+            return false;
+        }
         if (shouldLogFailure()) {
             LogHr(L"SetColorSpace1 " + ColorSpaceName(colorSpace), hr);
         }

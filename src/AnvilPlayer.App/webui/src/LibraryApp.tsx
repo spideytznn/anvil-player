@@ -1,4 +1,4 @@
-import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type Dispatch, type FormEvent, type ReactNode, type SetStateAction } from 'react'
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type Dispatch, type FormEvent, type ReactNode, type SetStateAction } from 'react'
 import {
   Activity,
   ArrowDownWideNarrow,
@@ -88,7 +88,7 @@ import {
   saveWebDavCredentials
 } from './manager/webdavClient'
 import { loadSmbCredentials, removeSmbCredentials, saveSmbCredentials } from './manager/smbCredentials'
-import type { LibraryHomeCard, LibraryHomeSection, LibrarySource, LibraryView, MediaFilterKey, MediaItem, NavKey, PersonCredit, SortKey, SortOrder, SourceKind } from './manager/types'
+import type { LibraryHomeSection, LibrarySource, LibraryView, MediaFilterKey, MediaItem, NavKey, PersonCredit, SortKey, SortOrder, SourceKind } from './manager/types'
 import { postNativeCommand, subscribeNativeMessages, type LocalFolderPickResult, type LocalFolderScanCompleted, type LocalFolderScanFailed } from './nativeBridge'
 import {
   applyDocumentLanguage,
@@ -127,7 +127,6 @@ import {
   compareMediaIndex,
   duplicateMetadataKey,
   dissolveMediaCollection,
-  hasImageBackground,
   imageBackgroundUrl,
   itemMergeRank,
   localFileName,
@@ -143,6 +142,22 @@ import { MetadataMatchDialog } from './library/MetadataMatchDialog'
 import { MetadataDeleteDialog } from './library/MetadataDeleteDialog'
 import { MediaManagementDialog } from './library/MediaManagementDialog'
 import { TaskCenter, type BackgroundTask } from './library/TaskCenter'
+import {
+  ContinueCard as LibraryContinueCard,
+  EmptyState as LibraryEmptyState,
+  HorizontalScroller as LibraryHorizontalScroller,
+  LibraryHome as LibraryHomeView,
+  MediaArtwork as LibraryMediaArtwork,
+  homeCardViewId as extractedHomeCardViewId
+} from './library/LibraryHome'
+import { LibraryList } from './library/LibraryList'
+import {
+  FileServiceDirectoryBrowser as SourceDirectoryBrowser,
+  SourceManager,
+  type FileServiceDirectory
+} from './library/SourceManager'
+import { DetailPanel as DetailPanelLayout } from './library/DetailPanel'
+import { useLibraryRequestCancellation } from './library/useLibraryRequestCancellation'
 
 const LIBRARY_LISTING_PAGE_SIZE = 60
 const DISSOLVED_COLLECTION_PATHS_KEY = 'anvil-player.library.dissolved-paths.v1'
@@ -255,11 +270,6 @@ interface NavItem {
 
 type SourceSetupMode = 'hidden' | 'select' | 'emby' | 'localFolder' | 'smb' | 'webdav' | 'settings'
 
-interface FileServiceDirectory {
-  name: string
-  path: string
-}
-
 const primaryNav: NavItem[] = [
   { key: 'continue', label: 'continue', icon: <Clock3 size={16} /> },
   { key: 'recent', label: 'recent', icon: <Grid3X3 size={16} /> },
@@ -357,14 +367,6 @@ function localizedSortOptions(language: UiLanguage): Array<{ key: SortKey; label
   ]
 }
 
-function mediaTypeLabel(type: MediaItem['type']): string {
-  switch (type) {
-    case 'movie': return currentLibraryLanguage === 'zh' ? '电影' : 'Movie'
-    case 'series': return currentLibraryLanguage === 'zh' ? '剧集' : 'Series'
-    default: return currentLibraryLanguage === 'zh' ? '文件夹' : 'Folder'
-  }
-}
-
 function sourceKindLabel(kind: SourceKind): string {
   switch (kind) {
     case 'Emby': return 'Emby'
@@ -413,48 +415,6 @@ function navLabel(navKey: NavKey, sourceMap: Map<string, LibrarySource>, languag
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : '连接 Emby 失败'
-}
-
-function posterMark(item: MediaItem): string {
-  if (item.type === 'folder') return '合集'
-  return item.title.slice(0, 2)
-}
-
-function MediaArtwork(props: {
-  background: string
-  className: string
-  children?: ReactNode
-}): JSX.Element {
-  const imageUrl = imageBackgroundUrl(props.background)
-  const [imageFailed, setImageFailed] = useState(false)
-  const showImage = Boolean(imageUrl && !imageFailed)
-
-  useEffect(() => {
-    setImageFailed(false)
-  }, [imageUrl])
-
-  return (
-    <div className={`${props.className} ${showImage ? 'has-media-image' : 'has-default-media-poster'}`}>
-      <div className="library-default-film" style={{ backgroundImage: 'url("./default-media-poster.png")' }} aria-hidden="true" />
-      {showImage ? (
-        <img
-          className="library-art-image"
-          src={imageUrl}
-          alt=""
-          loading="lazy"
-          decoding="async"
-          draggable={false}
-          onError={() => setImageFailed(true)}
-        />
-      ) : null}
-      {props.children}
-    </div>
-  )
-}
-
-function homeCardViewId(card: LibraryHomeCard): string {
-  if (card.viewId) return card.viewId
-  return card.kind === 'view' && card.id.startsWith('view:') ? card.id.slice('view:'.length) : ''
 }
 
 function cleanJoin(values: string[], separator = ' · '): string {
@@ -562,13 +522,15 @@ function ToolbarSelect<T extends string>(props: {
     setSelectState((current) => current === 'open' || current === 'opening' ? 'closing' : 'opening')
   }
 
-  function animatePanel(expand: boolean): void {
+  const animatePanel = useCallback((expand: boolean): void => {
     const panel = panelRef.current
     if (!panel) return
 
     animationRef.current?.cancel()
     const fromHeight = panel.getBoundingClientRect().height || TOOLBAR_SELECT_CLOSED_HEIGHT
-    const toHeight = expand ? measureOpenHeight() : TOOLBAR_SELECT_CLOSED_HEIGHT
+    const toHeight = expand
+      ? TOOLBAR_SELECT_CLOSED_HEIGHT + (menuContentRef.current?.offsetHeight ?? 0)
+      : TOOLBAR_SELECT_CLOSED_HEIGHT
     panel.style.height = `${fromHeight}px`
 
     const prefersReducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false
@@ -591,7 +553,7 @@ function ToolbarSelect<T extends string>(props: {
       panel.style.height = expand ? `${toHeight}px` : ''
       setSelectState(expand ? 'open' : 'closed')
     }
-  }
+  }, [])
 
   useLayoutEffect(() => {
     const panel = panelRef.current
@@ -610,7 +572,7 @@ function ToolbarSelect<T extends string>(props: {
     }
 
     return undefined
-  }, [selectState, props.options])
+  }, [animatePanel, selectState, props.options])
 
   useEffect(() => {
     return () => animationRef.current?.cancel()
@@ -696,238 +658,6 @@ function ToolbarSelect<T extends string>(props: {
         ) : null}
       </div>
     </div>
-  )
-}
-
-function EmptyState(props: { icon: ReactNode; title: string; caption: string }): JSX.Element {
-  return (
-    <div className="library-empty-state">
-      {props.icon}
-      <strong>{props.title}</strong>
-      <span>{props.caption}</span>
-    </div>
-  )
-}
-
-function HorizontalScroller(props: {
-  className: string
-  children: ReactNode
-  pageRatio?: number
-}): JSX.Element {
-  const scrollerRef = useRef<HTMLDivElement | null>(null)
-  const [scrollState, setScrollState] = useState({ canLeft: false, canRight: false })
-
-  function updateScrollState(): void {
-    const scroller = scrollerRef.current
-    if (!scroller) return
-    const maxScrollLeft = scroller.scrollWidth - scroller.clientWidth
-    setScrollState({
-      canLeft: scroller.scrollLeft > 2,
-      canRight: scroller.scrollLeft < maxScrollLeft - 2
-    })
-  }
-
-  function scrollPage(direction: -1 | 1): void {
-    const scroller = scrollerRef.current
-    if (!scroller) return
-    const distance = Math.max(160, scroller.clientWidth * (props.pageRatio ?? 0.72))
-    scroller.scrollBy({ left: direction * distance, behavior: 'smooth' })
-  }
-
-  useLayoutEffect(() => {
-    const scroller = scrollerRef.current
-    if (!scroller) return undefined
-
-    let frame = 0
-    const scheduleUpdate = (): void => {
-      window.cancelAnimationFrame(frame)
-      frame = window.requestAnimationFrame(updateScrollState)
-    }
-
-    scheduleUpdate()
-    scroller.addEventListener('scroll', scheduleUpdate, { passive: true })
-    window.addEventListener('resize', scheduleUpdate)
-    const observer = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(scheduleUpdate)
-    observer?.observe(scroller)
-
-    return () => {
-      window.cancelAnimationFrame(frame)
-      scroller.removeEventListener('scroll', scheduleUpdate)
-      window.removeEventListener('resize', scheduleUpdate)
-      observer?.disconnect()
-    }
-  }, [props.children])
-
-  const isScrollable = scrollState.canLeft || scrollState.canRight
-  const shellClassName = [
-    'horizontal-scroll-shell',
-    props.className.includes('library-home-grid') ? 'is-home-grid' : '',
-    props.className.includes('library-continue-row') ? 'is-continue-row' : '',
-    props.className.includes('library-episode-row') ? 'is-episode-row' : '',
-    props.className.includes('library-cast-row') ? 'is-cast-row' : '',
-    props.className.includes('library-similar-row') ? 'is-similar-row' : '',
-    props.className.includes('library-season-tabs') ? 'is-season-tabs' : ''
-  ].filter(Boolean).join(' ')
-
-  return (
-    <div
-      className={shellClassName}
-      data-scrollable={isScrollable}
-      data-can-left={scrollState.canLeft}
-      data-can-right={scrollState.canRight}
-      onPointerEnter={updateScrollState}
-    >
-      <div className={props.className} ref={scrollerRef}>
-        {props.children}
-      </div>
-      <div className="horizontal-scroll-edge is-left">
-        <button
-          className="horizontal-scroll-button"
-          type="button"
-          title="上一页"
-          aria-label="上一页"
-          disabled={!scrollState.canLeft}
-          onClick={() => scrollPage(-1)}
-        >
-          <ChevronLeft size={18} />
-        </button>
-      </div>
-      <div className="horizontal-scroll-edge is-right">
-        <button
-          className="horizontal-scroll-button"
-          type="button"
-          title="下一页"
-          aria-label="下一页"
-          disabled={!scrollState.canRight}
-          onClick={() => scrollPage(1)}
-        >
-          <ChevronRight size={18} />
-        </button>
-      </div>
-    </div>
-  )
-}
-
-function ContinueCard(props: {
-  item: MediaItem
-  selected: boolean
-  onSelect: (id: string) => void
-}): JSX.Element {
-  const art = hasImageBackground(props.item.backdrop) ? props.item.backdrop : props.item.poster
-  return (
-    <button
-      className={`library-continue-card ${props.selected ? 'is-selected' : ''}`}
-      type="button"
-      onClick={() => props.onSelect(props.item.id)}
-    >
-      <MediaArtwork background={art} className="library-continue-art">
-        <span className="library-continue-progress" style={{ width: `${Math.round(props.item.progress * 100)}%` }} />
-      </MediaArtwork>
-      <strong>{props.item.title}</strong>
-      <small>{Math.round(props.item.progress * 100)}%</small>
-    </button>
-  )
-}
-
-function MediaPoster(props: {
-  item: MediaItem
-  source: LibrarySource
-  selected: boolean
-  onSelect: (id: string) => void
-}): JSX.Element {
-  return (
-    <button
-      className={`library-poster-card ${props.selected ? 'is-selected' : ''} ${props.item.availability === 'missing' ? 'is-missing' : ''}`}
-      type="button"
-      onClick={() => props.onSelect(props.item.id)}
-    >
-      <MediaArtwork background={props.item.poster} className="library-poster-art">
-        <div className="library-poster-shine" />
-        <span className="library-poster-type">{mediaTypeLabel(props.item.type)}</span>
-        {props.item.availability === 'missing' ? <span className="library-poster-warning">{currentLibraryLanguage === 'zh' ? '缺失' : 'Missing'}</span> : null}
-        {(props.item.versions?.length ?? 0) > 0 ? <span className="library-poster-versions">{(props.item.versions?.length ?? 0) + 1}×</span> : null}
-      </MediaArtwork>
-      {props.item.progress > 0 && props.item.progress < 1 ? (
-        <span className="library-progress-track">
-          <span style={{ width: `${Math.round(props.item.progress * 100)}%` }} />
-        </span>
-      ) : null}
-      <span className="library-poster-title">{props.item.title}</span>
-      <span className="library-poster-meta">
-        {props.item.year} · {props.item.quality} · {props.source.name}
-      </span>
-    </button>
-  )
-}
-
-function HomeCard(props: {
-  card: LibraryHomeCard
-  layout: LibraryHomeSection['layout']
-  selected: boolean
-  onSelectItem: (id: string) => void
-  onSelectView: (id: string) => void
-}): JSX.Element {
-  const viewId = homeCardViewId(props.card)
-  const selectable = Boolean(props.card.itemId || viewId)
-
-  return (
-    <button
-      className={`library-home-card is-${props.layout} ${props.selected ? 'is-selected' : ''}`}
-      type="button"
-      onClick={() => {
-        if (props.card.itemId) props.onSelectItem(props.card.itemId)
-        else if (viewId) props.onSelectView(viewId)
-      }}
-      aria-disabled={!selectable}
-    >
-      {props.card.kind === 'view' ? (
-        <div className="library-home-card-art" style={{ background: props.card.image }}>
-          <span className="library-home-view-icon">{sourceIcon('Emby', 16)}</span>
-        </div>
-      ) : (
-        <MediaArtwork background={props.card.image} className="library-home-card-art">
-          <div className="library-poster-shine" />
-          {props.card.mediaType ? (
-            <span className="library-poster-type">{mediaTypeLabel(props.card.mediaType)}</span>
-          ) : null}
-        </MediaArtwork>
-      )}
-      <span className="library-home-card-title">{props.card.title}</span>
-      <span className="library-home-card-meta">{props.card.subtitle}</span>
-    </button>
-  )
-}
-
-function LibraryHomeSections(props: {
-  sections: LibraryHomeSection[]
-  selectedId: string
-  selectedViewId: string
-  onSelectItem: (id: string) => void
-  onSelectView: (id: string) => void
-}): JSX.Element {
-  return (
-    <>
-      {props.sections.map((section) => (
-        <section className="library-home-section" key={section.id}>
-          <div className="library-section-heading">
-            <span>{section.title}</span>
-            <small>{section.cards.length}</small>
-          </div>
-          <HorizontalScroller className={`library-home-grid is-${section.layout}`}>
-            {section.cards.map((card) => (
-              <HomeCard
-                key={card.id}
-                card={card}
-                layout={section.layout}
-                selected={card.itemId === props.selectedId || homeCardViewId(card) === props.selectedViewId}
-                onSelectItem={props.onSelectItem}
-                onSelectView={props.onSelectView}
-              />
-            ))}
-          </HorizontalScroller>
-        </section>
-      ))}
-    </>
   )
 }
 
@@ -1039,24 +769,29 @@ function YouTubeTrailer(props: {
 }): JSX.Element {
   const playerHostRef = useRef<HTMLDivElement>(null)
   const playerRef = useRef<YouTubePlayerInstance | undefined>(undefined)
+  const latestPropsRef = useRef(props)
+  latestPropsRef.current = props
   const [ready, setReady] = useState(false)
   const [playbackStarted, setPlaybackStarted] = useState(false)
 
   useEffect(() => {
     let disposed = false
+    let playerReady = false
+    let playbackHasStarted = false
     let player: YouTubePlayerInstance | undefined
+    const reactHost = playerHostRef.current
+    const videoId = props.videoId
     const timeout = window.setTimeout(() => {
-      if (!disposed && !ready) {
-        postNativeCommand({ type: 'command', command: 'debugLog', message: `trailer youtube ready timeout id=${props.videoId}` })
-        props.onError()
+      if (!disposed && !playerReady) {
+        postNativeCommand({ type: 'command', command: 'debugLog', message: `trailer youtube ready timeout id=${videoId}` })
+        latestPropsRef.current.onError()
       }
     }, 15000)
     void loadYouTubeApi().then((api) => {
-      if (disposed || !playerHostRef.current) return
-      const reactHost = playerHostRef.current
+      if (disposed || !reactHost) return
       const playerFrame = document.createElement('iframe')
       const origin = encodeURIComponent(window.location.origin)
-      playerFrame.src = `https://www.youtube.com/embed/${encodeURIComponent(props.videoId)}?autoplay=1&playsinline=1&rel=0&controls=0&disablekb=1&fs=0&iv_load_policy=3&enablejsapi=1&origin=${origin}`
+      playerFrame.src = `https://www.youtube.com/embed/${encodeURIComponent(videoId)}?autoplay=1&playsinline=1&rel=0&controls=0&disablekb=1&fs=0&iv_load_policy=3&enablejsapi=1&origin=${origin}`
       playerFrame.allow = 'autoplay; encrypted-media; picture-in-picture; fullscreen'
       playerFrame.allowFullscreen = true
       playerFrame.referrerPolicy = 'origin'
@@ -1069,31 +804,34 @@ function YouTubeTrailer(props: {
           onReady: (event: { target: YouTubePlayerInstance }) => {
             if (disposed) return
             window.clearTimeout(timeout)
+            playerReady = true
             setReady(true)
-            postNativeCommand({ type: 'command', command: 'debugLog', message: `trailer youtube ready id=${props.videoId}` })
+            postNativeCommand({ type: 'command', command: 'debugLog', message: `trailer youtube ready id=${videoId}` })
             playerRef.current = event.target
-            if (props.muted) event.target.mute()
+            if (latestPropsRef.current.muted) event.target.mute()
             else event.target.unMute()
             event.target.playVideo()
           },
           onError: (event: { data: number }) => {
-            postNativeCommand({ type: 'command', command: 'debugLog', message: `trailer youtube error id=${props.videoId} code=${event.data}` })
-            if (!disposed) props.onError()
+            postNativeCommand({ type: 'command', command: 'debugLog', message: `trailer youtube error id=${videoId} code=${event.data}` })
+            if (!disposed) latestPropsRef.current.onError()
           },
           onStateChange: (event: { data: number }) => {
-            if (disposed || event.data !== 1 || playbackStarted) return
-            postNativeCommand({ type: 'command', command: 'debugLog', message: `trailer youtube playing id=${props.videoId}` })
+            if (disposed || event.data !== 1 || playbackHasStarted) return
+            playbackHasStarted = true
+            postNativeCommand({ type: 'command', command: 'debugLog', message: `trailer youtube playing id=${videoId}` })
             setPlaybackStarted(true)
-            props.onPlaybackStarted()
+            latestPropsRef.current.onPlaybackStarted()
           },
           onAutoplayBlocked: () => {
             if (disposed) return
             window.clearTimeout(timeout)
+            playerReady = true
             setReady(true)
-            postNativeCommand({ type: 'command', command: 'debugLog', message: `trailer youtube autoplay blocked id=${props.videoId}` })
+            postNativeCommand({ type: 'command', command: 'debugLog', message: `trailer youtube autoplay blocked id=${videoId}` })
             player?.mute()
             player?.playVideo()
-            props.onAutoplayMuted()
+            latestPropsRef.current.onAutoplayMuted()
           }
         }
       })
@@ -1101,9 +839,9 @@ function YouTubeTrailer(props: {
       postNativeCommand({
         type: 'command',
         command: 'debugLog',
-        message: `trailer youtube api failed id=${props.videoId} error=${error instanceof Error ? error.message : String(error)}`
+        message: `trailer youtube api failed id=${videoId} error=${error instanceof Error ? error.message : String(error)}`
       })
-      if (!disposed) props.onError()
+      if (!disposed) latestPropsRef.current.onError()
     })
     return () => {
       disposed = true
@@ -1114,7 +852,7 @@ function YouTubeTrailer(props: {
       } catch {
         // The iframe may already have been removed during WebView navigation.
       }
-      playerHostRef.current?.replaceChildren()
+      reactHost?.replaceChildren()
     }
   }, [props.videoId])
 
@@ -1134,7 +872,7 @@ function YouTubeTrailer(props: {
   )
 }
 
-function DetailPanel(props: {
+function DetailPanelContent(props: {
   item: MediaItem
   source: LibrarySource
   language: UiLanguage
@@ -1148,7 +886,7 @@ function DetailPanel(props: {
   isScrapingMetadata: boolean
   canEditMetadata: boolean
   onPlayIntent: (item: MediaItem, audioTrackIndex: number, subtitleTrackIndex: number) => void
-  onTrailerIntent: (item: MediaItem) => Promise<string[]>
+  onTrailerIntent: (item: MediaItem, signal: AbortSignal) => Promise<string[]>
   onRemoveFromLibrary: (item: MediaItem) => void
   onToggleFavorite: (item: MediaItem) => void
   playlists: MediaPlaylist[]
@@ -1179,10 +917,14 @@ function DetailPanel(props: {
   const [playlistMenuOpen, setPlaylistMenuOpen] = useState(false)
   const [trailerPlaying, setTrailerPlaying] = useState(false)
   const [trailerPlaybackStarted, setTrailerPlaybackStarted] = useState(false)
-  const initialTrailerUrls = (): string[] => [...new Set([
+  const initialTrailerUrls = useCallback((): string[] => [...new Set([
     props.item.trailerUrl,
     ...(props.item.trailerUrls ?? [])
-  ].filter((url): url is string => typeof url === 'string' && trailerUrlMatchesSource(url, props.trailerSource)))]
+  ].filter((url): url is string => typeof url === 'string' && trailerUrlMatchesSource(url, props.trailerSource)))], [
+    props.item.trailerUrl,
+    props.item.trailerUrls,
+    props.trailerSource
+  ])
   const [resolvedTrailerUrls, setResolvedTrailerUrls] = useState<string[]>(initialTrailerUrls)
   const [trailerUrlIndex, setTrailerUrlIndex] = useState(0)
   const [isResolvingTrailer, setIsResolvingTrailer] = useState(false)
@@ -1191,6 +933,8 @@ function DetailPanel(props: {
     !props.trailerSoundEnabled
   )
   const autoPlayedTrailerRef = useRef('')
+  const trailerAbortControllerRef = useRef<AbortController>()
+  const toggleTrailerRef = useRef<() => Promise<void>>()
   const [overviewExpanded, setOverviewExpanded] = useState(false)
   const [overviewOverflowing, setOverviewOverflowing] = useState(false)
   const [overviewExpandedHeight, setOverviewExpandedHeight] = useState(0)
@@ -1253,6 +997,7 @@ function DetailPanel(props: {
   }, [activeSeasonId, seasons])
 
   useEffect(() => {
+    trailerAbortControllerRef.current?.abort()
     setSelectedVersionId(props.item.id)
     setTrailerPlaying(false)
     setTrailerPlaybackStarted(false)
@@ -1266,7 +1011,7 @@ function DetailPanel(props: {
     setOverviewExpanded(false)
     setOverviewOverflowing(false)
     setOverviewExpandedHeight(0)
-  }, [props.item.id, props.trailerSource])
+  }, [initialTrailerUrls, props.item.id, props.trailerSoundEnabled, props.trailerSource])
 
   useEffect(() => {
     const defaultMuted = !props.trailerSoundEnabled
@@ -1277,7 +1022,7 @@ function DetailPanel(props: {
   useEffect(() => {
     const urls = initialTrailerUrls()
     if (urls.length) setResolvedTrailerUrls(urls)
-  }, [props.item.trailerUrl, props.item.trailerUrls, props.trailerSource])
+  }, [initialTrailerUrls])
 
   async function toggleTrailer(): Promise<void> {
     setTrailerPlaybackFailed(false)
@@ -1297,8 +1042,11 @@ function DetailPanel(props: {
       return
     }
     setIsResolvingTrailer(true)
+    trailerAbortControllerRef.current?.abort()
+    const abortController = new AbortController()
+    trailerAbortControllerRef.current = abortController
     try {
-      const urls = await props.onTrailerIntent(props.item)
+      const urls = await props.onTrailerIntent(props.item, abortController.signal)
       if (urls.length) {
         setResolvedTrailerUrls(urls)
         setTrailerUrlIndex(0)
@@ -1312,12 +1060,19 @@ function DetailPanel(props: {
         postNativeCommand({ type: 'command', command: 'setLibraryWebViewMuted', muted: defaultMuted })
         setTrailerPlaying(true)
       }
+    } catch (error) {
+      if (!(error instanceof DOMException && error.name === 'AbortError')) throw error
     } finally {
-      setIsResolvingTrailer(false)
+      if (trailerAbortControllerRef.current === abortController) {
+        trailerAbortControllerRef.current = undefined
+        setIsResolvingTrailer(false)
+      }
     }
   }
+  toggleTrailerRef.current = toggleTrailer
 
   useEffect(() => () => {
+    trailerAbortControllerRef.current?.abort()
     postNativeCommand({ type: 'command', command: 'setLibraryWebViewMuted', muted: false })
   }, [])
 
@@ -1331,14 +1086,14 @@ function DetailPanel(props: {
     if (autoPlayedTrailerRef.current === autoPlayKey) return
     autoPlayedTrailerRef.current = autoPlayKey
     postNativeCommand({ type: 'command', command: 'debugLog', message: `trailer auto start item=${props.item.id} source=${props.trailerSource}` })
-    void toggleTrailer()
+    void toggleTrailerRef.current?.()
   }, [props.item.id, props.trailerSource, props.trailerAutoPlay, props.trailerAutoPlayReady])
 
   useEffect(() => {
     const nextAudioStreams = selectedPlaybackVersion.streamSpecs?.filter((stream) => stream.type === 'audio') ?? []
     setSelectedAudioStreamId((nextAudioStreams.find((stream) => stream.isDefault) ?? nextAudioStreams[0])?.id ?? '')
     setSelectedSubtitleStreamId('subtitle-auto')
-  }, [selectedPlaybackVersion.id])
+  }, [selectedPlaybackVersion.id, selectedPlaybackVersion.streamSpecs])
 
   useLayoutEffect(() => {
     const overview = overviewRef.current
@@ -1363,7 +1118,7 @@ function DetailPanel(props: {
   }
 
   return (
-    <aside className="library-detail">
+    <DetailPanelLayout>
       <div className="library-detail-backdrop">
         {trailerPlaying && trailerYouTubeId ? (
           <YouTubeTrailer
@@ -1703,7 +1458,7 @@ function DetailPanel(props: {
                 )}
               </div>
             ) : null}
-            <HorizontalScroller className="library-episode-row">
+            <LibraryHorizontalScroller className="library-episode-row">
               {episodeRows.map((episode) => (
                 <button
                   className="library-episode-card"
@@ -1720,15 +1475,15 @@ function DetailPanel(props: {
                     playMediaAndCloseTrailer(episode.item, -2, -2)
                   }}
                 >
-                  <MediaArtwork background={episode.poster} className="library-episode-thumb">
+                  <LibraryMediaArtwork background={episode.poster} className="library-episode-thumb">
                     <Play size={18} />
-                  </MediaArtwork>
+                  </LibraryMediaArtwork>
                   <span>{episode.index}</span>
                   <strong>{episode.title}</strong>
                   <small>{episode.duration}</small>
                 </button>
               ))}
-            </HorizontalScroller>
+            </LibraryHorizontalScroller>
             {expandedEpisode?.item?.versions?.length ? (
               <div className="library-episode-version-picker">
                 <span>{props.language === 'zh' ? `${expandedEpisode.title} · 选择版本` : `${expandedEpisode.title} · Select version`}</span>
@@ -1754,7 +1509,7 @@ function DetailPanel(props: {
             <div className="library-section-heading">
               <span>演职人员</span>
             </div>
-            <HorizontalScroller className="library-cast-row">
+            <LibraryHorizontalScroller className="library-cast-row">
               {props.item.cast.map((person) => (
                 <button className="library-person-card" type="button" key={person.id} onClick={() => props.onSearchPerson(person)}>
                   <div style={{ background: person.image }} />
@@ -1762,7 +1517,7 @@ function DetailPanel(props: {
                   <small>{person.role}</small>
                 </button>
               ))}
-            </HorizontalScroller>
+            </LibraryHorizontalScroller>
           </section>
         ) : null}
 
@@ -1771,15 +1526,15 @@ function DetailPanel(props: {
             <div className="library-section-heading">
               <span>更多类似</span>
             </div>
-            <HorizontalScroller className="library-similar-row">
+            <LibraryHorizontalScroller className="library-similar-row">
               {props.item.similarItems.map((item) => (
                 <button className="library-similar-card" type="button" key={item.id} onClick={() => props.onSelectItem(item)}>
-                  <MediaArtwork background={item.poster} className="library-similar-art" />
+                  <LibraryMediaArtwork background={item.poster} className="library-similar-art" />
                   <strong>{item.title}</strong>
                   <small>{item.year || item.runtime}</small>
                 </button>
               ))}
-            </HorizontalScroller>
+            </LibraryHorizontalScroller>
           </section>
         ) : null}
 
@@ -1818,7 +1573,7 @@ function DetailPanel(props: {
           <span />
         </div>
       ) : null}
-    </aside>
+    </DetailPanelLayout>
   )
 }
 
@@ -1955,134 +1710,6 @@ function EmptyDetail(): JSX.Element {
         <span>接入真实媒体源后会显示详情</span>
       </div>
     </aside>
-  )
-}
-
-function FileServiceDirectoryBrowser(props: {
-  currentPath: string
-  directories: FileServiceDirectory[]
-  selectedPaths: string[]
-  loading: boolean
-  emptyLabel: string
-  parentPath: string
-  onBrowse: (path?: string) => void
-  onToggle: (path: string) => void
-}): JSX.Element {
-  return (
-    <div className="library-folder-browser">
-      <div className="library-folder-browser-toolbar">
-        <button
-          className="library-secondary-action"
-          type="button"
-          disabled={props.loading || !props.parentPath}
-          onClick={() => props.onBrowse(props.parentPath)}
-        >
-          <ArrowLeft size={15} />
-          <span>上级</span>
-        </button>
-        <button
-          className="library-secondary-action"
-          type="button"
-          disabled={props.loading}
-          onClick={() => props.onBrowse(props.currentPath || undefined)}
-        >
-          <Search size={15} />
-          <span>{props.loading ? '读取中' : '刷新'}</span>
-        </button>
-        <button
-          className="library-secondary-action"
-          type="button"
-          disabled={props.loading || !props.currentPath}
-          onClick={() => props.onToggle(props.currentPath)}
-        >
-          <Check size={15} />
-          <span>{props.selectedPaths.some((path) => locationKey(path) === locationKey(props.currentPath)) ? '取消当前' : '选择当前'}</span>
-        </button>
-        <span className="library-folder-browser-path">{props.currentPath || '尚未连接'}</span>
-      </div>
-
-      <div className="library-folder-browser-list">
-        {props.directories.length ? props.directories.map((directory) => (
-          <div className="library-folder-browser-row" key={directory.path}>
-            <label>
-              <input
-                type="checkbox"
-                checked={props.selectedPaths.some((path) => locationKey(path) === locationKey(directory.path))}
-                onChange={() => props.onToggle(directory.path)}
-              />
-              <FolderOpen size={16} />
-              <span>{directory.name}</span>
-            </label>
-            <button className="library-icon-action" type="button" onClick={() => props.onBrowse(directory.path)}>
-              <ChevronRight size={16} />
-            </button>
-          </div>
-        )) : (
-          <div className="library-folder-browser-empty">{props.loading ? '正在读取...' : props.emptyLabel}</div>
-        )}
-      </div>
-
-      {props.selectedPaths.length ? (
-        <div className="library-folder-selected-list">
-          {props.selectedPaths.map((path) => (
-            <button type="button" key={path} onClick={() => props.onToggle(path)}>
-              <Check size={13} />
-              <span>{directoryDisplayName(path, path)}</span>
-              <X size={13} />
-            </button>
-          ))}
-        </div>
-      ) : null}
-    </div>
-  )
-}
-
-function SourceTypePicker(props: {
-  onSelectEmby: () => void
-  onSelectLocalFolder: () => void
-  onSelectSmb: () => void
-  onSelectWebDav: () => void
-}): JSX.Element {
-  return (
-    <section className="library-source-setup">
-      <div className="library-source-setup-heading">
-        <span>媒体源</span>
-        <h2>添加媒体源</h2>
-      </div>
-
-      <div className="library-source-type-sections">
-        <section className="library-source-type-section">
-          <span>文件系统</span>
-          <div className="library-source-type-grid">
-            <button className="library-source-type-button" type="button" onClick={props.onSelectLocalFolder}>
-              {sourceIcon('Local', 22)}
-              <strong>本地文件夹</strong>
-              <span>扫描本机目录，后续可自行刮削</span>
-            </button>
-            <button className="library-source-type-button" type="button" onClick={props.onSelectSmb}>
-              {sourceIcon('SMB', 22)}
-              <strong>SMB</strong>
-              <span>扫描 Windows 共享或映射盘路径</span>
-            </button>
-            <button className="library-source-type-button" type="button" onClick={props.onSelectWebDav}>
-              {sourceIcon('WebDAV', 22)}
-              <strong>WebDAV</strong>
-              <span>连接常见 WebDAV 文件服务</span>
-            </button>
-          </div>
-        </section>
-        <section className="library-source-type-section">
-          <span>媒体库服务</span>
-          <div className="library-source-type-grid">
-            <button className="library-source-type-button" type="button" onClick={props.onSelectEmby}>
-              {sourceIcon('Emby', 22)}
-              <strong>Emby</strong>
-              <span>服务器媒体库</span>
-            </button>
-          </div>
-        </section>
-      </div>
-    </section>
   )
 }
 
@@ -2624,6 +2251,7 @@ function LibrarySettingsPage(props: {
 }
 
 export default function LibraryApp(): JSX.Element {
+  const requestCancellation = useLibraryRequestCancellation()
   const savedConnections = useMemo(() => loadSavedEmbyConnections(), [])
   const savedConnection = savedConnections[0]
   const initialActiveNav = useMemo(() => loadSavedLibraryNav(savedConnections), [savedConnections])
@@ -2767,7 +2395,25 @@ export default function LibraryApp(): JSX.Element {
   const taskStatusRef = useRef<Map<string, BackgroundTask['status']>>(new Map())
   const taskRetryRef = useRef<Map<string, () => void>>(new Map())
   const taskNativeCancelRef = useRef<Map<string, () => void>>(new Map())
+  const taskAbortControllerRef = requestCancellation.tasks
   const dissolvedCollectionPathsRef = useRef<Set<string>>(loadDissolvedCollectionPaths())
+  const detailItemsByIdRef = useRef(detailItemsById)
+  const mergeCachedDuplicateMetadataRef = useRef(mergeCachedDuplicateMetadata)
+  const beginSourceScanRef = useRef(beginSourceScan)
+  const completeSourceScanFolderRef = useRef(completeSourceScanFolder)
+  const failSourceScanFolderRef = useRef(failSourceScanFolder)
+  const enrichEmbySnapshotRef = useRef(enrichEmbySnapshot)
+  const startTaskRef = useRef(startTask)
+  const applyUpdatedMediaItemRef = useRef(applyUpdatedMediaItem)
+  const connectionAbortControllerRef = requestCancellation.connection
+  detailItemsByIdRef.current = detailItemsById
+  mergeCachedDuplicateMetadataRef.current = mergeCachedDuplicateMetadata
+  beginSourceScanRef.current = beginSourceScan
+  completeSourceScanFolderRef.current = completeSourceScanFolder
+  failSourceScanFolderRef.current = failSourceScanFolder
+  enrichEmbySnapshotRef.current = enrichEmbySnapshot
+  startTaskRef.current = startTask
+  applyUpdatedMediaItemRef.current = applyUpdatedMediaItem
 
   useEffect(() => {
     allItemsRef.current = allItems
@@ -2807,6 +2453,7 @@ export default function LibraryApp(): JSX.Element {
 
   function pauseTask(task: BackgroundTask): void {
     updateTask(task.id, { status: 'paused' })
+    taskAbortControllerRef.current.get(task.id)?.abort()
     taskNativeCancelRef.current.get(task.id)?.()
     if (task.kind === 'probe' && task.id.startsWith('probe:')) {
       const requestId = task.id.slice('probe:'.length)
@@ -2828,6 +2475,7 @@ export default function LibraryApp(): JSX.Element {
   }
 
   function cancelTask(task: BackgroundTask): void {
+    taskAbortControllerRef.current.get(task.id)?.abort()
     taskNativeCancelRef.current.get(task.id)?.()
     updateTask(task.id, { status: 'cancelled' })
     if (task.kind === 'probe' && task.id.startsWith('probe:')) {
@@ -3032,7 +2680,7 @@ export default function LibraryApp(): JSX.Element {
         sourceRows,
         allRows,
         mergedCount
-      } = await mergeCachedDuplicateMetadata(rawSourceRows, rawAllRows)
+      } = await mergeCachedDuplicateMetadataRef.current(rawSourceRows, rawAllRows)
       const [visibleRows, continueRows, homeRows] = await Promise.all([
         client.listItems({ navKey: initialActiveNav, view: 'home', search: '', sortKey: 'recent' }),
         client.getContinueWatching(),
@@ -3175,7 +2823,7 @@ export default function LibraryApp(): JSX.Element {
       } else {
         pendingFolderScanCountsRef.current.delete(snapshot.source.id)
       }
-      completeSourceScanFolder(snapshot.source, mergedItems.length, stillScanningSource, result.folder.path, result.truncated)
+      completeSourceScanFolderRef.current(snapshot.source, mergedItems.length, stillScanningSource, result.folder.path, result.truncated)
       setScanningLocalFolderSourceIds((current) => {
         const next = new Set(current)
         if (!stillScanningSource) {
@@ -3235,7 +2883,7 @@ export default function LibraryApp(): JSX.Element {
         ignoredLocalFolderScanSourceIdsRef.current.delete(source.id)
         setScanningLocalFolderSourceIds((current) => new Set(current).add(source.id))
         const sourceItems = (await client.listAllItems()).filter((item) => item.sourceId === source.id)
-        beginSourceScan(source, 1, sourceItems.length)
+        beginSourceScanRef.current(source, 1, sourceItems.length)
         await client.upsertSourceItems({ ...source, itemCount: sourceItems.length }, sourceItems)
 
         const sourceNav = `source:${source.id}` as NavKey
@@ -3301,7 +2949,7 @@ export default function LibraryApp(): JSX.Element {
       } else {
         pendingFolderScanCountsRef.current.delete(source.id)
       }
-      failSourceScanFolder(source, stillScanningSource, result.folder.path)
+      failSourceScanFolderRef.current(source, stillScanningSource, result.folder.path)
       setScanningLocalFolderSourceIds((current) => {
         const next = new Set(current)
         if (!stillScanningSource) {
@@ -3396,7 +3044,7 @@ export default function LibraryApp(): JSX.Element {
         if (['cancelled', 'paused'].includes(taskStatusRef.current.get(`probe:${message.requestId}`) ?? '')) return
         updateTask(`probe:${message.requestId}`, { status: 'completed', completed: 1 })
         const item = allItemsRef.current.find((candidate) => candidate.id === message.requestId)
-          ?? detailItemsById.get(message.requestId)
+          ?? detailItemsByIdRef.current.get(message.requestId)
         if (!item) return
         const updatedItem: MediaItem = {
           ...item,
@@ -3445,6 +3093,7 @@ export default function LibraryApp(): JSX.Element {
   useEffect(() => {
     const connections = savedConnections.filter((connection) => connection.session)
     if (!connections.length) return undefined
+    const abortController = new AbortController()
     let cancelled = false
 
     async function refreshSavedConnections(): Promise<void> {
@@ -3456,8 +3105,9 @@ export default function LibraryApp(): JSX.Element {
             command: 'setAllowInsecureCertificates',
             enabled: connection.ignoreCertificateErrors
           })
-          const snapshot = await enrichEmbySnapshot(
-            await refreshEmbyLibrary(savedSession, connection.name)
+          const snapshot = await enrichEmbySnapshotRef.current(
+            await refreshEmbyLibrary(savedSession, connection.name, undefined, abortController.signal),
+            abortController.signal
           )
           await client.upsertSourceItems(snapshot.source, snapshot.items, snapshot.homeSections)
 
@@ -3493,7 +3143,7 @@ export default function LibraryApp(): JSX.Element {
             setActiveNav(`source:${snapshot.source.id}` as NavKey)
           }
         } catch (error) {
-          if (cancelled) return
+          if (cancelled || abortController.signal.aborted) return
           debugLibraryPlayback(`emby saved refresh failed source=${connection.sourceId || connection.name} error=${errorText(error)}`)
         }
       }
@@ -3502,6 +3152,7 @@ export default function LibraryApp(): JSX.Element {
     void refreshSavedConnections()
     return () => {
       cancelled = true
+      abortController.abort()
     }
   }, [client, savedConnections, embyRefreshPulse])
 
@@ -3511,6 +3162,7 @@ export default function LibraryApp(): JSX.Element {
   }, [query])
 
   useEffect(() => {
+    const abortController = new AbortController()
     let cancelled = false
     const activeSourceId = activeNav.startsWith('source:') ? activeNav.slice('source:'.length) : ''
     const activeSourceKind = activeSourceId ? sources.find((source) => source.id === activeSourceId)?.kind : undefined
@@ -3524,7 +3176,8 @@ export default function LibraryApp(): JSX.Element {
             view: activeView,
             filterKey: mediaFilter,
             sortKey,
-            sortOrder
+            sortOrder,
+            signal: abortController.signal
           })
           if (!cancelled) {
             setVisibleItems(applyEmbyPlaylistMembership(
@@ -3535,6 +3188,7 @@ export default function LibraryApp(): JSX.Element {
           }
           return
         } catch (error) {
+          if (abortController.signal.aborted) return
           debugLibraryPlayback(`emby view load failed source=${activeSourceId} view=${activeLibraryViewId} error=${errorText(error)}`)
         }
       }
@@ -3550,14 +3204,16 @@ export default function LibraryApp(): JSX.Element {
                 view: activeView,
                 filterKey: mediaFilter,
                 sortKey,
-                sortOrder
+                sortOrder,
+                signal: abortController.signal
               })
             : await searchEmbyLibrary(activeSession, debouncedQuery, {
                 libraryViewId: activeLibraryViewId || undefined,
                 view: activeView,
                 filterKey: mediaFilter,
                 sortKey,
-                sortOrder
+                sortOrder,
+                signal: abortController.signal
               })
           if (!cancelled) {
             setVisibleItems(applyEmbyPlaylistMembership(
@@ -3568,6 +3224,7 @@ export default function LibraryApp(): JSX.Element {
           }
           return
         } catch (error) {
+          if (abortController.signal.aborted) return
           debugLibraryPlayback(`emby search failed source=${activeSourceId} error=${errorText(error)}`)
         }
       }
@@ -3587,6 +3244,7 @@ export default function LibraryApp(): JSX.Element {
     void loadVisibleItems()
     return () => {
       cancelled = true
+      abortController.abort()
     }
   }, [activeLibraryViewId, activeNav, activeView, client, debouncedQuery, embyPlaylistsBySourceId, embySessionsBySourceId, mediaFilter, personSearch, sortKey, sortOrder, sources])
 
@@ -3714,7 +3372,7 @@ export default function LibraryApp(): JSX.Element {
     mediaProbeRequestedIdsRef.current.add(selectedDetailItem.id)
     const taskId = `probe:${selectedDetailItem.id}`
     const requestProbe = (): void => {
-      startTask(taskId, 'probe', `${language === 'zh' ? '媒体探测' : 'Media probe'} · ${selectedDetailItem.title}`, probePath, 1, requestProbe)
+      startTaskRef.current(taskId, 'probe', `${language === 'zh' ? '媒体探测' : 'Media probe'} · ${selectedDetailItem.title}`, probePath, 1, requestProbe)
       postNativeCommand({ type: 'command', command: 'probeMediaDetails', requestId: selectedDetailItem.id, path: probePath })
     }
     taskNativeCancelRef.current.set(taskId, () => postNativeCommand({ type: 'command', command: 'cancelLibraryProbe', requestId: selectedDetailItem.id }))
@@ -3726,21 +3384,27 @@ export default function LibraryApp(): JSX.Element {
         setPlayIntent('媒体信息读取超时，请关闭详情后重试')
       }
     }, 25000)
-    mediaProbeTimeoutsRef.current.set(selectedDetailItem.id, timeout)
+    const mediaProbeTimeouts = mediaProbeTimeoutsRef.current
+    const mediaProbeRequestedIds = mediaProbeRequestedIdsRef.current
+    mediaProbeTimeouts.set(selectedDetailItem.id, timeout)
     return () => {
       window.clearTimeout(timeout)
-      mediaProbeTimeoutsRef.current.delete(selectedDetailItem.id)
-      mediaProbeRequestedIdsRef.current.delete(selectedDetailItem.id)
+      mediaProbeTimeouts.delete(selectedDetailItem.id)
+      mediaProbeRequestedIds.delete(selectedDetailItem.id)
     }
   }, [isDetailOpen, language, selectedDetailItem, selectedId, sourceMap])
   useEffect(() => {
     if (!isDetailOpen || !selectedDetailItem || selectedDetailItem.cast?.length ||
         selectedDetailItem.metadataProvider !== 'tmdb' || !selectedDetailItem.externalIds?.tmdb ||
         castRefreshRequestedIdsRef.current.has(selectedDetailItem.id)) return
+    const abortController = new AbortController()
     castRefreshRequestedIdsRef.current.add(selectedDetailItem.id)
-    void scrapeTmdbItem(selectedDetailItem, tmdbSettings)
-      .then((updatedItem) => applyUpdatedMediaItem(updatedItem))
-      .catch(() => castRefreshRequestedIdsRef.current.delete(selectedDetailItem.id))
+    void scrapeTmdbItem(selectedDetailItem, tmdbSettings, { signal: abortController.signal })
+      .then((updatedItem) => applyUpdatedMediaItemRef.current(updatedItem))
+      .catch(() => {
+        castRefreshRequestedIdsRef.current.delete(selectedDetailItem.id)
+      })
+    return () => abortController.abort()
   }, [isDetailOpen, selectedDetailItem, tmdbSettings])
   const activeMetadataEditorItem = metadataEditorItem
     ? detailItemsById.get(metadataEditorItem.id)
@@ -3759,7 +3423,7 @@ export default function LibraryApp(): JSX.Element {
     ? homeSections.filter((section) => section.sourceId === activeSource.id)
     : homeSections
   const libraryViewCards = scopedHomeSections.flatMap((section) => section.cards).filter((card) => card.kind === 'view')
-  const activeLibraryCard = libraryViewCards.find((card) => homeCardViewId(card) === activeLibraryViewId)
+  const activeLibraryCard = libraryViewCards.find((card) => extractedHomeCardViewId(card) === activeLibraryViewId)
   const showHomeSections = Boolean(
     isActiveEmby
     && !activeLibraryViewId
@@ -3846,12 +3510,13 @@ export default function LibraryApp(): JSX.Element {
 
     const detailItem = selectedItem
     const detailSession = session
+    const abortController = new AbortController()
     let cancelled = false
 
     async function loadSelectedDetail(): Promise<void> {
       try {
         debugLibraryPlayback(`emby detail load start item=${detailItem.id}`)
-        const detail = await loadEmbyItemDetails(detailSession, detailItem)
+        const detail = await loadEmbyItemDetails(detailSession, detailItem, abortController.signal)
         if (cancelled) return
         setDetailItemsById((current) => {
           const next = new Map(current)
@@ -3865,6 +3530,7 @@ export default function LibraryApp(): JSX.Element {
         })
         debugLibraryPlayback(`emby detail load ok item=${detailItem.id}`)
       } catch (error) {
+        if (abortController.signal.aborted) return
         debugLibraryPlayback(`emby detail load failed item=${detailItem.id} error=${errorText(error)}`)
       }
     }
@@ -3872,6 +3538,7 @@ export default function LibraryApp(): JSX.Element {
     void loadSelectedDetail()
     return () => {
       cancelled = true
+      abortController.abort()
     }
   }, [embySessionsBySourceId, isDetailOpen, selectedDetailLoaded, selectedItem, sourceMap])
 
@@ -3887,13 +3554,15 @@ export default function LibraryApp(): JSX.Element {
     const refreshSession = session
     const refreshSourceName = activeSource.name
     homeSectionRefreshSourceIdsRef.current.add(sourceId)
+    const abortController = new AbortController()
     let cancelled = false
 
     async function refreshMissingHomeSections(): Promise<void> {
       try {
         debugLibraryPlayback(`emby home refresh start source=${sourceId}`)
-        const snapshot = await enrichEmbySnapshot(
-          await refreshEmbyLibrary(refreshSession, refreshSourceName)
+        const snapshot = await enrichEmbySnapshotRef.current(
+          await refreshEmbyLibrary(refreshSession, refreshSourceName, undefined, abortController.signal),
+          abortController.signal
         )
         await client.upsertSourceItems(snapshot.source, snapshot.items, snapshot.homeSections)
 
@@ -3930,6 +3599,7 @@ export default function LibraryApp(): JSX.Element {
         }
         debugLibraryPlayback(`emby home refresh ok source=${sourceId} sections=${snapshot.homeSections.length}`)
       } catch (error) {
+        if (abortController.signal.aborted) return
         debugLibraryPlayback(`emby home refresh failed source=${sourceId} error=${errorText(error)}`)
       }
     }
@@ -3937,6 +3607,7 @@ export default function LibraryApp(): JSX.Element {
     void refreshMissingHomeSections()
     return () => {
       cancelled = true
+      abortController.abort()
     }
   }, [
     activeLibraryViewId,
@@ -4110,11 +3781,12 @@ export default function LibraryApp(): JSX.Element {
     activateFileSystemSource(source, visibleRows)
   }
 
-  async function enrichEmbySnapshot(snapshot: EmbyLibrarySnapshot): Promise<EmbyLibrarySnapshot> {
+  async function enrichEmbySnapshot(snapshot: EmbyLibrarySnapshot, signal?: AbortSignal): Promise<EmbyLibrarySnapshot> {
     const [favoritesResult, playlistsResult] = await Promise.allSettled([
-      listEmbyFavoriteItems(snapshot.session),
-      listEmbyPlaylists(snapshot.session)
+      listEmbyFavoriteItems(snapshot.session, signal),
+      listEmbyPlaylists(snapshot.session, signal)
     ])
+    signal?.throwIfAborted()
     const favorites = favoritesResult.status === 'fulfilled'
       ? favoritesResult.value
       : allItemsRef.current.filter((item) => item.sourceId === snapshot.source.id && item.favorite)
@@ -4396,12 +4068,18 @@ export default function LibraryApp(): JSX.Element {
     }
 
     const taskId = `metadata:${item.id}`
+    taskAbortControllerRef.current.get(taskId)?.abort()
+    const abortController = new AbortController()
+    taskAbortControllerRef.current.set(taskId, abortController)
     startTask(taskId, 'metadata', `${language === 'zh' ? '元数据刮削' : 'Metadata'} · ${item.title}`, 'TMDB', 1, () => { void scrapeMediaMetadata(item, ignoreSavedMatch) })
     setScrapingMetadataItemId(item.id)
     setPlayIntent('正在从 TMDB 刮削元数据...')
     debugLibraryPlayback(`tmdb scrape start id=${item.id} title=${item.title}`)
     try {
-      const updatedItem = await scrapeTmdbItem(item, tmdbSettings, { ignoreSavedMatch })
+      const updatedItem = await scrapeTmdbItem(item, tmdbSettings, {
+        ignoreSavedMatch,
+        signal: abortController.signal
+      })
       if (await waitWhileTaskPaused(taskId)) return
       await applyUpdatedMediaItem(updatedItem)
       updateTask(taskId, { status: 'completed', completed: 1, detail: `TMDB ${updatedItem.externalIds?.tmdb ?? ''}` })
@@ -4409,11 +4087,15 @@ export default function LibraryApp(): JSX.Element {
       setPlayIntent(`已用 TMDB 更新 ${updatedItem.title}`)
       debugLibraryPlayback(`tmdb scrape ok id=${item.id} tmdb=${updatedItem.externalIds?.tmdb ?? 'unknown'}`)
     } catch (error) {
+      if (abortController.signal.aborted) return
       const message = error instanceof Error ? error.message : 'TMDB 刮削失败'
       setPlayIntent(message)
       updateTask(taskId, { status: 'failed', error: message })
       debugLibraryPlayback(`tmdb scrape failed id=${item.id} error=${message}`)
     } finally {
+      if (taskAbortControllerRef.current.get(taskId) === abortController) {
+        taskAbortControllerRef.current.delete(taskId)
+      }
       setScrapingMetadataItemId((current) => current === item.id ? '' : current)
     }
   }
@@ -4426,12 +4108,12 @@ export default function LibraryApp(): JSX.Element {
     setPlayIntent(`已删除 ${clearedItem.title} 的元数据`)
   }
 
-  async function resolveMediaTrailer(item: MediaItem): Promise<string[]> {
+  async function resolveMediaTrailer(item: MediaItem, signal: AbortSignal): Promise<string[]> {
     try {
       debugLibraryPlayback(`trailer lookup start item=${item.id} source=${trailerSettings.source}`)
       const urls = trailerSettings.source === 'bilibili'
-        ? await searchBilibiliTrailerUrls(item, trailerSettings)
-        : await fetchTmdbTrailerUrls(item, tmdbSettings)
+        ? await searchBilibiliTrailerUrls(item, trailerSettings, signal)
+        : await fetchTmdbTrailerUrls(item, tmdbSettings, signal)
       debugLibraryPlayback(`trailer lookup result item=${item.id} source=${trailerSettings.source} count=${urls.length}`)
       if (!urls.length) {
         const provider = trailerSettings.source === 'bilibili' ? (language === 'zh' ? 'B 站' : 'Bilibili') : 'TMDB'
@@ -4446,6 +4128,7 @@ export default function LibraryApp(): JSX.Element {
       }
       return urls
     } catch (error) {
+      if (signal.aborted) throw error
       const message = error instanceof Error ? error.message : (language === 'zh' ? '预告片查询失败' : 'Trailer lookup failed')
       debugLibraryPlayback(`trailer lookup failed item=${item.id} source=${trailerSettings.source} error=${message}`)
       setPlayIntent(message)
@@ -5535,6 +5218,9 @@ export default function LibraryApp(): JSX.Element {
 
   async function connectEmbySource(): Promise<void> {
     if (!canConnectEmby) return
+    connectionAbortControllerRef.current?.abort()
+    const abortController = new AbortController()
+    connectionAbortControllerRef.current = abortController
 
     setIsConnecting(true)
     setConnectTone('idle')
@@ -5551,14 +5237,15 @@ export default function LibraryApp(): JSX.Element {
             serverUrl,
             username,
             password,
-            displayName: connectionName
+            displayName: connectionName,
+            signal: abortController.signal
           })
           : await refreshEmbyLibrary({
             ...(editingSession as EmbySession),
             apiBaseUrl: serverUrl,
             userName: username.trim() || editingSession?.userName || ''
-          }, connectionName)
-      const snapshot = await enrichEmbySnapshot(rawSnapshot)
+          }, connectionName, undefined, abortController.signal)
+      const snapshot = await enrichEmbySnapshot(rawSnapshot, abortController.signal)
       await client.upsertSourceItems(snapshot.source, snapshot.items, snapshot.homeSections)
       saveSavedEmbyConnection({
         sourceId: snapshot.source.id,
@@ -5607,10 +5294,14 @@ export default function LibraryApp(): JSX.Element {
       setConnectTone('success')
       setConnectMessage(`已连接 ${snapshot.source.name}，加载 ${visibleRows.length} / ${snapshot.totalRecordCount} 条`)
     } catch (error) {
+      if (abortController.signal.aborted) return
       setConnectTone('error')
       setConnectMessage(errorText(error))
     } finally {
-      setIsConnecting(false)
+      if (connectionAbortControllerRef.current === abortController) {
+        connectionAbortControllerRef.current = undefined
+        setIsConnecting(false)
+      }
     }
   }
 
@@ -5871,7 +5562,7 @@ export default function LibraryApp(): JSX.Element {
             onTrailerSettingsChange={setTrailerSettings}
           />
         ) : sourceSetupMode === 'select' ? (
-          <SourceTypePicker
+          <SourceManager
             onSelectEmby={openEmbySetup}
             onSelectLocalFolder={openLocalFolderSetup}
             onSelectSmb={() => openSmbSetup()}
@@ -6026,7 +5717,7 @@ export default function LibraryApp(): JSX.Element {
                   />
                 </label>
               </div>
-              <FileServiceDirectoryBrowser
+              <SourceDirectoryBrowser
                 currentPath={smbCurrentPath}
                 directories={smbDirectories}
                 selectedPaths={smbSelectedRows}
@@ -6142,7 +5833,7 @@ export default function LibraryApp(): JSX.Element {
                   />
                 </label>
               </div>
-              <FileServiceDirectoryBrowser
+              <SourceDirectoryBrowser
                 currentPath={webDavCurrentPath}
                 directories={webDavDirectories}
                 selectedPaths={webDavSelectedRows}
@@ -6323,107 +6014,63 @@ export default function LibraryApp(): JSX.Element {
                 </button>
               </div>
               {scopedContinueItems.length ? (
-                <HorizontalScroller className="library-continue-row">
+                <LibraryHorizontalScroller className="library-continue-row">
                   {scopedContinueItems.map((item) => (
-                    <ContinueCard
+                    <LibraryContinueCard
                       key={item.id}
                       item={item}
                       selected={selectedItem?.id === item.id}
                       onSelect={selectMediaItem}
                     />
                   ))}
-                </HorizontalScroller>
+                </LibraryHorizontalScroller>
               ) : (
-                <EmptyState icon={<Clock3 size={24} />} title="暂无继续观看" caption="当前没有来自真实媒体源的播放进度" />
+                <LibraryEmptyState icon={<Clock3 size={24} />} title="暂无继续观看" caption="当前没有来自真实媒体源的播放进度" />
               )}
             </section>
             ) : null}
 
             {showHomeSections ? (
-              <LibraryHomeSections
+              <LibraryHomeView
                 sections={scopedHomeSections}
                 selectedId={selectedItem?.id ?? ''}
                 selectedViewId={activeLibraryViewId}
+                language={language}
                 onSelectItem={selectMediaItem}
                 onSelectView={openLibraryView}
               />
             ) : (
-            <section className="library-grid-section" ref={listingSectionRef}>
-              <div className="library-section-heading">
-                <span>{listingTitle} · {visibleItems.length}</span>
-                <button type="button" onClick={resetCurrentListing}>
-                  <ListFilter size={13} />
-                  <span>{activeLibraryViewId ? '全部媒体库' : '重置'}</span>
-                </button>
-              </div>
-              {visibleItems.length ? (
-                <>
-                  {classificationGroups.length ? classificationGroups.map((group) => (
-                    <section className="library-classification-group" key={group.label}>
-                      <div className="library-section-heading"><span>{group.label}</span><small>{group.items.length}</small></div>
-                      <div className="library-poster-grid">
-                        {group.items.map((item) => (
-                          <MediaPoster key={`${group.label}:${item.id}`} item={item} source={sourceFor(item.sourceId)} selected={selectedItem?.id === item.id} onSelect={selectMediaItem} />
-                        ))}
-                      </div>
-                    </section>
-                  )) : (
-                    <div className="library-poster-grid">
-                      {pagedVisibleItems.map((item) => (
-                        <MediaPoster
-                          key={item.id}
-                          item={item}
-                          source={sourceFor(item.sourceId)}
-                          selected={selectedItem?.id === item.id}
-                          onSelect={selectMediaItem}
-                        />
-                      ))}
-                    </div>
-                  )}
-                  {!classificationGroups.length && listingPageCount > 1 ? (
-                    <nav className="library-pagination" aria-label="媒体库分页">
-                      <button
-                        type="button"
-                        disabled={effectiveListingPage === 1}
-                        aria-label="上一页"
-                        onClick={() => changeListingPage(effectiveListingPage - 1)}
-                      >
-                        <ChevronLeft size={15} />
-                        <span>上一页</span>
-                      </button>
-                      <span className="library-pagination-status">
-                        {listingRangeStart}-{listingRangeEnd} / {visibleItems.length}
-                        <small>第 {effectiveListingPage} / {listingPageCount} 页</small>
-                      </span>
-                      <button
-                        type="button"
-                        disabled={effectiveListingPage === listingPageCount}
-                        aria-label="下一页"
-                        onClick={() => changeListingPage(effectiveListingPage + 1)}
-                      >
-                        <span>下一页</span>
-                        <ChevronRight size={15} />
-                      </button>
-                    </nav>
-                  ) : null}
-                </>
-              ) : (
-                <EmptyState
-                  icon={<Film size={24} />}
-                  title="暂无媒体"
-                  caption={activeSourceScanProgress
-                    ? scanProgressSummary(activeSourceScanProgress, activeSource?.itemCount ?? 0)
-                    : isActiveFileSystemScanning ? '正在后台扫描媒体文件，扫描完成后会自动出现。' : '当前没有来自真实媒体源的条目'}
-                />
-              )}
-            </section>
+            <>
+            <LibraryList
+              title={listingTitle}
+              language={language}
+              items={visibleItems}
+              pagedItems={pagedVisibleItems}
+              groups={classificationGroups}
+              selectedId={selectedItem?.id ?? ''}
+              page={effectiveListingPage}
+              pageCount={listingPageCount}
+              rangeStart={listingRangeStart}
+              rangeEnd={listingRangeEnd}
+              emptyCaption={activeSourceScanProgress
+                ? scanProgressSummary(activeSourceScanProgress, activeSource?.itemCount ?? 0)
+                : isActiveFileSystemScanning
+                  ? (language === 'zh' ? '正在后台扫描媒体文件，完成后会自动出现。' : 'Scanning media files in the background.')
+                  : (language === 'zh' ? '当前没有来自真实媒体源的条目。' : 'There are no items from the selected source.')}
+              sectionRef={listingSectionRef}
+              sourceFor={sourceFor}
+              onSelect={selectMediaItem}
+              onReset={resetCurrentListing}
+              onPageChange={changeListingPage}
+            />
+            </>
             )}
           </>
         )}
       </main>
 
       {showDetailPanel && selectedDetailItem ? (
-        <DetailPanel
+        <DetailPanelContent
           key={`${selectedDetailItem.id}:${trailerSettings.source}`}
           item={selectedDetailItem}
           source={sourceFor(selectedDetailItem.sourceId)}

@@ -309,6 +309,8 @@ private:
     void CompleteAsyncRuntimeStop();
     void PollPlaybackSupervisorCompletion();
     void CompleteRendererInitialization(D3D11RendererState state);
+    void HandleRendererDeviceLost(HRESULT reason);
+    bool RecreateRendererAfterDeviceLoss();
     void BeginClose();
     void TryFinishClose();
     bool RuntimeStopInProgress() const;
@@ -472,6 +474,9 @@ private:
     HWND hdrToneCurveWindow_ = nullptr;
     bool videoHostReady_ = false;
     bool videoHostInitializationFailureHandled_ = false;
+    bool rendererDeviceRecoveryPending_ = false;
+    unsigned int rendererDeviceRecoveryAttempts_ = 0;
+    std::chrono::steady_clock::time_point lastRendererDeviceLossAt_{};
     bool gpuFullscreenUiOverlayActive_ = false;
     bool gpuFullscreenSubtitleMenuOverlayActive_ = false;
     bool gpuFullscreenUiOverlayLogged_ = false;

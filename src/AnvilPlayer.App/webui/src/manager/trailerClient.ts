@@ -124,25 +124,43 @@ export function trailerUrlMatchesSource(url: string, source: TrailerSource): boo
   }
 }
 
-export async function searchBilibiliTrailerUrls(item: MediaItem, settings: TrailerSettings): Promise<string[]> {
+export async function searchBilibiliTrailerUrls(
+  item: MediaItem,
+  settings: TrailerSettings,
+  signal?: AbortSignal
+): Promise<string[]> {
   const requestId = `bilibili-trailer-${Date.now()}-${Math.random().toString(36).slice(2)}`
   const keyword = searchKeyword(item, settings.bilibiliKeywordTemplate)
   const payload = await new Promise<BilibiliSearchPayload>((resolve, reject) => {
+    let unsubscribe = (): void => {}
+    const abort = (): void => {
+      window.clearTimeout(timeout)
+      unsubscribe()
+      reject(new DOMException('The trailer request was cancelled', 'AbortError'))
+    }
     const timeout = window.setTimeout(() => {
+      signal?.removeEventListener('abort', abort)
       unsubscribe()
       reject(new Error('B 站搜索超时'))
     }, 18000)
-    const unsubscribe = subscribeNativeMessages((message) => {
+    unsubscribe = subscribeNativeMessages((message) => {
       if (message.type === 'bilibiliTrailerSearchCompleted' && message.requestId === requestId) {
         window.clearTimeout(timeout)
+        signal?.removeEventListener('abort', abort)
         unsubscribe()
         resolve(message.response as BilibiliSearchPayload)
       } else if (message.type === 'bilibiliTrailerSearchFailed' && message.requestId === requestId) {
         window.clearTimeout(timeout)
+        signal?.removeEventListener('abort', abort)
         unsubscribe()
         reject(new Error(message.message))
       }
     })
+    signal?.addEventListener('abort', abort, { once: true })
+    if (signal?.aborted) {
+      abort()
+      return
+    }
     postNativeCommand({ type: 'command', command: 'searchBilibiliTrailers', requestId, keyword })
   })
 

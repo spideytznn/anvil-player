@@ -66,6 +66,7 @@ export interface EmbyConnectionInput {
   username: string
   password: string
   displayName?: string
+  signal?: AbortSignal
 }
 
 export interface EmbyLibrarySnapshot {
@@ -84,6 +85,7 @@ export interface EmbySearchOptions {
   sortKey?: SortKey
   sortOrder?: SortOrder
   limit?: number
+  signal?: AbortSignal
 }
 
 export interface EmbyPlaylistSnapshot {
@@ -111,7 +113,7 @@ export async function setEmbyFavorite(
   )
 }
 
-export async function listEmbyFavoriteItems(session: EmbySession): Promise<MediaItem[]> {
+export async function listEmbyFavoriteItems(session: EmbySession, signal?: AbortSignal): Promise<MediaItem[]> {
   const sourceId = sourceIdForSession(session)
   const items: EmbyItem[] = []
   let startIndex = 0
@@ -127,7 +129,7 @@ export async function listEmbyFavoriteItems(session: EmbySession): Promise<Media
         SortBy: 'SortName',
         SortOrder: 'Ascending'
       }),
-      { method: 'GET', headers: authHeadersForSession(session) },
+      { method: 'GET', headers: authHeadersForSession(session), signal },
       '读取 Emby 收藏'
     )
     const page = response.Items ?? []
@@ -139,7 +141,7 @@ export async function listEmbyFavoriteItems(session: EmbySession): Promise<Media
   return items.map((item) => mapItem(session, sourceId, item))
 }
 
-export async function listEmbyPlaylists(session: EmbySession): Promise<EmbyPlaylistSnapshot[]> {
+export async function listEmbyPlaylists(session: EmbySession, signal?: AbortSignal): Promise<EmbyPlaylistSnapshot[]> {
   const sourceId = sourceIdForSession(session)
   const response = await fetchJson<EmbyItemsResponse>(
     apiUrl(session.apiBaseUrl, `/Users/${session.userId}/Items`, {
@@ -150,7 +152,7 @@ export async function listEmbyPlaylists(session: EmbySession): Promise<EmbyPlayl
       SortOrder: 'Ascending',
       Limit: EMBY_USER_COLLECTION_PAGE_SIZE
     }),
-    { method: 'GET', headers: authHeadersForSession(session) },
+    { method: 'GET', headers: authHeadersForSession(session), signal },
     '读取 Emby 片单'
   )
 
@@ -164,7 +166,7 @@ export async function listEmbyPlaylists(session: EmbySession): Promise<EmbyPlayl
         Fields: EMBY_ITEM_FIELDS,
         Limit: 10000
       }),
-      { method: 'GET', headers: authHeadersForSession(session) },
+      { method: 'GET', headers: authHeadersForSession(session), signal },
       `读取 Emby 片单“${playlist.Name ?? ''}”`
     )
     const rows = playlistItems.Items ?? []
@@ -542,13 +544,14 @@ function playbackStreamUrl(
   })
 }
 
-async function assertPlayableHttpUrl(url: string): Promise<void> {
+async function assertPlayableHttpUrl(url: string, signal?: AbortSignal): Promise<void> {
   if (!/^https?:\/\//i.test(url)) return
 
   let response: Response
   try {
-    response = await fetch(url, { method: 'HEAD', redirect: 'follow' })
+    response = await fetch(url, { method: 'HEAD', redirect: 'follow', signal })
   } catch {
+    signal?.throwIfAborted()
     return
   }
 
@@ -568,6 +571,7 @@ async function assertPlayableHttpUrl(url: string): Promise<void> {
     const body = await fetch(url, {
       method: 'GET',
       redirect: 'follow',
+      signal,
       headers: { Range: 'bytes=0-2047' }
     })
     const text = (await body.text()).trim()
@@ -580,19 +584,20 @@ async function assertPlayableHttpUrl(url: string): Promise<void> {
       }
     }
   } catch {
+    signal?.throwIfAborted()
     detail = contentType
   }
 
   throw new Error(`播放地址返回的不是视频${detail ? `：${detail}` : ''}`)
 }
 
-async function fetchPlaybackInfo(session: EmbySession, itemId: string): Promise<EmbyPlaybackInfoResponse> {
+async function fetchPlaybackInfo(session: EmbySession, itemId: string, signal?: AbortSignal): Promise<EmbyPlaybackInfoResponse> {
   return await fetchJson<EmbyPlaybackInfoResponse>(
     apiUrl(session.apiBaseUrl, `/Items/${itemId}/PlaybackInfo`, {
       UserId: session.userId,
       api_key: session.accessToken
     }),
-    { method: 'GET' },
+    { method: 'GET', signal },
     '读取 Emby 播放信息'
   )
 }
@@ -612,7 +617,8 @@ function choosePlayableEpisode(items: EmbyItem[]): EmbyItem | undefined {
 
 export async function resolveEmbyPlaybackTarget(
   session: EmbySession,
-  item: MediaItem
+  item: MediaItem,
+  signal?: AbortSignal
 ): Promise<EmbyPlaybackTarget> {
   const fields = [
     'MediaSources',
@@ -630,10 +636,10 @@ export async function resolveEmbyPlaybackTarget(
         Fields: fields,
         api_key: session.accessToken
       }),
-      { method: 'GET' },
+      { method: 'GET', signal },
       '读取 Emby 播放信息'
     )
-    const playbackInfo = await fetchPlaybackInfo(session, detail.Id)
+    const playbackInfo = await fetchPlaybackInfo(session, detail.Id, signal)
     const source = item.mediaSourceId
       ? playbackInfo.MediaSources?.find((row) => row.Id === item.mediaSourceId)
       : playbackInfo.MediaSources?.[0]
@@ -641,7 +647,7 @@ export async function resolveEmbyPlaybackTarget(
       ? detail.MediaSources?.find((row) => row.Id === item.mediaSourceId)
       : detail.MediaSources?.[0]
     const url = playbackStreamUrl(session, detail.Id, source ?? fallbackSource, playbackInfo.PlaySessionId)
-    await assertPlayableHttpUrl(url)
+    await assertPlayableHttpUrl(url, signal)
     return {
       itemId: detail.Id,
       title: detail.Name ?? item.title,
@@ -661,7 +667,7 @@ export async function resolveEmbyPlaybackTarget(
         SortOrder: 'Ascending',
         api_key: session.accessToken
       }),
-      { method: 'GET' },
+      { method: 'GET', signal },
       '读取 Emby 剧集'
     )
     const episode = choosePlayableEpisode(episodes.Items ?? [])
@@ -675,11 +681,11 @@ export async function resolveEmbyPlaybackTarget(
         : '',
       episode.Name ?? ''
     ].filter(Boolean)
-    const playbackInfo = await fetchPlaybackInfo(session, episode.Id)
+    const playbackInfo = await fetchPlaybackInfo(session, episode.Id, signal)
     const source = playbackInfo.MediaSources?.[0]
     const fallbackSource = episode.MediaSources?.[0]
     const url = playbackStreamUrl(session, episode.Id, source ?? fallbackSource, playbackInfo.PlaySessionId)
-    await assertPlayableHttpUrl(url)
+    await assertPlayableHttpUrl(url, signal)
     return {
       itemId: episode.Id,
       title: titleParts.join(' - '),
@@ -715,7 +721,7 @@ export async function searchEmbyLibrary(
       SortOrder: sort.SortOrder,
       ...filterParamsForSearch(options.filterKey)
     }),
-    { method: 'GET', headers: authHeadersForSession(session) },
+    { method: 'GET', headers: authHeadersForSession(session), signal: options.signal },
     '鎼滅储 Emby'
   )
 
@@ -732,7 +738,7 @@ export async function listEmbyLibraryView(
   const sort = sortParamsForSearch(options.sortKey, options.sortOrder)
   const views = await fetchJson<import('./emby/core').EmbyViewsResponse>(
     apiUrl(session.apiBaseUrl, `/Users/${session.userId}/Views`),
-    { method: 'GET', headers: authHeadersForSession(session) },
+    { method: 'GET', headers: authHeadersForSession(session), signal: options.signal },
     '读取 Emby 媒体库'
   )
   const collectionType = views.Items?.find((view) => view.Id === options.libraryViewId)?.CollectionType
@@ -753,7 +759,7 @@ export async function listEmbyLibraryView(
         SortOrder: sort.SortOrder,
         ...filterParamsForSearch(options.filterKey)
       }),
-      { method: 'GET', headers: authHeadersForSession(session) },
+      { method: 'GET', headers: authHeadersForSession(session), signal: options.signal },
       '读取 Emby 媒体库'
     )
     const page = response.Items ?? []
@@ -794,7 +800,7 @@ export async function searchEmbyPersonLibrary(
       SortOrder: sort.SortOrder,
       ...filterParamsForSearch(options.filterKey)
     }),
-    { method: 'GET', headers: authHeadersForSession(session) },
+    { method: 'GET', headers: authHeadersForSession(session), signal: options.signal },
     '搜索 Emby 演员作品'
   )
 
@@ -803,7 +809,7 @@ export async function searchEmbyPersonLibrary(
   )
 }
 
-async function loadSimilarItems(session: EmbySession, sourceId: string, itemId: string, libraryViewId?: string): Promise<MediaItem[]> {
+async function loadSimilarItems(session: EmbySession, sourceId: string, itemId: string, libraryViewId?: string, signal?: AbortSignal): Promise<MediaItem[]> {
   try {
     const response = await fetchJson<EmbyItemsResponse>(
       apiUrl(session.apiBaseUrl, `/Items/${itemId}/Similar`, {
@@ -811,16 +817,17 @@ async function loadSimilarItems(session: EmbySession, sourceId: string, itemId: 
         Limit: 24,
         Fields: EMBY_ITEM_FIELDS
       }),
-      { method: 'GET', headers: authHeadersForSession(session) },
+      { method: 'GET', headers: authHeadersForSession(session), signal },
       '读取相似媒体'
     )
     return (response.Items ?? []).map((row) => mapItem(session, sourceId, row, libraryViewId))
   } catch {
+    signal?.throwIfAborted()
     return []
   }
 }
 
-async function loadSeriesSeasons(session: EmbySession, sourceId: string, item: MediaItem): Promise<SeasonItem[]> {
+async function loadSeriesSeasons(session: EmbySession, sourceId: string, item: MediaItem, signal?: AbortSignal): Promise<SeasonItem[]> {
   if (item.type !== 'series') return []
   try {
     const seasons = await fetchJson<EmbyItemsResponse>(
@@ -828,7 +835,7 @@ async function loadSeriesSeasons(session: EmbySession, sourceId: string, item: M
         UserId: session.userId,
         Fields: EMBY_ITEM_FIELDS
       }),
-      { method: 'GET', headers: authHeadersForSession(session) },
+      { method: 'GET', headers: authHeadersForSession(session), signal },
       '读取分季'
     )
     const seasonRows = seasons.Items ?? []
@@ -841,13 +848,14 @@ async function loadSeriesSeasons(session: EmbySession, sourceId: string, item: M
             SeasonId: season.Id,
             Fields: EMBY_ITEM_FIELDS
           }),
-          { method: 'GET', headers: authHeadersForSession(session) },
+          { method: 'GET', headers: authHeadersForSession(session), signal },
           '读取分集'
         )
         episodes = (episodeResponse.Items ?? []).map((episode) =>
           mapEpisodeItem(session, sourceId, episode, item.libraryViewId)
         )
       } catch {
+        signal?.throwIfAborted()
         episodes = []
       }
 
@@ -861,11 +869,12 @@ async function loadSeriesSeasons(session: EmbySession, sourceId: string, item: M
       }
     }))
   } catch {
+    signal?.throwIfAborted()
     return []
   }
 }
 
-async function loadFolderEpisodes(session: EmbySession, sourceId: string, item: MediaItem): Promise<SeasonItem[]> {
+async function loadFolderEpisodes(session: EmbySession, sourceId: string, item: MediaItem, signal?: AbortSignal): Promise<SeasonItem[]> {
   if (item.type !== 'folder') return []
   try {
     const response = await fetchJson<EmbyItemsResponse>(
@@ -877,7 +886,7 @@ async function loadFolderEpisodes(session: EmbySession, sourceId: string, item: 
         SortBy: 'SortName',
         SortOrder: 'Ascending'
       }),
-      { method: 'GET', headers: authHeadersForSession(session) },
+      { method: 'GET', headers: authHeadersForSession(session), signal },
       '读取 Emby 纪录片选集'
     )
     const episodes = (response.Items ?? []).map((episode) =>
@@ -893,26 +902,27 @@ async function loadFolderEpisodes(session: EmbySession, sourceId: string, item: 
       episodes
     }]
   } catch {
+    signal?.throwIfAborted()
     return []
   }
 }
 
-export async function loadEmbyItemDetails(session: EmbySession, item: MediaItem): Promise<MediaItem> {
+export async function loadEmbyItemDetails(session: EmbySession, item: MediaItem, signal?: AbortSignal): Promise<MediaItem> {
   const sourceId = sourceIdForSession(session)
   const detail = await fetchJson<EmbyItem>(
     apiUrl(session.apiBaseUrl, `/Users/${session.userId}/Items/${item.id}`, {
       Fields: EMBY_ITEM_FIELDS
     }),
-    { method: 'GET', headers: authHeadersForSession(session) },
+    { method: 'GET', headers: authHeadersForSession(session), signal },
     '读取媒体详情'
   )
 
   const mapped = mapItem(session, sourceId, detail, item.libraryViewId, item.continueWatching ?? false)
   const [similarItems, seasons] = await Promise.all([
-    loadSimilarItems(session, sourceId, item.id, item.libraryViewId),
+    loadSimilarItems(session, sourceId, item.id, item.libraryViewId, signal),
     mapped.type === 'series'
-      ? loadSeriesSeasons(session, sourceId, mapped)
-      : loadFolderEpisodes(session, sourceId, mapped)
+      ? loadSeriesSeasons(session, sourceId, mapped, signal)
+      : loadFolderEpisodes(session, sourceId, mapped, signal)
   ])
 
   return {
@@ -927,7 +937,8 @@ export async function loadEmbyItemDetails(session: EmbySession, item: MediaItem)
 async function loadLibraryForSession(
   session: EmbySession,
   displayName: string | undefined,
-  limit: number
+  limit: number,
+  signal?: AbortSignal
 ): Promise<EmbyLibrarySnapshot> {
   const apiBaseUrl = session.apiBaseUrl
   const authHeaders = authHeadersForSession(session)
@@ -936,7 +947,7 @@ async function loadLibraryForSession(
   const [views, items] = await Promise.all([
     fetchJson<import('./emby/core').EmbyViewsResponse>(
       apiUrl(apiBaseUrl, `/Users/${session.userId}/Views`),
-      { method: 'GET', headers: authHeaders },
+      { method: 'GET', headers: authHeaders, signal },
       '读取媒体库'
     ),
     fetchJson<EmbyItemsResponse>(
@@ -948,7 +959,7 @@ async function loadLibraryForSession(
         SortOrder: 'Descending',
         Limit: limit
       }),
-      { method: 'GET', headers: authHeaders },
+      { method: 'GET', headers: authHeaders, signal },
       '读取媒体条目'
     )
   ])
@@ -972,7 +983,7 @@ async function loadLibraryForSession(
           SortOrder: 'Descending',
           Limit: limit
         }),
-        { method: 'GET', headers: authHeaders },
+        { method: 'GET', headers: authHeaders, signal },
         '读取媒体库条目'
       )
       return {
@@ -981,6 +992,7 @@ async function loadLibraryForSession(
         totalRecordCount: response.TotalRecordCount ?? response.Items?.length ?? 0
       }
     } catch {
+      signal?.throwIfAborted()
       return { view, items: [], totalRecordCount: 0 }
     }
   }))
@@ -999,12 +1011,13 @@ async function loadLibraryForSession(
           IncludeItemTypes: includeItemTypes,
           GroupItems: false
         }),
-        { method: 'GET', headers: authHeaders },
+        { method: 'GET', headers: authHeaders, signal },
         '读取最新媒体'
       )
       const supportedLatest = filterSupportedLatestItems(latest, includeItemTypes)
       if (supportedLatest.length) return { view, items: supportedLatest }
     } catch {
+      signal?.throwIfAborted()
       // Some Emby libraries do not expose Series rows through Items/Latest.
     }
 
@@ -1020,11 +1033,12 @@ async function loadLibraryForSession(
           Fields: fields,
           Limit: Math.min(Math.max(limit, 24), 80)
         }),
-        { method: 'GET', headers: authHeaders },
+        { method: 'GET', headers: authHeaders, signal },
         '读取 Emby 继续观看'
       )
       return resume.Items ?? []
     } catch {
+      signal?.throwIfAborted()
       return []
     }
   })()
@@ -1072,7 +1086,7 @@ async function loadLibraryForSession(
 }
 
 export async function loadEmbyLibrary(input: EmbyConnectionInput, limit = DEFAULT_LIMIT): Promise<EmbyLibrarySnapshot> {
-  const { apiBaseUrl, publicInfo } = await resolveApiBase(input.serverUrl)
+  const { apiBaseUrl, publicInfo } = await resolveApiBase(input.serverUrl, input.signal)
   const auth = await fetchJson<EmbyAuthResult>(
     apiUrl(apiBaseUrl, '/Users/AuthenticateByName'),
     {
@@ -1081,7 +1095,8 @@ export async function loadEmbyLibrary(input: EmbyConnectionInput, limit = DEFAUL
         'Content-Type': 'application/json',
         'X-Emby-Authorization': authorizationHeader()
       },
-      body: JSON.stringify({ Username: input.username.trim(), Pw: input.password })
+      body: JSON.stringify({ Username: input.username.trim(), Pw: input.password }),
+      signal: input.signal
     },
     '登录 Emby'
   )
@@ -1096,13 +1111,14 @@ export async function loadEmbyLibrary(input: EmbyConnectionInput, limit = DEFAUL
     accessToken: auth.AccessToken
   }
 
-  return await loadLibraryForSession(session, input.displayName, limit)
+  return await loadLibraryForSession(session, input.displayName, limit, input.signal)
 }
 
 export async function refreshEmbyLibrary(
   session: EmbySession,
   displayName?: string,
-  limit = DEFAULT_LIMIT
+  limit = DEFAULT_LIMIT,
+  signal?: AbortSignal
 ): Promise<EmbyLibrarySnapshot> {
-  return await loadLibraryForSession(session, displayName, limit)
+  return await loadLibraryForSession(session, displayName, limit, signal)
 }
