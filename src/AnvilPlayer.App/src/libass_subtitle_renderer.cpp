@@ -26,6 +26,22 @@ constexpr uint64_t kAssCoalesceMaxPixels = 2500000;
 constexpr uint64_t kAssCoalesceMaxExpansionFactor = 4;
 constexpr uint64_t kSlowAssRenderLogThresholdUs = 8000;
 
+constexpr char kPlainTextAssHeader[] =
+    "[Script Info]\n"
+    "ScriptType: v4.00+\n"
+    "PlayResX: 1920\n"
+    "PlayResY: 1080\n"
+    "ScaledBorderAndShadow: yes\n"
+    "WrapStyle: 0\n"
+    "[V4+ Styles]\n"
+    "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+    "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
+    "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+    "Style: Default,Microsoft YaHei UI,54,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,"
+    "0,0,0,0,100,100,0,0,1,3,1,2,80,80,54,1\n"
+    "[Events]\n"
+    "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n";
+
 std::filesystem::path ExeDirectory() {
     wchar_t buffer[MAX_PATH]{};
     const DWORD length = GetModuleFileNameW(nullptr, buffer, static_cast<DWORD>(std::size(buffer)));
@@ -175,6 +191,7 @@ struct LibassSubtitleRenderer::Impl {
             api.free_track(track);
         }
         track = nullptr;
+        plainTextReadOrder = 0;
         ResetRenderCache();
     }
 
@@ -247,6 +264,29 @@ struct LibassSubtitleRenderer::Impl {
         return track != nullptr;
     }
 
+    bool ConfigurePlainTextTrack() {
+        if (!IsAvailable()) {
+            return false;
+        }
+        ResetTrack();
+        track = api.new_track(library);
+        if (!track) {
+            return false;
+        }
+        api.process_codec_private(track,
+                                  kPlainTextAssHeader,
+                                  static_cast<int>(std::strlen(kPlainTextAssHeader)));
+        if (api.set_check_readorder) {
+            api.set_check_readorder(track, 1);
+        }
+        if (api.configure_prune) {
+            api.configure_prune(track, kStreamingEventPruneDelay.count());
+        }
+        plainTextReadOrder = 0;
+        ResetRenderCache();
+        return true;
+    }
+
     bool ProcessPacket(const uint8_t* data,
                        const int size,
                        const std::chrono::milliseconds pts,
@@ -263,6 +303,36 @@ struct LibassSubtitleRenderer::Impl {
                           pts.count(),
                           duration.count());
         return true;
+    }
+
+    bool ProcessPlainText(const std::wstring& text,
+                          const std::chrono::milliseconds pts,
+                          const std::chrono::milliseconds duration) {
+        if (!IsAvailable() || !track || text.empty()) {
+            return false;
+        }
+
+        std::string escaped;
+        const std::string utf8 = WideToUtf8(text);
+        escaped.reserve(utf8.size() + 32);
+        for (const char ch : utf8) {
+            if (ch == '\r') {
+                continue;
+            }
+            if (ch == '\n') {
+                escaped += "\\N";
+            } else if (ch == '{') {
+                escaped += "\\{";
+            } else if (ch == '}') {
+                escaped += "\\}";
+            } else {
+                escaped.push_back(ch);
+            }
+        }
+        const std::string packet = std::to_string(plainTextReadOrder++) +
+            ",0,Default,,0,0,0,," + escaped;
+        return ProcessPacket(reinterpret_cast<const uint8_t*>(packet.data()),
+                             static_cast<int>(packet.size()), pts, duration);
     }
 
     std::vector<NativeSubtitleBitmap> Render(const std::chrono::milliseconds pts,
@@ -631,6 +701,7 @@ struct LibassSubtitleRenderer::Impl {
     std::vector<NativeSubtitleBitmap> cachedBitmaps;
     bool coalescedRenderLogged = false;
     int slowRenderLogCount = 0;
+    uint64_t plainTextReadOrder = 0;
 };
 
 LibassSubtitleRenderer::LibassSubtitleRenderer(LogSinkPtr logSink)
@@ -670,11 +741,21 @@ bool LibassSubtitleRenderer::ConfigureTrackFromMemory(const uint8_t* data, const
     return impl_->ConfigureTrackFromMemory(data, size);
 }
 
+bool LibassSubtitleRenderer::ConfigurePlainTextTrack() {
+    return impl_->ConfigurePlainTextTrack();
+}
+
 bool LibassSubtitleRenderer::ProcessPacket(const uint8_t* data,
                                            const int size,
                                            const std::chrono::milliseconds pts,
                                            const std::chrono::milliseconds duration) {
     return impl_->ProcessPacket(data, size, pts, duration);
+}
+
+bool LibassSubtitleRenderer::ProcessPlainText(const std::wstring& text,
+                                               const std::chrono::milliseconds pts,
+                                               const std::chrono::milliseconds duration) {
+    return impl_->ProcessPlainText(text, pts, duration);
 }
 
 std::vector<NativeSubtitleBitmap> LibassSubtitleRenderer::Render(const std::chrono::milliseconds pts,

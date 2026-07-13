@@ -638,6 +638,7 @@ private:
     bool subtitleCanvasLogged_ = false;
     uint64_t subtitleBitmapSerial_ = 0;
     bool subtitleAssActive_ = false;
+    bool subtitlePlainTextAssActive_ = false;
     bool subtitleAssExternalFullTrack_ = false;
     bool subtitleAssLogged_ = false;
     // Subtitle cues and libass stay decode-thread-owned. Frames carry a

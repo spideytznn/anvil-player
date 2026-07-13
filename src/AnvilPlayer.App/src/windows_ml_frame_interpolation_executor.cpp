@@ -220,7 +220,7 @@ bool WindowsMlFrameInterpolationExecutor::IsReady() const noexcept {
 
 bool WindowsMlFrameInterpolationExecutor::CanSubmit() const noexcept {
     std::scoped_lock lock(impl_->mutex);
-    constexpr std::size_t kMaxOutstandingJobs = 2;
+    constexpr std::size_t kMaxOutstandingJobs = 8;
     return impl_->ready &&
         impl_->jobs.size() + (impl_->jobActive ? 1u : 0u) < kMaxOutstandingJobs;
 }
@@ -252,7 +252,7 @@ SubmitResult WindowsMlFrameInterpolationExecutor::Submit(
             result.reason = L"windows_ml_executor_not_ready";
             return result;
         }
-        constexpr std::size_t kMaxOutstandingJobs = 2;
+        constexpr std::size_t kMaxOutstandingJobs = 8;
         if (impl_->jobs.size() + (impl_->jobActive ? 1u : 0u) >=
             kMaxOutstandingJobs) {
             result.reason = L"windows_ml_executor_busy";

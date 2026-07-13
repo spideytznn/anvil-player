@@ -10,6 +10,7 @@
 #include "AnvilPlayer/App/window_chrome.h"
 #include "AnvilPlayer/App/web_ui_json.h"
 #include "AnvilPlayer/App/webui_root.h"
+#include "AnvilPlayer/Playback/CapabilityReport.h"
 #include "AnvilPlayer/Playback/MediaProbe.h"
 
 #include <commdlg.h>
@@ -1765,6 +1766,9 @@ void LibraryWindow::HandleWebUiMessage(const std::wstring_view message) {
         const bool autoDisplayFormat = LoadVideoPassthroughSetting(L"AutoDisplayFormat", false);
         const bool windowsHdrEnabled = anvil::playback::CapabilityDetector::IsHdrEnabledNow();
         const int displayPeakBrightnessNits = LoadVideoDwordSetting(L"DisplayPeakBrightnessNits", 0);
+        const int detectedDisplayPeakBrightnessNits = std::max(
+            0, anvil::playback::CapabilityDetector::CollectBasic()
+                   .display.reportedPeakBrightnessNits);
         const bool dolbySystemPipeline =
             windowsHdrEnabled &&
             LoadVideoPassthroughSetting(L"DolbyVisionSystemPipelineExperimental", false);
@@ -1780,6 +1784,8 @@ void LibraryWindow::HandleWebUiMessage(const std::wstring_view message) {
                        std::wstring(windowsHdrEnabled ? L"true" : L"false") +
                        L",\"displayPeakBrightnessNits\":" +
                        std::to_wstring(displayPeakBrightnessNits) +
+                       L",\"detectedDisplayPeakBrightnessNits\":" +
+                       std::to_wstring(detectedDisplayPeakBrightnessNits) +
                        L"}");
     } else if (MessageContains(message, L"\"command\":\"setGlobalAutoDisplayFormat\"")) {
         SaveVideoPassthroughSetting(L"AutoDisplayFormat",

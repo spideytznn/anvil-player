@@ -53,8 +53,25 @@ public:
     TensorPreprocessResult SubmitPair(const NativeVideoFrame& first,
                                       const NativeVideoFrame& second,
                                       float interpolationT,
+                                      float hlgPeakNits,
                                       uint64_t epoch,
                                       const GpuFencePoint& orderingDependency = {});
+    // Consumes two libplacebo scRGB intermediates (linear BT.709, 1.0 = 80
+    // nits) and converts them to the same canonical BT.2020/PQ tensor domain
+    // used by the HDR interpolation model.
+    TensorPreprocessResult SubmitScRgbPair(ID3D12Resource* first,
+                                           ID3D12Resource* second,
+                                           float interpolationT,
+                                           uint64_t epoch,
+                                           const GpuFencePoint& orderingDependency = {});
+    // Uploads libplacebo's CPU RGB output (BGRA SDR or X2BGR10LE BT.2020/PQ)
+    // directly into the RGB tensor path. This keeps P5/P8 interpolation on the
+    // same decoded colors as the original frames.
+    TensorPreprocessResult SubmitPixelPair(const NativeVideoFrame& first,
+                                           const NativeVideoFrame& second,
+                                           float interpolationT,
+                                           uint64_t epoch,
+                                           const GpuFencePoint& orderingDependency = {});
     bool RetainUntil(ID3D12Resource* tensor, const GpuFencePoint& completion);
 
 private:
@@ -73,6 +90,12 @@ private:
         Microsoft::WRL::ComPtr<ID3D12Resource> secondTexture;
         Microsoft::WRL::ComPtr<ID3D12Resource> firstEnhancementTexture;
         Microsoft::WRL::ComPtr<ID3D12Resource> secondEnhancementTexture;
+        Microsoft::WRL::ComPtr<ID3D12Resource> ownedFirstRgbTexture;
+        Microsoft::WRL::ComPtr<ID3D12Resource> ownedSecondRgbTexture;
+        Microsoft::WRL::ComPtr<ID3D12Resource> firstRgbUpload;
+        Microsoft::WRL::ComPtr<ID3D12Resource> secondRgbUpload;
+        UINT64 firstRgbUploadCapacity = 0;
+        UINT64 secondRgbUploadCapacity = 0;
         std::shared_ptr<AVFrame> firstFrameRef;
         std::shared_ptr<AVFrame> secondFrameRef;
         std::shared_ptr<AVFrame> firstEnhancementFrameRef;
@@ -89,6 +112,7 @@ private:
     D3D12FrameGraph* frameGraph_ = nullptr;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> rootSignature_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline_;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> scRgbPipeline_;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> doviPipeline_;
     std::atomic<ID3D12PipelineState*> publishedDoviPipeline_{nullptr};
     std::atomic_bool doviInitializationStarted_{false};

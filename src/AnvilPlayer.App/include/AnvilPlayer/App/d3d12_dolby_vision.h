@@ -42,8 +42,17 @@ static_assert(offsetof(DoviShaderConstantsPair, yccToRgb) == 366 * sizeof(float)
 static_assert(offsetof(DoviShaderConstantsPair, signalMeta) == 392 * sizeof(float) * 4);
 static_assert(offsetof(DoviShaderConstantsPair, trimD) == 400 * sizeof(float) * 4);
 
+enum class DoviDisplayTrimSource {
+    None,
+    Level2,
+    Level3,
+    Level8,
+};
+
 struct DoviDisplayTrim {
     bool enabled = false;
+    DoviDisplayTrimSource source = DoviDisplayTrimSource::None;
+    bool includesLevel3 = false;
     float slope = 1.0f;
     float offset = 0.0f;
     float power = 1.0f;

@@ -31,10 +31,14 @@ public:
     bool AddFont(const std::string& name, const uint8_t* data, int size);
     bool ConfigureTrackFromCodecPrivate(const uint8_t* data, int size);
     bool ConfigureTrackFromMemory(const uint8_t* data, std::size_t size);
+    bool ConfigurePlainTextTrack();
     bool ProcessPacket(const uint8_t* data,
                        int size,
                        std::chrono::milliseconds pts,
                        std::chrono::milliseconds duration);
+    bool ProcessPlainText(const std::wstring& text,
+                          std::chrono::milliseconds pts,
+                          std::chrono::milliseconds duration);
 
     std::vector<NativeSubtitleBitmap> Render(std::chrono::milliseconds pts,
                                              int frameWidth,

@@ -491,6 +491,10 @@ private:
     // code still branches on it; the legacy setWebUiRoute switching is gone.
     bool webUiPlayerRouteActive_ = true;
     mutable std::chrono::steady_clock::time_point lastWebUiStatePostedAt_{};
+    mutable std::chrono::steady_clock::time_point interpolationUiSampleStartedAt_{};
+    mutable uint64_t interpolationUiHardwareBaseline_ = 0;
+    mutable uint64_t interpolationUiGeneratedBaseline_ = 0;
+    mutable double interpolationUiEffectiveMultiplier_ = 1.0;
     bool layoutDirty_ = true;
     bool nativeFrameHoldVisible_ = false;
     bool pendingPausedFrameRefresh_ = false;

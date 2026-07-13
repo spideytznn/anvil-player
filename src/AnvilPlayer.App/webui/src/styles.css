@@ -2025,10 +2025,15 @@ input:focus-visible {
   transition: color 160ms ease, background 160ms ease, border-color 160ms ease;
 }
 
-.refresh-rate-toggle:hover {
+.refresh-rate-toggle:not(:disabled):hover {
   border-color: var(--line);
   background: rgba(255, 255, 255, 0.025);
   color: var(--text);
+}
+
+.refresh-rate-toggle:disabled {
+  opacity: 0.42;
+  cursor: default;
 }
 
 .refresh-rate-toggle-track {

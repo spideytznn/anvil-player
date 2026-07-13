@@ -829,6 +829,33 @@ std::wstring MainWindow::BuildWebUiStateJson() const {
     const VideoRenderStats rendererStats = d3dRenderer_
         ? d3dRenderer_->TakeRenderStats()
         : VideoRenderStats{};
+    const auto interpolationSampleNow = std::chrono::steady_clock::now();
+    const bool interpolationCountersReset =
+        rendererStats.hardwareFrames < interpolationUiHardwareBaseline_ ||
+        rendererStats.generatedFrames < interpolationUiGeneratedBaseline_;
+    if (!settings.video.frameInterpolationEnabled ||
+        rendererStats.hardwareFrames == 0 || interpolationCountersReset ||
+        interpolationUiSampleStartedAt_.time_since_epoch().count() == 0) {
+        interpolationUiHardwareBaseline_ = rendererStats.hardwareFrames;
+        interpolationUiGeneratedBaseline_ = rendererStats.generatedFrames;
+        interpolationUiSampleStartedAt_ = interpolationSampleNow;
+        interpolationUiEffectiveMultiplier_ = 1.0;
+    } else if (interpolationSampleNow - interpolationUiSampleStartedAt_ >=
+                   std::chrono::milliseconds{750}) {
+        const uint64_t hardwareDelta =
+            rendererStats.hardwareFrames - interpolationUiHardwareBaseline_;
+        const uint64_t generatedDelta =
+            rendererStats.generatedFrames - interpolationUiGeneratedBaseline_;
+        if (hardwareDelta >= 5) {
+            interpolationUiEffectiveMultiplier_ = std::clamp(
+                static_cast<double>(hardwareDelta + generatedDelta) /
+                    static_cast<double>(hardwareDelta),
+                1.0, 5.0);
+            interpolationUiHardwareBaseline_ = rendererStats.hardwareFrames;
+            interpolationUiGeneratedBaseline_ = rendererStats.generatedFrames;
+            interpolationUiSampleStartedAt_ = interpolationSampleNow;
+        }
+    }
     if (backend_ == PlaybackBackend::NativeFfmpegD3D12 &&
         nativeVideoDecoder_ &&
         snapshot.media.has_value()) {
@@ -898,6 +925,8 @@ std::wstring MainWindow::BuildWebUiStateJson() const {
          << (settings.video.frameInterpolationEnabled ? L"true" : L"false") << L",";
     json << L"\"frameInterpolationActive\":"
          << (rendererStats.generatedSubmitted > 0 ? L"true" : L"false") << L",";
+    json << L"\"frameInterpolationMultiplier\":" << std::fixed
+         << std::setprecision(1) << interpolationUiEffectiveMultiplier_ << L",";
     json << L"\"frameInterpolationBackend\":\""
          << JsonEscape(rendererStats.interpolationBackend) << L"\",";
     json << L"\"frameInterpolationReason\":\"\",";
@@ -2239,6 +2268,10 @@ void MainWindow::MaybeLogNativeSchedulerStats(const NativeVideoQueueStats& stats
     const VideoRenderStats renderStats = d3dRenderer_
         ? d3dRenderer_->TakeRenderStats()
         : VideoRenderStats{};
+    const double effectiveInterpolationMultiplier = renderStats.hardwareFrames > 0
+        ? static_cast<double>(renderStats.hardwareFrames + renderStats.generatedFrames) /
+            static_cast<double>(renderStats.hardwareFrames)
+        : 1.0;
     const bool interpolationActive = renderStats.generatedSubmitted > 0;
     const std::wstring& interpolationBackend = renderStats.interpolationBackend;
     LogRuntime(LogLevel::Debug,
@@ -2293,6 +2326,8 @@ void MainWindow::MaybeLogNativeSchedulerStats(const NativeVideoQueueStats& stats
         L" inference_failures=" + std::to_wstring(renderStats.inferenceFailures) +
         L" interpolation_multiplier=" +
             std::to_wstring(renderStats.interpolationMultiplier) +
+        L" interpolation_effective_multiplier=" +
+            FormatFixed2(effectiveInterpolationMultiplier) +
         L" interpolation_backend=" + renderStats.interpolationBackend +
         L" bgra_frames=" + std::to_wstring(renderStats.bgraFrames) +
         L" avg_ms=" + FormatAverageMilliseconds(renderStats.totalRenderUs, renderStats.frames) +
@@ -4965,7 +5000,7 @@ bool MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
             const bool finalHdrOutput = WantsDolbyVisionHdrOutput(runtimeSettings.video, CachedCapabilities().display);
             LogApp(LogLevel::Info,
                    L"dolby vision path=ffmpeg_d3d12va+rpu_el_fel_frame_graph final=" +
-                       std::wstring(finalHdrOutput ? L"scrgb_hdr_composition" : L"sdr") +
+                       std::wstring(finalHdrOutput ? L"rgb10_hdr10_pq" : L"sdr") +
                        (cmv4Intermediate ? L" cmv4=on" : L" cmv4=off") +
                        (enableDolbyVisionEnhancementDecode ? L" el_decode=on" : L" el_decode=off"));
         }
@@ -5694,7 +5729,9 @@ void MainWindow::StartPlayback() {
             nativeVideoDecoder_ &&
             nativeVideoDecoder_->IsRunning() &&
             !nativeVideoDecoder_->OneShotFrame() &&
-            !audioPlayer_.IsStopping() &&
+            (!snapshot.media->hasAudio ||
+             settings.audio.selectedTrackIndex == anvil::playback::kAudioTrackOff ||
+             !audioPlayer_.IsStopping()) &&
             !enhancedPlaybackNeedsRestart;
         if (resumedSystemDolbyVision) {
             systemDolbyVisionPlayer_.SetVolume(snapshot.volume);
@@ -6011,7 +6048,8 @@ void MainWindow::ToggleFullscreen() {
 }
 
 bool MainWindow::RefreshRateSyncEffective() const {
-    return refreshRateSyncEnabled_;
+    return refreshRateSyncEnabled_ &&
+           !controller_.Settings().video.frameInterpolationEnabled;
 }
 
 void MainWindow::SetFrameInterpolationEnabled(const bool enabled) {
@@ -6023,10 +6061,11 @@ void MainWindow::SetFrameInterpolationEnabled(const bool enabled) {
     controller_.ApplySettings(settings);
     SaveVideoBooleanSetting(L"FrameInterpolationEnabled", enabled);
 
+    refreshRateController_.Restore();
+    refreshRateSyncUnavailable_ = false;
     const auto snapshot = controller_.Snapshot();
-    if (fullscreen_ && refreshRateSyncEnabled_ &&
+    if (!enabled && fullscreen_ && refreshRateSyncEnabled_ &&
         snapshot.media.has_value() && snapshot.media->videoFrameRate > 0.0) {
-        refreshRateController_.Restore();
         refreshRateSyncUnavailable_ =
             !refreshRateController_.ApplyForWindow(
                 hwnd_, snapshot.media->videoFrameRate, refreshRateMaximumMultiple_);
@@ -6068,6 +6107,10 @@ void MainWindow::SetFrameInterpolationEnabled(const bool enabled) {
 }
 
 void MainWindow::SetRefreshRateSyncEnabled(const bool enabled) {
+    if (controller_.Settings().video.frameInterpolationEnabled) {
+        PostWebUiState();
+        return;
+    }
     refreshRateSyncOverridden_ = true;
     refreshRateSyncEnabled_ = enabled;
     if (!enabled) {
@@ -6091,6 +6134,10 @@ void MainWindow::SetRefreshRateSyncEnabled(const bool enabled) {
 }
 
 void MainWindow::SetRefreshRateMaximumMultiple(const bool enabled) {
+    if (controller_.Settings().video.frameInterpolationEnabled) {
+        PostWebUiState();
+        return;
+    }
     refreshRateMaximumMultipleOverridden_ = true;
     refreshRateMaximumMultiple_ = enabled;
     if (RefreshRateSyncEffective() && fullscreen_) {

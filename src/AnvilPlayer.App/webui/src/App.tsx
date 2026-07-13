@@ -93,6 +93,7 @@ const en = {
   frameRate: 'Frame rate',
   frameInterpolation: 'GPU frame interpolation',
   frameInterpolationHint: 'HDR-aware adaptive cadence matched to the display · current video',
+  frameInterpolationActual: 'Actual',
   frameInterpolationDynamicHdrUnavailable: 'Dynamic HDR and Dolby Vision are not supported yet.',
   refreshRateInterpolationBlocked: 'Refresh synchronization also drives interpolation cadence',
   refreshRateSync: 'Smart refresh-rate sync',
@@ -218,7 +219,8 @@ const zh: Record<keyof typeof en, string> = {
   resolution: '分辨率',
   frameRate: '帧率',
   frameInterpolation: 'GPU 补帧',
-  frameInterpolationHint: '运动补偿 2 倍输出 · 仅当前视频',
+  frameInterpolationHint: '运动补偿自适应输出 · 仅当前视频',
+  frameInterpolationActual: '实际',
   frameInterpolationDynamicHdrUnavailable: '暂不支持动态 HDR 和杜比视界片源。',
   refreshRateInterpolationBlocked: 'GPU 补帧开启时不可用',
   refreshRateSync: '智能刷新率同步',
@@ -761,6 +763,11 @@ function danmakuModeLabel(mode: number, t: Copy): string {
 
 function formatNits(nits: number, t: Copy): string {
   return `${Math.round(nits)} ${t.nits}`
+}
+
+function formatInterpolationMultiplier(value: number): string {
+  const rounded = Math.round(Math.max(1, Math.min(5, value || 1)) * 10) / 10
+  return `${Number.isInteger(rounded) ? rounded.toFixed(0) : rounded.toFixed(1)}x`
 }
 
 function IconButton({
@@ -1414,6 +1421,7 @@ function InspectorContent({
   t: Copy
 }): JSX.Element {
   if (state.inspectorTab === 'settings') {
+    const refreshRateSyncEffective = state.refreshRateSyncEnabled && !state.frameInterpolationEnabled
     return (
       <div className="inspector-content">
         <div className="section-title">
@@ -1453,8 +1461,8 @@ function InspectorContent({
         )}
         <PassthroughSetting
           label={t.frameInterpolation}
-          hint={state.frameInterpolationActive
-            ? `${t.frameInterpolationHint} · ${state.frameInterpolationBackend}`
+          hint={state.frameInterpolationEnabled
+            ? `${t.frameInterpolationHint} · ${t.frameInterpolationActual} ${formatInterpolationMultiplier(state.frameInterpolationMultiplier)}${state.frameInterpolationActive ? ` · ${state.frameInterpolationBackend}` : ''}`
             : t.frameInterpolationHint}
           enabled={state.frameInterpolationEnabled}
           available
@@ -1471,27 +1479,28 @@ function InspectorContent({
                 ? t.refreshRateInterpolationBlocked
                 : t.refreshRateSyncHint}</small>
           </div>
-          <label className={`refresh-rate-maximum ${state.refreshRateSyncEnabled ? '' : 'is-disabled'}`}>
+          <label className={`refresh-rate-maximum ${refreshRateSyncEffective ? '' : 'is-disabled'}`}>
             <input
               type="checkbox"
               checked={state.refreshRateMaximumMultiple}
-              disabled={!state.refreshRateSyncEnabled}
+              disabled={!refreshRateSyncEffective}
               onChange={(event) => postNativeCommand({ type: 'command', command: 'setRefreshRateMaximumMultiple', enabled: event.currentTarget.checked })}
             />
             <span>{t.maximumRefreshMultiple}</span>
           </label>
           <button
-            className={`refresh-rate-toggle ${state.refreshRateSyncEnabled ? 'is-active' : ''}`}
+            className={`refresh-rate-toggle ${refreshRateSyncEffective ? 'is-active' : ''}`}
             type="button"
             role="switch"
-            aria-checked={state.refreshRateSyncEnabled}
+            aria-checked={refreshRateSyncEffective}
             aria-label={t.refreshRateSync}
+            disabled={state.frameInterpolationEnabled}
             onClick={() => postNativeCommand({ type: 'command', command: 'setRefreshRateSync', enabled: !state.refreshRateSyncEnabled })}
           >
             <span className="refresh-rate-toggle-track" aria-hidden="true">
               <span className="refresh-rate-toggle-thumb" />
             </span>
-            <span className="refresh-rate-toggle-label">{state.refreshRateSyncEnabled ? t.on : t.off}</span>
+            <span className="refresh-rate-toggle-label">{refreshRateSyncEffective ? t.on : t.off}</span>
           </button>
         </div>
         <InfoRow label={t.backend} value={state.backendLabel} emptyLabel={t.none} />

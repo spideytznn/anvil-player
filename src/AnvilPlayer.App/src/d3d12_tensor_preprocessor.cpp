@@ -50,14 +50,6 @@ UINT TransferMode(const VideoTransferCharacteristic transfer) noexcept {
     return 1;
 }
 
-float HlgPeakNits(const anvil::playback::VideoColorMetadata& color) noexcept {
-    if (color.masteringDisplay.hasLuminance && color.masteringDisplay.maxLuminanceNits > 0.0) {
-        return static_cast<float>(std::clamp(color.masteringDisplay.maxLuminanceNits,
-                                             100.0, 10000.0));
-    }
-    return 1000.0f;
-}
-
 D3D12_RESOURCE_BARRIER TransitionBarrier(ID3D12Resource* resource,
                                          const UINT subresource,
                                          const D3D12_RESOURCE_STATES before,
@@ -164,6 +156,7 @@ void D3D12TensorPreprocessor::Reset() {
         slot = {};
     }
     doviPipeline_.Reset();
+    scRgbPipeline_.Reset();
     pipeline_.Reset();
     doviShaderSource_.clear();
     rootSignature_.Reset();
@@ -277,7 +270,9 @@ float3 hlg_to_nits(float3 v, float peak) {
     const float a = 0.17883277, b = 0.28466892, c = 0.55991073;
     float3 scene = lerp((exp((v - c) / a) + b) / 12.0,
                         v * v / 3.0, step(v, 0.5));
-    return pow(max(scene, 0.0), 1.2) * max(peak, 1000.0);
+    scene=max(scene,0.0);
+    float sceneLuma=max(dot(scene,float3(0.2627,0.6780,0.0593)),0.000001);
+    return scene*pow(sceneLuma,0.2)*max(peak,1000.0);
 }
 float3 rec709_to_rec2020(float3 v) {
     return mul(float3x3(0.6274, 0.3293, 0.0433,
@@ -285,6 +280,10 @@ float3 rec709_to_rec2020(float3 v) {
                        0.0164, 0.0880, 0.8956), v);
 }
 float3 canonical(float3 encoded, uint4 modes, float hlgPeak) {
+    // Keep SDR in its native display-encoded RGB domain. The interpolation
+    // model was trained on normalized SDR images; round-tripping these frames
+    // through PQ made generated and original frames alternate in brightness.
+    if (modes.z == 1) return saturate(encoded);
     float3 nits;
     if (modes.z == 2) nits = pq_to_nits(encoded);
     else if (modes.z == 3) nits = hlg_to_nits(encoded, hlgPeak);
@@ -307,7 +306,13 @@ float sample_el_y(Texture2DArray<float> tex,float2 uv,bool cubic) {
     }
     return saturate(sum/max(weight,0.000001));
 }
+float2 left_chroma_uv(Texture2DArray<float2> tex,float2 uv) {
+    uint w,h,layers,levels; tex.GetDimensions(0,w,h,layers,levels);
+    uv.x+=0.25/max((float)w,1.0);
+    return uv;
+}
 float2 sample_el_uv(Texture2DArray<float2> tex,float2 uv,bool cubic) {
+    uv=left_chroma_uv(tex,uv);
     if(!cubic) return tex.SampleLevel(linearClamp,float3(uv,0),0);
     uint w,h,layers,levels; tex.GetDimensions(0,w,h,layers,levels);
     float2 c=uv*float2(w,h)-0.5,f=frac(c); int2 base=int2(floor(c)); float2 sum=0.0; float weight=0.0;
@@ -328,12 +333,12 @@ float3 load_first(float2 uv,float2 displayUv) {
     if(doviSignalMeta[0].x>0.5 && (displayUv.x<doviTrimC[0].z || displayUv.y<doviTrimC[0].w ||
        displayUv.x>doviTrimD[0].x || displayUv.y>doviTrimD[0].y)) return 0.0;
     float y=firstY.SampleLevel(linearClamp,float3(uv,0),0);
-    float2 chroma=firstUv.SampleLevel(linearClamp,float3(uv,0),0);
+    float2 chroma=firstUv.SampleLevel(linearClamp,float3(left_chroma_uv(firstUv,uv),0),0);
     if(doviSignalMeta[0].x>1.5) {
         float2 elUv=lerp(firstEnhancementRect.xy,firstEnhancementRect.zw,displayUv);
         float3 composed=dovi_compose_p7_fel(0,float3(y,chroma),float3(chroma_site_y(firstY,uv),chroma),
             float3(sample_el_y(firstElY,elUv,doviComposerScale[0].w>0.5),sample_el_uv(firstElUv,elUv,doviComposerScale[0].w>0.5)));
-        uint4 modes=firstModes; modes.x=3; modes.y=(uint)(doviTrimD[0].w+0.5); return saturate(yuv_to_rgb(composed.x,composed.yz,modes));
+        return dovi_decode_reshaped(0,composed);
     }
     if(doviSignalMeta[0].x>0.5) return dovi_decode_single_layer(0,saturate(float3(y,chroma)*doviSignalMeta[0].w));
     return canonical(yuv_to_rgb(y,chroma,firstModes),firstModes,hlgPeakNits.x);
@@ -342,12 +347,12 @@ float3 load_second(float2 uv,float2 displayUv) {
     if(doviSignalMeta[1].x>0.5 && (displayUv.x<doviTrimC[1].z || displayUv.y<doviTrimC[1].w ||
        displayUv.x>doviTrimD[1].x || displayUv.y>doviTrimD[1].y)) return 0.0;
     float y=secondY.SampleLevel(linearClamp,float3(uv,0),0);
-    float2 chroma=secondUv.SampleLevel(linearClamp,float3(uv,0),0);
+    float2 chroma=secondUv.SampleLevel(linearClamp,float3(left_chroma_uv(secondUv,uv),0),0);
     if(doviSignalMeta[1].x>1.5) {
         float2 elUv=lerp(secondEnhancementRect.xy,secondEnhancementRect.zw,displayUv);
         float3 composed=dovi_compose_p7_fel(1,float3(y,chroma),float3(chroma_site_y(secondY,uv),chroma),
             float3(sample_el_y(secondElY,elUv,doviComposerScale[1].w>0.5),sample_el_uv(secondElUv,elUv,doviComposerScale[1].w>0.5)));
-        uint4 modes=secondModes; modes.x=3; modes.y=(uint)(doviTrimD[1].w+0.5); return saturate(yuv_to_rgb(composed.x,composed.yz,modes));
+        return dovi_decode_reshaped(1,composed);
     }
     if(doviSignalMeta[1].x>0.5) return dovi_decode_single_layer(1,saturate(float3(y,chroma)*doviSignalMeta[1].w));
     return canonical(yuv_to_rgb(y,chroma,secondModes),secondModes,hlgPeakNits.y);
@@ -437,7 +442,9 @@ float3 hlg_to_nits(float3 v, float peak) {
     const float a = 0.17883277, b = 0.28466892, c = 0.55991073;
     float3 scene = lerp((exp((v - c) / a) + b) / 12.0,
                         v * v / 3.0, step(v, 0.5));
-    return pow(max(scene, 0.0), 1.2) * max(peak, 1000.0);
+    scene=max(scene,0.0);
+    float sceneLuma=max(dot(scene,float3(0.2627,0.6780,0.0593)),0.000001);
+    return scene*pow(sceneLuma,0.2)*max(peak,1000.0);
 }
 float3 rec709_to_rec2020(float3 v) {
     return mul(float3x3(0.6274, 0.3293, 0.0433,
@@ -445,6 +452,7 @@ float3 rec709_to_rec2020(float3 v) {
                        0.0164, 0.0880, 0.8956), v);
 }
 float3 canonical(float3 encoded, uint4 modes, float hlgPeak) {
+    if (modes.z == 1) return saturate(encoded);
     float3 nits;
     if (modes.z == 2) nits = pq_to_nits(encoded);
     else if (modes.z == 3) nits = hlg_to_nits(encoded, hlgPeak);
@@ -503,8 +511,79 @@ void main(uint3 id : SV_DispatchThreadID) {
     D3D12_COMPUTE_PIPELINE_STATE_DESC pipelineDesc{};
     pipelineDesc.pRootSignature = rootSignature_.Get();
     pipelineDesc.CS = {bytecode->GetBufferPointer(), bytecode->GetBufferSize()};
-    return SUCCEEDED(device_->CreateComputePipelineState(&pipelineDesc,
-                                                         IID_PPV_ARGS(&pipeline_)));
+    if (FAILED(device_->CreateComputePipelineState(&pipelineDesc,
+                                                    IID_PPV_ARGS(&pipeline_)))) {
+        return false;
+    }
+
+    constexpr char scRgbShader[] = R"(
+Texture2D<float4> firstRgb : register(t0);
+Texture2D<float4> secondRgb : register(t2);
+RWByteAddressBuffer outputTensor : register(u0);
+SamplerState linearClamp : register(s0);
+cbuffer PreprocessConstants : register(b0) {
+    float4 firstSourceRect;
+    float4 secondSourceRect;
+    float4 firstEnhancementRect;
+    float4 secondEnhancementRect;
+    uint4 firstModes;
+    uint4 secondModes;
+    uint2 outputSize;
+    float2 hlgPeakNits;
+    float interpolationT;
+    float preprocessPadding;
+};
+float3 rec709_to_rec2020(float3 value) {
+    return mul(float3x3(0.6274,0.3293,0.0433,
+                       0.0691,0.9195,0.0114,
+                       0.0164,0.0880,0.8956),value);
+}
+float3 nits_to_pq(float3 nits) {
+    const float m1=2610.0/16384.0,m2=2523.0/32.0;
+    const float c1=3424.0/4096.0,c2=2413.0/128.0,c3=2392.0/128.0;
+    float3 p=pow(max(nits/10000.0,0.0),m1);
+    return pow((c1+c2*p)/max(1.0+c3*p,0.000001),m2);
+}
+float3 canonical(float3 sampledRgb,uint mode) {
+    if(mode==1||mode==2) return saturate(sampledRgb);
+    float3 scRgb=max(sampledRgb,0.0);
+    return nits_to_pq(max(rec709_to_rec2020(scRgb*80.0),0.0));
+}
+uint pack_half2(float first,float second) {
+    return f32tof16(first)|(f32tof16(second)<<16);
+}
+void store_pair(uint plane,uint y,uint x,float firstValue,float secondValue) {
+    uint element=(plane*outputSize.y+y)*outputSize.x+x;
+    outputTensor.Store(element*2,pack_half2(firstValue,secondValue));
+}
+[numthreads(8,8,1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint x=id.x*2;
+    if(x>=outputSize.x||id.y>=outputSize.y) return;
+    uint x1=min(x+1,outputSize.x-1);
+    float2 p0=(float2(x,id.y)+0.5)/float2(outputSize);
+    float2 p1=(float2(x1,id.y)+0.5)/float2(outputSize);
+    float3 a0=canonical(firstRgb.SampleLevel(linearClamp,p0,0).rgb,firstModes.z);
+    float3 a1=canonical(firstRgb.SampleLevel(linearClamp,p1,0).rgb,firstModes.z);
+    float3 b0=canonical(secondRgb.SampleLevel(linearClamp,p0,0).rgb,secondModes.z);
+    float3 b1=canonical(secondRgb.SampleLevel(linearClamp,p1,0).rgb,secondModes.z);
+    [unroll] for(uint channel=0;channel<3;++channel) {
+        store_pair(channel,id.y,x,a0[channel],a1[channel]);
+        store_pair(channel+3,id.y,x,b0[channel],b1[channel]);
+    }
+    store_pair(6,id.y,x,interpolationT,interpolationT);
+}
+)";
+    bytecode.Reset();
+    errors.Reset();
+    if (FAILED(D3DCompile(scRgbShader, std::strlen(scRgbShader), nullptr, nullptr, nullptr,
+                          "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL1, 0,
+                          &bytecode, &errors))) {
+        return false;
+    }
+    pipelineDesc.CS = {bytecode->GetBufferPointer(), bytecode->GetBufferSize()};
+    return SUCCEEDED(device_->CreateComputePipelineState(
+        &pipelineDesc, IID_PPV_ARGS(&scRgbPipeline_)));
 }
 
 bool D3D12TensorPreprocessor::InitializeDolbyVisionPipeline() {
@@ -603,6 +682,7 @@ TensorPreprocessResult D3D12TensorPreprocessor::SubmitPair(
     const NativeVideoFrame& first,
     const NativeVideoFrame& second,
     const float interpolationT,
+    const float hlgPeakNits,
     const uint64_t epoch,
     const GpuFencePoint& orderingDependency) {
     TensorPreprocessResult result;
@@ -753,8 +833,13 @@ TensorPreprocessResult D3D12TensorPreprocessor::SubmitPair(
     fillUv(secondEnhancement, constants.secondEnhancementUv);
     constants.outputWidth = shape.width;
     constants.outputHeight = shape.height;
-    constants.firstHlgPeakNits = HlgPeakNits(first.color);
-    constants.secondHlgPeakNits = HlgPeakNits(second.color);
+    // HLG's OOTF is display-dependent. Match the original-frame shader's
+    // active display target before converting both endpoints to BT.2020/PQ.
+    // Using mastering metadata or a fixed 1000-nit value here made original
+    // and generated frames alternate in brightness on high-peak displays.
+    const float effectiveHlgPeakNits = std::clamp(hlgPeakNits, 1000.0f, 10000.0f);
+    constants.firstHlgPeakNits = effectiveHlgPeakNits;
+    constants.secondHlgPeakNits = effectiveHlgPeakNits;
     constants.interpolationT = std::clamp(interpolationT, 0.0f, 1.0f);
     slot->commandList->SetComputeRoot32BitConstants(1, 30, &constants, 0);
     DoviShaderConstantsPair doviConstants{};
@@ -832,6 +917,409 @@ TensorPreprocessResult D3D12TensorPreprocessor::SubmitPair(
     slot->firstFrameRef = first.hardwareFrameRef;
     slot->secondFrameRef = second.hardwareFrameRef;
 
+    result.accepted = true;
+    result.shape = shape;
+    result.tensor.pts = second.pts;
+    result.tensor.epoch = epoch;
+    result.tensor.resource = slot->output;
+    result.tensor.producingQueue = GpuFrameQueue::ComputeMl;
+    result.tensor.ready = submit.completion;
+    result.tensor.color = second.color;
+    return result;
+}
+
+TensorPreprocessResult D3D12TensorPreprocessor::SubmitScRgbPair(
+    ID3D12Resource* first,
+    ID3D12Resource* second,
+    const float interpolationT,
+    const uint64_t epoch,
+    const GpuFencePoint& orderingDependency) {
+    TensorPreprocessResult result;
+    if (!device_ || !frameGraph_ || !scRgbPipeline_) {
+        result.reason = L"scrgb_tensor_preprocessor_not_initialized";
+        return result;
+    }
+    if (!first || !second) {
+        result.reason = L"scrgb_tensor_missing_input";
+        return result;
+    }
+    const D3D12_RESOURCE_DESC firstDesc = first->GetDesc();
+    const D3D12_RESOURCE_DESC secondDesc = second->GetDesc();
+    if (firstDesc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        secondDesc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        firstDesc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT ||
+        secondDesc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT ||
+        firstDesc.Width != secondDesc.Width || firstDesc.Height != secondDesc.Height ||
+        firstDesc.Width > std::numeric_limits<UINT>::max()) {
+        result.reason = L"unsupported_scrgb_tensor_input";
+        return result;
+    }
+    const TensorShape shape{static_cast<UINT>(firstDesc.Width), firstDesc.Height};
+    if (!shape.IsValid()) {
+        result.reason = L"invalid_scrgb_tensor_shape";
+        return result;
+    }
+    Slot* slot = AcquireSlot();
+    if (!slot) {
+        result.reason = L"tensor_preprocess_gpu_busy";
+        return result;
+    }
+    constexpr std::size_t channels = 7;
+    constexpr std::size_t fp16Bytes = 2;
+    const std::size_t bytes = channels * shape.width * shape.height * fp16Bytes;
+    if (!EnsureOutput(*slot, bytes) || FAILED(slot->allocator->Reset()) ||
+        FAILED(slot->commandList->Reset(slot->allocator.Get(), scRgbPipeline_.Get()))) {
+        result.reason = L"scrgb_tensor_resource_reset_failed";
+        return result;
+    }
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Texture2D.MipLevels = 1;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu =
+        slot->descriptors->GetCPUDescriptorHandleForHeapStart();
+    for (UINT index = 0; index < 8; ++index) {
+        device_->CreateShaderResourceView(nullptr, &srv, cpu);
+        cpu.ptr += descriptorIncrement_;
+    }
+    cpu = slot->descriptors->GetCPUDescriptorHandleForHeapStart();
+    device_->CreateShaderResourceView(first, &srv, cpu);
+    cpu.ptr += static_cast<SIZE_T>(2) * descriptorIncrement_;
+    device_->CreateShaderResourceView(second, &srv, cpu);
+    cpu = slot->descriptors->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += static_cast<SIZE_T>(8) * descriptorIncrement_;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format = DXGI_FORMAT_R32_TYPELESS;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Buffer.NumElements = static_cast<UINT>(bytes / sizeof(UINT));
+    uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    device_->CreateUnorderedAccessView(slot->output.Get(), nullptr, &uav, cpu);
+
+    const std::array beginBarriers{
+        TransitionBarrier(first, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          D3D12_RESOURCE_STATE_COMMON,
+                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        TransitionBarrier(second, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          D3D12_RESOURCE_STATE_COMMON,
+                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
+    slot->commandList->ResourceBarrier(static_cast<UINT>(beginBarriers.size()),
+                                       beginBarriers.data());
+    slot->commandList->SetComputeRootSignature(rootSignature_.Get());
+    ID3D12DescriptorHeap* heaps[] = {slot->descriptors.Get()};
+    slot->commandList->SetDescriptorHeaps(1, heaps);
+    slot->commandList->SetComputeRootDescriptorTable(
+        0, slot->descriptors->GetGPUDescriptorHandleForHeapStart());
+    PreprocessConstants constants{};
+    constants.firstSourceUv[2] = 1.0f;
+    constants.firstSourceUv[3] = 1.0f;
+    constants.secondSourceUv[2] = 1.0f;
+    constants.secondSourceUv[3] = 1.0f;
+    constants.firstModes[2] = 4;
+    constants.secondModes[2] = 4;
+    constants.outputWidth = shape.width;
+    constants.outputHeight = shape.height;
+    constants.interpolationT = std::clamp(interpolationT, 0.0f, 1.0f);
+    slot->commandList->SetComputeRoot32BitConstants(1, 30, &constants, 0);
+    slot->commandList->SetComputeRootConstantBufferView(
+        2, slot->doviConstants->GetGPUVirtualAddress());
+    slot->commandList->Dispatch((shape.width + 15) / 16,
+                                (shape.height + 7) / 8, 1);
+    const std::array endBarriers{
+        TransitionBarrier(first, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                          D3D12_RESOURCE_STATE_COMMON),
+        TransitionBarrier(second, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                          D3D12_RESOURCE_STATE_COMMON)};
+    slot->commandList->ResourceBarrier(static_cast<UINT>(endBarriers.size()),
+                                       endBarriers.data());
+    if (FAILED(slot->commandList->Close())) {
+        result.reason = L"scrgb_tensor_command_close_failed";
+        return result;
+    }
+    const std::array dependencies{orderingDependency};
+    SubmitResult submit = frameGraph_->Submit(
+        GpuFrameQueue::ComputeMl, slot->commandList.Get(), dependencies);
+    if (!submit.accepted) {
+        result.reason = std::move(submit.reason);
+        return result;
+    }
+    slot->completion = submit.completion;
+    slot->firstTexture = first;
+    slot->secondTexture = second;
+    result.accepted = true;
+    result.shape = shape;
+    result.tensor.epoch = epoch;
+    result.tensor.resource = slot->output;
+    result.tensor.producingQueue = GpuFrameQueue::ComputeMl;
+    result.tensor.ready = submit.completion;
+    return result;
+}
+
+TensorPreprocessResult D3D12TensorPreprocessor::SubmitPixelPair(
+    const NativeVideoFrame& first,
+    const NativeVideoFrame& second,
+    const float interpolationT,
+    const uint64_t epoch,
+    const GpuFencePoint& orderingDependency) {
+    TensorPreprocessResult result;
+    if (!device_ || !frameGraph_ || !scRgbPipeline_) {
+        result.reason = L"rgb_tensor_preprocessor_not_initialized";
+        return result;
+    }
+    const auto supported = [](const NativeVideoFrame& frame) {
+        return frame.HasPixels() && frame.stride >= frame.width * 4 &&
+            (frame.softwareFormat == AV_PIX_FMT_X2BGR10LE ||
+             frame.softwareFormat == AV_PIX_FMT_BGRA);
+    };
+    if (!supported(first) || !supported(second)) {
+        result.reason = L"unsupported_rgb_tensor_input";
+        return result;
+    }
+    const UINT maxWidth = static_cast<UINT>(std::max(first.width, second.width));
+    const UINT maxHeight = static_cast<UINT>(std::max(first.height, second.height));
+    // CPU libplacebo output would otherwise be uploaded twice at full 4K for
+    // every pair. The model output is scaled for presentation anyway, so
+    // downsample the authoritative RGB endpoints before upload and leave the
+    // original presentation frames untouched.
+    const double sourceFps = second.frameRateNumerator != 0 &&
+            second.frameRateDenominator != 0
+        ? static_cast<double>(second.frameRateNumerator) /
+            static_cast<double>(second.frameRateDenominator)
+        : 0.0;
+    const TensorShape shape = maxWidth <= 3840 && maxHeight <= 2176
+        ? (sourceFps >= 47.5 ? TensorShape{640, 368} : TensorShape{960, 544})
+        : SelectInterpolationTensorShape(maxWidth, maxHeight);
+    if (!shape.IsValid()) {
+        result.reason = L"no_tensor_shape_bucket";
+        return result;
+    }
+    Slot* slot = AcquireSlot();
+    if (!slot) {
+        result.reason = L"tensor_preprocess_gpu_busy";
+        return result;
+    }
+    constexpr std::size_t channels = 7;
+    constexpr std::size_t fp16Bytes = 2;
+    const std::size_t bytes = channels * shape.width * shape.height * fp16Bytes;
+    if (!EnsureOutput(*slot, bytes) || FAILED(slot->allocator->Reset()) ||
+        FAILED(slot->commandList->Reset(slot->allocator.Get(), scRgbPipeline_.Get()))) {
+        result.reason = L"rgb_tensor_resource_reset_failed";
+        return result;
+    }
+
+    struct UploadedInput {
+        ID3D12Resource* texture = nullptr;
+        ID3D12Resource* upload = nullptr;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        bool textureCreated = false;
+    };
+    const auto prepareInput = [&](const NativeVideoFrame& frame,
+                                  Microsoft::WRL::ComPtr<ID3D12Resource>& texture,
+                                  Microsoft::WRL::ComPtr<ID3D12Resource>& upload,
+                                  UINT64& uploadCapacity,
+                                  UploadedInput& prepared) {
+        const DXGI_FORMAT format = frame.softwareFormat == AV_PIX_FMT_X2BGR10LE
+            ? DXGI_FORMAT_R10G10B10A2_UNORM
+            : DXGI_FORMAT_B8G8R8A8_UNORM;
+        D3D12_RESOURCE_DESC textureDesc{};
+        textureDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        textureDesc.Width = shape.width;
+        textureDesc.Height = shape.height;
+        textureDesc.DepthOrArraySize = 1;
+        textureDesc.MipLevels = 1;
+        textureDesc.Format = format;
+        textureDesc.SampleDesc.Count = 1;
+        textureDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        bool createTexture = true;
+        if (texture) {
+            const D3D12_RESOURCE_DESC existing = texture->GetDesc();
+            createTexture = existing.Width != textureDesc.Width ||
+                existing.Height != textureDesc.Height || existing.Format != format;
+        }
+        if (createTexture) {
+            texture.Reset();
+            D3D12_HEAP_PROPERTIES heap{};
+            heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+            if (FAILED(device_->CreateCommittedResource(
+                    &heap, D3D12_HEAP_FLAG_NONE, &textureDesc,
+                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                    IID_PPV_ARGS(&texture)))) {
+                return false;
+            }
+        }
+        UINT rowCount = 0;
+        UINT64 rowSize = 0;
+        UINT64 uploadBytes = 0;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+        device_->GetCopyableFootprints(&textureDesc, 0, 1, 0, &footprint,
+                                       &rowCount, &rowSize, &uploadBytes);
+        if (!upload || uploadCapacity < uploadBytes) {
+            upload.Reset();
+            D3D12_HEAP_PROPERTIES heap{};
+            heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+            D3D12_RESOURCE_DESC uploadDesc{};
+            uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            uploadDesc.Width = uploadBytes;
+            uploadDesc.Height = 1;
+            uploadDesc.DepthOrArraySize = 1;
+            uploadDesc.MipLevels = 1;
+            uploadDesc.SampleDesc.Count = 1;
+            uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (FAILED(device_->CreateCommittedResource(
+                    &heap, D3D12_HEAP_FLAG_NONE, &uploadDesc,
+                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                    IID_PPV_ARGS(&upload)))) {
+                return false;
+            }
+            uploadCapacity = uploadBytes;
+        }
+        void* mapped = nullptr;
+        const D3D12_RANGE noRead{0, 0};
+        if (FAILED(upload->Map(0, &noRead, &mapped))) return false;
+        const auto* source = frame.bgra->data();
+        auto* destination = static_cast<std::uint8_t*>(mapped) + footprint.Offset;
+        for (UINT row = 0; row < rowCount; ++row) {
+            auto* destinationRow = destination +
+                static_cast<std::size_t>(row) * footprint.Footprint.RowPitch;
+            const std::size_t sourceY = static_cast<std::size_t>(row) *
+                static_cast<std::size_t>(frame.height) / std::max<UINT>(1, rowCount);
+            const auto* sourceRow = source + sourceY * static_cast<std::size_t>(frame.stride);
+            for (UINT x = 0; x < shape.width; ++x) {
+                const std::size_t sourceX = static_cast<std::size_t>(x) *
+                    static_cast<std::size_t>(frame.width) / std::max<UINT>(1, shape.width);
+                std::memcpy(destinationRow + static_cast<std::size_t>(x) * 4,
+                            sourceRow + sourceX * 4, 4);
+            }
+        }
+        upload->Unmap(0, nullptr);
+        prepared.texture = texture.Get();
+        prepared.upload = upload.Get();
+        prepared.footprint = footprint;
+        prepared.format = format;
+        prepared.textureCreated = createTexture;
+        return true;
+    };
+
+    UploadedInput firstInput;
+    UploadedInput secondInput;
+    if (!prepareInput(first, slot->ownedFirstRgbTexture, slot->firstRgbUpload,
+                      slot->firstRgbUploadCapacity, firstInput) ||
+        !prepareInput(second, slot->ownedSecondRgbTexture, slot->secondRgbUpload,
+                      slot->secondRgbUploadCapacity, secondInput)) {
+        result.reason = L"rgb_tensor_upload_allocation_failed";
+        return result;
+    }
+    std::vector<D3D12_RESOURCE_BARRIER> uploadBarriers;
+    if (!firstInput.textureCreated) {
+        uploadBarriers.push_back(TransitionBarrier(
+            firstInput.texture, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST));
+    }
+    if (!secondInput.textureCreated) {
+        uploadBarriers.push_back(TransitionBarrier(
+            secondInput.texture, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST));
+    }
+    if (!uploadBarriers.empty()) {
+        slot->commandList->ResourceBarrier(static_cast<UINT>(uploadBarriers.size()),
+                                           uploadBarriers.data());
+    }
+    const auto copyInput = [&](const UploadedInput& input) {
+        D3D12_TEXTURE_COPY_LOCATION destination{};
+        destination.pResource = input.texture;
+        destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        D3D12_TEXTURE_COPY_LOCATION source{};
+        source.pResource = input.upload;
+        source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        source.PlacedFootprint = input.footprint;
+        slot->commandList->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    };
+    copyInput(firstInput);
+    copyInput(secondInput);
+    const std::array readBarriers{
+        TransitionBarrier(firstInput.texture, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          D3D12_RESOURCE_STATE_COPY_DEST,
+                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        TransitionBarrier(secondInput.texture, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          D3D12_RESOURCE_STATE_COPY_DEST,
+                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
+    slot->commandList->ResourceBarrier(static_cast<UINT>(readBarriers.size()),
+                                       readBarriers.data());
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC nullSrv{};
+    nullSrv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    nullSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    nullSrv.Texture2D.MipLevels = 1;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu =
+        slot->descriptors->GetCPUDescriptorHandleForHeapStart();
+    for (UINT index = 0; index < 8; ++index) {
+        device_->CreateShaderResourceView(nullptr, &nullSrv, cpu);
+        cpu.ptr += descriptorIncrement_;
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv = nullSrv;
+    srv.Format = firstInput.format;
+    cpu = slot->descriptors->GetCPUDescriptorHandleForHeapStart();
+    device_->CreateShaderResourceView(firstInput.texture, &srv, cpu);
+    srv.Format = secondInput.format;
+    cpu.ptr += static_cast<SIZE_T>(2) * descriptorIncrement_;
+    device_->CreateShaderResourceView(secondInput.texture, &srv, cpu);
+    cpu = slot->descriptors->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += static_cast<SIZE_T>(8) * descriptorIncrement_;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format = DXGI_FORMAT_R32_TYPELESS;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Buffer.NumElements = static_cast<UINT>(bytes / sizeof(UINT));
+    uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    device_->CreateUnorderedAccessView(slot->output.Get(), nullptr, &uav, cpu);
+
+    slot->commandList->SetComputeRootSignature(rootSignature_.Get());
+    ID3D12DescriptorHeap* heaps[] = {slot->descriptors.Get()};
+    slot->commandList->SetDescriptorHeaps(1, heaps);
+    slot->commandList->SetComputeRootDescriptorTable(
+        0, slot->descriptors->GetGPUDescriptorHandleForHeapStart());
+    PreprocessConstants constants{};
+    constants.firstSourceUv[2] = 1.0f;
+    constants.firstSourceUv[3] = 1.0f;
+    constants.secondSourceUv[2] = 1.0f;
+    constants.secondSourceUv[3] = 1.0f;
+    constants.firstModes[2] = first.softwareFormat == AV_PIX_FMT_X2BGR10LE ? 2u : 1u;
+    constants.secondModes[2] = second.softwareFormat == AV_PIX_FMT_X2BGR10LE ? 2u : 1u;
+    constants.outputWidth = shape.width;
+    constants.outputHeight = shape.height;
+    constants.interpolationT = std::clamp(interpolationT, 0.0f, 1.0f);
+    slot->commandList->SetComputeRoot32BitConstants(1, 30, &constants, 0);
+    slot->commandList->SetComputeRootConstantBufferView(
+        2, slot->doviConstants->GetGPUVirtualAddress());
+    slot->commandList->Dispatch((shape.width + 15) / 16,
+                                (shape.height + 7) / 8, 1);
+    const std::array endBarriers{
+        TransitionBarrier(firstInput.texture, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                          D3D12_RESOURCE_STATE_COMMON),
+        TransitionBarrier(secondInput.texture, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                          D3D12_RESOURCE_STATE_COMMON)};
+    slot->commandList->ResourceBarrier(static_cast<UINT>(endBarriers.size()),
+                                       endBarriers.data());
+    if (FAILED(slot->commandList->Close())) {
+        result.reason = L"rgb_tensor_command_close_failed";
+        return result;
+    }
+    const std::array dependencies{orderingDependency};
+    SubmitResult submit = frameGraph_->Submit(
+        GpuFrameQueue::ComputeMl, slot->commandList.Get(), dependencies);
+    if (!submit.accepted) {
+        result.reason = std::move(submit.reason);
+        return result;
+    }
+    slot->completion = submit.completion;
+    slot->firstTexture = slot->ownedFirstRgbTexture;
+    slot->secondTexture = slot->ownedSecondRgbTexture;
     result.accepted = true;
     result.shape = shape;
     result.tensor.pts = second.pts;

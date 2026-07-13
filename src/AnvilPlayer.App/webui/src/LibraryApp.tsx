@@ -1797,7 +1797,7 @@ const settingsCopy: Record<UiLanguage, {
     dolbyVisionSystemPipelineExperimental: '杜比视界直通（实验性）',
     dolbyVisionSystemPipelineExperimentalCaption: '强制杜比视界片源使用 Windows MediaEngine 与 Dolby Vision Extensions；默认关闭。',
     frameInterpolation: 'GPU 补帧',
-    frameInterpolationCaption: '全局默认。使用显卡运动补偿生成中间帧，当前版本输出为源帧率的 2 倍。',
+    frameInterpolationCaption: '全局默认。使用显卡运动补偿生成中间帧，并根据当前显示刷新率自适应选择 2x–5x 输出。',
     frameInterpolationRefreshBlocked: 'GPU 补帧开启时，刷新率同步会保留原设置但暂时失效。',
     refreshRateSync: '智能刷新率同步',
     refreshRateSyncCaption: '全局默认。播放视频进入全屏时，自动选择与帧率整数倍匹配的最高刷新率。',
@@ -1912,6 +1912,7 @@ function LibrarySettingsPage(props: {
   onAudioPassthroughChange: (enabled: boolean) => void
   displayMetadataPassthrough: boolean
   displayPeakBrightnessNits: number
+  detectedDisplayPeakBrightnessNits: number
   autoDisplayFormat: boolean
   dolbyVisionSystemPipelineExperimental: boolean
   windowsHdrEnabled: boolean
@@ -1937,9 +1938,13 @@ function LibrarySettingsPage(props: {
   const peakPassthroughActive = props.autoDisplayFormat ||
     props.displayMetadataPassthrough ||
     props.dolbyVisionSystemPipelineExperimental
+  const refreshRateSyncBlocked = props.frameInterpolationEnabled
+  const refreshRateSyncEffective = props.refreshRateSyncEnabled && !refreshRateSyncBlocked
   const displayPeakValue = props.displayPeakBrightnessNits > 0
     ? Math.max(100, Math.min(10000, props.displayPeakBrightnessNits))
-    : 1000
+    : (props.detectedDisplayPeakBrightnessNits > 0
+        ? Math.max(100, Math.min(10000, props.detectedDisplayPeakBrightnessNits))
+        : 1000)
   const updateTmdbSettings = (patch: Partial<TmdbSettings>): void => {
     props.onTmdbSettingsChange({ ...props.tmdbSettings, ...patch })
   }
@@ -2175,20 +2180,20 @@ function LibrarySettingsPage(props: {
         </label>
         <p>{t.refreshRateSyncCaption}</p>
         <p className="library-settings-warning">{props.frameInterpolationEnabled ? t.frameInterpolationRefreshBlocked : t.refreshRateSyncRequirement}</p>
-        <div className="library-refresh-sync-controls">
+        <div className={`library-refresh-sync-controls ${refreshRateSyncBlocked ? 'is-disabled' : ''}`}>
           <div className="library-setting-options" role="group" aria-label={t.refreshRateSync}>
-            <button className={props.refreshRateSyncEnabled ? 'is-selected' : ''} type="button" onClick={() => props.onRefreshRateSyncChange(true)}>
+            <button className={refreshRateSyncEffective ? 'is-selected' : ''} type="button" disabled={refreshRateSyncBlocked} onClick={() => props.onRefreshRateSyncChange(true)}>
               <span>{t.enabled}</span>
             </button>
-            <button className={!props.refreshRateSyncEnabled ? 'is-selected' : ''} type="button" onClick={() => props.onRefreshRateSyncChange(false)}>
+            <button className={!refreshRateSyncEffective ? 'is-selected' : ''} type="button" disabled={refreshRateSyncBlocked} onClick={() => props.onRefreshRateSyncChange(false)}>
               <span>{t.disabled}</span>
             </button>
           </div>
-          <label className={`library-checkbox-option ${props.refreshRateSyncEnabled ? '' : 'is-disabled'}`}>
+          <label className={`library-checkbox-option ${refreshRateSyncEffective ? '' : 'is-disabled'}`}>
             <input
               type="checkbox"
               checked={props.refreshRateMaximumMultiple}
-              disabled={!props.refreshRateSyncEnabled}
+              disabled={!refreshRateSyncEffective}
               onChange={(event) => props.onRefreshRateMaximumMultipleChange(event.currentTarget.checked)}
             />
             <span>{t.maximumRefreshMultiple}</span>
@@ -2297,6 +2302,7 @@ export default function LibraryApp(): JSX.Element {
   currentLibraryLanguage = language
   const [displayMetadataPassthrough, setDisplayMetadataPassthrough] = useState(false)
   const [displayPeakBrightnessNits, setDisplayPeakBrightnessNits] = useState(0)
+  const [detectedDisplayPeakBrightnessNits, setDetectedDisplayPeakBrightnessNits] = useState(0)
   const [autoDisplayFormat, setAutoDisplayFormat] = useState(false)
   const [dolbyVisionSystemPipelineExperimental, setDolbyVisionSystemPipelineExperimental] = useState(false)
   const [windowsHdrEnabled, setWindowsHdrEnabled] = useState(false)
@@ -3020,6 +3026,7 @@ export default function LibraryApp(): JSX.Element {
         setAutoDisplayFormat(message.autoDisplayFormat)
         setDisplayMetadataPassthrough(message.displayMetadataPassthrough)
         setDisplayPeakBrightnessNits(message.displayPeakBrightnessNits)
+        setDetectedDisplayPeakBrightnessNits(message.detectedDisplayPeakBrightnessNits)
         setDolbyVisionSystemPipelineExperimental(message.dolbyVisionSystemPipelineExperimental)
         setWindowsHdrEnabled(message.windowsHdrEnabled)
         setVideoPassthroughSettingsLoaded(true)
@@ -5570,6 +5577,7 @@ export default function LibraryApp(): JSX.Element {
             language={language}
             displayMetadataPassthrough={displayMetadataPassthrough}
             displayPeakBrightnessNits={displayPeakBrightnessNits}
+            detectedDisplayPeakBrightnessNits={detectedDisplayPeakBrightnessNits}
             autoDisplayFormat={autoDisplayFormat}
             dolbyVisionSystemPipelineExperimental={dolbyVisionSystemPipelineExperimental}
             windowsHdrEnabled={windowsHdrEnabled}

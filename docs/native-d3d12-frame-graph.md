@@ -10,8 +10,10 @@ older D3D11 handoff and phase-one documents are historical records only.
 - Decode, preprocess compute, ML compute, graphics, and copy work use queues
   from that device. Preprocess and ML have separate compute queues so a long
   inference cannot delay an original decoded frame that is ready to present.
-- Normal playback never creates a D3D11 device, shared NT handle, cross-API
-  fence, staging video texture, CPU pixel buffer, or dynamic video upload.
+- Normal playback never creates a shared NT handle, cross-API fence, staging
+  video texture, CPU pixel buffer, or dynamic video upload. The packaged
+  libplacebo DV bridge is the sole D3D11On12 exception and
+  still shares the original D3D12 device, queue, resources, and fences.
 - Every resource handoff carries a producing fence/value. Queue waits are GPU
   waits; the CPU scheduler never waits for inference.
 - Seek increments the frame-graph epoch. Old work completes naturally and is
@@ -87,6 +89,28 @@ inside one HEVC elementary stream still depend on FFmpeg exposing a separate
 enhancement surface; the compositor cannot reconstruct pixels it was never
 given. This input limitation is reported as `no_el_only_stream`, while the BL
 RPU path remains active.
+
+### libplacebo D3D12 interop
+
+The packaged libplacebo API 371 renderer is selected by default. Set
+`ANVIL_DOVI_LIBPLACEBO_D3D12=0` to disable it for driver diagnostics.
+libplacebo has no native D3D12 backend, so the adapter creates a
+D3D11On12 device on the application's existing D3D12 graphics queue. It wraps
+the D3D12VA NV12/P010 base layer, an optional Profile 7 enhancement layer, and
+the `R16G16B16A16_FLOAT` swap-chain buffer without copying pixels or creating
+shared handles. The resource state contract is `COMMON -> COMMON` for decode
+surfaces and `PRESENT -> PRESENT` for the back buffer.
+
+Profiles 5 and 8 use libplacebo's BL+RPU reshape. Profile 7 uses BL+EL/FEL+NLQ
+when FFmpeg provides a separate enhancement surface and the RPU contains a
+non-trivial LINEAR_DZ mapping; otherwise it safely falls back to BL+RPU. The
+target remains scRGB, so the existing D3D12 subtitle/UI overlay and swap-chain
+presentation stages are unchanged.
+
+Frame interpolation keeps using the native D3D12 reconstruction path so source
+and generated frames stay in the same canonical BT.2020 PQ domain. Any bridge
+load or per-frame rendering failure falls back to the native D3D12 DV shader.
+Use `ANVIL_LIBPLACEBO_DLL` to test another API-compatible DLL explicitly.
 
 ## Overlay lifetime
 

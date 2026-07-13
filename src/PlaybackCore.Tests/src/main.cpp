@@ -110,6 +110,16 @@ void TestCapabilityProbeDoesNotBlockRepeatedPrepare() {
     assert(!initialReport.gpu.d3dFeatureLevel.empty());
     assert(!initialReport.gpu.hardwareDecodeProfiles.empty());
     assert(elapsed < std::chrono::milliseconds{2500});
+
+#if defined(_DEBUG)
+    // Keep the process alive until the deliberately delayed worker has run.
+    // This catches ABI/lifetime regressions in the real _beginthreadex entry
+    // instead of letting the test executable exit while the probe still sleeps.
+    std::this_thread::sleep_for(std::chrono::milliseconds{5250});
+    const auto completedReport = controller.CollectCapabilityReport();
+    assert(!completedReport.display.colorSpace.empty());
+    assert(!completedReport.gpu.adapterName.empty());
+#endif
 }
 
 void TestOpenAndTransport() {

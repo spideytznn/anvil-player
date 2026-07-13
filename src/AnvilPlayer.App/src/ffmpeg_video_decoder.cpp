@@ -1128,6 +1128,7 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
     subtitleCanvasLogged_ = false;
     subtitleBitmapSerial_ = 0;
     subtitleAssActive_ = false;
+    subtitlePlainTextAssActive_ = false;
     subtitleAssExternalFullTrack_ = false;
     subtitleAssLogged_ = false;
     subtitleAssRenderer_.reset();
@@ -1270,6 +1271,7 @@ void FfmpegVideoDecoder::Stop() {
     sharedD3D12Device_.Reset();
     subtitleAssRenderer_.reset();
     subtitleAssActive_ = false;
+    subtitlePlainTextAssActive_ = false;
     subtitleAssExternalFullTrack_ = false;
 }
 
@@ -3005,6 +3007,7 @@ bool FfmpegVideoDecoder::ConfigureAssSubtitleStream(AVFormatContext* formatCtx, 
     }
 
     subtitleAssActive_ = true;
+    subtitlePlainTextAssActive_ = false;
     subtitleAssExternalFullTrack_ = false;
     LogThread(LogLevel::Info,
               L"subtitle",
@@ -3179,6 +3182,7 @@ bool FfmpegVideoDecoder::DecodeExternalAssSubtitleFile(const std::filesystem::pa
     }
 
     subtitleAssActive_ = true;
+    subtitlePlainTextAssActive_ = false;
     subtitleAssExternalFullTrack_ = true;
     subtitleCues_.clear();
     LogThread(LogLevel::Info,
@@ -3659,14 +3663,15 @@ bool FfmpegVideoDecoder::ReceiveDolbyVisionEnhancementFrames(AVCodecContext* cod
 }
 
 bool FfmpegVideoDecoder::ShouldUsePrimaryDoviLibplacebo() const {
-    if (!dolbyVisionStream_ || sharedD3D12Device_) {
+    if (!dolbyVisionStream_) {
         return false;
     }
 
     // Profiles 5 and 8 are the practical single-layer fallback targets:
     // libplacebo can consume the per-frame RPU and output display-ready SDR or
-    // HDR10/PQ. The native D3D12 path never reaches this fallback: it keeps
-    // BL/EL surfaces resident and reconstructs RPU+FEL in the frame graph.
+    // HDR10/PQ. Keep this proven decoder-side path on D3D12 as well: the
+    // renderer uploads its already processed RGB output instead of attempting
+    // a second, subtly different RPU color implementation.
     const bool singleLayer = dolbyVisionBlPresent_ && !dolbyVisionElPresent_;
     return singleLayer && (dolbyVisionProfile_ == 5 || dolbyVisionProfile_ == 8);
 }
@@ -4173,6 +4178,62 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
 
     AVFrame* conversionFrame = frame;
     if (frame && frame->format == hardwarePixelFormat_ && hardwarePixelFormat_ != AV_PIX_FMT_NONE) {
+        // This is the color-authoritative path used by the pre-D3D12 renderer.
+        // It deliberately transfers P5/P8 to a normal AVFrame before invoking
+        // FFmpeg's libplacebo filter. Passing the decoder's padded P010 surface
+        // through a new D3D11On12 wrapper changed plane semantics and produced
+        // the severe tint reported after migration.
+        if (ShouldUsePrimaryDoviLibplacebo()) {
+            if (!softwareFrame) {
+                LogThread(LogLevel::Error,
+                          L"decoder",
+                          L"dolby_vision_libplacebo failed reason=missing_transfer_frame");
+                return false;
+            }
+            av_frame_unref(softwareFrame);
+            const int transferError = av_hwframe_transfer_data(softwareFrame, frame, 0);
+            if (transferError < 0) {
+                LogThread(LogLevel::Error,
+                          L"decoder",
+                          L"dolby_vision_libplacebo transfer_failed reason=" +
+                              FfmpegErrorString(transferError));
+                return false;
+            }
+            const int propertyError = av_frame_copy_props(softwareFrame, frame);
+            if (propertyError < 0) {
+                LogThread(LogLevel::Warning,
+                          L"decoder",
+                          L"dolby_vision_libplacebo frame_props_copy_failed reason=" +
+                              FfmpegErrorString(propertyError));
+            }
+            softwareFrame->pts = frame->pts;
+            softwareFrame->best_effort_timestamp = frame->best_effort_timestamp;
+            softwareFrame->sample_aspect_ratio = frame->sample_aspect_ratio;
+            if (!firstCpuTransferFrameLogged_) {
+                firstCpuTransferFrameLogged_ = true;
+                LogThread(LogLevel::Info,
+                          L"decoder",
+                          L"hardware_frame path=cpu_transfer_for_libplacebo format=" +
+                              PixelFormatName(static_cast<AVPixelFormat>(softwareFrame->format)) +
+                              L" pts_ms=" + std::to_wstring(pts.count()) +
+                              L" size=" + std::to_wstring(softwareFrame->width) + L"x" +
+                              std::to_wstring(softwareFrame->height));
+            }
+            {
+                std::scoped_lock lock(mutex_);
+                ++stats_.hardwareFrames;
+                ++stats_.cpuTransferFrames;
+                stats_.usingHardwareDecode = true;
+                stats_.decoder = L"ffmpeg_d3d12va_libplacebo_reference";
+            }
+            if (TryPublishDoviLibplaceboFrame(
+                    softwareFrame, timeBase, pts, serial)) {
+                return true;
+            }
+            LogThread(LogLevel::Warning,
+                      L"decoder",
+                      L"dolby_vision_libplacebo reference_path_failed fallback=d3d12_surface");
+        }
         NativeVideoFrame textureFrame;
         const bool builtTexture = TryBuildD3D12TextureFrame(frame, pts, serial, textureFrame);
         if (builtTexture) {
@@ -4181,8 +4242,28 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
                 textureFrame.dolbyVisionRpu = ExtractDolbyVisionRpu(frame);
                 textureFrame.dovi = ExtractFrameDolbyVisionMetadata(frame);
                 if (textureFrame.dovi && textureFrame.dovi->valid) {
-                    textureFrame.dynamicMetadataPath = L"dolby_vision_d3d12_shader";
+                    const bool creativeTrim = textureFrame.dovi->dmLevel2Present ||
+                        textureFrame.dovi->dmLevel3Present ||
+                        textureFrame.dovi->dmLevel8Present;
+                    textureFrame.dynamicMetadataPath = creativeTrim
+                        ? L"dolby_vision_d3d12_shader+dynamic_trim"
+                        : L"dolby_vision_d3d12_shader";
                     textureFrame.dynamicMetadataDetails = DoviFrameSummary(textureFrame.dovi.get());
+
+                    const bool metadataChanged =
+                        !dolbyVisionDynamicMetadataLogged_ ||
+                        textureFrame.dovi->dynamicMetadataFingerprint !=
+                            dolbyVisionLastDynamicMetadataFingerprint_;
+                    if (metadataChanged) {
+                        LogThread(dolbyVisionDynamicMetadataLogged_ ? LogLevel::Debug
+                                                                   : LogLevel::Info,
+                                  L"decoder",
+                                  L"dolby_vision_dynamic_metadata path=d3d12_zero_copy " +
+                                      DoviDynamicLogSummary(*textureFrame.dovi));
+                        dolbyVisionDynamicMetadataLogged_ = true;
+                        dolbyVisionLastDynamicMetadataFingerprint_ =
+                            textureFrame.dovi->dynamicMetadataFingerprint;
+                    }
                 }
             }
             if (!firstHardwareFrameLogged_) {
@@ -4669,7 +4750,8 @@ bool FfmpegVideoDecoder::ApplyPendingSeek(AVFormatContext* formatCtx,
         subtitleCues_.clear();
     }
     if (subtitleAssRenderer_) {
-        if (subtitleAssActive_ && !subtitleAssExternalFullTrack_) {
+        if ((subtitleAssActive_ && !subtitleAssExternalFullTrack_) ||
+            (subtitlePlainTextAssActive_ && !externalSubtitlesActive_)) {
             subtitleAssRenderer_->FlushEvents();
         } else {
             subtitleAssRenderer_->ResetRenderCache();
@@ -4787,6 +4869,18 @@ bool FfmpegVideoDecoder::DecodeSubtitlePacket(AVCodecContext* subtitleCodecCtx,
     if (text.empty() && bitmaps.empty()) {
         avsubtitle_free(&subtitle);
         return true;
+    }
+    if (!text.empty() && !subtitleAssActive_) {
+        if (!subtitlePlainTextAssActive_ && EnsureAssSubtitleRenderer() &&
+            subtitleAssRenderer_->ConfigurePlainTextTrack()) {
+            subtitlePlainTextAssActive_ = true;
+            LogThread(LogLevel::Info,
+                      L"subtitle",
+                      L"libass plain-text stream active=true font=Microsoft YaHei UI");
+        }
+        if (subtitlePlainTextAssActive_) {
+            subtitleAssRenderer_->ProcessPlainText(text, start, end - start);
+        }
     }
     if (!bitmaps.empty() && !bitmapSubtitleLogged_) {
         bitmapSubtitleLogged_ = true;
@@ -4947,7 +5041,8 @@ std::vector<NativeSubtitleBitmap> FfmpegVideoDecoder::SubtitleBitmapsForPts(cons
             bitmaps.insert(bitmaps.end(), cue.bitmaps.begin(), cue.bitmaps.end());
         }
     }
-    if (includeAss && subtitleAssActive_ && subtitleAssRenderer_) {
+    if (includeAss && (subtitleAssActive_ || subtitlePlainTextAssActive_) &&
+        subtitleAssRenderer_) {
         auto assBitmaps = subtitleAssRenderer_->Render(effectivePts, frameWidth, frameHeight, subtitleBitmapSerial_);
         if (!assBitmaps.empty() && !subtitleAssLogged_) {
             subtitleAssLogged_ = true;
@@ -5455,7 +5550,8 @@ bool FfmpegVideoDecoder::SeekPrerollReadyLocked() const {
 
     const bool softwareFrame = frameQueue_.front().HasYuv() || frameQueue_.front().HasPixels();
     const bool enhancementOverlayFrame =
-        softwareFrame && enableDolbyVisionEnhancementDecode_ && dolbyVisionEnhancementActive_;
+        enableDolbyVisionEnhancementDecode_ && dolbyVisionEnhancementActive_ &&
+        frameQueue_.front().HasEnhancementSurface();
     const auto maxQueueDepth = MaxQueueDepthForFrame(frameQueue_.front());
     const auto effectiveMaxQueueDepth = maxQueueDepth > 1 ? maxQueueDepth - 1 : maxQueueDepth;
     const auto minQueuedFrames = enhancementOverlayFrame
@@ -5478,7 +5574,6 @@ bool FfmpegVideoDecoder::SeekPrerollReadyLocked() const {
                                                      : std::chrono::milliseconds{160});
     const auto decodedSpan = frameQueue_.back().pts - frameQueue_.front().pts;
     const bool decodedQueueFull = frameQueue_.size() >= effectiveMaxQueueDepth;
-    const bool decodedQueueAtCapacity = frameQueue_.size() >= maxQueueDepth;
     // Large 4K libplacebo frames usually hit the 128 MiB byte budget before
     // the nominal six-frame depth. Treat that byte saturation as a full queue;
     // otherwise seek preroll waits for a fifth frame that can never be queued.
@@ -5492,9 +5587,10 @@ bool FfmpegVideoDecoder::SeekPrerollReadyLocked() const {
     const bool softwareQueueFullWithLead =
         softwareQueueSaturated &&
         stats_.readAheadDuration >= kSeekPrerollSoftwareQueueFullMinReadAhead;
-    const bool hardwareQueueFull =
-        !softwareFrame &&
-        decodedQueueAtCapacity;
+    // The decode loop intentionally stops one slot short of the hard hardware
+    // queue capacity so the scheduler can drain it. Treat that effective limit
+    // as full; waiting for the sixth frame deadlocks seek preroll at five.
+    const bool hardwareQueueFull = !softwareFrame && decodedQueueFull;
     const bool readAheadReady =
         stats_.readAheadDuration >= minReadAhead ||
         softwareQueueFullWithLead ||
@@ -5537,7 +5633,7 @@ bool FfmpegVideoDecoder::EnqueuePresentationFrame(NativeVideoFrame&& frame) {
         std::scoped_lock lock(frameGraphCallbackMutex_);
         callback = frameGraphInputCallback_;
     }
-    if (callback && frame.HasD3D12Texture() &&
+    if (callback && (frame.HasD3D12Texture() || frame.HasPixels()) &&
         (frame.timelineSerial == 0 || frame.timelineSerial == CurrentTimelineSerial())) {
         callback(frame);
     }

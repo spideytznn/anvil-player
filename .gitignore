@@ -23,6 +23,12 @@ third_party/ffmpeg/lib/
 third_party/ffmpeg/*.txt
 third_party/ffmpeg-shared.zip
 
+# Optional libplacebo runtime produced by scripts/build-libplacebo.ps1.
+# Public API headers and license metadata remain tracked.
+third_party/libplacebo/bin/
+third_party/libplacebo/lib/
+third_party/libplacebo/build/
+
 # React/WebView2 UI build output and package cache
 src/AnvilPlayer.App/webui/node_modules/
 src/AnvilPlayer.App/webui/dist/

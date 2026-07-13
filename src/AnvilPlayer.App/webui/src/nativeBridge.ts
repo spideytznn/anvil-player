@@ -20,6 +20,7 @@ export interface PlayerState {
   customTitleBar: boolean
   frameInterpolationEnabled: boolean
   frameInterpolationActive: boolean
+  frameInterpolationMultiplier: number
   frameInterpolationBackend: string
   frameInterpolationReason: string
   refreshRateSyncEnabled: boolean
@@ -203,7 +204,7 @@ export type NativeMessage =
   | MediaDetailsProbed
   | MediaDetailsProbeFailed
   | { type: 'windowChrome'; customTitleBar: boolean }
-  | { type: 'globalVideoPassthroughSettings'; frameInterpolationEnabled: boolean; autoDisplayFormat: boolean; displayMetadataPassthrough: boolean; dolbyVisionSystemPipelineExperimental: boolean; windowsHdrEnabled: boolean; displayPeakBrightnessNits: number }
+  | { type: 'globalVideoPassthroughSettings'; frameInterpolationEnabled: boolean; autoDisplayFormat: boolean; displayMetadataPassthrough: boolean; dolbyVisionSystemPipelineExperimental: boolean; windowsHdrEnabled: boolean; displayPeakBrightnessNits: number; detectedDisplayPeakBrightnessNits: number }
   | { type: 'globalAudioPassthroughSettings'; enabled: boolean }
   | { type: 'deliverEmbyPlaybackReport'; report: unknown }
   | { type: 'command'; command: 'localPlaybackProgress'; path: string; positionMs: number; durationMs: number; playbackState: string }
@@ -368,6 +369,7 @@ export const EMPTY_STATE: PlayerState = {
   customTitleBar: false,
   frameInterpolationEnabled: false,
   frameInterpolationActive: false,
+  frameInterpolationMultiplier: 1,
   frameInterpolationBackend: 'inactive',
   frameInterpolationReason: '',
   refreshRateSyncEnabled: false,

@@ -67,11 +67,16 @@ DoviDisplayTrim SelectDoviDisplayTrim(const DolbyVisionFrameMetadata* metadata,
         ApplyTrimCodes(trim, metadata->dmLevel8TrimSlope, metadata->dmLevel8TrimOffset,
                        metadata->dmLevel8TrimPower, metadata->dmLevel8TrimChromaWeight,
                        metadata->dmLevel8TrimSaturationGain, metadata->dmLevel8MsWeight);
+        trim.source = DoviDisplayTrimSource::Level8;
         trim.midContrast = std::clamp(
             trim.midContrast + OptionalTrimDelta(metadata->dmLevel8TargetMidContrast) * 0.35f,
             -0.20f, 0.20f);
         trim.clip = std::clamp(OptionalTrimDelta(metadata->dmLevel8ClipTrim) * 0.40f,
                                -0.18f, 0.18f);
+    } else if (metadata->dmLevel3Present && metadata->dmLevel8Present) {
+        // Match the old D3D11 CMv4 rule. L2 is a CMv2.9 compatibility
+        // derivative; when a CMv4 stream carries neutral L8 plus L3, L3 must
+        // drive the scene instead of falling back to the much stronger L2.
     } else if (metadata->dmLevel2Present && metadata->dmLevel2Count > 0) {
         int selected = 0;
         float distance = std::numeric_limits<float>::max();
@@ -89,6 +94,7 @@ DoviDisplayTrim SelectDoviDisplayTrim(const DolbyVisionFrameMetadata* metadata,
                        metadata->dmLevel2TrimChromaWeight[selected],
                        metadata->dmLevel2TrimSaturationGain[selected],
                        metadata->dmLevel2MsWeight[selected]);
+        trim.source = DoviDisplayTrimSource::Level2;
         usedLevel2 = true;
     }
     if (!usedLevel2 && metadata->dmLevel3Present) {
@@ -100,6 +106,10 @@ DoviDisplayTrim SelectDoviDisplayTrim(const DolbyVisionFrameMetadata* metadata,
             -0.07f, 0.07f);
         if (std::abs(middle) > 0.001f || std::abs(contrast) > 0.001f) {
             trim.enabled = true;
+            trim.includesLevel3 = true;
+            if (trim.source == DoviDisplayTrimSource::None) {
+                trim.source = DoviDisplayTrimSource::Level3;
+            }
             trim.midOffset = std::clamp(trim.midOffset + middle, -0.18f, 0.18f);
             trim.midContrast = std::clamp(trim.midContrast + contrast, -0.18f, 0.18f);
         }
@@ -305,15 +315,18 @@ float3 dovi_nits_to_pq(float3 n) {
     const float m1=2610.0/16384.0,m2=2523.0/32.0,c1=3424.0/4096.0,c2=2413.0/128.0,c3=2392.0/128.0;
     float3 p=pow(saturate(n/10000.0),m1); return pow((c1+c2*p)/max(1.0+c3*p,0.000001),m2);
 }
-float3 dovi_decode_single_layer(int f, float3 signal) {
-    float3 mapped=dovi_map(f,signal,false)-doviYccOffset[f].xyz*doviCurveMeta[f].w;
+float3 dovi_decode_reshaped(int f, float3 reshaped) {
+    float3 mapped=reshaped-doviYccOffset[f].xyz*doviCurveMeta[f].w;
     float3 pq=float3(dot(doviYccToRgb[f][0].xyz,mapped),dot(doviYccToRgb[f][1].xyz,mapped),dot(doviYccToRgb[f][2].xyz,mapped));
     float3 linearRgb=dovi_pq_to_nits(pq)/10000.0;
     float3 lms=float3(dot(doviRgbToLms[f][0].xyz,linearRgb),dot(doviRgbToLms[f][1].xyz,linearRgb),dot(doviRgbToLms[f][2].xyz,linearRgb));
     // Dolby's LMS-to-BT.2020 matrix. Keep the full reference coefficients:
     // even small row-sum errors become a visible neutral-axis tint after PQ.
-    float3 bt2020=mul(float3x3(3.06441879,-2.16597676,0.10155818,-0.65612108,1.78554118,-0.12943794,0.01736321,-0.04725154,1.03004253),lms);
+    float3 bt2020=mul(float3x3(3.06441879,-2.16597676,0.10155818,-0.65612108,1.78554118,-0.12943749,0.01736321,-0.04725154,1.03004253),lms);
     return dovi_nits_to_pq(max(bt2020,0.0)*10000.0);
+}
+float3 dovi_decode_single_layer(int f, float3 signal) {
+    return dovi_decode_reshaped(f,dovi_map(f,signal,false));
 }
 float dovi_inverse_nlq(int f, float sample, int c) {
     if (doviComposerMeta[f].x<0.5 || doviComposerMeta[f].y!=0.0) return 0.0;
@@ -340,17 +353,26 @@ float3 dovi_compose_p7_fel(int f, float3 blPixel, float3 blChroma, float3 fel) {
 }
 float3 dovi_apply_display_trim(int f, float3 nits, float targetPeak) {
     if (doviTrimA[f].x<0.5) return nits;
-    float sourcePeak=max(doviTrimD[f].z,100.0), normalization=max(sourcePeak,targetPeak);
-    float3 src=saturate(nits/normalization); float l=max(dot(src,float3(0.2627,0.6780,0.0593)),0.000001);
-    float midMask=saturate(1.0-abs(l-0.45)*2.4), toeMask=saturate(1.0-l*2.2), pivot=0.42;
+    // Keep the old known-good D3D11 domain exactly: creative trim parameters
+    // operate on normalized ST 2084 code values, not on nits divided by the
+    // display peak. Linear-nits normalization makes slope/power scene changes
+    // explode into alternating over-bright and crushed frames.
+    float3 src=saturate(dovi_nits_to_pq(max(nits,0.0)));
+    float l=saturate(dot(src,float3(0.2627,0.6780,0.0593)));
+    float toeMask=smoothstep(0.02,0.18,l);
+    float shoulderMask=1.0-smoothstep(0.70,0.98,l);
+    float midMask=toeMask*shoulderMask;
     float outputLuma=saturate(l+doviTrimB[f].w*midMask);
-    outputLuma=saturate(pivot+(outputLuma-pivot)*(1.0+doviTrimC[f].x*midMask));
+    outputLuma=saturate(0.45+(outputLuma-0.45)*(1.0+doviTrimC[f].x*midMask));
     outputLuma=saturate((outputLuma-0.5)*max(doviTrimA[f].y,0.01)+0.5+doviTrimA[f].z*toeMask);
     outputLuma=pow(max(outputLuma,0.0),max(doviTrimA[f].w,0.05));
-    outputLuma=saturate(outputLuma+doviTrimC[f].y*saturate((l-0.75)*4.0)*(1.0-outputLuma)*0.45);
-    float3 color=src*(outputLuma/l); float gray=dot(color,float3(0.2627,0.6780,0.0593));
+    float clipMask=smoothstep(0.62,1.0,outputLuma);
+    outputLuma=saturate(outputLuma+doviTrimC[f].y*clipMask*(1.0-outputLuma)*0.45);
+    float3 color=saturate(src*(outputLuma/max(l,0.0001)));
+    float gray=saturate(dot(color,float3(0.2627,0.6780,0.0593)));
     float saturation=clamp(doviTrimB[f].x*lerp(1.0,doviTrimB[f].y,0.25)*lerp(1.0,doviTrimB[f].z,0.10),0.75,1.25);
-    return max(lerp(gray.xxx,color,saturation),0.0)*normalization;
+    color=saturate(gray.xxx+(color-gray.xxx)*saturation);
+    return dovi_pq_to_nits(color);
 }
 )DOVI";
     return library;

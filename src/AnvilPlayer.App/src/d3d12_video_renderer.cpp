@@ -22,7 +22,61 @@ using anvil::playback::VideoColorRange;
 using anvil::playback::VideoMatrixCoefficients;
 using anvil::playback::VideoTransferCharacteristic;
 
-constexpr DXGI_FORMAT kCompositionFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+// Match the known-good D3D11 presentation contract: shaders write display-ready
+// G22/BT.709 or PQ/BT.2020 into an RGB10 swap chain. The libplacebo bridge keeps
+// its scRGB intermediate and is converted explicitly before presentation.
+constexpr DXGI_FORMAT kCompositionFormat = DXGI_FORMAT_R10G10B10A2_UNORM;
+constexpr DXGI_FORMAT kLibplaceboTargetFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+constexpr uint64_t k8KPixelCount = 7680ull * 4320ull;
+constexpr DWORD kFrameLatencyWaitTimeoutMs = 8;
+
+int SanitizeDisplayPeakNits(const int value) noexcept {
+    return value > 0 ? std::clamp(value, 100, 10000) : 0;
+}
+
+int QueryMonitorPeakNits(IDXGIFactory4* factory, const HMONITOR monitor) {
+    if (!factory || !monitor) return 0;
+    for (UINT adapterIndex = 0;; ++adapterIndex) {
+        Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+        if (factory->EnumAdapters1(adapterIndex, &adapter) == DXGI_ERROR_NOT_FOUND) break;
+        if (!adapter) continue;
+        for (UINT outputIndex = 0;; ++outputIndex) {
+            Microsoft::WRL::ComPtr<IDXGIOutput> output;
+            if (adapter->EnumOutputs(outputIndex, &output) == DXGI_ERROR_NOT_FOUND) break;
+            DXGI_OUTPUT_DESC outputDescription{};
+            if (!output || FAILED(output->GetDesc(&outputDescription)) ||
+                outputDescription.Monitor != monitor) {
+                continue;
+            }
+            Microsoft::WRL::ComPtr<IDXGIOutput6> output6;
+            DXGI_OUTPUT_DESC1 description{};
+            if (FAILED(output.As(&output6)) ||
+                FAILED(output6->GetDesc1(&description)) ||
+                !std::isfinite(description.MaxLuminance)) {
+                return 0;
+            }
+            return SanitizeDisplayPeakNits(
+                static_cast<int>(std::lround(description.MaxLuminance)));
+        }
+    }
+    return 0;
+}
+
+double EffectiveRefreshRate(const DWORD nominalFrequency) noexcept {
+    // EnumDisplaySettings reports NTSC-compatible modes using nominal integer
+    // labels. Restore their effective rates before applying a strict floor so
+    // 23.976 -> 119.88 can still select the exact x5 cadence.
+    switch (nominalFrequency) {
+    case 23: return 24000.0 / 1001.0;
+    case 29: return 30000.0 / 1001.0;
+    case 47: return 48000.0 / 1001.0;
+    case 59: return 60000.0 / 1001.0;
+    case 71: return 72000.0 / 1001.0;
+    case 95: return 96000.0 / 1001.0;
+    case 119: return 120000.0 / 1001.0;
+    default: return static_cast<double>(nominalFrequency);
+    }
+}
 
 struct CompositionConstants {
     float sourceUv[4]{};
@@ -35,6 +89,12 @@ struct CompositionConstants {
     float sourcePeakNits = 1000.0f;
     float targetPeakNits = 100.0f;
     float padding = 0.0f;
+    float hdr10PlusA[4]{};
+    float hdr10PlusB[4]{};
+    float hdr10PlusCurve[16]{};
+    // Packed as five float4 values: (input, output) pairs 0..8. The final
+    // float2 is unused so the layout matches HLSL constant-buffer packing.
+    float hdrToneCurve[20]{};
 };
 
 struct TensorCompositionConstants {
@@ -43,15 +103,18 @@ struct TensorCompositionConstants {
     float hdrOutput = 0.0f;
     float sourcePeakNits = 1000.0f;
     float targetPeakNits = 100.0f;
-    float padding[3]{};
+    UINT transfer = 1;
+    UINT primaries = 0;
+    float padding = 0.0f;
     float trimA[4]{};
     float trimB[4]{};
     float trimC[4]{};
+    float hdrToneCurve[20]{};
 };
 
-static_assert(sizeof(TensorCompositionConstants) == 20 * sizeof(UINT));
+static_assert(sizeof(TensorCompositionConstants) == 40 * sizeof(UINT));
 
-static_assert(sizeof(CompositionConstants) == 16 * sizeof(UINT));
+static_assert(sizeof(CompositionConstants) == 60 * sizeof(UINT));
 
 UINT MatrixMode(const VideoMatrixCoefficients matrix) {
     switch (matrix) {
@@ -79,6 +142,153 @@ float SourcePeakNits(const anvil::playback::VideoColorMetadata& color) {
         return static_cast<float>(std::clamp(color.contentLight.maxContentLightLevelNits, 100, 10000));
     }
     return color.IsHdr() ? 1000.0f : 100.0f;
+}
+
+const anvil::playback::DolbyVisionFrameMetadata* FrameDolbyVisionMetadata(
+    const NativeVideoFrame& frame) noexcept {
+    if (frame.enhancementDovi && frame.enhancementDovi->valid) {
+        return frame.enhancementDovi.get();
+    }
+    return frame.dovi && frame.dovi->valid ? frame.dovi.get() : nullptr;
+}
+
+bool FrameCarriesHdr(const NativeVideoFrame& frame) noexcept {
+    return frame.color.IsHdr() || FrameDolbyVisionMetadata(frame) != nullptr;
+}
+
+float FrameSourcePeakNits(const NativeVideoFrame& frame) noexcept {
+    const auto* dovi = FrameDolbyVisionMetadata(frame);
+    return dovi && dovi->sourceMaxNits > 0.0f
+        ? dovi->sourceMaxNits
+        : SourcePeakNits(frame.color);
+}
+
+float TargetPeakNits(const anvil::playback::VideoSettings& settings,
+                     const anvil::playback::DisplayCapabilities& display) noexcept {
+    if (settings.displayPeakBrightnessNits >= 100) {
+        return static_cast<float>(settings.displayPeakBrightnessNits);
+    }
+    if (display.reportedPeakBrightnessNits >= 100) {
+        return static_cast<float>(display.reportedPeakBrightnessNits);
+    }
+    // Windows can publish Advanced Color before the asynchronous DXGI output
+    // probe has completed. A 100-nit fallback silently turns HDR into SDR;
+    // use the documented application default instead.
+    return 1000.0f;
+}
+
+const wchar_t* DoviTrimSourceName(const DoviDisplayTrimSource source) noexcept {
+    switch (source) {
+    case DoviDisplayTrimSource::Level2:
+        return L"L2_compat";
+    case DoviDisplayTrimSource::Level3:
+        return L"L3_cmv4";
+    case DoviDisplayTrimSource::Level8:
+        return L"L8_cmv4";
+    default:
+        return L"none";
+    }
+}
+
+float SampleHdr10PlusBezier(const Hdr10PlusFrameMetadata& metadata,
+                            const float position) noexcept {
+    const int anchorCount = std::min<int>(metadata.anchorCount, 15);
+    const int degree = anchorCount + 1;
+    std::array<double, 17> points{};
+    for (int index = 0; index < anchorCount; ++index) {
+        points[index + 1] = std::clamp(
+            static_cast<double>(metadata.bezierAnchors[index]), 0.0, 1.0);
+    }
+    points[degree] = 1.0;
+    const double t = std::clamp(static_cast<double>(position), 0.0, 1.0);
+    for (int level = degree; level > 0; --level) {
+        for (int index = 0; index < level; ++index) {
+            points[index] += (points[index + 1] - points[index]) * t;
+        }
+    }
+    return static_cast<float>(std::clamp(points[0], 0.0, 1.0));
+}
+
+void FillHdr10PlusConstants(CompositionConstants& constants,
+                            const NativeVideoFrame& frame,
+                            const bool enabled) noexcept {
+    const Hdr10PlusFrameMetadata* metadata = frame.hdr10Plus.get();
+    if (!enabled || !metadata || !metadata->valid || !metadata->toneMappingPresent) return;
+    constants.hdr10PlusA[0] = 1.0f;
+    constants.hdr10PlusA[1] = std::max(metadata->targetedPeakNits, 1.0f);
+    constants.hdr10PlusA[2] = std::max(metadata->sourcePeakNits, 1.0f);
+    constants.hdr10PlusA[3] = std::clamp(metadata->kneePointX, 0.0001f, 0.9999f);
+    constants.hdr10PlusB[0] = std::clamp(metadata->kneePointY, 0.0001f, 0.9999f);
+    constants.hdr10PlusB[1] = static_cast<float>(std::min<int>(metadata->anchorCount, 15));
+    constants.hdr10PlusB[2] = std::max(metadata->saturationWeight, 0.0f);
+    for (std::size_t index = 0; index < std::size(constants.hdr10PlusCurve); ++index) {
+        constants.hdr10PlusCurve[index] = SampleHdr10PlusBezier(
+            *metadata, static_cast<float>(index) /
+                static_cast<float>(std::size(constants.hdr10PlusCurve) - 1));
+    }
+}
+
+uint64_t FillHdrToneCurveConstants(float (&packedCurve)[20],
+                                   float& processingFlags,
+                                   const NativeVideoFrame& frame,
+                                   const anvil::playback::VideoSettings& settings,
+                                   const bool hdrOutput) noexcept {
+    const bool dolbyVision = FrameDolbyVisionMetadata(frame) != nullptr;
+    const bool hdr10Plus = frame.hdr10Plus && frame.hdr10Plus->valid;
+    if (!hdrOutput || !frame.color.IsHdr() || dolbyVision || hdr10Plus ||
+        settings.displayMetadataPassthrough) {
+        return 0;
+    }
+
+    double previousInput = 0.0;
+    double previousOutput = 0.0;
+    for (std::size_t index = 0; index < settings.hdrToneCurve.size(); ++index) {
+        const auto& source = settings.hdrToneCurve[index];
+        const double input = index == 0
+            ? 0.0
+            : std::clamp(std::max(
+                  anvil::playback::kDefaultHdrToneCurve[index].inputNits,
+                  previousInput + 0.001), 0.0, 10000.0);
+        const double output = index == 0
+            ? 0.0
+            : std::clamp(std::max(source.outputNits, previousOutput), 0.0, 10000.0);
+        packedCurve[index * 2] = static_cast<float>(input);
+        packedCurve[index * 2 + 1] = static_cast<float>(output);
+        previousInput = input;
+        previousOutput = output;
+    }
+    // Bit 0: user-authored HDR curve. Bit 1 is reserved for the physical
+    // display-peak mapping restored from the D3D11 path.
+    processingFlags += 1.0f;
+
+    uint64_t fingerprint = 1469598103934665603ull;
+    for (const float value : packedCurve) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        fingerprint ^= bits;
+        fingerprint *= 1099511628211ull;
+    }
+    return fingerprint;
+}
+
+float InitialHdrProcessingFlags(const NativeVideoFrame& frame,
+                                const anvil::playback::VideoSettings& settings,
+                                const bool hdrOutput) noexcept {
+    const bool appSideDisplayMapping = hdrOutput && frame.color.IsHdr() &&
+        FrameDolbyVisionMetadata(frame) == nullptr &&
+        !settings.displayMetadataPassthrough;
+    return appSideDisplayMapping ? 2.0f : 0.0f;
+}
+
+bool HdrOutputEnabled(const NativeVideoFrame& frame,
+                      const anvil::playback::VideoSettings& settings,
+                      const anvil::playback::DisplayCapabilities& display,
+                      const bool hdr10ColorSpaceSupported) noexcept {
+    return FrameCarriesHdr(frame) &&
+        settings.hdrOutput != HdrOutputMode::ForceSdr &&
+        (settings.dolbyVisionHdrOutput || settings.hdrOutput == HdrOutputMode::ForceHdr) &&
+        (display.hdrEnabled || settings.hdrOutput == HdrOutputMode::ForceHdr) &&
+        hdr10ColorSpaceSupported;
 }
 
 bool IsDeviceRemoved(const HRESULT result) {
@@ -228,6 +438,23 @@ void D3D12VideoRenderer::ConfigureColorPipeline(
             videoSettings_.frameInterpolationEnabled != settings.frameInterpolationEnabled;
         videoSettings_ = settings;
         displayCapabilities_ = display;
+        int detectedPeakNits = detectedDisplayPeakNits_.load(std::memory_order_acquire);
+        if (detectedPeakNits <= 0) {
+            detectedPeakNits = SanitizeDisplayPeakNits(display.reportedPeakBrightnessNits);
+            if (detectedPeakNits > 0) {
+                detectedDisplayPeakNits_.store(detectedPeakNits, std::memory_order_release);
+            }
+        }
+        if (detectedPeakNits > 0) {
+            displayCapabilities_.reportedPeakBrightnessNits = detectedPeakNits;
+        }
+        const int configuredPeakNits =
+            SanitizeDisplayPeakNits(settings.displayPeakBrightnessNits);
+        effectiveDisplayPeakNits_.store(
+            configuredPeakNits > 0
+                ? configuredPeakNits
+                : (detectedPeakNits > 0 ? detectedPeakNits : 1000),
+            std::memory_order_release);
         mediaColor_ = mediaColor;
         interpolationRequested_.store(settings.frameInterpolationEnabled,
                                       std::memory_order_release);
@@ -316,7 +543,7 @@ VideoRenderStats D3D12VideoRenderer::TakeRenderStats() const {
 }
 
 void D3D12VideoRenderer::Render(const NativeVideoFrame& frame) {
-    if (!IsReady() || !frame.HasD3D12Texture()) {
+    if (!IsReady() || (!frame.HasD3D12Texture() && !frame.HasPixels())) {
         return;
     }
     try {
@@ -333,7 +560,7 @@ void D3D12VideoRenderer::Render(const NativeVideoFrame& frame) {
 
 void D3D12VideoRenderer::QueueFrameGraphInput(const NativeVideoFrame& frame) {
     if (!IsReady() || !interpolationRequested_.load(std::memory_order_acquire) ||
-        !frame.HasD3D12Texture()) return;
+        (!frame.HasD3D12Texture() && !frame.HasPixels())) return;
     try {
         auto input = std::make_unique<NativeVideoFrame>(frame);
         {
@@ -506,6 +733,14 @@ bool D3D12VideoRenderer::InitializeGpu() {
         FAILED(createQueue(D3D12_COMMAND_LIST_TYPE_COPY, copyQueue_))) {
         return false;
     }
+    if (LibplaceboD3D12Bridge::RequestedByEnvironment()) {
+        libplaceboBridge_ = std::make_unique<LibplaceboD3D12Bridge>(logSink_);
+        if (!libplaceboBridge_->Initialize(device_.Get(), queue_.Get())) {
+            libplaceboBridge_.reset();
+            Log(LogLevel::Warning,
+                L"optional libplacebo backend unavailable; using native D3D12 Dolby Vision path");
+        }
+    }
 
     RECT client{};
     GetClientRect(host_.load(), &client);
@@ -540,8 +775,11 @@ bool D3D12VideoRenderer::InitializeGpu() {
     fenceEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!fenceEvent_) return false;
     Log(LogLevel::Info,
-        L"d3d12 resident pipeline ready queues=graphics+preprocess+ml+copy "
-        L"output=scRGB ml=lazy_background dovi_shaders=background_precompile");
+        L"d3d12 resident pipeline ready queues=graphics+preprocess+ml+copy output=" +
+            std::wstring(hdr10ColorSpaceSupported_ ? L"rgb10_hdr10" : L"rgb10_sdr") +
+            L" target_peak_nits=" +
+            std::to_wstring(static_cast<int>(TargetPeakNits(videoSettings_, displayCapabilities_))) +
+            L" ml=lazy_background dovi_shaders=background_precompile");
     return true;
 }
 
@@ -655,26 +893,77 @@ bool D3D12VideoRenderer::CreateSwapChain(const UINT width, const UINT height) {
     desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     desc.Scaling = DXGI_SCALING_STRETCH;
     desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+    desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
     Microsoft::WRL::ComPtr<IDXGISwapChain1> swapChain1;
-    if (FAILED(factory_->CreateSwapChainForHwnd(queue_.Get(), host_.load(), &desc, nullptr,
-                                                nullptr, &swapChain1)) ||
-        FAILED(swapChain1.As(&swapChain_))) {
+    HRESULT createResult = factory_->CreateSwapChainForHwnd(
+        queue_.Get(), host_.load(), &desc, nullptr, nullptr, &swapChain1);
+    swapChainWaitable_ = SUCCEEDED(createResult);
+    if (FAILED(createResult)) {
+        desc.Flags = 0;
+        swapChain1.Reset();
+        createResult = factory_->CreateSwapChainForHwnd(
+            queue_.Get(), host_.load(), &desc, nullptr, nullptr, &swapChain1);
+    }
+    if (FAILED(createResult) || FAILED(swapChain1.As(&swapChain_))) {
         return false;
     }
+    ConfigureFramePacing();
     factory_->MakeWindowAssociation(host_.load(), DXGI_MWA_NO_ALT_ENTER);
-    UINT colorSpaceSupport = 0;
-    if (SUCCEEDED(swapChain_->CheckColorSpaceSupport(
-            DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, &colorSpaceSupport)) &&
-        (colorSpaceSupport & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) != 0) {
-        swapChain_->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709);
+    UINT sdrColorSpaceSupport = 0;
+    const HRESULT sdrColorSpaceQuery = swapChain_->CheckColorSpaceSupport(
+        DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, &sdrColorSpaceSupport);
+    if (FAILED(sdrColorSpaceQuery) ||
+        (sdrColorSpaceSupport & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) == 0 ||
+        FAILED(swapChain_->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709))) {
+        Log(LogLevel::Warning, L"RGB10 SDR swap-chain color space unavailable");
     }
+    UINT hdrColorSpaceSupport = 0;
+    const HRESULT hdrColorSpaceQuery = swapChain_->CheckColorSpaceSupport(
+        DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, &hdrColorSpaceSupport);
+    hdr10ColorSpaceSupported_ =
+        SUCCEEDED(hdrColorSpaceQuery) &&
+        (hdrColorSpaceSupport & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) != 0;
+    if (!hdr10ColorSpaceSupported_) {
+        Log(LogLevel::Warning,
+            L"HDR10 swap-chain color space unavailable; HDR will use the SDR fallback");
+    }
+
+    // The process-wide capability probe can still be pending when playback
+    // starts. Query the output which actually contains this swap chain so the
+    // physical peak does not incorrectly remain at zero (and fall back to SDR).
+    Microsoft::WRL::ComPtr<IDXGIOutput> containingOutput;
+    Microsoft::WRL::ComPtr<IDXGIOutput6> containingOutput6;
+    DXGI_OUTPUT_DESC1 outputDescription{};
+    if (SUCCEEDED(swapChain_->GetContainingOutput(&containingOutput)) &&
+        SUCCEEDED(containingOutput.As(&containingOutput6)) &&
+        SUCCEEDED(containingOutput6->GetDesc1(&outputDescription))) {
+        const bool outputAdvancedColorActive =
+            outputDescription.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 ||
+            outputDescription.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
+            outputDescription.ColorSpace == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020;
+        displayCapabilities_.hdrEnabled = outputAdvancedColorActive;
+        displayCapabilities_.hdrSupported = outputAdvancedColorActive ||
+            outputDescription.MaxLuminance >= 400.0f;
+        if (outputDescription.MaxLuminance >= 100.0f) {
+            displayCapabilities_.reportedPeakBrightnessNits =
+                static_cast<int>(outputDescription.MaxLuminance + 0.5f);
+        }
+        Log(LogLevel::Info,
+            L"d3d12 containing output advanced_color=" +
+                std::wstring(outputAdvancedColorActive ? L"on" : L"off") +
+                L" dxgi_color_space=" +
+                std::to_wstring(static_cast<int>(outputDescription.ColorSpace)) +
+                L" peak_nits=" +
+                std::to_wstring(displayCapabilities_.reportedPeakBrightnessNits));
+    }
+    RefreshDisplayPeakNits();
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
     for (UINT index = 0; index < kBufferCount; ++index) {
         if (FAILED(swapChain_->GetBuffer(index, IID_PPV_ARGS(&backBuffers_[index])))) return false;
         device_->CreateRenderTargetView(backBuffers_[index].Get(), nullptr, rtv);
         rtv.ptr += rtvIncrement_;
     }
-    return true;
+    return CreateLibplaceboTargets(width, height);
 }
 
 bool D3D12VideoRenderer::CreatePipeline() {
@@ -690,7 +979,9 @@ bool D3D12VideoRenderer::CreatePipeline() {
     parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters[1].Constants.ShaderRegister = 0;
-    parameters[1].Constants.Num32BitValues = 16;
+    // 60 DWORDs plus the SRV table (1) and root CBV (2) stay within D3D12's
+    // 64-DWORD root-signature limit.
+    parameters[1].Constants.Num32BitValues = 60;
     parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     parameters[2].Descriptor.ShaderRegister = 1;
@@ -737,6 +1028,10 @@ cbuffer CompositionConstants : register(b0) {
     float4 enhancementRect;
     uint4 modes;
     float4 tone;
+    float4 hdr10PlusA;
+    float4 hdr10PlusB;
+    float4 hdr10PlusCurve[4];
+    float4 hdrToneCurve[5];
 };
 float3 yuv_to_rgb(float y, float2 uv, bool forceBt2020) {
     bool full = modes.y != 0;
@@ -760,15 +1055,99 @@ float3 pq_to_nits(float3 v) {
     float3 p = pow(saturate(v), 1.0 / m2);
     return 10000.0 * pow(max(p - c1, 0.0) / max(c2 - c3 * p, 0.000001), 1.0 / m1);
 }
+float3 nits_to_pq(float3 nits) {
+    const float m1 = 2610.0 / 16384.0, m2 = 2523.0 / 32.0;
+    const float c1 = 3424.0 / 4096.0, c2 = 2413.0 / 128.0, c3 = 2392.0 / 128.0;
+    float3 y = pow(max(nits / 10000.0, 0.0), m1);
+    return pow((c1 + c2 * y) / (1.0 + c3 * y), m2);
+}
 float3 hlg_to_nits(float3 v) {
     const float a = 0.17883277, b = 0.28466892, c = 0.55991073;
     float3 scene = lerp((exp((v - c) / a) + b) / 12.0, v * v / 3.0, step(v, 0.5));
-    return pow(max(scene, 0.0), 1.2) * max(tone.z, 1000.0);
+    scene=max(scene,0.0);
+    float sceneLuma=max(dot(scene,float3(0.2627,0.6780,0.0593)),0.000001);
+    return scene*pow(sceneLuma,0.2)*max(tone.z,1000.0);
 }
 float3 rec2020_to_scrgb(float3 v) {
     return mul(float3x3(1.6605, -0.5876, -0.0728,
                        -0.1246, 1.1329, -0.0083,
                        -0.0182, -0.1006, 1.1187), v);
+}
+float3 rec709_to_rec2020(float3 v) {
+    return mul(float3x3(0.6274, 0.3293, 0.0433,
+                       0.0691, 0.9195, 0.0114,
+                       0.0164, 0.0880, 0.8956), v);
+}
+float3 linear_to_srgb(float3 v) {
+    v=max(v,0.0);
+    return lerp(1.055*pow(v,1.0/2.4)-0.055,12.92*v,
+                step(v,float3(0.0031308,0.0031308,0.0031308)));
+}
+float3 sdr_tone_map_nits(float3 nits,float sourcePeak,float3 weights) {
+    nits=max(nits,0.0);
+    float luma=max(dot(nits,weights),0.000001);
+    float working=luma*0.80;
+    const float target=100.0,knee=45.0,shoulder=55.0;
+    if(working<=knee) return nits*0.80;
+    float peak=max(max(sourcePeak*0.80,working),target+1.0);
+    float mapped=knee+shoulder*log(1.0+(working-knee)/shoulder)/
+        max(log(1.0+(peak-knee)/shoulder),0.0001);
+    return nits*(min(mapped,target)/luma);
+}
+float hdr10plus_curve(float t) {
+    float position=saturate(t)*15.0; int lower=clamp((int)floor(position),0,14);
+    int upper=lower+1;
+    float a=hdr10PlusCurve[lower/4][lower%4];
+    float b=hdr10PlusCurve[upper/4][upper%4];
+    return lerp(a,b,position-lower);
+}
+float3 apply_hdr10plus(float3 sourceNits) {
+    if(hdr10PlusA.x<0.5) return max(sourceNits,0.0);
+    float3 nits=max(sourceNits,0.0); float maxRgb=max(nits.r,max(nits.g,nits.b));
+    if(maxRgb<=0.0001) return nits;
+    float x=saturate(maxRgb/max(hdr10PlusA.z,1.0));
+    float kx=hdr10PlusA.w,ky=hdr10PlusB.x;
+    float y=x<=kx?x*ky/kx:ky+(1.0-ky)*hdr10plus_curve((x-kx)/(1.0-kx));
+    float mappedMax=y*max(hdr10PlusA.y,1.0); float3 mapped=nits*(mappedMax/maxRgb);
+    float luma=max(dot(mapped,float3(0.2627,0.6780,0.0593)),0.0);
+    return max(luma.xxx+(mapped-luma.xxx)*max(hdr10PlusB.z,0.0),0.0);
+}
+float2 hdr_curve_point(int index) {
+    float4 pairs=hdrToneCurve[index/2];
+    return (index&1)==0?pairs.xy:pairs.zw;
+}
+float hdr_curve_luma(float lumaNits) {
+    float2 previous=hdr_curve_point(0);
+    if(lumaNits<=previous.x) return max(previous.y,0.0);
+    [unroll] for(int index=1;index<9;++index) {
+        float2 next=hdr_curve_point(index);
+        if(lumaNits<=next.x) {
+            float amount=saturate((lumaNits-previous.x)/max(next.x-previous.x,0.0001));
+            return max(lerp(previous.y,next.y,amount),0.0);
+        }
+        previous=next;
+    }
+    return max(previous.y,0.0);
+}
+float3 apply_hdr_tone_curve(float3 sourceNits) {
+    float3 nits=max(sourceNits,0.0);
+    float flags=floor(tone.w+0.5);
+    if(fmod(flags,2.0)<0.5) return nits;
+    float luma=max(dot(nits,float3(0.2627,0.6780,0.0593)),0.0);
+    return nits*(hdr_curve_luma(luma)/max(luma,0.0001));
+}
+float3 apply_hdr_display_mapping(float3 sourceNits) {
+    float3 nits=max(sourceNits,0.0); float flags=floor(tone.w+0.5);
+    float peak=max(nits.r,max(nits.g,nits.b));
+    if(flags<2.0 || peak<=0.0001) return nits;
+    float target=max(tone.z,100.0),source=max(tone.y,peak);
+    if(source<=target+1.0) return nits;
+    float knee=target*0.65;
+    if(peak<=knee) return nits;
+    float shoulder=max(target-knee,1.0);
+    float denominator=max(1.0-exp(-(source-knee)/shoulder),0.0001);
+    float mapped=knee+shoulder*(1.0-exp(-(min(peak,source)-knee)/shoulder))/denominator;
+    return nits*(min(mapped,target)/peak);
 }
 )") + std::string(D3D12DolbyVisionHlsl()) + R"(
 float dovi_cubic_weight(float x) {
@@ -787,8 +1166,13 @@ float dovi_sample_el_y(float2 uv) {
     return saturate(sum/max(weight,0.000001));
 }
 float2 dovi_sample_el_uv(float2 uv) {
-    if (doviComposerScale[0].w<0.5) return enhancementUv.SampleLevel(linearClamp,float3(uv,0),0);
     uint w,h,layers,levels; enhancementUv.GetDimensions(0,w,h,layers,levels);
+    // HEVC 4:2:0 chroma is left-sited. libplacebo represents this as
+    // plane.shift_x=-0.5; in normalized coordinates that is one quarter of an
+    // UV texel towards the right. Apply it before both linear and cubic EL
+    // reconstruction so BL and FEL stay registered.
+    uv.x+=0.25/max((float)w,1.0);
+    if (doviComposerScale[0].w<0.5) return enhancementUv.SampleLevel(linearClamp,float3(uv,0),0);
     float2 c=uv*float2(w,h)-0.5,f=frac(c); int2 base=int2(floor(c)); float2 sum=0.0; float weight=0.0;
     [unroll] for(int j=-1;j<=2;++j) [unroll] for(int i=-1;i<=2;++i) {
         float q=dovi_cubic_weight(i-f.x)*dovi_cubic_weight(j-f.y);
@@ -810,14 +1194,21 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_Target {
          displayUv.x>doviTrimD[0].x || displayUv.y>doviTrimD[0].y)) return float4(0,0,0,1);
     float2 sampleUv = lerp(sourceRect.xy, sourceRect.zw, displayUv);
     float y=sourceY.Sample(linearClamp,float3(sampleUv,0.0));
-    float2 chroma=sourceUv.Sample(linearClamp,float3(sampleUv,0.0));
+    uint chromaW,chromaH,chromaLayers,chromaLevels;
+    sourceUv.GetDimensions(0,chromaW,chromaH,chromaLayers,chromaLevels);
+    float2 chromaUv=sampleUv;
+    // Match libplacebo's PL_CHROMA_LEFT / shift_x=-0.5 convention. Omitting
+    // this offset is especially visible for Profile 5 because its chroma
+    // channels carry IPT rather than ordinary YCbCr.
+    chromaUv.x+=0.25/max((float)chromaW,1.0);
+    float2 chroma=sourceUv.Sample(linearClamp,float3(chromaUv,0.0));
     float3 encoded;
     bool canonical2020=(modes.w&2)!=0;
     if (doviSignalMeta[0].x>1.5) {
         float2 elUv=lerp(enhancementRect.xy,enhancementRect.zw,displayUv);
         float3 composed=dovi_compose_p7_fel(0,float3(y,chroma),
             float3(dovi_chroma_site_luma(sampleUv),chroma),float3(dovi_sample_el_y(elUv),dovi_sample_el_uv(elUv)));
-        encoded=yuv_to_rgb(composed.x,composed.yz,true); canonical2020=true;
+        encoded=dovi_decode_reshaped(0,composed); canonical2020=true;
     } else if (doviSignalMeta[0].x>0.5) {
         encoded=dovi_decode_single_layer(0,saturate(float3(y,chroma)*doviSignalMeta[0].w)); canonical2020=true;
     } else encoded=yuv_to_rgb(y,chroma,false);
@@ -825,19 +1216,22 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_Target {
     if (doviSignalMeta[0].x>0.5 || modes.z == 2) linearNits = pq_to_nits(encoded);
     else if (modes.z == 3) linearNits = hlg_to_nits(encoded);
     else linearNits = pow(saturate(encoded), 2.2) * 80.0;
+    linearNits=apply_hdr10plus(linearNits);
+    // L2/L3/L8 are per-frame creative trims, not an SDR-only tone map. Apply
+    // them before either the SDR roll-off or the HDR10 PQ conversion so CMv4
+    // scene changes remain visible in both output modes.
     if (doviSignalMeta[0].x>0.5) linearNits=dovi_apply_display_trim(0,linearNits,tone.z);
-    if (tone.x < 0.5 && (doviSignalMeta[0].x>0.5 || modes.z == 2 || modes.z == 3)) {
-        float peak = max(tone.y, 100.0);
-        float luma=max(dot(max(linearNits,0.0),canonical2020?float3(0.2627,0.6780,0.0593):float3(0.2126,0.7152,0.0722)),0.000001);
-        float mapped=100.0*(luma/peak)/(1.0+luma/peak);
-        linearNits=max(linearNits,0.0)*(mapped/luma);
+    linearNits=apply_hdr_tone_curve(linearNits);
+    linearNits=apply_hdr_display_mapping(linearNits);
+    if (tone.x < 0.5 && (doviSignalMeta[0].x>0.5 || modes.z == 2 || modes.z == 3))
+        linearNits=sdr_tone_map_nits(linearNits,tone.y,
+            canonical2020?float3(0.2627,0.6780,0.0593):float3(0.2126,0.7152,0.0722));
+    if (tone.x >= 0.5) {
+        if (!canonical2020) linearNits=rec709_to_rec2020(linearNits);
+        return float4(nits_to_pq(max(linearNits,0.0)),1.0);
     }
-    // scRGB carries BT.2020 primaries through negative BT.709 components.
-    // Clamping those components here changes hue/saturation before DWM's HDR
-    // composition. Only clamp while tone-mapping to SDR; HDR scRGB is signed.
-    if (canonical2020) linearNits = rec2020_to_scrgb(linearNits);
-    if (tone.x < 0.5) linearNits=max(linearNits,0.0);
-    return float4(linearNits / 80.0, 1.0);
+    if (canonical2020) linearNits=rec2020_to_scrgb(linearNits);
+    return float4(linear_to_srgb(max(linearNits,0.0)/100.0),1.0);
 })";
     doviPixelShaderSource_ = pixelShader;
     constexpr char basePixelShader[] = R"(
@@ -849,6 +1243,10 @@ cbuffer CompositionConstants : register(b0) {
     float4 enhancementRect;
     uint4 modes;
     float4 tone;
+    float4 hdr10PlusA;
+    float4 hdr10PlusB;
+    float4 hdr10PlusCurve[4];
+    float4 hdrToneCurve[5];
 };
 float3 yuv_to_rgb(float y, float2 uv) {
     bool full = modes.y != 0;
@@ -878,38 +1276,261 @@ float3 hlg_to_nits(float3 v) {
     const float a = 0.17883277, b = 0.28466892, c = 0.55991073;
     float3 scene = lerp((exp((v - c) / a) + b) / 12.0,
                         v * v / 3.0, step(v, 0.5));
-    return pow(max(scene, 0.0), 1.2) * max(tone.z, 1000.0);
+    scene=max(scene,0.0);
+    float sceneLuma=max(dot(scene,float3(0.2627,0.6780,0.0593)),0.000001);
+    return scene*pow(sceneLuma,0.2)*max(tone.z,1000.0);
 }
 float3 rec2020_to_scrgb(float3 v) {
     return mul(float3x3(1.6605, -0.5876, -0.0728,
                        -0.1246, 1.1329, -0.0083,
                        -0.0182, -0.1006, 1.1187), v);
 }
+float3 nits_to_pq(float3 nits) {
+    const float m1 = 2610.0 / 16384.0, m2 = 2523.0 / 32.0;
+    const float c1 = 3424.0 / 4096.0, c2 = 2413.0 / 128.0, c3 = 2392.0 / 128.0;
+    float3 y=pow(max(nits/10000.0,0.0),m1);
+    return pow((c1+c2*y)/(1.0+c3*y),m2);
+}
+float3 rec709_to_rec2020(float3 v) {
+    return mul(float3x3(0.6274,0.3293,0.0433,
+                       0.0691,0.9195,0.0114,
+                       0.0164,0.0880,0.8956),v);
+}
+float3 linear_to_srgb(float3 v) {
+    v=max(v,0.0);
+    return lerp(1.055*pow(v,1.0/2.4)-0.055,12.92*v,
+                step(v,float3(0.0031308,0.0031308,0.0031308)));
+}
+float3 sdr_tone_map_nits(float3 nits,float sourcePeak,float3 weights) {
+    nits=max(nits,0.0); float luma=max(dot(nits,weights),0.000001);
+    float working=luma*0.80; const float target=100.0,knee=45.0,shoulder=55.0;
+    if(working<=knee) return nits*0.80;
+    float peak=max(max(sourcePeak*0.80,working),target+1.0);
+    float mapped=knee+shoulder*log(1.0+(working-knee)/shoulder)/
+        max(log(1.0+(peak-knee)/shoulder),0.0001);
+    return nits*(min(mapped,target)/luma);
+}
+float hdr10plus_curve(float t) {
+    float position=saturate(t)*15.0; int lower=clamp((int)floor(position),0,14),upper=lower+1;
+    float a=hdr10PlusCurve[lower/4][lower%4],b=hdr10PlusCurve[upper/4][upper%4];
+    return lerp(a,b,position-lower);
+}
+float3 apply_hdr10plus(float3 sourceNits) {
+    if(hdr10PlusA.x<0.5) return max(sourceNits,0.0);
+    float3 nits=max(sourceNits,0.0); float maxRgb=max(nits.r,max(nits.g,nits.b));
+    if(maxRgb<=0.0001) return nits;
+    float x=saturate(maxRgb/max(hdr10PlusA.z,1.0)),kx=hdr10PlusA.w,ky=hdr10PlusB.x;
+    float y=x<=kx?x*ky/kx:ky+(1.0-ky)*hdr10plus_curve((x-kx)/(1.0-kx));
+    float3 mapped=nits*(y*max(hdr10PlusA.y,1.0)/maxRgb);
+    float luma=max(dot(mapped,float3(0.2627,0.6780,0.0593)),0.0);
+    return max(luma.xxx+(mapped-luma.xxx)*max(hdr10PlusB.z,0.0),0.0);
+}
+float2 hdr_curve_point(int index) {
+    float4 pairs=hdrToneCurve[index/2];
+    return (index&1)==0?pairs.xy:pairs.zw;
+}
+float hdr_curve_luma(float lumaNits) {
+    float2 previous=hdr_curve_point(0);
+    if(lumaNits<=previous.x) return max(previous.y,0.0);
+    [unroll] for(int index=1;index<9;++index) {
+        float2 next=hdr_curve_point(index);
+        if(lumaNits<=next.x) {
+            float amount=saturate((lumaNits-previous.x)/max(next.x-previous.x,0.0001));
+            return max(lerp(previous.y,next.y,amount),0.0);
+        }
+        previous=next;
+    }
+    return max(previous.y,0.0);
+}
+float3 apply_hdr_tone_curve(float3 sourceNits) {
+    float3 nits=max(sourceNits,0.0);
+    float flags=floor(tone.w+0.5);
+    if(fmod(flags,2.0)<0.5) return nits;
+    float luma=max(dot(nits,float3(0.2627,0.6780,0.0593)),0.0);
+    return nits*(hdr_curve_luma(luma)/max(luma,0.0001));
+}
+float3 apply_hdr_display_mapping(float3 sourceNits) {
+    float3 nits=max(sourceNits,0.0); float flags=floor(tone.w+0.5);
+    float peak=max(nits.r,max(nits.g,nits.b));
+    if(flags<2.0 || peak<=0.0001) return nits;
+    float target=max(tone.z,100.0),source=max(tone.y,peak);
+    if(source<=target+1.0) return nits;
+    float knee=target*0.65;
+    if(peak<=knee) return nits;
+    float shoulder=max(target-knee,1.0);
+    float denominator=max(1.0-exp(-(source-knee)/shoulder),0.0001);
+    float mapped=knee+shoulder*(1.0-exp(-(min(peak,source)-knee)/shoulder))/denominator;
+    return nits*(min(mapped,target)/peak);
+}
 float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_Target {
     float2 sampleUv = lerp(sourceRect.xy, sourceRect.zw, saturate(uv));
     float3 encoded = yuv_to_rgb(
         sourceY.Sample(linearClamp, float3(sampleUv, 0.0)),
         sourceUv.Sample(linearClamp, float3(sampleUv, 0.0)));
+    if (tone.x < 0.5 && modes.z == 1 && (modes.w & 2) == 0)
+        return float4(saturate(encoded),1.0);
     float3 linearNits = modes.z == 2 ? pq_to_nits(encoded) :
                         (modes.z == 3 ? hlg_to_nits(encoded) :
                          pow(saturate(encoded), 2.2) * 80.0);
-    if (tone.x < 0.5 && (modes.z == 2 || modes.z == 3)) {
-        float peak = max(tone.y, 100.0);
-        float3 weights=(modes.w&2)!=0?float3(0.2627,0.6780,0.0593):float3(0.2126,0.7152,0.0722);
-        float luma=max(dot(max(linearNits,0.0),weights),0.000001);
-        float mapped=100.0*(luma/peak)/(1.0+luma/peak);
-        linearNits=max(linearNits,0.0)*(mapped/luma);
+    linearNits=apply_hdr10plus(linearNits);
+    linearNits=apply_hdr_tone_curve(linearNits);
+    linearNits=apply_hdr_display_mapping(linearNits);
+    if (tone.x < 0.5 && (modes.z == 2 || modes.z == 3))
+        linearNits=sdr_tone_map_nits(linearNits,tone.y,
+            (modes.w&2)!=0?float3(0.2627,0.6780,0.0593):float3(0.2126,0.7152,0.0722));
+    bool canonical2020=(modes.w&2)!=0;
+    if (tone.x >= 0.5) {
+        if (!canonical2020) linearNits=rec709_to_rec2020(linearNits);
+        return float4(nits_to_pq(max(linearNits,0.0)),1.0);
     }
-    if ((modes.w & 2) != 0) linearNits=rec2020_to_scrgb(linearNits);
-    if (tone.x < 0.5) linearNits=max(linearNits,0.0);
-    return float4(linearNits / 80.0, 1.0);
+    if (canonical2020) linearNits=rec2020_to_scrgb(linearNits);
+    return float4(linear_to_srgb(max(linearNits,0.0)/100.0),1.0);
+})";
+    const std::string rgbPixelShader = std::string(R"(
+Texture2D<float4> source : register(t0);
+SamplerState linearClamp : register(s0);
+cbuffer CompositionConstants : register(b0) {
+    float4 sourceRect;
+    float4 enhancementRect;
+    uint4 modes;
+    float4 tone;
+    float4 hdr10PlusA;
+    float4 hdr10PlusB;
+    float4 hdr10PlusCurve[4];
+    float4 hdrToneCurve[5];
+};
+float3 pq_to_nits(float3 v) {
+    const float m1=2610.0/16384.0,m2=2523.0/32.0;
+    const float c1=3424.0/4096.0,c2=2413.0/128.0,c3=2392.0/128.0;
+    float3 p=pow(saturate(v),1.0/m2);
+    return 10000.0*pow(max(p-c1,0.0)/max(c2-c3*p,0.000001),1.0/m1);
+}
+float3 nits_to_pq(float3 nits) {
+    const float m1=2610.0/16384.0,m2=2523.0/32.0;
+    const float c1=3424.0/4096.0,c2=2413.0/128.0,c3=2392.0/128.0;
+    float3 y=pow(max(nits/10000.0,0.0),m1);
+    return pow((c1+c2*y)/(1.0+c3*y),m2);
+}
+float3 rec2020_to_rec709(float3 v) {
+    return mul(float3x3(1.6605,-0.5876,-0.0728,
+                       -0.1246,1.1329,-0.0083,
+                       -0.0182,-0.1006,1.1187),v);
+}
+float3 rec709_to_rec2020(float3 v) {
+    return mul(float3x3(0.6274,0.3293,0.0433,
+                       0.0691,0.9195,0.0114,
+                       0.0164,0.0880,0.8956),v);
+}
+float3 srgb_to_linear(float3 v) {
+    return lerp(pow((v+0.055)/1.055,2.4),v/12.92,
+                step(v,float3(0.04045,0.04045,0.04045)));
+}
+float3 linear_to_srgb(float3 v) {
+    v=max(v,0.0);
+    return lerp(1.055*pow(v,1.0/2.4)-0.055,12.92*v,
+                step(v,float3(0.0031308,0.0031308,0.0031308)));
+}
+float3 sdr_tone_map_nits(float3 nits,float sourcePeak) {
+    nits=max(nits,0.0); float luma=max(dot(nits,float3(0.2627,0.6780,0.0593)),0.000001);
+    float working=luma*0.80; const float target=100.0,knee=45.0,shoulder=55.0;
+    if(working<=knee) return nits*0.80;
+    float peak=max(max(sourcePeak*0.80,working),target+1.0);
+    float mapped=knee+shoulder*log(1.0+(working-knee)/shoulder)/
+        max(log(1.0+(peak-knee)/shoulder),0.0001);
+    return nits*(min(mapped,target)/luma);
+}
+float hdr10plus_curve(float t) {
+    float position=saturate(t)*15.0; int lower=clamp((int)floor(position),0,14),upper=lower+1;
+    float a=hdr10PlusCurve[lower/4][lower%4],b=hdr10PlusCurve[upper/4][upper%4];
+    return lerp(a,b,position-lower);
+}
+float3 apply_hdr10plus(float3 sourceNits) {
+    if(hdr10PlusA.x<0.5) return max(sourceNits,0.0);
+    float3 nits=max(sourceNits,0.0); float maxRgb=max(nits.r,max(nits.g,nits.b));
+    if(maxRgb<=0.0001) return nits;
+    float x=saturate(maxRgb/max(hdr10PlusA.z,1.0)),kx=hdr10PlusA.w,ky=hdr10PlusB.x;
+    float y=x<=kx?x*ky/kx:ky+(1.0-ky)*hdr10plus_curve((x-kx)/(1.0-kx));
+    float3 mapped=nits*(y*max(hdr10PlusA.y,1.0)/maxRgb);
+    float luma=max(dot(mapped,float3(0.2627,0.6780,0.0593)),0.0);
+    return max(luma.xxx+(mapped-luma.xxx)*max(hdr10PlusB.z,0.0),0.0);
+}
+float2 hdr_curve_point(int index) {
+    float4 pairs=hdrToneCurve[index/2];
+    return (index&1)==0?pairs.xy:pairs.zw;
+}
+float hdr_curve_luma(float lumaNits) {
+    float2 previous=hdr_curve_point(0);
+    if(lumaNits<=previous.x) return max(previous.y,0.0);
+    [unroll] for(int index=1;index<9;++index) {
+        float2 next=hdr_curve_point(index);
+        if(lumaNits<=next.x) {
+            float amount=saturate((lumaNits-previous.x)/max(next.x-previous.x,0.0001));
+            return max(lerp(previous.y,next.y,amount),0.0);
+        }
+        previous=next;
+    }
+    return max(previous.y,0.0);
+}
+float3 apply_hdr_tone_curve(float3 sourceNits) {
+    float3 nits=max(sourceNits,0.0);
+    float flags=floor(tone.w+0.5);
+    if(fmod(flags,2.0)<0.5) return nits;
+    float luma=max(dot(nits,float3(0.2627,0.6780,0.0593)),0.0);
+    return nits*(hdr_curve_luma(luma)/max(luma,0.0001));
+}
+float3 apply_hdr_display_mapping(float3 sourceNits) {
+    float3 nits=max(sourceNits,0.0); float flags=floor(tone.w+0.5);
+    float peak=max(nits.r,max(nits.g,nits.b));
+    if(flags<2.0 || peak<=0.0001) return nits;
+    float target=max(tone.z,100.0),source=max(tone.y,peak);
+    if(source<=target+1.0) return nits;
+    float knee=target*0.65;
+    if(peak<=knee) return nits;
+    float shoulder=max(target-knee,1.0);
+    float denominator=max(1.0-exp(-(source-knee)/shoulder),0.0001);
+    float mapped=knee+shoulder*(1.0-exp(-(min(peak,source)-knee)/shoulder))/denominator;
+    return nits*(min(mapped,target)/peak);
+}
+)") + std::string(D3D12DolbyVisionHlsl()) + R"(
+float4 main(float4 position : SV_POSITION,float2 uv : TEXCOORD0) : SV_Target {
+    float2 displayUv=saturate(uv);
+    if(doviSignalMeta[0].x>0.5 &&
+       (displayUv.x<doviTrimC[0].z || displayUv.y<doviTrimC[0].w ||
+        displayUv.x>doviTrimD[0].x || displayUv.y>doviTrimD[0].y))
+        return float4(0,0,0,1);
+    float3 encoded=source.Sample(linearClamp,lerp(sourceRect.xy,sourceRect.zw,displayUv)).rgb;
+    if(modes.z==2) {
+        float3 nits=apply_hdr10plus(pq_to_nits(encoded));
+        if(doviSignalMeta[0].x>0.5)
+            nits=dovi_apply_display_trim(0,nits,tone.z);
+        nits=apply_hdr_tone_curve(nits);
+        nits=apply_hdr_display_mapping(nits);
+        if(tone.x>=0.5)
+            return float4(nits_to_pq(max(nits,0.0)),1.0);
+        nits=rec2020_to_rec709(sdr_tone_map_nits(nits,tone.y));
+        return float4(linear_to_srgb(max(nits,0.0)/100.0),1.0);
+    }
+    if(modes.z==4) {
+        float3 nits709=encoded*80.0;
+        if(tone.x>=0.5)
+            return float4(nits_to_pq(rec709_to_rec2020(nits709)),1.0);
+        return float4(linear_to_srgb(max(nits709,0.0)/100.0),1.0);
+    }
+    if(tone.x>=0.5) {
+        float3 nits709=srgb_to_linear(saturate(encoded))*80.0;
+        return float4(nits_to_pq(rec709_to_rec2020(nits709)),1.0);
+    }
+    return float4(saturate(encoded),1.0);
 })";
     Microsoft::WRL::ComPtr<ID3DBlob> vs;
     Microsoft::WRL::ComPtr<ID3DBlob> ps;
+    Microsoft::WRL::ComPtr<ID3DBlob> rgbPs;
     if (FAILED(D3DCompile(vertexShader, std::strlen(vertexShader), nullptr, nullptr, nullptr,
                           "main", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vs, &errors)) ||
         FAILED(D3DCompile(basePixelShader, std::strlen(basePixelShader), nullptr, nullptr, nullptr,
-                          "main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &ps, &errors))) {
+                          "main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &ps, &errors)) ||
+        FAILED(D3DCompile(rgbPixelShader.data(), rgbPixelShader.size(), nullptr, nullptr, nullptr,
+                          "main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &rgbPs, &errors))) {
         if (errors && errors->GetBufferPointer()) {
             Log(LogLevel::Error,
                 L"d3d12 shader compile failed: " +
@@ -939,6 +1560,10 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_Target {
     if (FAILED(device_->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&yuvPipeline_)))) {
         return false;
     }
+    desc.PS = {rgbPs->GetBufferPointer(), rgbPs->GetBufferSize()};
+    if (FAILED(device_->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&rgbPipeline_)))) {
+        return false;
+    }
 
     D3D12_DESCRIPTOR_RANGE tensorRange{};
     tensorRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -952,7 +1577,7 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_Target {
     tensorParameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     tensorParameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     tensorParameters[1].Constants.ShaderRegister = 0;
-    tensorParameters[1].Constants.Num32BitValues = 20;
+    tensorParameters[1].Constants.Num32BitValues = 40;
     tensorParameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_ROOT_SIGNATURE_DESC tensorRootDesc{};
     tensorRootDesc.NumParameters = static_cast<UINT>(std::size(tensorParameters));
@@ -974,10 +1599,13 @@ cbuffer TensorCompositionConstants : register(b0) {
     float hdrOutput;
     float sourcePeakNits;
     float targetPeakNits;
-    float3 padding;
+    uint inputTransfer;
+    uint inputPrimaries;
+    float padding;
     float4 trimA;
     float4 trimB;
     float4 trimC;
+    float4 hdrToneCurve[5];
 };
 float load_half(uint plane, uint2 position) {
     uint element = (plane * tensorSize.y + position.y) * tensorSize.x + position.x;
@@ -1006,35 +1634,116 @@ float3 pq_to_nits(float3 v) {
     float3 p = pow(saturate(v), 1.0 / m2);
     return 10000.0 * pow(max(p - c1, 0.0) / max(c2 - c3 * p, 0.000001), 1.0 / m1);
 }
-float3 rec2020_to_scrgb(float3 v) {
+float3 nits_to_pq(float3 nits) {
+    const float m1 = 2610.0 / 16384.0, m2 = 2523.0 / 32.0;
+    const float c1 = 3424.0 / 4096.0, c2 = 2413.0 / 128.0, c3 = 2392.0 / 128.0;
+    float3 y=pow(max(nits/10000.0,0.0),m1);
+    return pow((c1+c2*y)/(1.0+c3*y),m2);
+}
+float3 rec2020_to_rec709(float3 v) {
     return mul(float3x3(1.6605, -0.5876, -0.0728,
                        -0.1246, 1.1329, -0.0083,
                        -0.0182, -0.1006, 1.1187), v);
 }
+float3 linear_to_srgb(float3 v) {
+    v=max(v,0.0);
+    return lerp(1.055*pow(v,1.0/2.4)-0.055,12.92*v,
+                step(v,float3(0.0031308,0.0031308,0.0031308)));
+}
+float3 srgb_to_linear(float3 v) {
+    return lerp(pow((v+0.055)/1.055,2.4),v/12.92,
+                step(v,float3(0.04045,0.04045,0.04045)));
+}
+float3 rec709_to_rec2020(float3 v) {
+    return mul(float3x3(0.6274,0.3293,0.0433,
+                       0.0691,0.9195,0.0114,
+                       0.0164,0.0880,0.8956),v);
+}
+float3 sdr_tone_map_nits(float3 nits,float sourcePeak) {
+    nits=max(nits,0.0); float luma=max(dot(nits,float3(0.2627,0.6780,0.0593)),0.000001);
+    float working=luma*0.80; const float target=100.0,knee=45.0,shoulder=55.0;
+    if(working<=knee) return nits*0.80;
+    float peak=max(max(sourcePeak*0.80,working),target+1.0);
+    float mapped=knee+shoulder*log(1.0+(working-knee)/shoulder)/
+        max(log(1.0+(peak-knee)/shoulder),0.0001);
+    return nits*(min(mapped,target)/luma);
+}
+float2 hdr_curve_point(int index) {
+    float4 pairs=hdrToneCurve[index/2];
+    return (index&1)==0?pairs.xy:pairs.zw;
+}
+float hdr_curve_luma(float lumaNits) {
+    float2 previous=hdr_curve_point(0);
+    if(lumaNits<=previous.x) return max(previous.y,0.0);
+    [unroll] for(int index=1;index<9;++index) {
+        float2 next=hdr_curve_point(index);
+        if(lumaNits<=next.x) {
+            float amount=saturate((lumaNits-previous.x)/max(next.x-previous.x,0.0001));
+            return max(lerp(previous.y,next.y,amount),0.0);
+        }
+        previous=next;
+    }
+    return max(previous.y,0.0);
+}
+float3 apply_hdr_tone_curve(float3 sourceNits) {
+    float3 nits=max(sourceNits,0.0);
+    float flags=floor(padding+0.5);
+    if(fmod(flags,2.0)<0.5) return nits;
+    float luma=max(dot(nits,float3(0.2627,0.6780,0.0593)),0.0);
+    return nits*(hdr_curve_luma(luma)/max(luma,0.0001));
+}
+float3 apply_hdr_display_mapping(float3 sourceNits) {
+    float3 nits=max(sourceNits,0.0); float flags=floor(padding+0.5);
+    float peak=max(nits.r,max(nits.g,nits.b));
+    if(flags<2.0 || peak<=0.0001) return nits;
+    float target=max(targetPeakNits,100.0),source=max(sourcePeakNits,peak);
+    if(source<=target+1.0) return nits;
+    float knee=target*0.65;
+    if(peak<=knee) return nits;
+    float shoulder=max(target-knee,1.0);
+    float denominator=max(1.0-exp(-(source-knee)/shoulder),0.0001);
+    float mapped=knee+shoulder*(1.0-exp(-(min(peak,source)-knee)/shoulder))/denominator;
+    return nits*(min(mapped,target)/peak);
+}
 float3 apply_dovi_trim(float3 nits) {
     if(trimA.x<0.5) return nits;
-    float normalization=max(trimC.z,targetPeakNits);
-    float3 src=saturate(nits/normalization); float l=max(dot(src,float3(0.2627,0.6780,0.0593)),0.000001);
-    float mid=saturate(1.0-abs(l-0.45)*2.4),toe=saturate(1.0-l*2.2),outputLuma=saturate(l+trimB.w*mid);
-    outputLuma=saturate(0.42+(outputLuma-0.42)*(1.0+trimC.x*mid));
+    float3 src=saturate(nits_to_pq(max(nits,0.0)));
+    float l=saturate(dot(src,float3(0.2627,0.6780,0.0593)));
+    float toe=smoothstep(0.02,0.18,l);
+    float shoulder=1.0-smoothstep(0.70,0.98,l);
+    float mid=toe*shoulder;
+    float outputLuma=saturate(l+trimB.w*mid);
+    outputLuma=saturate(0.45+(outputLuma-0.45)*(1.0+trimC.x*mid));
     outputLuma=saturate((outputLuma-0.5)*max(trimA.y,0.01)+0.5+trimA.z*toe);
     outputLuma=pow(max(outputLuma,0.0),max(trimA.w,0.05));
-    outputLuma=saturate(outputLuma+trimC.y*saturate((l-0.75)*4.0)*(1.0-outputLuma)*0.45);
-    float3 color=src*(outputLuma/l); float gray=dot(color,float3(0.2627,0.6780,0.0593));
+    float clipMask=smoothstep(0.62,1.0,outputLuma);
+    outputLuma=saturate(outputLuma+trimC.y*clipMask*(1.0-outputLuma)*0.45);
+    float3 color=saturate(src*(outputLuma/max(l,0.0001)));
+    float gray=saturate(dot(color,float3(0.2627,0.6780,0.0593)));
     float saturation=clamp(trimB.x*lerp(1.0,trimB.y,0.25)*lerp(1.0,trimB.z,0.10),0.75,1.25);
-    return max(lerp(gray.xxx,color,saturation),0.0)*normalization;
+    color=saturate(gray.xxx+(color-gray.xxx)*saturation);
+    return pq_to_nits(color);
 }
 float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_Target {
-    float3 nits = apply_dovi_trim(pq_to_nits(sample_rgb(uv)));
-    if (hdrOutput < 0.5) {
-        float peak = max(sourcePeakNits, 100.0);
-        float luma=max(dot(max(nits,0.0),float3(0.2627,0.6780,0.0593)),0.000001);
-        float mapped=100.0*(luma/peak)/(1.0+luma/peak);
-        nits=max(nits,0.0)*(mapped/luma);
+    float3 generatedRgb=sample_rgb(uv);
+    if (inputTransfer == 1) {
+        if (hdrOutput < 0.5) return float4(saturate(generatedRgb),1.0);
+        float3 nits2020=rec709_to_rec2020(srgb_to_linear(saturate(generatedRgb))*80.0);
+        return float4(nits_to_pq(nits2020),1.0);
     }
-    nits=rec2020_to_scrgb(nits);
-    if (hdrOutput < 0.5) nits=max(nits,0.0);
-    return float4(nits / 80.0, 1.0);
+    if (inputTransfer == 4) {
+        float3 mappedNits=pq_to_nits(generatedRgb);
+        if (hdrOutput >= 0.5) return float4(nits_to_pq(max(mappedNits,0.0)),1.0);
+        mappedNits=rec2020_to_rec709(mappedNits);
+        return float4(linear_to_srgb(max(mappedNits,0.0)/100.0),1.0);
+    }
+    float3 nits = apply_dovi_trim(pq_to_nits(generatedRgb));
+    nits=apply_hdr_tone_curve(nits);
+    nits=apply_hdr_display_mapping(nits);
+    if (hdrOutput < 0.5) nits=sdr_tone_map_nits(nits,sourcePeakNits);
+    if (hdrOutput >= 0.5) return float4(nits_to_pq(max(nits,0.0)),1.0);
+    nits=rec2020_to_rec709(nits);
+    return float4(linear_to_srgb(max(nits,0.0)/100.0),1.0);
 })";
     Microsoft::WRL::ComPtr<ID3DBlob> tensorPs;
     errors.Reset();
@@ -1104,14 +1813,37 @@ float3 srgb_to_linear(float3 c) {
     return lerp(pow((c + 0.055) / 1.055, 2.4), c / 12.92,
                 step(c, float3(0.04045, 0.04045, 0.04045)));
 }
+float3 rec709_to_rec2020(float3 v) {
+    return mul(float3x3(0.6274,0.3293,0.0433,
+                       0.0691,0.9195,0.0114,
+                       0.0164,0.0880,0.8956),v);
+}
+float3 nits_to_pq(float3 nits) {
+    const float m1=2610.0/16384.0,m2=2523.0/32.0;
+    const float c1=3424.0/4096.0,c2=2413.0/128.0,c3=2392.0/128.0;
+    float3 y=pow(max(nits/10000.0,0.0),m1);
+    return pow((c1+c2*y)/(1.0+c3*y),m2);
+}
 float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_Target {
     float4 color = source.Sample(linearClamp, saturate(uv));
-    if (alphaFromRgb != 0) color.a = max(color.r, max(color.g, color.b));
-    float alpha = saturate(color.a * opacity);
+    float alpha;
+    float3 straight;
+    if (alphaFromRgb != 0) {
+        // GDI leaves the alpha channel at zero. Match the D3D11 path: RGB is a
+        // binary coverage mask, while the original RGB values remain the UI
+        // color. Deriving continuous alpha from RGB makes dark menu panels
+        // nearly transparent and then incorrectly normalizes their color.
+        alpha = max(color.r, max(color.g, color.b)) > (0.5 / 255.0)
+            ? saturate(opacity) : 0.0;
+        straight = saturate(color.rgb);
+    } else {
+        alpha = saturate(color.a * opacity);
+        straight = saturate(color.rgb / max(color.a, 0.00001));
+    }
     if (alpha <= 0.00001) return 0.0;
-    float3 straight = saturate(color.rgb / max(color.a, 0.00001));
-    float3 linearRgb = srgb_to_linear(straight) * (max(sdrWhiteNits, 1.0) / 80.0);
-    return float4(linearRgb * alpha, alpha);
+    if (hdrComposition < 0.5) return float4(straight * alpha, alpha);
+    float3 nits2020=rec709_to_rec2020(srgb_to_linear(straight))*max(sdrWhiteNits,1.0);
+    return float4(nits_to_pq(nits2020)*alpha,alpha);
 })";
     Microsoft::WRL::ComPtr<ID3DBlob> overlayPs;
     errors.Reset();
@@ -1240,10 +1972,29 @@ bool D3D12VideoRenderer::Resize(const UINT width, const UINT height) {
     for (UINT index = 0; index < kBufferCount; ++index) {
         if (!WaitForBackBuffer(index)) return false;
     }
+    for (auto& target : libplaceboTargets_) target.Reset();
     for (auto& buffer : backBuffers_) buffer.Reset();
+    if (frameLatencyWaitable_) {
+        CloseHandle(frameLatencyWaitable_);
+        frameLatencyWaitable_ = nullptr;
+    }
     const HRESULT result = swapChain_->ResizeBuffers(kBufferCount, width, height,
-                                                      kCompositionFormat, 0);
+                                                      kCompositionFormat,
+                                                      swapChainWaitable_
+                                                          ? DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
+                                                          : 0);
     if (FAILED(result)) return !DeviceLost(result, L"ResizeBuffers");
+    ConfigureFramePacing();
+    const DXGI_COLOR_SPACE_TYPE colorSpace = swapChainHdr_
+        ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+        : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    if (FAILED(swapChain_->SetColorSpace1(colorSpace))) {
+        if (swapChainHdr_) hdr10ColorSpaceSupported_ = false;
+        swapChainHdr_ = false;
+        swapChain_->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+        Log(LogLevel::Warning,
+            L"RGB10 swap-chain color space was lost after resize; using SDR fallback");
+    }
     width_ = width;
     height_ = height;
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
@@ -1252,10 +2003,589 @@ bool D3D12VideoRenderer::Resize(const UINT width, const UINT height) {
         device_->CreateRenderTargetView(backBuffers_[index].Get(), nullptr, rtv);
         rtv.ptr += rtvIncrement_;
     }
+    RefreshDisplayPeakNits();
+    return CreateLibplaceboTargets(width, height);
+}
+
+bool D3D12VideoRenderer::CreateLibplaceboTargets(const UINT width, const UINT height) {
+    for (auto& target : libplaceboTargets_) target.Reset();
+    if (!libplaceboBridge_ || !libplaceboBridge_->IsReady()) return true;
+
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = std::max<UINT>(1, width);
+    desc.Height = std::max<UINT>(1, height);
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = kLibplaceboTargetFormat;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    D3D12_CLEAR_VALUE clear{};
+    clear.Format = kLibplaceboTargetFormat;
+    for (auto& target : libplaceboTargets_) {
+        if (FAILED(device_->CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
+                &clear, IID_PPV_ARGS(&target)))) {
+            for (auto& created : libplaceboTargets_) created.Reset();
+            libplaceboBridge_->Reset();
+            libplaceboBridge_.reset();
+            Log(LogLevel::Warning,
+                L"libplacebo composition targets unavailable; using native D3D12 Dolby Vision path");
+            return true;
+        }
+    }
+    return true;
+}
+
+bool D3D12VideoRenderer::ConfigureFramePacing() {
+    if (frameLatencyWaitable_) {
+        CloseHandle(frameLatencyWaitable_);
+        frameLatencyWaitable_ = nullptr;
+    }
+    if (!swapChain_ || !swapChainWaitable_) {
+        if (!framePacingLogged_) {
+            framePacingLogged_ = true;
+            Log(LogLevel::Info,
+                L"d3d12 frame pacing waitable=unavailable reason=swap_chain_flag "
+                L"present_sync_interval=1");
+        }
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<IDXGISwapChain2> swapChain2;
+    if (FAILED(swapChain_.As(&swapChain2)) || !swapChain2) {
+        if (!framePacingLogged_) {
+            framePacingLogged_ = true;
+            Log(LogLevel::Info,
+                L"d3d12 frame pacing waitable=unavailable reason=swapchain2 "
+                L"present_sync_interval=1");
+        }
+        return false;
+    }
+
+    const HRESULT latencyResult = swapChain2->SetMaximumFrameLatency(1);
+    if (FAILED(latencyResult)) {
+        Log(LogLevel::Warning,
+            L"d3d12 SetMaximumFrameLatency(1) failed; using driver presentation pacing");
+    }
+    frameLatencyWaitable_ = swapChain2->GetFrameLatencyWaitableObject();
+    if (!frameLatencyWaitable_) {
+        if (!framePacingLogged_) {
+            framePacingLogged_ = true;
+            Log(LogLevel::Info,
+                L"d3d12 frame pacing waitable=unavailable reason=no_handle "
+                L"present_sync_interval=1");
+        }
+        return false;
+    }
+
+    if (!framePacingLogged_) {
+        framePacingLogged_ = true;
+        Log(LogLevel::Info,
+            L"d3d12 frame pacing waitable=active max_frame_latency=1 "
+            L"present_sync_interval=1");
+    }
+    return true;
+}
+
+void D3D12VideoRenderer::WaitForFrameLatencyObject() {
+    if (!frameLatencyWaitable_) return;
+    const auto waitStartedAt = std::chrono::steady_clock::now();
+    const DWORD waitResult = WaitForSingleObjectEx(
+        frameLatencyWaitable_, kFrameLatencyWaitTimeoutMs, TRUE);
+    const uint64_t waitUs = static_cast<uint64_t>(std::max<int64_t>(
+        0, std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now() - waitStartedAt).count()));
+    {
+        std::scoped_lock lock(statsMutex_);
+        ++renderStats_.frameLatencyWaits;
+        renderStats_.frameLatencyWaitUs += waitUs;
+        renderStats_.maxFrameLatencyWaitUs = std::max(
+            renderStats_.maxFrameLatencyWaitUs, waitUs);
+        if (waitResult == WAIT_TIMEOUT || waitResult == WAIT_FAILED) {
+            ++renderStats_.frameLatencyWaitTimeouts;
+        }
+        publishedStats_ = renderStats_;
+    }
+}
+
+void D3D12VideoRenderer::RefreshDisplayPeakNits() {
+    const HWND window = host_.load(std::memory_order_acquire);
+    const HMONITOR monitor = window && IsWindow(window)
+                                 ? MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST)
+                                 : nullptr;
+    const bool monitorChanged = monitor != displayPeakMonitor_;
+    if (monitorChanged || !displayPeakQueryAttempted_) {
+        displayPeakMonitor_ = monitor;
+        displayPeakQueryAttempted_ = true;
+        const int detectedPeakNits = QueryMonitorPeakNits(factory_.Get(), monitor);
+        detectedDisplayPeakNits_.store(detectedPeakNits, std::memory_order_release);
+        displayCapabilities_.reportedPeakBrightnessNits = detectedPeakNits;
+    }
+
+    const int configuredPeakNits =
+        SanitizeDisplayPeakNits(videoSettings_.displayPeakBrightnessNits);
+    const int detectedPeakNits =
+        detectedDisplayPeakNits_.load(std::memory_order_acquire);
+    const int effectivePeakNits = configuredPeakNits > 0
+                                      ? configuredPeakNits
+                                      : (detectedPeakNits > 0 ? detectedPeakNits : 1000);
+    const int previousPeakNits = effectiveDisplayPeakNits_.exchange(
+        effectivePeakNits, std::memory_order_acq_rel);
+    if (monitorChanged || previousPeakNits != effectivePeakNits) {
+        Log(LogLevel::Info,
+            L"hdr display peak mode=" +
+                std::wstring(configuredPeakNits > 0 ? L"manual" : L"auto") +
+                L" detected=" +
+                (detectedPeakNits > 0 ? std::to_wstring(detectedPeakNits)
+                                      : std::wstring(L"unavailable")) +
+                L" effective=" + std::to_wstring(effectivePeakNits) + L" nits" +
+                (configuredPeakNits == 0 && detectedPeakNits == 0
+                     ? std::wstring(L" fallback=1000")
+                     : std::wstring{}));
+    }
+}
+
+bool D3D12VideoRenderer::TryRenderDolbyVisionWithLibplacebo(
+    const NativeVideoFrame& frame,
+    const UINT backBufferIndex,
+    const std::chrono::steady_clock::time_point startedAt) {
+    if (!libplaceboBridge_ || !libplaceboBridge_->IsReady() ||
+        backBufferIndex >= kBufferCount || !libplaceboTargets_[backBufferIndex]) {
+        return false;
+    }
+
+    GpuFencePoint computeDependency;
+    const auto computeCompletion = sourceComputeCompletions_.find(
+        {frame.timelineSerial, frame.serial});
+    if (computeCompletion != sourceComputeCompletions_.end()) {
+        computeDependency = computeCompletion->second;
+    }
+    const bool hdrOutput = SetHdrOutputState(
+        frame, HdrOutputEnabled(frame, videoSettings_, displayCapabilities_,
+                                hdr10ColorSpaceSupported_));
+    const float targetPeakNits = TargetPeakNits(videoSettings_, displayCapabilities_);
+    if (!libplaceboBridge_->RenderDolbyVision(
+            frame, libplaceboTargets_[backBufferIndex].Get(), width_, height_, hdrOutput,
+            targetPeakNits, computeDependency.fence.Get(), computeDependency.value)) {
+        if (!libplaceboRenderFailureLogged_) {
+            libplaceboRenderFailureLogged_ = true;
+            Log(LogLevel::Warning,
+                L"libplacebo frame render failed; retrying with native D3D12 Dolby Vision shader");
+        }
+        return false;
+    }
+    libplaceboRenderFailureLogged_ = false;
+    if (computeCompletion != sourceComputeCompletions_.end()) {
+        sourceComputeCompletions_.erase(computeCompletion);
+    }
+
+    if (FAILED(allocators_[backBufferIndex]->Reset()) ||
+        FAILED(commandList_->Reset(allocators_[backBufferIndex].Get(), rgbPipeline_.Get()))) {
+        return false;
+    }
+    const std::array<D3D12_RESOURCE_BARRIER, 2> beginBarriers{
+        TransitionBarrier(
+            backBuffers_[backBufferIndex].Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET),
+        TransitionBarrier(
+            libplaceboTargets_[backBufferIndex].Get(),
+            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)};
+    commandList_->ResourceBarrier(
+        static_cast<UINT>(beginBarriers.size()), beginBarriers.data());
+
+    D3D12_CPU_DESCRIPTOR_HANDLE srvCpu = srvHeap_->GetCPUDescriptorHandleForHeapStart();
+    srvCpu.ptr += static_cast<SIZE_T>(backBufferIndex * 4) * srvIncrement_;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = kLibplaceboTargetFormat;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Texture2D.MipLevels = 1;
+    device_->CreateShaderResourceView(libplaceboTargets_[backBufferIndex].Get(), &srv, srvCpu);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
+    rtv.ptr += static_cast<SIZE_T>(backBufferIndex) * rtvIncrement_;
+    commandList_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    D3D12_VIEWPORT viewport{};
+    viewport.Width = static_cast<float>(width_);
+    viewport.Height = static_cast<float>(height_);
+    viewport.MinDepth = 0.0f;
+    viewport.MaxDepth = 1.0f;
+    const D3D12_RECT scissor{0, 0, static_cast<LONG>(width_), static_cast<LONG>(height_)};
+    commandList_->RSSetViewports(1, &viewport);
+    commandList_->RSSetScissorRects(1, &scissor);
+    commandList_->SetGraphicsRootSignature(rootSignature_.Get());
+    ID3D12DescriptorHeap* heaps[]{srvHeap_.Get()};
+    commandList_->SetDescriptorHeaps(1, heaps);
+    D3D12_GPU_DESCRIPTOR_HANDLE srvGpu = srvHeap_->GetGPUDescriptorHandleForHeapStart();
+    srvGpu.ptr += static_cast<UINT64>(backBufferIndex * 4) * srvIncrement_;
+    commandList_->SetGraphicsRootDescriptorTable(0, srvGpu);
+    CompositionConstants constants{};
+    constants.sourceUv[2] = 1.0f;
+    constants.sourceUv[3] = 1.0f;
+    constants.transfer = 4u;  // libplacebo scRGB intermediate
+    constants.hdrOutput = hdrOutput ? 1.0f : 0.0f;
+    constants.sourcePeakNits = FrameSourcePeakNits(frame);
+    constants.targetPeakNits = targetPeakNits;
+    constants.padding = InitialHdrProcessingFlags(frame, videoSettings_, hdrOutput);
+    FillHdr10PlusConstants(constants, frame,
+                           !nvidiaHdrOutput_.Hdr10PlusGamingActive());
+    const uint64_t hdrToneCurveFingerprint = FillHdrToneCurveConstants(
+        constants.hdrToneCurve, constants.padding, frame, videoSettings_, hdrOutput);
+    if (hdrToneCurveFingerprint != 0 &&
+        hdrToneCurveFingerprint != loggedHdrToneCurveFingerprint_) {
+        loggedHdrToneCurveFingerprint_ = hdrToneCurveFingerprint;
+        Log(LogLevel::Info, L"HDR custom tone curve active pipeline=libplacebo_scrgb");
+    }
+    // This bridge already owns the complete BL(+EL/FEL)+RPU composition. Its
+    // Profile 7 L5 offsets describe the active image inside the source (often
+    // an existing letterbox), so applying them again here would manufacture a
+    // second post-reshape mask. Decoder-side P5/P8 RGB10 frames take the
+    // separate RenderPixelFrame path, where synthetic L5 masks are handled.
+    DoviShaderConstantsPair doviConstants{};
+    std::memcpy(doviConstantMappings_[backBufferIndex], &doviConstants,
+                sizeof(doviConstants));
+    commandList_->SetGraphicsRoot32BitConstants(1, 60, &constants, 0);
+    commandList_->SetGraphicsRootConstantBufferView(
+        2, doviConstantBuffers_[backBufferIndex]->GetGPUVirtualAddress());
+    commandList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    commandList_->DrawInstanced(3, 1, 0, 0);
+    DrawOverlays(&frame, viewport, backBufferIndex);
+
+    const std::array<D3D12_RESOURCE_BARRIER, 2> endBarriers{
+        TransitionBarrier(libplaceboTargets_[backBufferIndex].Get(),
+                          D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                          D3D12_RESOURCE_STATE_COMMON),
+        TransitionBarrier(backBuffers_[backBufferIndex].Get(),
+                          D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          D3D12_RESOURCE_STATE_RENDER_TARGET,
+                          D3D12_RESOURCE_STATE_PRESENT)};
+    commandList_->ResourceBarrier(
+        static_cast<UINT>(endBarriers.size()), endBarriers.data());
+    if (FAILED(commandList_->Close())) return false;
+    const SubmitResult graphSubmit = frameGraph_.Submit(
+        GpuFrameQueue::Graphics, commandList_.Get());
+    if (!graphSubmit.accepted) {
+        Log(LogLevel::Error,
+            L"frame graph libplacebo overlay submit failed reason=" + graphSubmit.reason);
+        return false;
+    }
+    sourceGraphicsCompletions_[{frame.timelineSerial, frame.serial}] =
+        graphSubmit.completion;
+
+    const HRESULT presentResult = swapChain_->Present(1, 0);
+    if (FAILED(presentResult)) return !DeviceLost(presentResult, L"Present");
+    const uint64_t fenceValue = nextFenceValue_++;
+    if (FAILED(queue_->Signal(fence_.Get(), fenceValue))) return false;
+    bufferFenceValues_[backBufferIndex] = fenceValue;
+    inFlightFrames_[backBufferIndex] = std::make_unique<NativeVideoFrame>(frame);
+    AnchorGeneratedFrames(frame, std::chrono::steady_clock::now());
+
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - startedAt).count();
+    {
+        std::scoped_lock lock(statsMutex_);
+        ++renderStats_.frames;
+        ++renderStats_.hardwareFrames;
+        renderStats_.totalRenderUs += static_cast<uint64_t>(std::max<int64_t>(0, elapsed));
+        renderStats_.maxRenderUs = std::max(
+            renderStats_.maxRenderUs,
+            static_cast<uint64_t>(std::max<int64_t>(0, elapsed)));
+        publishedStats_ = renderStats_;
+    }
+    return true;
+}
+
+bool D3D12VideoRenderer::RenderPixelFrame(const NativeVideoFrame& frame) {
+    if (!frame.HasPixels() || !rgbPipeline_ || !frame.bgra ||
+        frame.width <= 0 || frame.height <= 0 || frame.stride < frame.width * 4) {
+        return false;
+    }
+    const auto startedAt = std::chrono::steady_clock::now();
+    const UINT backBufferIndex = swapChain_->GetCurrentBackBufferIndex();
+    if (!WaitForBackBuffer(backBufferIndex)) return false;
+    inFlightFrames_[backBufferIndex].reset();
+    transients_[backBufferIndex].clear();
+
+    const bool packedPq = frame.softwareFormat == AV_PIX_FMT_X2BGR10LE;
+    const DXGI_FORMAT textureFormat = packedPq
+        ? DXGI_FORMAT_R10G10B10A2_UNORM
+        : DXGI_FORMAT_B8G8R8A8_UNORM;
+    D3D12_RESOURCE_DESC textureDesc{};
+    textureDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    textureDesc.Width = static_cast<UINT64>(frame.width);
+    textureDesc.Height = static_cast<UINT>(frame.height);
+    textureDesc.DepthOrArraySize = 1;
+    textureDesc.MipLevels = 1;
+    textureDesc.Format = textureFormat;
+    textureDesc.SampleDesc.Count = 1;
+    textureDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+    PixelFrameUploadCache& cache = pixelFrameUploadCaches_[backBufferIndex];
+    const bool recreate = !cache.texture || !cache.upload || !cache.mappedUpload ||
+        cache.width != static_cast<UINT>(frame.width) ||
+        cache.height != static_cast<UINT>(frame.height) || cache.format != textureFormat;
+    if (recreate) {
+        if (cache.upload && cache.mappedUpload) cache.upload->Unmap(0, nullptr);
+        cache = {};
+
+        D3D12_HEAP_PROPERTIES defaultHeap{};
+        defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        if (FAILED(device_->CreateCommittedResource(
+                &defaultHeap, D3D12_HEAP_FLAG_NONE, &textureDesc,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                IID_PPV_ARGS(&cache.texture)))) {
+            return false;
+        }
+
+        UINT64 uploadBytes = 0;
+        device_->GetCopyableFootprints(
+            &textureDesc, 0, 1, 0, &cache.footprint, &cache.rowCount,
+            &cache.rowSize, &uploadBytes);
+        D3D12_RESOURCE_DESC uploadDesc{};
+        uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        uploadDesc.Width = uploadBytes;
+        uploadDesc.Height = 1;
+        uploadDesc.DepthOrArraySize = 1;
+        uploadDesc.MipLevels = 1;
+        uploadDesc.SampleDesc.Count = 1;
+        uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_HEAP_PROPERTIES uploadHeap{};
+        uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        if (FAILED(device_->CreateCommittedResource(
+                &uploadHeap, D3D12_HEAP_FLAG_NONE, &uploadDesc,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                IID_PPV_ARGS(&cache.upload)))) {
+            cache.texture.Reset();
+            return false;
+        }
+        const D3D12_RANGE noRead{0, 0};
+        if (FAILED(cache.upload->Map(0, &noRead, &cache.mappedUpload))) {
+            cache = {};
+            return false;
+        }
+        cache.format = textureFormat;
+        cache.width = static_cast<UINT>(frame.width);
+        cache.height = static_cast<UINT>(frame.height);
+        cache.uploadCapacity = uploadBytes;
+    }
+
+    const auto* source = frame.bgra->data();
+    auto* destination = static_cast<std::uint8_t*>(cache.mappedUpload) +
+        cache.footprint.Offset;
+    const std::size_t copyBytes = static_cast<std::size_t>(
+        std::min<UINT64>(cache.rowSize, static_cast<UINT64>(frame.stride)));
+    for (UINT row = 0; row < cache.rowCount; ++row) {
+        std::memcpy(destination + static_cast<std::size_t>(row) *
+                        cache.footprint.Footprint.RowPitch,
+                    source + static_cast<std::size_t>(row) * frame.stride,
+                    copyBytes);
+    }
+
+    if (FAILED(allocators_[backBufferIndex]->Reset()) ||
+        FAILED(commandList_->Reset(allocators_[backBufferIndex].Get(), rgbPipeline_.Get()))) {
+        return false;
+    }
+    D3D12_TEXTURE_COPY_LOCATION destinationLocation{};
+    destinationLocation.pResource = cache.texture.Get();
+    destinationLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    destinationLocation.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION sourceLocation{};
+    sourceLocation.pResource = cache.upload.Get();
+    sourceLocation.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    sourceLocation.PlacedFootprint = cache.footprint;
+    commandList_->CopyTextureRegion(
+        &destinationLocation, 0, 0, 0, &sourceLocation, nullptr);
+    const std::array beginBarriers{
+        TransitionBarrier(cache.texture.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          D3D12_RESOURCE_STATE_COPY_DEST,
+                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+        TransitionBarrier(backBuffers_[backBufferIndex].Get(),
+                          D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          D3D12_RESOURCE_STATE_PRESENT,
+                          D3D12_RESOURCE_STATE_RENDER_TARGET)};
+    commandList_->ResourceBarrier(
+        static_cast<UINT>(beginBarriers.size()), beginBarriers.data());
+
+    D3D12_CPU_DESCRIPTOR_HANDLE srvCpu = srvHeap_->GetCPUDescriptorHandleForHeapStart();
+    srvCpu.ptr += static_cast<SIZE_T>(backBufferIndex * 4) * srvIncrement_;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = textureFormat;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Texture2D.MipLevels = 1;
+    device_->CreateShaderResourceView(cache.texture.Get(), &srv, srvCpu);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
+    rtv.ptr += static_cast<SIZE_T>(backBufferIndex) * rtvIncrement_;
+    constexpr float clearColor[4]{};
+    commandList_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    commandList_->ClearRenderTargetView(rtv, clearColor, 0, nullptr);
+    const float sourceAspect = static_cast<float>(frame.width) / std::max(1, frame.height);
+    const float outputAspect = static_cast<float>(width_) / std::max<UINT>(1, height_);
+    D3D12_VIEWPORT viewport{};
+    if (sourceAspect > outputAspect) {
+        viewport.Width = static_cast<float>(width_);
+        viewport.Height = viewport.Width / sourceAspect;
+        viewport.TopLeftY = (static_cast<float>(height_) - viewport.Height) * 0.5f;
+    } else {
+        viewport.Height = static_cast<float>(height_);
+        viewport.Width = viewport.Height * sourceAspect;
+        viewport.TopLeftX = (static_cast<float>(width_) - viewport.Width) * 0.5f;
+    }
+    viewport.MinDepth = 0.0f;
+    viewport.MaxDepth = 1.0f;
+    const D3D12_RECT scissor{0, 0, static_cast<LONG>(width_), static_cast<LONG>(height_)};
+    commandList_->RSSetViewports(1, &viewport);
+    commandList_->RSSetScissorRects(1, &scissor);
+    commandList_->SetGraphicsRootSignature(rootSignature_.Get());
+    ID3D12DescriptorHeap* heaps[]{srvHeap_.Get()};
+    commandList_->SetDescriptorHeaps(1, heaps);
+    D3D12_GPU_DESCRIPTOR_HANDLE srvGpu = srvHeap_->GetGPUDescriptorHandleForHeapStart();
+    srvGpu.ptr += static_cast<UINT64>(backBufferIndex * 4) * srvIncrement_;
+    commandList_->SetGraphicsRootDescriptorTable(0, srvGpu);
+
+    CompositionConstants constants{};
+    constants.sourceUv[2] = 1.0f;
+    constants.sourceUv[3] = 1.0f;
+    constants.transfer = packedPq ? 2u : TransferMode(frame.color.transfer);
+    constants.primaries = frame.color.primaries == VideoColorPrimaries::Bt2020 ? 2u : 0u;
+    const bool hdrOutput = SetHdrOutputState(
+        frame, HdrOutputEnabled(frame, videoSettings_, displayCapabilities_,
+                                hdr10ColorSpaceSupported_));
+    constants.hdrOutput = hdrOutput ? 1.0f : 0.0f;
+    constants.sourcePeakNits = FrameSourcePeakNits(frame);
+    constants.targetPeakNits = TargetPeakNits(videoSettings_, displayCapabilities_);
+    constants.padding = InitialHdrProcessingFlags(frame, videoSettings_, hdrOutput);
+    FillHdr10PlusConstants(constants, frame,
+                           !nvidiaHdrOutput_.Hdr10PlusGamingActive());
+    const uint64_t hdrToneCurveFingerprint = FillHdrToneCurveConstants(
+        constants.hdrToneCurve, constants.padding, frame, videoSettings_, hdrOutput);
+    if (hdrToneCurveFingerprint != 0 &&
+        hdrToneCurveFingerprint != loggedHdrToneCurveFingerprint_) {
+        loggedHdrToneCurveFingerprint_ = hdrToneCurveFingerprint;
+        Log(LogLevel::Info, L"HDR custom tone curve active pipeline=rgb");
+    }
+
+    // P5/P8 use FFmpeg/libplacebo to perform the RPU reshaping before this
+    // RGB10 upload. L5 active-area masking and the display-target CMv4 trims
+    // still have to run after that conversion, just as they did in the D3D11
+    // compositor. Populate b1 instead of leaving the bound buffer stale.
+    DoviShaderConstantsPair doviConstants{};
+    const auto* dovi = FrameDolbyVisionMetadata(frame);
+    const bool hasDoviCompositionMetadata = packedPq && dovi;
+    const bool applyDoviDisplayTrim = hasDoviCompositionMetadata &&
+        videoSettings_.dolbyVisionCmv4Approx;
+    if (hasDoviCompositionMetadata) {
+        FillDoviShaderConstants(doviConstants, 0, frame,
+                                constants.targetPeakNits);
+        if (!applyDoviDisplayTrim) {
+            // L5 active-area masking is part of Dolby Vision composition, not
+            // a CMv4 creative trim. Keep its bounds while disabling L2/L3/L8.
+            doviConstants.trimA[0][0] = 0.0f;
+        }
+        if (dovi->sceneRefreshFlag != 0 && dovi->dmLevel5Present &&
+            (dovi->dmLevel5LeftOffset != 0 || dovi->dmLevel5RightOffset != 0 ||
+             dovi->dmLevel5TopOffset != 0 || dovi->dmLevel5BottomOffset != 0)) {
+            Log(LogLevel::Info,
+                L"Dolby Vision active-area mask submitted left=" +
+                    std::to_wstring(dovi->dmLevel5LeftOffset) +
+                    L" right=" + std::to_wstring(dovi->dmLevel5RightOffset) +
+                    L" top=" + std::to_wstring(dovi->dmLevel5TopOffset) +
+                    L" bottom=" + std::to_wstring(dovi->dmLevel5BottomOffset));
+        }
+    }
+    if (applyDoviDisplayTrim) {
+        const DoviDisplayTrim trim = SelectDoviDisplayTrim(
+            dovi, constants.targetPeakNits);
+        if (trim.enabled &&
+            (!dolbyVisionDynamicTrimLogged_ ||
+             (dovi->sceneRefreshFlag != 0 &&
+              dovi->dynamicMetadataFingerprint != loggedDoviTrimFingerprint_))) {
+            Log(LogLevel::Info,
+                L"Dolby Vision dynamic trim submitted profile=" +
+                    std::to_wstring(dovi->profile) +
+                    L" fingerprint=" +
+                    std::to_wstring(dovi->dynamicMetadataFingerprint) +
+                    L" selected=" +
+                    std::wstring(DoviTrimSourceName(trim.source)) +
+                    (trim.includesLevel3 &&
+                             trim.source != DoviDisplayTrimSource::Level3
+                         ? L"+L3"
+                         : L"") +
+                    L" target_peak_nits=" +
+                    std::to_wstring(static_cast<int>(
+                        constants.targetPeakNits + 0.5f)));
+            dolbyVisionDynamicTrimLogged_ = true;
+        }
+        loggedDoviTrimFingerprint_ = dovi->dynamicMetadataFingerprint;
+    }
+    std::memcpy(doviConstantMappings_[backBufferIndex], &doviConstants,
+                sizeof(doviConstants));
+    commandList_->SetGraphicsRoot32BitConstants(1, 60, &constants, 0);
+    commandList_->SetGraphicsRootConstantBufferView(
+        2, doviConstantBuffers_[backBufferIndex]->GetGPUVirtualAddress());
+    commandList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    commandList_->DrawInstanced(3, 1, 0, 0);
+    DrawOverlays(&frame, viewport, backBufferIndex);
+
+    const std::array endBarriers{
+        TransitionBarrier(cache.texture.Get(),
+                          D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                          D3D12_RESOURCE_STATE_COPY_DEST),
+        TransitionBarrier(backBuffers_[backBufferIndex].Get(),
+                          D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          D3D12_RESOURCE_STATE_RENDER_TARGET,
+                          D3D12_RESOURCE_STATE_PRESENT)};
+    commandList_->ResourceBarrier(
+        static_cast<UINT>(endBarriers.size()), endBarriers.data());
+    if (FAILED(commandList_->Close())) return false;
+    const SubmitResult graphSubmit = frameGraph_.Submit(
+        GpuFrameQueue::Graphics, commandList_.Get());
+    if (!graphSubmit.accepted) {
+        Log(LogLevel::Error,
+            L"RGB upload composite submit failed reason=" + graphSubmit.reason);
+        return false;
+    }
+    sourceGraphicsCompletions_[{frame.timelineSerial, frame.serial}] =
+        graphSubmit.completion;
+    const HRESULT presentResult = swapChain_->Present(1, 0);
+    if (FAILED(presentResult)) return !DeviceLost(presentResult, L"Present");
+    const uint64_t fenceValue = nextFenceValue_++;
+    if (FAILED(queue_->Signal(fence_.Get(), fenceValue))) return false;
+    bufferFenceValues_[backBufferIndex] = fenceValue;
+    inFlightFrames_[backBufferIndex] = std::make_unique<NativeVideoFrame>(frame);
+    AnchorGeneratedFrames(frame, std::chrono::steady_clock::now());
+
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - startedAt).count();
+    {
+        std::scoped_lock lock(statsMutex_);
+        ++renderStats_.frames;
+        ++renderStats_.bgraFrames;
+        renderStats_.bgraUploadUs += static_cast<uint64_t>(std::max<int64_t>(0, elapsed));
+        renderStats_.totalRenderUs += static_cast<uint64_t>(std::max<int64_t>(0, elapsed));
+        renderStats_.maxRenderUs = std::max(
+            renderStats_.maxRenderUs,
+            static_cast<uint64_t>(std::max<int64_t>(0, elapsed)));
+        publishedStats_ = renderStats_;
+    }
     return true;
 }
 
 bool D3D12VideoRenderer::RenderFrame(const NativeVideoFrame& frame) {
+    RefreshDisplayPeakNits();
+    WaitForFrameLatencyObject();
+    if (frame.HasPixels()) {
+        return RenderPixelFrame(frame);
+    }
     if (!frame.HasD3D12Texture() ||
         (frame.d3dFormat != DXGI_FORMAT_NV12 && frame.d3dFormat != DXGI_FORMAT_P010)) {
         Log(LogLevel::Warning, L"d3d12 compositor rejected non-resident or unsupported frame");
@@ -1270,6 +2600,10 @@ bool D3D12VideoRenderer::RenderFrame(const NativeVideoFrame& frame) {
         (frame.dovi && frame.dovi->valid) ||
         (frame.enhancementDovi && frame.enhancementDovi->valid) ||
         frame.HasEnhancementD3D12Texture();
+    if (requiresDolbyVisionPipeline && libplaceboBridge_ &&
+        TryRenderDolbyVisionWithLibplacebo(frame, backBufferIndex, startedAt)) {
+        return true;
+    }
     ID3D12PipelineState* compositionPipeline = yuvPipeline_.Get();
     if (requiresDolbyVisionPipeline) {
         StartAdvancedPipelineInitialization();
@@ -1410,16 +2744,23 @@ bool D3D12VideoRenderer::RenderFrame(const NativeVideoFrame& frame) {
     constants.transfer = TransferMode(frame.color.transfer);
     constants.primaries = (tenBit ? 1u : 0u) |
         (frame.color.primaries == VideoColorPrimaries::Bt2020 ? 2u : 0u);
-    const bool hdrOutput = frame.color.IsHdr() &&
-        videoSettings_.hdrOutput != HdrOutputMode::ForceSdr &&
-        (displayCapabilities_.hdrEnabled || videoSettings_.hdrOutput == HdrOutputMode::ForceHdr);
+    const bool hdrOutput = SetHdrOutputState(
+        frame, HdrOutputEnabled(frame, videoSettings_, displayCapabilities_,
+                                hdr10ColorSpaceSupported_));
     constants.hdrOutput = hdrOutput ? 1.0f : 0.0f;
-    constants.sourcePeakNits = SourcePeakNits(frame.color);
-    constants.targetPeakNits = static_cast<float>(
-        videoSettings_.displayPeakBrightnessNits > 0
-            ? videoSettings_.displayPeakBrightnessNits
-            : std::max(100, displayCapabilities_.reportedPeakBrightnessNits));
-    commandList_->SetGraphicsRoot32BitConstants(1, 16, &constants, 0);
+    constants.sourcePeakNits = FrameSourcePeakNits(frame);
+    constants.targetPeakNits = TargetPeakNits(videoSettings_, displayCapabilities_);
+    constants.padding = InitialHdrProcessingFlags(frame, videoSettings_, hdrOutput);
+    FillHdr10PlusConstants(constants, frame,
+                           !nvidiaHdrOutput_.Hdr10PlusGamingActive());
+    const uint64_t hdrToneCurveFingerprint = FillHdrToneCurveConstants(
+        constants.hdrToneCurve, constants.padding, frame, videoSettings_, hdrOutput);
+    if (hdrToneCurveFingerprint != 0 &&
+        hdrToneCurveFingerprint != loggedHdrToneCurveFingerprint_) {
+        loggedHdrToneCurveFingerprint_ = hdrToneCurveFingerprint;
+        Log(LogLevel::Info, L"HDR custom tone curve active pipeline=yuv");
+    }
+    commandList_->SetGraphicsRoot32BitConstants(1, 60, &constants, 0);
     DoviShaderConstantsPair doviConstants{};
     FillDoviShaderConstants(doviConstants, 0, frame, constants.targetPeakNits);
     std::memcpy(doviConstantMappings_[backBufferIndex], &doviConstants,
@@ -1522,17 +2863,24 @@ int D3D12VideoRenderer::InterpolationMultiplier(const NativeVideoFrame& first,
         mode.dmSize = sizeof(mode);
         if (EnumDisplaySettingsW(monitor.szDevice, ENUM_CURRENT_SETTINGS, &mode) &&
             mode.dmDisplayFrequency > 1) {
-            refreshHz = static_cast<double>(mode.dmDisplayFrequency);
+            refreshHz = EffectiveRefreshRate(mode.dmDisplayFrequency);
         }
     }
-    int multiplier = 2;
+    int multiplier = 1;
     if (sourceFps > 1.0 && refreshHz > 1.0) {
-        const double ratio = refreshHz / sourceFps;
-        multiplier = ratio < 1.25 ? 1 : std::clamp(static_cast<int>(std::lround(ratio)), 2, 5);
+        // Never synthesize a cadence above the active refresh rate. The small
+        // tolerance matches the display refresh-rate controller's exact-mode
+        // comparison without rounding a genuinely fractional ratio upwards.
+        const int refreshLimited = static_cast<int>(
+            std::floor((refreshHz + 0.015) / sourceFps));
+        multiplier = std::clamp(refreshLimited, 1,
+                                kMaximumInterpolationMultiplier);
     }
-    const int maxDimension = std::max(second.width, second.height);
-    if (maxDimension > 2560) multiplier = std::min(multiplier, 2);
-    else if (maxDimension > 1920) multiplier = std::min(multiplier, 3);
+    const uint64_t sourcePixels = static_cast<uint64_t>(std::max(0, second.width)) *
+        static_cast<uint64_t>(std::max(0, second.height));
+    // Every source below 8K may request the refresh-limited maximum. Keep a
+    // conservative ceiling only at 8K and above.
+    if (sourcePixels >= k8KPixelCount) multiplier = std::min(multiplier, 2);
     return std::min(multiplier, adaptiveMultiplierCap_);
 }
 
@@ -1540,10 +2888,30 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
     IMlFrameInterpolationExecutor* executor =
         mlExecutor_.load(std::memory_order_acquire);
     if (!interpolationRequested_.load(std::memory_order_acquire) || !executor ||
-        !executor->IsReady() || !frame.HasD3D12Texture()) {
+        !executor->IsReady() || (!frame.HasD3D12Texture() && !frame.HasPixels())) {
         tensorPreviousFrame_.reset();
+        sourceComputeCompletions_.clear();
+        sourceGraphicsCompletions_.clear();
         return;
     }
+    const bool dolbyVisionFrame =
+        (frame.dovi && frame.dovi->valid) ||
+        (frame.enhancementDovi && frame.enhancementDovi->valid) ||
+        frame.HasEnhancementD3D12Texture();
+    const bool libplaceboDolbyVisionInput = dolbyVisionFrame && frame.HasD3D12Texture() &&
+        libplaceboBridge_ && libplaceboBridge_->IsReady();
+    const bool libplaceboPixelDolbyVisionInput = dolbyVisionFrame && frame.HasPixels();
+    dolbyVisionInterpolationColorBypassLogged_ = false;
+    if (frame.hdr10Plus && frame.hdr10Plus->valid) {
+        if (!hdr10PlusInterpolationBypassLogged_) {
+            hdr10PlusInterpolationBypassLogged_ = true;
+            Log(LogLevel::Info,
+                L"HDR10+ interpolation bypassed reason=preserve_per_frame_st2094_40");
+        }
+        ResetInterpolationState();
+        return;
+    }
+    hdr10PlusInterpolationBypassLogged_ = false;
     const auto nominalInterval = frame.frameRateNumerator != 0
         ? std::chrono::milliseconds{static_cast<int64_t>(std::llround(
               1000.0 * frame.frameRateDenominator / frame.frameRateNumerator))}
@@ -1569,12 +2937,35 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
     }
 
     const NativeVideoFrame& first = *tensorPreviousFrame_;
+    const int multiplier = InterpolationMultiplier(first, frame);
+    if (multiplier <= 1) {
+        sourceComputeCompletions_.clear();
+        sourceGraphicsCompletions_.clear();
+        tensorPreviousDoviTarget_.Reset();
+        try {
+            tensorPreviousFrame_ = std::make_unique<NativeVideoFrame>(frame);
+        } catch (...) {
+            tensorPreviousFrame_.reset();
+        }
+        std::scoped_lock lock(statsMutex_);
+        renderStats_.interpolationMultiplier = 1;
+        publishedStats_ = renderStats_;
+        return;
+    }
     if (!executor->CanSubmit()) {
+        // A requested intermediate frame that cannot even enter the inference
+        // queue is also a missed cadence deadline. Previously these misses were
+        // invisible to the adaptive cap, so the UI kept reporting x5 while the
+        // renderer delivered only a fraction of the requested frames.
+        for (int sample = 1; sample < multiplier; ++sample) {
+            RecordGeneratedDeadline(false);
+        }
         // Keep only the newest endpoint while inference is saturated. Most
         // importantly, do not enqueue preprocessing on the shared resource:
         // original frames must continue directly to graphics without waiting
         // behind old ML work.
         sourceGraphicsCompletions_.erase({first.timelineSerial, first.serial});
+        tensorPreviousDoviTarget_.Reset();
         try {
             tensorPreviousFrame_ = std::make_unique<NativeVideoFrame>(frame);
         } catch (...) {
@@ -1582,7 +2973,16 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
         }
         return;
     }
-    const int multiplier = InterpolationMultiplier(first, frame);
+    const float interpolationHlgPeakNits = std::max(
+        TargetPeakNits(videoSettings_, displayCapabilities_), 1000.0f);
+    if (frame.color.transfer == VideoTransferCharacteristic::Hlg &&
+        !hlgInterpolationColorPathLogged_) {
+        hlgInterpolationColorPathLogged_ = true;
+        Log(LogLevel::Info,
+            L"HLG interpolation active canonical=bt2020_pq shared_ootf_peak_nits=" +
+                std::to_wstring(static_cast<int>(interpolationHlgPeakNits + 0.5f)) +
+                L" cadence=x" + std::to_wstring(multiplier));
+    }
     GpuFencePoint orderingDependency;
     const auto takeGraphicsDependency = [&](const NativeVideoFrame& source) {
         const auto found = sourceGraphicsCompletions_.find(
@@ -1597,14 +2997,91 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
     };
     takeGraphicsDependency(first);
     takeGraphicsDependency(frame);
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> currentDoviTarget;
+    if (libplaceboDolbyVisionInput) {
+        const TensorShape doviShape = SelectInterpolationTensorShape(
+            static_cast<UINT>(std::max(first.width, frame.width)),
+            static_cast<UINT>(std::max(first.height, frame.height)));
+        const auto createTarget = [&](Microsoft::WRL::ComPtr<ID3D12Resource>& target) {
+            if (!doviShape.IsValid()) return false;
+            D3D12_HEAP_PROPERTIES heap{};
+            heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC desc{};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            desc.Width = doviShape.width;
+            desc.Height = doviShape.height;
+            desc.DepthOrArraySize = 1;
+            desc.MipLevels = 1;
+            desc.Format = kLibplaceboTargetFormat;
+            desc.SampleDesc.Count = 1;
+            desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            D3D12_CLEAR_VALUE clear{};
+            clear.Format = kLibplaceboTargetFormat;
+            return SUCCEEDED(device_->CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
+                &clear, IID_PPV_ARGS(&target)));
+        };
+        const bool hdrOutput = HdrOutputEnabled(
+            frame, videoSettings_, displayCapabilities_, hdr10ColorSpaceSupported_);
+        const float targetPeakNits = TargetPeakNits(videoSettings_, displayCapabilities_);
+        const auto renderEndpoint = [&](const NativeVideoFrame& endpoint,
+                                        Microsoft::WRL::ComPtr<ID3D12Resource>& target) {
+            return (target || createTarget(target)) &&
+                libplaceboBridge_->RenderDolbyVision(
+                    endpoint, target.Get(), doviShape.width, doviShape.height,
+                    hdrOutput, targetPeakNits, orderingDependency.fence.Get(),
+                    orderingDependency.value, true);
+        };
+        if (!renderEndpoint(first, tensorPreviousDoviTarget_) ||
+            !renderEndpoint(frame, currentDoviTarget)) {
+            Log(LogLevel::Warning,
+                L"Dolby Vision interpolation skipped reason=libplacebo_tensor_endpoint_failed");
+            ResetInterpolationState();
+            return;
+        }
+        const uint64_t doviReadyValue = nextFenceValue_++;
+        if (FAILED(queue_->Signal(fence_.Get(), doviReadyValue))) {
+            ResetInterpolationState();
+            return;
+        }
+        orderingDependency.fence = fence_;
+        orderingDependency.value = doviReadyValue;
+        if (!dolbyVisionInterpolationColorPathLogged_) {
+            dolbyVisionInterpolationColorPathLogged_ = true;
+            Log(LogLevel::Info,
+                L"Dolby Vision interpolation active color_source=libplacebo_scrgb "
+                L"tensor_domain=bt2020_pq");
+        }
+    }
+    if (libplaceboPixelDolbyVisionInput && !dolbyVisionInterpolationColorPathLogged_) {
+        dolbyVisionInterpolationColorPathLogged_ = true;
+        Log(LogLevel::Info,
+            L"Dolby Vision interpolation active color_source=decoder_libplacebo_rgb "
+            L"tensor_domain=sdr_encoded_or_bt2020_pq");
+    }
+    int submittedSamples = 0;
     for (int sample = 1; sample < multiplier; ++sample) {
         if (!executor->CanSubmit()) break;
         const std::optional<std::size_t> generatedSlot = AcquireGeneratedSlot();
         if (!generatedSlot) break;
         const float interpolationT = static_cast<float>(sample) /
             static_cast<float>(multiplier);
-        TensorPreprocessResult preprocess = tensorPreprocessor_.SubmitPair(
-            first, frame, interpolationT, frameGraph_.CurrentEpoch(), orderingDependency);
+        TensorPreprocessResult preprocess;
+        if (libplaceboDolbyVisionInput) {
+            preprocess = tensorPreprocessor_.SubmitScRgbPair(
+                tensorPreviousDoviTarget_.Get(), currentDoviTarget.Get(),
+                interpolationT, frameGraph_.CurrentEpoch(), orderingDependency);
+        } else if (libplaceboPixelDolbyVisionInput) {
+            preprocess = tensorPreprocessor_.SubmitPixelPair(
+                first, frame, interpolationT, frameGraph_.CurrentEpoch(), orderingDependency);
+        } else {
+            preprocess = tensorPreprocessor_.SubmitPair(
+                first, frame, interpolationT, interpolationHlgPeakNits,
+                frameGraph_.CurrentEpoch(), orderingDependency);
+        }
         if (!preprocess.accepted) {
             if (preprocess.reason != L"tensor_preprocess_gpu_busy") {
                 Log(LogLevel::Warning,
@@ -1613,10 +3090,12 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
             break;
         }
         orderingDependency = preprocess.tensor.ready;
-        sourceComputeCompletions_[{first.timelineSerial, first.serial}] =
-            preprocess.tensor.ready;
-        sourceComputeCompletions_[{frame.timelineSerial, frame.serial}] =
-            preprocess.tensor.ready;
+        if (!libplaceboDolbyVisionInput && !libplaceboPixelDolbyVisionInput) {
+            sourceComputeCompletions_[{first.timelineSerial, first.serial}] =
+                preprocess.tensor.ready;
+            sourceComputeCompletions_[{frame.timelineSerial, frame.serial}] =
+                preprocess.tensor.ready;
+        }
         if (!EnsureGeneratedOutput(*generatedSlot, preprocess.shape)) break;
 
         GeneratedFrameSlot& output = generatedSlots_[*generatedSlot];
@@ -1647,6 +3126,22 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
         output.completionStatusConsumed = false;
         try {
             output.overlayFrame = std::make_unique<NativeVideoFrame>(frame);
+            // Subtitles are presentation overlays, never interpolation input.
+            // Hold the left endpoint's subtitle snapshot across every generated
+            // frame, then switch once at the next original frame. Using the
+            // right endpoint here made subtitle state alternate at cue and ASS
+            // animation boundaries, which was visible as a one-frame flash.
+            output.overlayFrame->subtitleText = first.subtitleText;
+            output.overlayFrame->subtitleBitmaps = first.subtitleBitmaps;
+            output.overlayFrame->subtitlesPrepared = first.subtitlesPrepared;
+            if (!interpolatedSubtitleCompositionLogged_ &&
+                (!first.subtitleText.empty() || !first.subtitleBitmaps.empty() ||
+                 !frame.subtitleText.empty() || !frame.subtitleBitmaps.empty())) {
+                interpolatedSubtitleCompositionLogged_ = true;
+                Log(LogLevel::Info,
+                    L"interpolated subtitle composition active stage=post_ml "
+                    L"snapshot=left_endpoint");
+            }
         } catch (...) {
             output.overlayFrame.reset();
         }
@@ -1654,20 +3149,38 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
             frame.enhancementDovi && frame.enhancementDovi->valid
                 ? frame.enhancementDovi.get()
                 : (frame.dovi && frame.dovi->valid ? frame.dovi.get() : nullptr);
-        const float interpolationTargetPeak = static_cast<float>(
-            videoSettings_.displayPeakBrightnessNits > 0
-                ? videoSettings_.displayPeakBrightnessNits
-                : std::max(100, displayCapabilities_.reportedPeakBrightnessNits));
-        output.doviTrim = SelectDoviDisplayTrim(generatedDovi, interpolationTargetPeak);
+        const float interpolationTargetPeak =
+            TargetPeakNits(videoSettings_, displayCapabilities_);
+        output.inputTransfer = libplaceboDolbyVisionInput
+            ? 4u
+            : (frame.color.transfer == VideoTransferCharacteristic::Pq ||
+               frame.color.transfer == VideoTransferCharacteristic::Hlg ? 2u : 0u);
+        output.doviTrim = libplaceboDolbyVisionInput
+            ? DoviDisplayTrim{}
+            : SelectDoviDisplayTrim(generatedDovi, interpolationTargetPeak);
         output.doviSourcePeakNits = generatedDovi && generatedDovi->sourceMaxNits > 0.0f
             ? generatedDovi->sourceMaxNits : SourcePeakNits(frame.color);
         if (presentedOriginalTimeline_ == first.timelineSerial &&
             presentedOriginalPts_ == first.pts) {
+            if (output.overlayFrame) {
+                try {
+                    output.overlayFrame->subtitleText = presentedOriginalSubtitleText_;
+                    output.overlayFrame->subtitleBitmaps =
+                        presentedOriginalSubtitleBitmaps_;
+                    output.overlayFrame->subtitlesPrepared =
+                        presentedOriginalSubtitlesPrepared_;
+                } catch (...) {
+                    output.overlayFrame->subtitleText.clear();
+                    output.overlayFrame->subtitleBitmaps.clear();
+                    output.overlayFrame->subtitlesPrepared = false;
+                }
+            }
             output.anchored = true;
             output.dueAt = presentedOriginalAt_ + (output.targetPts - output.leftPts);
         }
         output.pending = true;
         pendingGeneratedSlots_.push_back(*generatedSlot);
+        ++submittedSamples;
         {
             std::scoped_lock lock(statsMutex_);
             ++renderStats_.generatedSubmitted;
@@ -1688,8 +3201,17 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
                 L"frame graph preprocess active shape=" +
                     std::to_wstring(preprocess.shape.width) + L"x" +
                     std::to_wstring(preprocess.shape.height) +
-                    L" layout=fp16_nchw_7 domain=bt2020_pq variable_t=true");
+                    L" layout=fp16_nchw_7 domain=sdr_encoded_or_bt2020_pq variable_t=true");
         }
+    }
+    const int missedSubmissions = (multiplier - 1) - submittedSamples;
+    for (int missed = 0; missed < missedSubmissions; ++missed) {
+        RecordGeneratedDeadline(false);
+    }
+    if (libplaceboDolbyVisionInput) {
+        tensorPreviousDoviTarget_ = std::move(currentDoviTarget);
+    } else {
+        tensorPreviousDoviTarget_.Reset();
     }
     try {
         tensorPreviousFrame_ = std::make_unique<NativeVideoFrame>(frame);
@@ -1704,14 +3226,53 @@ void D3D12VideoRenderer::AnchorGeneratedFrames(
     presentedOriginalPts_ = original.pts;
     presentedOriginalTimeline_ = original.timelineSerial;
     presentedOriginalAt_ = presentedAt;
+    try {
+        presentedOriginalSubtitleText_ = original.subtitleText;
+        presentedOriginalSubtitleBitmaps_ = original.subtitleBitmaps;
+        presentedOriginalSubtitlesPrepared_ = original.subtitlesPrepared;
+    } catch (...) {
+        presentedOriginalSubtitleText_.clear();
+        presentedOriginalSubtitleBitmaps_.clear();
+        presentedOriginalSubtitlesPrepared_ = false;
+    }
+
+    const auto subtitleFingerprint = [](const NativeVideoFrame& frame) {
+        uint64_t fingerprint = static_cast<uint64_t>(frame.subtitleBitmaps.size());
+        for (const NativeSubtitleBitmap& bitmap : frame.subtitleBitmaps) {
+            fingerprint ^= bitmap.serial + 0x9e3779b97f4a7c15ull +
+                (fingerprint << 6) + (fingerprint >> 2);
+        }
+        return fingerprint;
+    };
     for (const std::size_t slotIndex : pendingGeneratedSlots_) {
         GeneratedFrameSlot& slot = generatedSlots_[slotIndex];
-        if (!slot.pending || slot.anchored ||
+        if (!slot.pending ||
             slot.timelineSerial != original.timelineSerial || slot.leftPts != original.pts) {
             continue;
         }
-        slot.anchored = true;
-        slot.dueAt = presentedAt + (slot.targetPts - slot.leftPts);
+        if (slot.overlayFrame) {
+            const bool changed = slot.overlayFrame->subtitleText != original.subtitleText ||
+                subtitleFingerprint(*slot.overlayFrame) != subtitleFingerprint(original);
+            try {
+                slot.overlayFrame->subtitleText = original.subtitleText;
+                slot.overlayFrame->subtitleBitmaps = original.subtitleBitmaps;
+                slot.overlayFrame->subtitlesPrepared = original.subtitlesPrepared;
+            } catch (...) {
+                slot.overlayFrame->subtitleText.clear();
+                slot.overlayFrame->subtitleBitmaps.clear();
+                slot.overlayFrame->subtitlesPrepared = false;
+            }
+            if (changed && !interpolatedSubtitlePresentationSyncLogged_) {
+                interpolatedSubtitlePresentationSyncLogged_ = true;
+                Log(LogLevel::Info,
+                    L"interpolated subtitle snapshot synchronized stage=presentation "
+                    L"source=displayed_left_endpoint");
+            }
+        }
+        if (!slot.anchored) {
+            slot.anchored = true;
+            slot.dueAt = presentedAt + (slot.targetPts - slot.leftPts);
+        }
     }
 }
 
@@ -1733,6 +3294,7 @@ std::optional<std::size_t> D3D12VideoRenderer::AcquireGeneratedSlot() {
         slot.overlayFrame.reset();
         slot.anchored = false;
         slot.completionStatusConsumed = false;
+        slot.inputTransfer = 0;
         return index;
     }
     return std::nullopt;
@@ -1819,26 +3381,13 @@ void D3D12VideoRenderer::ProcessGeneratedBefore(const NativeVideoFrame& nextOrig
             continue;
         }
         if (slot.targetPts >= nextOriginal.pts) return;
-        const bool ready = slot.ready.IsValid() &&
-            slot.ready.fence->GetCompletedValue() >= slot.ready.value;
-        if (ready) {
-            IMlFrameInterpolationExecutor* executor =
-                mlExecutor_.load(std::memory_order_acquire);
-            const std::wstring error = executor
-                ? executor->TakeCompletionError(slot.ready.value)
-                : L"ml_executor_unavailable";
-            slot.completionStatusConsumed = true;
-            if (error.empty()) {
-                RecordGeneratedDeadline(RenderGeneratedFrame(slotIndex));
-            }
-            else {
-                Log(LogLevel::Warning, L"ML generated frame dropped reason=" + error);
-                std::scoped_lock lock(statsMutex_);
-                ++renderStats_.inferenceFailures;
-                publishedStats_ = renderStats_;
-            }
-        } else {
-            RecordGeneratedDeadline(false);
+        // The next original frame has reached the presentation queue, so every
+        // earlier intermediate frame is already outside its cadence slot. Do
+        // not present ready-but-late frames in a burst immediately before the
+        // original; that inflated the measured multiplier while looking more
+        // juddery than a lower, evenly paced cadence.
+        RecordGeneratedDeadline(false);
+        {
             std::scoped_lock lock(statsMutex_);
             ++renderStats_.generatedDroppedNotReady;
             publishedStats_ = renderStats_;
@@ -1849,31 +3398,63 @@ void D3D12VideoRenderer::ProcessGeneratedBefore(const NativeVideoFrame& nextOrig
 }
 
 void D3D12VideoRenderer::RecordGeneratedDeadline(const bool met) {
+    constexpr auto kStartupGrace = std::chrono::milliseconds{750};
+    constexpr auto kCalibrationLimit = std::chrono::milliseconds{4500};
+    constexpr int kDeadlineWindowSamples = 24;
+    constexpr int kDeadlineWindowMissLimit = 3;
+    constexpr int kStableWindowsRequired = 3;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (adaptiveCalibrationStartedAt_ == std::chrono::steady_clock::time_point{}) {
+        adaptiveCalibrationStartedAt_ = now;
+        adaptiveDeadlineSamples_ = 0;
+        adaptiveDeadlineHits_ = 0;
+        return;
+    }
+    if (adaptiveCadenceLocked_) return;
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - adaptiveCalibrationStartedAt_);
+    if (elapsed < kStartupGrace) {
+        // Resource allocation and the first DirectML dispatch are deliberately
+        // excluded. Counting that one-off warm-up made fast 1080p content fall
+        // from x5 to x2 before steady-state throughput could be observed.
+        adaptiveDeadlineSamples_ = 0;
+        adaptiveDeadlineHits_ = 0;
+        return;
+    }
+
     ++adaptiveDeadlineSamples_;
     if (met) ++adaptiveDeadlineHits_;
-    if (adaptiveDeadlineSamples_ < 16) return;
+    if (adaptiveDeadlineSamples_ < kDeadlineWindowSamples &&
+        elapsed < kCalibrationLimit) {
+        return;
+    }
 
     const int missed = adaptiveDeadlineSamples_ - adaptiveDeadlineHits_;
-    if (missed >= 4 && adaptiveMultiplierCap_ > 2) {
+    if (missed >= kDeadlineWindowMissLimit && adaptiveMultiplierCap_ > 2) {
         --adaptiveMultiplierCap_;
-        adaptiveRecoveryWindows_ = 0;
+        adaptiveStableWindows_ = 0;
         Log(LogLevel::Info,
             L"adaptive interpolation cadence reduced cap=x" +
                 std::to_wstring(adaptiveMultiplierCap_) +
-                L" deadline_misses=" + std::to_wstring(missed) + L"/16");
-    } else if (missed == 0 && adaptiveMultiplierCap_ < 5) {
-        if (++adaptiveRecoveryWindows_ >= 32) {
-            ++adaptiveMultiplierCap_;
-            adaptiveRecoveryWindows_ = 0;
-            Log(LogLevel::Info,
-                L"adaptive interpolation cadence increased cap=x" +
-                    std::to_wstring(adaptiveMultiplierCap_));
-        }
+                L" deadline_misses=" + std::to_wstring(missed) + L"/" +
+                std::to_wstring(adaptiveDeadlineSamples_));
+    } else if (missed <= 1) {
+        ++adaptiveStableWindows_;
     } else {
-        adaptiveRecoveryWindows_ = 0;
+        adaptiveStableWindows_ = 0;
     }
     adaptiveDeadlineSamples_ = 0;
     adaptiveDeadlineHits_ = 0;
+
+    if (adaptiveStableWindows_ >= kStableWindowsRequired ||
+        elapsed >= kCalibrationLimit) {
+        adaptiveCadenceLocked_ = true;
+        Log(LogLevel::Info,
+            L"adaptive interpolation cadence settled cap=x" +
+                std::to_wstring(adaptiveMultiplierCap_) +
+                L" elapsed_ms=" + std::to_wstring(elapsed.count()));
+    }
 }
 
 void D3D12VideoRenderer::RetireGeneratedSlot(const std::size_t slotIndex,
@@ -1898,6 +3479,7 @@ bool D3D12VideoRenderer::RenderGeneratedFrame(const std::size_t slotIndex) {
     }
     GeneratedFrameSlot& slot = generatedSlots_[slotIndex];
     if (!slot.output || !slot.shape.IsValid()) return false;
+    WaitForFrameLatencyObject();
     const UINT backBufferIndex = swapChain_->GetCurrentBackBufferIndex();
     if (!WaitForBackBuffer(backBufferIndex)) return false;
     inFlightFrames_[backBufferIndex].reset();
@@ -1961,15 +3543,28 @@ bool D3D12VideoRenderer::RenderGeneratedFrame(const std::size_t slotIndex) {
     TensorCompositionConstants constants{};
     constants.tensorWidth = slot.shape.width;
     constants.tensorHeight = slot.shape.height;
-    const bool hdrOutput = videoSettings_.hdrOutput != HdrOutputMode::ForceSdr &&
-        (displayCapabilities_.hdrEnabled ||
-         videoSettings_.hdrOutput == HdrOutputMode::ForceHdr);
+    const NativeVideoFrame* generatedSource = slot.overlayFrame.get();
+    const bool hdrOutput = generatedSource && SetHdrOutputState(
+        *generatedSource, HdrOutputEnabled(*generatedSource, videoSettings_,
+                                           displayCapabilities_, hdr10ColorSpaceSupported_));
+    if (generatedSource) {
+        // SetHdrOutputState above also switches the RGB10 presentation color space.
+    } else {
+        swapChainHdr_ = false;
+    }
     constants.hdrOutput = hdrOutput ? 1.0f : 0.0f;
-    constants.sourcePeakNits = SourcePeakNits(mediaColor_);
-    constants.targetPeakNits = static_cast<float>(
-        videoSettings_.displayPeakBrightnessNits > 0
-            ? videoSettings_.displayPeakBrightnessNits
-            : std::max(100, displayCapabilities_.reportedPeakBrightnessNits));
+    constants.sourcePeakNits = slot.doviSourcePeakNits > 0.0f
+        ? slot.doviSourcePeakNits : SourcePeakNits(mediaColor_);
+    constants.targetPeakNits = TargetPeakNits(videoSettings_, displayCapabilities_);
+    constants.transfer = slot.inputTransfer != 0
+        ? slot.inputTransfer
+        : (generatedSource ? TransferMode(generatedSource->color.transfer)
+                           : TransferMode(mediaColor_.transfer));
+    constants.primaries = generatedSource &&
+            generatedSource->color.primaries == VideoColorPrimaries::Bt2020
+        ? 2u : 0u;
+    // Generated frames must use the same per-frame DV trim as originals. The
+    // trim is creative metadata and therefore remains active for HDR output.
     constants.trimA[0] = slot.doviTrim.enabled ? 1.0f : 0.0f;
     constants.trimA[1] = slot.doviTrim.slope;
     constants.trimA[2] = slot.doviTrim.offset;
@@ -1981,7 +3576,19 @@ bool D3D12VideoRenderer::RenderGeneratedFrame(const std::size_t slotIndex) {
     constants.trimC[0] = slot.doviTrim.midContrast;
     constants.trimC[1] = slot.doviTrim.clip;
     constants.trimC[2] = slot.doviSourcePeakNits;
-    commandList_->SetGraphicsRoot32BitConstants(1, 20, &constants, 0);
+    if (generatedSource) {
+        constants.padding = InitialHdrProcessingFlags(
+            *generatedSource, videoSettings_, hdrOutput);
+        const uint64_t hdrToneCurveFingerprint = FillHdrToneCurveConstants(
+            constants.hdrToneCurve, constants.padding, *generatedSource,
+            videoSettings_, hdrOutput);
+        if (hdrToneCurveFingerprint != 0 &&
+            hdrToneCurveFingerprint != loggedHdrToneCurveFingerprint_) {
+            loggedHdrToneCurveFingerprint_ = hdrToneCurveFingerprint;
+            Log(LogLevel::Info, L"HDR custom tone curve active pipeline=interpolated");
+        }
+    }
+    commandList_->SetGraphicsRoot32BitConstants(1, 40, &constants, 0);
     commandList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     commandList_->DrawInstanced(3, 1, 0, 0);
     DrawOverlays(slot.overlayFrame.get(), viewport, backBufferIndex);
@@ -2038,14 +3645,24 @@ bool D3D12VideoRenderer::DrawOverlays(const NativeVideoFrame* frame,
         float displayHeight = 0.0f;
         float opacity = 1.0f;
         uint64_t serial = 0;
+        std::size_t overlaySlotIndex = 0;
         bool alphaFromRgb = false;
         bool subtitle = false;
     };
     std::vector<DrawItem> items;
     items.reserve(kMaxOverlayTextures);
+    std::size_t activeUiOverlayCount = 0;
+    for (const OverlaySlot& slot : activeOverlaySlots_) {
+        if (slot.bitmap && slot.bitmap->bgraPremultiplied &&
+            slot.bitmap->width > 0 && slot.bitmap->height > 0) {
+            ++activeUiOverlayCount;
+        }
+    }
+    const std::size_t subtitleItemLimit = kMaxOverlayTextures -
+        std::min<std::size_t>(activeUiOverlayCount, kMaxOverlayTextures);
     if (frame) {
         for (const NativeSubtitleBitmap& bitmap : frame->subtitleBitmaps) {
-            if (!bitmap.HasPixels() || items.size() >= kMaxOverlayTextures) continue;
+            if (!bitmap.HasPixels() || items.size() >= subtitleItemLimit) continue;
             const int canvasWidth = std::max(1, bitmap.canvasWidth > 0
                                                     ? bitmap.canvasWidth
                                                     : frame->width);
@@ -2097,9 +3714,13 @@ bool D3D12VideoRenderer::DrawOverlays(const NativeVideoFrame* frame,
         item.displayHeight = static_cast<float>(hasPresentation
                                                     ? slot.presentation.height
                                                     : slot.bitmap->height);
-        item.opacity = std::clamp(slot.bitmap->opacity *
-                                      (hasPresentation ? slot.presentation.opacity : 1.0f),
+        // D3D11 treats the live presentation opacity as the current animation
+        // value. Multiplying it by the bitmap opacity applies the fade twice.
+        item.opacity = std::clamp(hasPresentation
+                                      ? slot.presentation.opacity
+                                      : slot.bitmap->opacity,
                                   0.0f, 1.0f);
+        item.overlaySlotIndex = slotIndex;
         item.alphaFromRgb = slot.bitmap->alphaFromRgb;
         items.push_back(std::move(item));
     }
@@ -2114,15 +3735,23 @@ bool D3D12VideoRenderer::DrawOverlays(const NativeVideoFrame* frame,
     commandList_->RSSetScissorRects(1, &scissor);
 
     bool drewSubtitle = false;
+    UINT subtitleItemIndex = 0;
     for (UINT itemIndex = 0; itemIndex < static_cast<UINT>(items.size()); ++itemIndex) {
         const DrawItem& item = items[itemIndex];
-        OverlayTextureCache& cache = overlayTextureCaches_[backBufferIndex][itemIndex];
+        OverlayTextureCache& cache = item.subtitle
+            ? subtitleTextureCaches_[subtitleItemIndex++]
+            : overlayTextureCaches_[backBufferIndex][item.overlaySlotIndex];
         const void* sourceIdentity = item.pixels.get();
+        const bool identityChanged = cache.sourceIdentity != sourceIdentity ||
+            cache.sourceSerial != item.serial;
+        // Subtitle textures are shared by every swap-chain back buffer. When
+        // the PGS/ASS content changes, allocate a new immutable texture instead
+        // of mutating one that may still be sampled by the other back buffer.
         const bool dimensionsChanged = !cache.texture ||
             cache.width != static_cast<UINT>(item.width) ||
-            cache.height != static_cast<UINT>(item.height);
-        const bool contentChanged = dimensionsChanged ||
-            cache.sourceIdentity != sourceIdentity || cache.sourceSerial != item.serial;
+            cache.height != static_cast<UINT>(item.height) ||
+            (item.subtitle && identityChanged);
+        const bool contentChanged = dimensionsChanged || identityChanged;
         D3D12_RESOURCE_DESC textureDesc{};
         textureDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         textureDesc.Width = static_cast<UINT64>(item.width);
@@ -2134,7 +3763,21 @@ bool D3D12VideoRenderer::DrawOverlays(const NativeVideoFrame* frame,
         D3D12_HEAP_PROPERTIES defaultHeap{};
         defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
         if (dimensionsChanged) {
-            cache.texture.Reset();
+            if (item.subtitle) {
+                if (cache.texture) {
+                    transients_[backBufferIndex].push_back(std::move(cache.texture));
+                }
+                if (cache.upload && cache.mappedUpload) {
+                    cache.upload->Unmap(0, nullptr);
+                }
+                cache.mappedUpload = nullptr;
+                if (cache.upload) {
+                    transients_[backBufferIndex].push_back(std::move(cache.upload));
+                }
+                cache.uploadCapacity = 0;
+            } else {
+                cache.texture.Reset();
+            }
             cache.sourceIdentity = nullptr;
             cache.sourceSerial = 0;
             if (FAILED(device_->CreateCommittedResource(
@@ -2250,6 +3893,11 @@ bool D3D12VideoRenderer::DrawOverlays(const NativeVideoFrame* frame,
         drewSubtitle = drewSubtitle || item.subtitle;
     }
     if (drewSubtitle) {
+        if (!sharedSubtitleTextureLogged_) {
+            sharedSubtitleTextureLogged_ = true;
+            Log(LogLevel::Info,
+                L"subtitle texture cache active mode=shared_immutable_across_backbuffers");
+        }
         std::scoped_lock lock(statsMutex_);
         ++renderStats_.subtitleFrames;
     }
@@ -2260,8 +3908,157 @@ bool D3D12VideoRenderer::RenderLastFrame() {
     return currentFrame_ && RenderFrame(*currentFrame_);
 }
 
+bool D3D12VideoRenderer::SetHdrOutputState(const NativeVideoFrame& frame,
+                                           const bool enabled) {
+    bool active = enabled && hdr10ColorSpaceSupported_;
+    const DXGI_COLOR_SPACE_TYPE desiredColorSpace = active
+        ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+        : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    if (swapChain_ && (swapChainHdr_ != active || loggedHdrOutputState_ < 0) &&
+        FAILED(swapChain_->SetColorSpace1(desiredColorSpace))) {
+        if (active) {
+            hdr10ColorSpaceSupported_ = false;
+            active = false;
+            swapChain_->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+        }
+    }
+    swapChainHdr_ = active;
+
+    nvidiaHdrOutput_.SetLogHandler(
+        [this](const std::wstring& message) { Log(LogLevel::Info, message); });
+    bool hdr10PlusDisplayPath = false;
+    if (active) {
+        hdr10PlusDisplayPath = videoSettings_.displayMetadataPassthrough &&
+            frame.hdr10PlusPayload && !frame.hdr10PlusPayload->empty() &&
+            nvidiaHdrOutput_.ApplyHdr10PlusGaming(host_.load(), frame.color);
+        if (!hdr10PlusDisplayPath) {
+            nvidiaHdrOutput_.ApplyHdr10(host_.load(), frame.color);
+        }
+    } else {
+        nvidiaHdrOutput_.Restore();
+    }
+    if (frame.hdr10Plus && frame.hdr10Plus->valid &&
+        loggedHdr10PlusFingerprint_ == 0) {
+        loggedHdr10PlusFingerprint_ = frame.hdr10Plus->fingerprint;
+        Log(LogLevel::Info,
+            L"HDR10+ dynamic metadata frame fingerprint=" +
+                std::to_wstring(frame.hdr10Plus->fingerprint) +
+                L" path=" +
+                std::wstring(hdr10PlusDisplayPath
+                                 ? L"nvapi_hdr10plus_gaming"
+                                 : L"shader_st2094_40"));
+    }
+
+    // Dolby Vision is already display-mapped by libplacebo/RPU processing, so
+    // retain the old D3D11 rule of signaling PQ/BT.2020 without stacking static
+    // HDR10 mastering metadata. Ordinary HDR10 keeps its stream metadata.
+    Microsoft::WRL::ComPtr<IDXGISwapChain4> swapChain4;
+    if (swapChain_ && SUCCEEDED(swapChain_.As(&swapChain4)) && swapChain4) {
+        const auto* dovi = FrameDolbyVisionMetadata(frame);
+        if (!active || dovi) {
+            swapChain4->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_NONE, 0, nullptr);
+        } else {
+            const auto chromaticity = [](const double value) {
+                return static_cast<UINT16>(
+                    std::clamp(value * 50000.0, 0.0, 65535.0) + 0.5);
+            };
+            const auto luminance = [](const double value) {
+                return static_cast<UINT>(
+                    std::clamp(value * 10000.0, 0.0, 4294967295.0) + 0.5);
+            };
+            DXGI_HDR_METADATA_HDR10 metadata{};
+            const auto& mastering = frame.color.masteringDisplay;
+            const auto setPrimary = [&chromaticity](UINT16 (&target)[2],
+                                                    const auto& point) {
+                target[0] = chromaticity(point.x);
+                target[1] = chromaticity(point.y);
+            };
+            if (mastering.hasPrimaries) {
+                setPrimary(metadata.RedPrimary, mastering.red);
+                setPrimary(metadata.GreenPrimary, mastering.green);
+                setPrimary(metadata.BluePrimary, mastering.blue);
+                setPrimary(metadata.WhitePoint, mastering.whitePoint);
+            } else {
+                metadata.RedPrimary[0] = chromaticity(0.708);
+                metadata.RedPrimary[1] = chromaticity(0.292);
+                metadata.GreenPrimary[0] = chromaticity(0.170);
+                metadata.GreenPrimary[1] = chromaticity(0.797);
+                metadata.BluePrimary[0] = chromaticity(0.131);
+                metadata.BluePrimary[1] = chromaticity(0.046);
+                metadata.WhitePoint[0] = chromaticity(0.3127);
+                metadata.WhitePoint[1] = chromaticity(0.3290);
+            }
+            const bool appSideDisplayMapping =
+                !videoSettings_.displayMetadataPassthrough;
+            const double targetPeakNits =
+                TargetPeakNits(videoSettings_, displayCapabilities_);
+            const double sourceMasteringPeak =
+                mastering.hasLuminance ? mastering.maxLuminanceNits : 1000.0;
+            const double signaledPeak = appSideDisplayMapping
+                ? std::clamp(sourceMasteringPeak, 100.0, targetPeakNits)
+                : sourceMasteringPeak;
+            metadata.MaxMasteringLuminance = luminance(signaledPeak);
+            metadata.MinMasteringLuminance = luminance(
+                mastering.hasLuminance ? mastering.minLuminanceNits : 0.005);
+            if (frame.color.contentLight.hasValues) {
+                metadata.MaxContentLightLevel = static_cast<UINT16>(std::clamp(
+                    appSideDisplayMapping
+                        ? std::min<double>(
+                              frame.color.contentLight.maxContentLightLevelNits,
+                              targetPeakNits)
+                        : frame.color.contentLight.maxContentLightLevelNits,
+                    0.0, 65535.0));
+                metadata.MaxFrameAverageLightLevel = static_cast<UINT16>(std::clamp(
+                    appSideDisplayMapping
+                        ? std::min<double>(
+                              frame.color.contentLight.maxFrameAverageLightLevelNits,
+                              targetPeakNits)
+                        : frame.color.contentLight.maxFrameAverageLightLevelNits,
+                    0.0, 65535.0));
+            }
+            swapChain4->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_HDR10,
+                                       sizeof(metadata), &metadata);
+        }
+    }
+
+    const int state = active ? 1 : 0;
+    if (loggedHdrOutputState_ == state) {
+        return active;
+    }
+    loggedHdrOutputState_ = state;
+
+    const auto* dovi = FrameDolbyVisionMetadata(frame);
+    std::wstring source;
+    if (dovi) {
+        source = L"dolby_vision_p" + std::to_wstring(dovi->profile);
+    } else if (frame.color.transfer == VideoTransferCharacteristic::Pq) {
+        source = L"pq";
+    } else if (frame.color.transfer == VideoTransferCharacteristic::Hlg) {
+        source = L"hlg";
+    } else {
+        source = L"sdr";
+    }
+
+    Log(LogLevel::Info,
+        L"HDR composition mode=" +
+            std::wstring(active ? L"active_hdr10_pq" : L"sdr_tonemap") +
+            L" source=" + source +
+            L" ui_hdr=" +
+            std::wstring(videoSettings_.dolbyVisionHdrOutput ? L"on" : L"off") +
+            L" advanced_color=" +
+            std::wstring(displayCapabilities_.hdrEnabled ? L"on" : L"off") +
+            L" hdr10_space=" + std::wstring(hdr10ColorSpaceSupported_ ? L"on" : L"off") +
+            L" source_peak_nits=" +
+            std::to_wstring(static_cast<int>(FrameSourcePeakNits(frame) + 0.5f)) +
+            L" target_peak_nits=" +
+            std::to_wstring(static_cast<int>(
+                TargetPeakNits(videoSettings_, displayCapabilities_) + 0.5f)));
+    return active;
+}
+
 void D3D12VideoRenderer::ResetInterpolationState() {
     tensorPreviousFrame_.reset();
+    tensorPreviousDoviTarget_.Reset();
     sourceComputeCompletions_.clear();
     sourceGraphicsCompletions_.clear();
     for (const std::size_t slotIndex : pendingGeneratedSlots_) {
@@ -2271,10 +4068,14 @@ void D3D12VideoRenderer::ResetInterpolationState() {
     tensorPreprocessorLogged_ = false;
     directMlSubmitLogged_ = false;
     generatedPresentLogged_ = false;
-    adaptiveMultiplierCap_ = 2;
+    dolbyVisionInterpolationColorPathLogged_ = false;
+    hlgInterpolationColorPathLogged_ = false;
+    adaptiveMultiplierCap_ = kMaximumInterpolationMultiplier;
     adaptiveDeadlineSamples_ = 0;
     adaptiveDeadlineHits_ = 0;
-    adaptiveRecoveryWindows_ = 0;
+    adaptiveStableWindows_ = 0;
+    adaptiveCalibrationStartedAt_ = {};
+    adaptiveCadenceLocked_ = false;
     frameGraph_.AdvanceEpoch();
     {
         std::scoped_lock lock(statsMutex_);
@@ -2285,6 +4086,8 @@ void D3D12VideoRenderer::ResetInterpolationState() {
 
 void D3D12VideoRenderer::ClearFrame() {
     currentFrame_.reset();
+    swapChainHdr_ = false;
+    loggedHdrOutputState_ = -1;
     presentedOriginalTimeline_ = 0;
     presentedOriginalPts_ = {};
     ResetInterpolationState();
@@ -2324,6 +4127,7 @@ bool D3D12VideoRenderer::WaitForBackBuffer(const UINT index) {
 }
 
 void D3D12VideoRenderer::ReleaseGpu() {
+    nvidiaHdrOutput_.Restore();
     if (queue_ && fence_ && fenceEvent_) {
         const uint64_t value = nextFenceValue_++;
         if (SUCCEEDED(queue_->Signal(fence_.Get(), value)) &&
@@ -2344,7 +4148,13 @@ void D3D12VideoRenderer::ReleaseGpu() {
     windowsMlExecutor_.Reset();
     directMlExecutor_.Reset();
     frameGraph_.WaitForIdle(2000);
+    if (libplaceboBridge_) {
+        libplaceboBridge_->Reset();
+        libplaceboBridge_.reset();
+    }
+    libplaceboRenderFailureLogged_ = false;
     tensorPreviousFrame_.reset();
+    tensorPreviousDoviTarget_.Reset();
     sourceComputeCompletions_.clear();
     sourceGraphicsCompletions_.clear();
     tensorPreprocessor_.Reset();
@@ -2356,7 +4166,16 @@ void D3D12VideoRenderer::ReleaseGpu() {
             cache = {};
         }
     }
+    for (OverlayTextureCache& cache : subtitleTextureCaches_) {
+        if (cache.upload && cache.mappedUpload) cache.upload->Unmap(0, nullptr);
+        cache = {};
+    }
+    for (PixelFrameUploadCache& cache : pixelFrameUploadCaches_) {
+        if (cache.upload && cache.mappedUpload) cache.upload->Unmap(0, nullptr);
+        cache = {};
+    }
     for (auto& frame : inFlightFrames_) frame.reset();
+    for (auto& target : libplaceboTargets_) target.Reset();
     for (auto& buffer : backBuffers_) buffer.Reset();
     for (UINT index = 0; index < kBufferCount; ++index) {
         if (doviConstantBuffers_[index] && doviConstantMappings_[index]) {
@@ -2381,6 +4200,12 @@ void D3D12VideoRenderer::ReleaseGpu() {
     tensorSrvHeap_.Reset();
     overlaySrvHeap_.Reset();
     rtvHeap_.Reset();
+    if (frameLatencyWaitable_) {
+        CloseHandle(frameLatencyWaitable_);
+        frameLatencyWaitable_ = nullptr;
+    }
+    swapChainWaitable_ = false;
+    framePacingLogged_ = false;
     swapChain_.Reset();
     frameGraph_.Reset();
     copyQueue_.Reset();
