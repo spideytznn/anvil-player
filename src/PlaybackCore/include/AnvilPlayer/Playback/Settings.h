@@ -41,7 +41,7 @@ struct VideoSettings {
     // while this option is enabled.
     bool frameInterpolationEnabled = false;
     HardwareDecodeMode hardwareDecode = HardwareDecodeMode::Auto;
-    std::wstring renderer = L"D3D11";
+    std::wstring renderer = L"D3D12";
     int selectedTrackIndex = kVideoTrackAuto;
     HdrOutputMode hdrOutput = HdrOutputMode::Auto;
     ToneMappingMode toneMapping = ToneMappingMode::Balanced;
@@ -55,7 +55,7 @@ struct VideoSettings {
     // The default remains the native FFmpeg/libplacebo RPU path.
     bool dolbyVisionSystemPipelineExperimental = false;
     // Prefer the Windows/native Dolby Vision presentation path when the
-    // display and installed system components expose it. The FFmpeg/D3D11
+    // display and installed system components expose it. The FFmpeg/D3D12
     // renderer must fall back to software DV reshape when native signaling is
     // unavailable; it must never label HDR10 output as native Dolby Vision.
     bool dolbyVisionHdrOutput = false;

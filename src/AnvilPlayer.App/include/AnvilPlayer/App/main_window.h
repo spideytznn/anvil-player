@@ -1,7 +1,7 @@
 #pragma once
 
 #include "AnvilPlayer/App/app_messages.h"
-#include "AnvilPlayer/App/d3d11_video_renderer.h"
+#include "AnvilPlayer/App/d3d12_video_renderer.h"
 #include "AnvilPlayer/App/display_refresh_rate.h"
 #include "AnvilPlayer/App/embedded_ffplay.h"
 #include "AnvilPlayer/App/external_video_decoder.h"
@@ -37,9 +37,9 @@
 
 namespace anvil::app {
 
-// The native Win32 main window. Owns the PlayerController, the three playback
-// backends (native FFmpeg/D3D11, embedded ffplay, raw-frame bridge), the
-// D3D11 video host window, layout state, and the GDI+ paint pipeline.
+// The native Win32 main window. Owns the PlayerController, the D3D12 frame
+// graph playback backend, compatibility backends, the video host window,
+// layout state, and the GDI+ chrome paint pipeline.
 // Implementation is split across main_window.cpp (lifecycle/messages/runtime/
 // transport/chrome), main_window_layout.cpp (layout + video host sizing),
 // main_window_input.cpp (mouse/key/drag handlers), and main_window_paint.cpp
@@ -308,7 +308,7 @@ private:
     void FinishRuntimeStopVisuals(bool clearVideoFrame);
     void CompleteAsyncRuntimeStop();
     void PollPlaybackSupervisorCompletion();
-    void CompleteRendererInitialization(D3D11RendererState state);
+    void CompleteRendererInitialization(VideoRendererState state);
     void HandleRendererDeviceLost(HRESULT reason);
     bool RecreateRendererAfterDeviceLoss();
     void BeginClose();
@@ -463,7 +463,7 @@ private:
     ExternalVideoDecoder videoDecoder_;
     WasapiAudioPlayer audioPlayer_;
     std::optional<FfmpegVideoDecoder> nativeVideoDecoder_;
-    std::optional<D3D11VideoRenderer> d3dRenderer_;
+    std::optional<D3D12VideoRenderer> d3dRenderer_;
     SystemDolbyVisionPlayer systemDolbyVisionPlayer_;
     IconPainter iconPainter_;
     std::unique_ptr<WebUiHost> webUiHost_;
@@ -520,6 +520,7 @@ private:
     bool deferredRuntimeStart_ = false;
     bool deferredRuntimeRestart_ = false;
     bool deferredRuntimeWaitForPreroll_ = false;
+    std::optional<std::chrono::milliseconds> deferredRuntimePosition_;
     bool deferredPausedFrameRefresh_ = false;
     bool deferredPausedFrameRefreshForceRestart_ = false;
     double pendingStartPositionRatio_ = 0.0;  // 0..1, seek here after next openPath playback start
@@ -538,7 +539,7 @@ private:
     int hoveredButton_ = -1;
     int hoveredInspectorPathItem_ = -1;
     InspectorTab inspectorTab_ = InspectorTab::Recent;
-    PlaybackBackend backend_ = PlaybackBackend::NativeFfmpegD3D11;
+    PlaybackBackend backend_ = PlaybackBackend::NativeFfmpegD3D12;
     bool fullscreen_ = false;
     bool refreshRateSyncEnabled_ = false;
     bool refreshRateMaximumMultiple_ = true;

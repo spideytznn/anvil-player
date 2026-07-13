@@ -585,7 +585,7 @@ void MainWindow::SetBackend(const PlaybackBackend backend) {
     backend_ = backend;
     std::wstring name;
     switch (backend_) {
-    case PlaybackBackend::NativeFfmpegD3D11: name = L"native_ffmpeg_d3d11"; break;
+    case PlaybackBackend::NativeFfmpegD3D12: name = L"native_ffmpeg_d3d12"; break;
     case PlaybackBackend::EmbeddedFfplay: name = L"embedded_ffplay"; break;
     case PlaybackBackend::RawFrameBridge: name = L"raw_frame_bridge"; break;
     }
@@ -826,14 +826,13 @@ std::wstring MainWindow::BuildWebUiStateJson() const {
     long long bufferedEndMs = positionMs;
     bool buffering = false;
     uint64_t networkBytesPerSecond = 0;
-    NativeVideoQueueStats nativeStats{};
-    bool hasNativeStats = false;
-    if (backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+    const VideoRenderStats rendererStats = d3dRenderer_
+        ? d3dRenderer_->TakeRenderStats()
+        : VideoRenderStats{};
+    if (backend_ == PlaybackBackend::NativeFfmpegD3D12 &&
         nativeVideoDecoder_ &&
         snapshot.media.has_value()) {
         const auto stats = nativeVideoDecoder_->Stats();
-        nativeStats = stats;
-        hasNativeStats = true;
         buffering = stats.buffering;
         networkBytesPerSecond = stats.networkBytesPerSecond;
         if (buffering && durationMs > 0) {
@@ -898,11 +897,10 @@ std::wstring MainWindow::BuildWebUiStateJson() const {
     json << L"\"frameInterpolationEnabled\":"
          << (settings.video.frameInterpolationEnabled ? L"true" : L"false") << L",";
     json << L"\"frameInterpolationActive\":"
-         << ((hasNativeStats && nativeStats.frameInterpolationActive) ? L"true" : L"false") << L",";
+         << (rendererStats.generatedSubmitted > 0 ? L"true" : L"false") << L",";
     json << L"\"frameInterpolationBackend\":\""
-         << JsonEscape(hasNativeStats ? nativeStats.frameInterpolationBackend : L"inactive") << L"\",";
-    json << L"\"frameInterpolationReason\":\""
-         << JsonEscape(hasNativeStats ? nativeStats.frameInterpolationReason : L"") << L"\",";
+         << JsonEscape(rendererStats.interpolationBackend) << L"\",";
+    json << L"\"frameInterpolationReason\":\"\",";
     json << L"\"refreshRateSyncEnabled\":" << (refreshRateSyncEnabled_ ? L"true" : L"false") << L",";
     json << L"\"refreshRateMaximumMultiple\":" << (refreshRateMaximumMultiple_ ? L"true" : L"false") << L",";
     json << L"\"refreshRateSyncUnavailable\":" << (refreshRateSyncUnavailable_ ? L"true" : L"false") << L",";
@@ -1873,7 +1871,7 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
         if (static_cast<uint64_t>(wParam) != windowLifetimeCookie_ || !d3dRenderer_) {
             return 0;
         }
-        CompleteRendererInitialization(static_cast<D3D11RendererState>(lParam));
+        CompleteRendererInitialization(static_cast<VideoRendererState>(lParam));
         return 0;
     }
     case kRenderDeviceLostMessage:
@@ -2238,6 +2236,11 @@ void MainWindow::MaybeLogNativeSchedulerStats(const NativeVideoQueueStats& stats
 
     const std::wstring master = stats.usingAudioClock ? L"audio" : L"wall";
     const std::wstring scheduler = stats.usingAudioClock ? L"audio_clock" : L"wall_clock";
+    const VideoRenderStats renderStats = d3dRenderer_
+        ? d3dRenderer_->TakeRenderStats()
+        : VideoRenderStats{};
+    const bool interpolationActive = renderStats.generatedSubmitted > 0;
+    const std::wstring& interpolationBackend = renderStats.interpolationBackend;
     LogRuntime(LogLevel::Debug,
                L"clock",
                L"master=" + master +
@@ -2256,11 +2259,11 @@ void MainWindow::MaybeLogNativeSchedulerStats(const NativeVideoQueueStats& stats
                     L" read_ahead_ms=" + std::to_wstring(stats.readAheadDuration.count()) +
                     L" buffering=" + std::wstring(stats.buffering ? L"true" : L"false") +
                     L" net_kbps=" + std::to_wstring(stats.networkBytesPerSecond / 1024) +
-                    L" rendered=" + std::to_wstring(stats.rendered) +
+                   L" rendered=" + std::to_wstring(stats.rendered) +
                    L" interpolation_active=" +
-                       std::wstring(stats.frameInterpolationActive ? L"true" : L"false") +
-                   L" interpolated_frames=" + std::to_wstring(stats.interpolatedFrames) +
-                   L" interpolation_backend=" + stats.frameInterpolationBackend +
+                       std::wstring(interpolationActive ? L"true" : L"false") +
+                   L" interpolated_frames=" + std::to_wstring(renderStats.generatedFrames) +
+                   L" interpolation_backend=" + interpolationBackend +
                    L" hardware_frames=" + std::to_wstring(stats.hardwareFrames) +
                    L" zero_copy_frames=" + std::to_wstring(stats.zeroCopyFrames) +
                    L" cpu_transfer_frames=" + std::to_wstring(stats.cpuTransferFrames) +
@@ -2276,7 +2279,6 @@ void MainWindow::MaybeLogNativeSchedulerStats(const NativeVideoQueueStats& stats
         return;
     }
 
-    const D3D11RenderStats renderStats = d3dRenderer_->TakeRenderStats();
     if (renderStats.frames == 0) {
         return;
     }
@@ -2284,6 +2286,14 @@ void MainWindow::MaybeLogNativeSchedulerStats(const NativeVideoQueueStats& stats
     std::wstring renderMessage =
         L"frames=" + std::to_wstring(renderStats.frames) +
         L" hw_frames=" + std::to_wstring(renderStats.hardwareFrames) +
+        L" generated_frames=" + std::to_wstring(renderStats.generatedFrames) +
+        L" generated_submitted=" + std::to_wstring(renderStats.generatedSubmitted) +
+        L" generated_dropped_not_ready=" +
+            std::to_wstring(renderStats.generatedDroppedNotReady) +
+        L" inference_failures=" + std::to_wstring(renderStats.inferenceFailures) +
+        L" interpolation_multiplier=" +
+            std::to_wstring(renderStats.interpolationMultiplier) +
+        L" interpolation_backend=" + renderStats.interpolationBackend +
         L" bgra_frames=" + std::to_wstring(renderStats.bgraFrames) +
         L" avg_ms=" + FormatAverageMilliseconds(renderStats.totalRenderUs, renderStats.frames) +
         L" max_ms=" + FormatMillisecondsFromMicroseconds(renderStats.maxRenderUs) +
@@ -2429,7 +2439,7 @@ bool MainWindow::TryRecoverNativeSeekFailure(const NativeDecodeFailure& failure,
     }
 
     const auto snapshot = controller_.Snapshot();
-    if (backend_ != PlaybackBackend::NativeFfmpegD3D11 ||
+    if (backend_ != PlaybackBackend::NativeFfmpegD3D12 ||
         snapshot.state != PlaybackState::Playing ||
         !snapshot.media.has_value() ||
         snapshot.media->path != failure.path ||
@@ -2771,7 +2781,7 @@ void MainWindow::UpdateUiAnimations() {
 
     if (sidebarWasActive && sidebarComplete) {
         UpdateVideoHost();
-        if (backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+        if (backend_ == PlaybackBackend::NativeFfmpegD3D12 &&
             nativeVideoDecoder_ &&
             nativeVideoDecoder_->IsRunning() &&
             d3dRenderer_) {
@@ -3163,11 +3173,11 @@ std::wstring MainWindow::RuntimeLabel() const {
         return L"Windows Media Foundation / Dolby Vision";
     }
     switch (backend_) {
-    case PlaybackBackend::NativeFfmpegD3D11: return kNativeFfmpegD3D11RuntimeLabel;
+    case PlaybackBackend::NativeFfmpegD3D12: return kNativeFfmpegD3D12RuntimeLabel;
     case PlaybackBackend::EmbeddedFfplay: return kExternalPlaybackRuntimeLabel;
     case PlaybackBackend::RawFrameBridge: return kInternalPlaybackRuntimeLabel;
     }
-    return kNativeFfmpegD3D11RuntimeLabel;
+    return kNativeFfmpegD3D12RuntimeLabel;
 }
 
 std::wstring MainWindow::RuntimeShortLabel() const {
@@ -3175,7 +3185,7 @@ std::wstring MainWindow::RuntimeShortLabel() const {
         return L"System Dolby Vision";
     }
     switch (backend_) {
-    case PlaybackBackend::NativeFfmpegD3D11: return L"Native FFmpeg";
+    case PlaybackBackend::NativeFfmpegD3D12: return L"Native FFmpeg";
     case PlaybackBackend::EmbeddedFfplay: return L"External FFplay";
     case PlaybackBackend::RawFrameBridge: return L"Internal FFmpeg";
     }
@@ -3219,8 +3229,8 @@ void MainWindow::OnPlaybackTimerTick() {
     }
     if (d3dRenderer_ && !videoHostReady_) {
         const auto rendererState = d3dRenderer_->State();
-        if (rendererState == D3D11RendererState::Ready ||
-            rendererState == D3D11RendererState::Failed) {
+        if (rendererState == VideoRendererState::Ready ||
+            rendererState == VideoRendererState::Failed) {
             CompleteRendererInitialization(rendererState);
         }
     }
@@ -3262,7 +3272,7 @@ void MainWindow::OnPlaybackTimerTick() {
         }
         nativeDecoderClockActive = true;
     }
-    if (backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+    if (backend_ == PlaybackBackend::NativeFfmpegD3D12 &&
         !systemDolbyVisionActive &&
         nativeVideoDecoder_) {
         const auto current = controller_.Snapshot();
@@ -3335,7 +3345,7 @@ void MainWindow::OnPlaybackTimerTick() {
             return;
         }
         if (snapshot.state == PlaybackState::Paused &&
-            backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+            backend_ == PlaybackBackend::NativeFfmpegD3D12 &&
             nativeVideoDecoder_ &&
             nativeVideoDecoder_->IsRunning()) {
             MaybeLogNativeSchedulerStats(nativeVideoDecoder_->Stats());
@@ -3385,7 +3395,7 @@ void MainWindow::OnPlaybackTimerTick() {
                     snapshot.media->hasAudio &&
                     runtimeSettings.audio.selectedTrackIndex != anvil::playback::kAudioTrackOff;
                 const bool audioOwnedByNativeVideoDemuxer =
-                    backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+                    backend_ == PlaybackBackend::NativeFfmpegD3D12 &&
                     snapshot.media->hasVideo &&
                     snapshot.media->hasAudio &&
                     IsNetworkMediaPath(snapshot.media->path);
@@ -3400,7 +3410,7 @@ void MainWindow::OnPlaybackTimerTick() {
                 }
             }
         }
-        if (backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+        if (backend_ == PlaybackBackend::NativeFfmpegD3D12 &&
             nativeVideoDecoder_ &&
             nativeVideoDecoder_->IsRunning() &&
             snapshot.media.has_value() &&
@@ -3523,7 +3533,7 @@ bool MainWindow::Cmv4ApproxActiveForPlayback(const PlaybackSessionSnapshot& snap
 }
 
 bool MainWindow::ApplyNativeColorSettingsLive(const PlaybackSessionSnapshot& snapshot) {
-    if (backend_ != PlaybackBackend::NativeFfmpegD3D11 ||
+    if (backend_ != PlaybackBackend::NativeFfmpegD3D12 ||
         !snapshot.media.has_value() ||
         !snapshot.media->hasVideo ||
         !d3dRenderer_) {
@@ -3583,7 +3593,7 @@ void MainWindow::ScheduleNativeColorSettingsRefresh(const bool requiresDecoderRe
 
 void MainWindow::ApplyNativeColorSettingsRefresh(const bool requiresDecoderRefresh) {
     const auto snapshot = controller_.Snapshot();
-    const bool nativeVideo = backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+    const bool nativeVideo = backend_ == PlaybackBackend::NativeFfmpegD3D12 &&
                              snapshot.media.has_value() &&
                              snapshot.media->hasVideo;
     bool handledLive = false;
@@ -3613,7 +3623,7 @@ bool MainWindow::NativeHdrOutputToggleRequiresDecoderRestart(const PlaybackSessi
 }
 
 bool MainWindow::NativeCmv4ToggleRequiresDecoderRestart(const PlaybackSessionSnapshot& snapshot) const {
-    return backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+    return backend_ == PlaybackBackend::NativeFfmpegD3D12 &&
            snapshot.media.has_value() &&
            snapshot.media->hasVideo &&
            MediaHasDolbyVisionEnhancementStream(snapshot.media);
@@ -3624,7 +3634,7 @@ bool MainWindow::NativeCmv4ToggleNeedsDecoderRefresh(const PlaybackSessionSnapsh
     if (!NativeCmv4ToggleRequiresDecoderRestart(snapshot) || !WantsCmv4Approx(settings)) {
         return false;
     }
-    if (heldNativeFrame_.has_value() && heldNativeFrame_->HasEnhancementYuv()) {
+    if (heldNativeFrame_.has_value() && heldNativeFrame_->HasEnhancementSurface()) {
         return false;
     }
     return !nativeVideoDecoder_ ||
@@ -3954,7 +3964,7 @@ void MainWindow::OpenSubtitleFileDialog() {
     if (updated.state == PlaybackState::Paused &&
         updated.media.has_value() &&
         updated.media->hasVideo &&
-        backend_ == PlaybackBackend::NativeFfmpegD3D11) {
+        backend_ == PlaybackBackend::NativeFfmpegD3D12) {
         RefreshPausedNativeFrame(updated, true);
     } else {
         RestartPlaybackIfPlaying();
@@ -4126,12 +4136,12 @@ void MainWindow::FinishRuntimeStopVisuals(const bool clearVideoFrame) {
         nativeFrameHoldVisible_ = false;
         pendingPausedFrameRefresh_ = false;
         heldNativeFrameNeedsPresent_ = false;
-    } else if (backend_ == PlaybackBackend::NativeFfmpegD3D11) {
+    } else if (backend_ == PlaybackBackend::NativeFfmpegD3D12) {
         nativeFrameHoldVisible_ = heldNativeFrame_.has_value();
         heldNativeFrameNeedsPresent_ = heldNativeFrame_.has_value() &&
                                        heldNativeFrame_->HasPixels();
     }
-    if (backend_ == PlaybackBackend::NativeFfmpegD3D11 && clearVideoFrame) {
+    if (backend_ == PlaybackBackend::NativeFfmpegD3D12 && clearVideoFrame) {
         if (d3dRenderer_) d3dRenderer_->Clear();
         if (videoHost_) {
             ShowWindow(videoHost_, SW_HIDE);
@@ -4174,11 +4184,11 @@ void MainWindow::PollPlaybackSupervisorCompletion() {
     }
 }
 
-void MainWindow::CompleteRendererInitialization(const D3D11RendererState state) {
+void MainWindow::CompleteRendererInitialization(const VideoRendererState state) {
     if (closePending_ || !d3dRenderer_ || state != d3dRenderer_->State()) {
         return;
     }
-    if (state == D3D11RendererState::Ready) {
+    if (state == VideoRendererState::Ready) {
         if (videoHostReady_) {
             return;
         }
@@ -4191,7 +4201,7 @@ void MainWindow::CompleteRendererInitialization(const D3D11RendererState state) 
         }
         return;
     }
-    if (state != D3D11RendererState::Failed || videoHostInitializationFailureHandled_) {
+    if (state != VideoRendererState::Failed || videoHostInitializationFailureHandled_) {
         return;
     }
     videoHostInitializationFailureHandled_ = true;
@@ -4270,8 +4280,8 @@ bool MainWindow::RecreateRendererAfterDeviceLoss() {
     videoHostInitializationFailureHandled_ = false;
     rendererDeviceRecoveryPending_ = false;
     EnsureVideoHost();
-    const bool accepted = d3dRenderer_->State() == D3D11RendererState::Initializing ||
-                          d3dRenderer_->State() == D3D11RendererState::Ready;
+    const bool accepted = d3dRenderer_->State() == VideoRendererState::Initializing ||
+                          d3dRenderer_->State() == VideoRendererState::Ready;
     LogApp(accepted ? LogLevel::Info : LogLevel::Error,
            L"d3d device recovery renderer_recreate=" +
                std::wstring(accepted ? L"accepted" : L"failed"));
@@ -4386,11 +4396,13 @@ void MainWindow::ClearDeferredRuntimeStart() {
     deferredRuntimeStart_ = false;
     deferredRuntimeRestart_ = false;
     deferredRuntimeWaitForPreroll_ = false;
+    deferredRuntimePosition_.reset();
 }
 
 void MainWindow::QueueDeferredRuntimeStart(const bool restart, const bool waitForPreroll) {
     if (!deferredRuntimeStart_) {
         deferredRuntimeWaitForPreroll_ = waitForPreroll;
+        deferredRuntimePosition_ = controller_.Snapshot().position;
     } else {
         deferredRuntimeWaitForPreroll_ = deferredRuntimeWaitForPreroll_ && waitForPreroll;
     }
@@ -4454,10 +4466,14 @@ void MainWindow::ContinueRuntimeAfterAsyncStop() {
     const bool waitForPreroll = deferredRuntimeWaitForPreroll_;
     const bool refreshPausedFrame = deferredPausedFrameRefresh_;
     const bool forcePausedFrameRefresh = deferredPausedFrameRefreshForceRestart_;
+    const auto deferredPosition = deferredRuntimePosition_;
     ClearDeferredRuntimeStart();
     deferredPausedFrameRefresh_ = false;
     deferredPausedFrameRefreshForceRestart_ = false;
 
+    if (deferredPosition.has_value()) {
+        controller_.Seek(*deferredPosition);
+    }
     const auto snapshot = controller_.Snapshot();
     if (snapshot.state == PlaybackState::Playing &&
         snapshot.media.has_value() &&
@@ -4474,7 +4490,7 @@ void MainWindow::ContinueRuntimeAfterAsyncStop() {
             refreshPausedFrame &&
             snapshot.media.has_value() &&
             snapshot.media->hasVideo &&
-            backend_ == PlaybackBackend::NativeFfmpegD3D11) {
+            backend_ == PlaybackBackend::NativeFfmpegD3D12) {
             RefreshPausedNativeFrame(snapshot, forcePausedFrameRefresh);
         }
     }
@@ -4488,7 +4504,7 @@ void MainWindow::ContinueRuntimeAfterAsyncStop() {
 }
 
 bool MainWindow::CaptureLatestNativeFrame() {
-    if (backend_ != PlaybackBackend::NativeFfmpegD3D11 || !nativeVideoDecoder_) {
+    if (backend_ != PlaybackBackend::NativeFfmpegD3D12 || !nativeVideoDecoder_) {
         return heldNativeFrame_.has_value();
     }
 
@@ -4537,7 +4553,7 @@ void MainWindow::RetireHeldNativeFrame() {
 }
 
 void MainWindow::RenderHeldNativeFrame(const bool logRepaint) {
-    if (backend_ != PlaybackBackend::NativeFfmpegD3D11 || !d3dRenderer_) {
+    if (backend_ != PlaybackBackend::NativeFfmpegD3D12 || !d3dRenderer_) {
         return;
     }
 
@@ -4547,7 +4563,7 @@ void MainWindow::RenderHeldNativeFrame(const bool logRepaint) {
                    L"repainting cached native frame pixels=" +
                        std::wstring(heldNativeFrame_->HasPixels() ? L"true" : L"false") +
                        L" texture=" +
-                       std::wstring(heldNativeFrame_->HasD3DTexture() ? L"true" : L"false"));
+                       std::wstring(heldNativeFrame_->HasD3D12Texture() ? L"true" : L"false"));
         }
         d3dRenderer_->Render(*heldNativeFrame_);
     } else if (logRepaint) {
@@ -4596,7 +4612,7 @@ bool MainWindow::StartRuntime(const PlaybackSessionSnapshot& snapshot,
         return true;
     }
 
-    if (backend_ == PlaybackBackend::NativeFfmpegD3D11) {
+    if (backend_ == PlaybackBackend::NativeFfmpegD3D12) {
         return StartNativeRuntime(snapshot, restart, waitForPreroll);
     }
 
@@ -4686,7 +4702,7 @@ void MainWindow::EnsureVideoHost() {
     }
 
     const auto rendererState = d3dRenderer_->State();
-    if (rendererState == D3D11RendererState::Ready) {
+    if (rendererState == VideoRendererState::Ready) {
         // A completion PostMessage can be lost during queue teardown. A caller
         // that is already starting the runtime may adopt the published ready
         // state directly; it must not recursively replay deferred work here.
@@ -4695,11 +4711,11 @@ void MainWindow::EnsureVideoHost() {
         UpdateVideoHost();
         return;
     }
-    if (rendererState == D3D11RendererState::Initializing) {
+    if (rendererState == VideoRendererState::Initializing) {
         return;
     }
-    if (rendererState == D3D11RendererState::Failed ||
-        rendererState == D3D11RendererState::Stopping) {
+    if (rendererState == VideoRendererState::Failed ||
+        rendererState == VideoRendererState::Stopping) {
         LogApp(LogLevel::Error, L"native d3d renderer is not available for initialization");
         ShowWindow(videoHost_, SW_HIDE);
         return;
@@ -4737,6 +4753,7 @@ bool MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
     const bool requestSystemDolbyVision =
         snapshot.media->hasVideo &&
         snapshot.media->dolbyVisionDetected &&
+        !runtimeSettings.video.frameInterpolationEnabled &&
         (runtimeSettings.video.autoDisplayFormat ||
          runtimeSettings.video.dolbyVisionSystemPipelineExperimental) &&
         runtimeSettings.video.dolbyVision != anvil::playback::DolbyVisionMode::Off &&
@@ -4799,7 +4816,7 @@ bool MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
         EnsureLayout();
         EnsureVideoHost();
         if (!videoHostReady_ || !d3dRenderer_ || !d3dRenderer_->IsReady()) {
-            if (d3dRenderer_ && d3dRenderer_->State() == D3D11RendererState::Initializing) {
+            if (d3dRenderer_ && d3dRenderer_->State() == VideoRendererState::Initializing) {
                 QueueDeferredRuntimeStart(restart, waitForPreroll);
                 LogApp(LogLevel::Debug, L"native runtime deferred while d3d initializes");
             } else {
@@ -4854,6 +4871,11 @@ bool MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
     }
     lastNativeStatsLog_ = {};
     if (snapshot.media->hasVideo) {
+        if (snapshot.media->selectedDecodePath != L"ffmpeg_d3d12va") {
+            LogApp(LogLevel::Error,
+                   L"native D3D12 pipeline requires a D3D12VA decode plan; CPU pixel fallback is disabled");
+            return false;
+        }
         if (d3dRenderer_) {
             const auto& settings = runtimeSettings;
             d3dRenderer_->ConfigureColorPipeline(settings.video, CachedCapabilities().display, snapshot.media->videoColor);
@@ -4862,11 +4884,19 @@ bool MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
         }
         const auto& settings = runtimeSettings;
         preferDolbyVisionHdrOutput = snapshot.media->dolbyVisionDetected;
-        const bool preferHardwareDecode = snapshot.media->selectedDecodePath == L"ffmpeg_d3d11va";
+        const bool preferHardwareDecode = snapshot.media->selectedDecodePath == L"ffmpeg_d3d12va";
         enableDolbyVisionEnhancementDecode =
             MediaHasDolbyVisionEnhancementStream(snapshot.media) &&
-            settings.video.dolbyVision != anvil::playback::DolbyVisionMode::Off &&
-            Cmv4ApproxActiveForPlayback(snapshot, settings.video);
+            settings.video.dolbyVision != anvil::playback::DolbyVisionMode::Off;
+        if (nativeVideoDecoder_) {
+            nativeVideoDecoder_->SetFrameGraphInputCallback(
+                d3dRenderer_
+                    ? FfmpegVideoDecoder::FrameGraphInputCallback{
+                          [renderer = &*d3dRenderer_](const NativeVideoFrame& frame) {
+                              renderer->QueueFrameGraphInput(frame);
+                          }}
+                    : FfmpegVideoDecoder::FrameGraphInputCallback{});
+        }
         videoStarted = videoHostReady_ && nativeVideoDecoder_ &&
                        nativeVideoDecoder_->Start(snapshot.media->path,
                                                   snapshot.position,
@@ -4887,7 +4917,6 @@ bool MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
                                                    false,
                                                    preferDolbyVisionHdrOutput,
                                                    enableDolbyVisionEnhancementDecode,
-                                                   settings.video.frameInterpolationEnabled,
                                                    std::move(audioPacketSink),
                                                    windowLifetimeCookie_);
         if (videoStarted) {
@@ -4902,8 +4931,7 @@ bool MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
         videoStarted &&
         snapshot.media->hasVideo &&
         nativeVideoDecoder_ &&
-        enableDolbyVisionEnhancementDecode &&
-        Cmv4ApproxActiveForPlayback(snapshot, runtimeSettings.video);
+        enableDolbyVisionEnhancementDecode;
     if (waitForEnhancedPreroll) {
         LogApp(LogLevel::Debug, L"native enhanced preroll continues asynchronously");
     } else if (waitForPreroll && videoStarted && snapshot.media->hasVideo && snapshot.media->hasAudio && nativeVideoDecoder_) {
@@ -4925,7 +4953,7 @@ bool MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
 
     const LogLevel level = videoStarted && audioStarted ? (restart ? LogLevel::Debug : LogLevel::Info) : LogLevel::Error;
     LogApp(level,
-           std::wstring(L"native ffmpeg/d3d11 playback ") +
+           std::wstring(L"native ffmpeg/d3d12 playback ") +
                (restart ? L"restart" : L"start") +
                L" video=" + (videoStarted ? L"true" : L"false") +
                L" audio=" + (audioStarted ? L"true" : L"false") +
@@ -4936,8 +4964,8 @@ bool MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
             const bool cmv4Intermediate = Cmv4ApproxActiveForPlayback(snapshot, runtimeSettings.video);
             const bool finalHdrOutput = WantsDolbyVisionHdrOutput(runtimeSettings.video, CachedCapabilities().display);
             LogApp(LogLevel::Info,
-                   L"dolby vision fallback path=ffmpeg_libplacebo final=" +
-                       std::wstring(finalHdrOutput ? L"windows_hdr10" : L"sdr") +
+                   L"dolby vision path=ffmpeg_d3d12va+rpu_el_fel_frame_graph final=" +
+                       std::wstring(finalHdrOutput ? L"scrgb_hdr_composition" : L"sdr") +
                        (cmv4Intermediate ? L" cmv4=on" : L" cmv4=off") +
                        (enableDolbyVisionEnhancementDecode ? L" el_decode=on" : L" el_decode=off"));
         }
@@ -4962,7 +4990,7 @@ bool MainWindow::SeekNativeRuntime(const PlaybackSessionSnapshot& snapshot) {
         systemDolbyVisionPlayer_.IsActive()) {
         return systemDolbyVisionPlayer_.Seek(snapshot.position);
     }
-    if (backend_ != PlaybackBackend::NativeFfmpegD3D11 ||
+    if (backend_ != PlaybackBackend::NativeFfmpegD3D12 ||
         snapshot.state != PlaybackState::Playing ||
         !snapshot.media.has_value() ||
         (!snapshot.media->hasVideo && !snapshot.media->hasAudio)) {
@@ -5038,7 +5066,7 @@ bool MainWindow::SeekNativeRuntime(const PlaybackSessionSnapshot& snapshot) {
 }
 
 bool MainWindow::PrepareNativeEnhancedPlaybackBeforePlay(const PlaybackSessionSnapshot& snapshot) {
-    if (backend_ != PlaybackBackend::NativeFfmpegD3D11 ||
+    if (backend_ != PlaybackBackend::NativeFfmpegD3D12 ||
         !snapshot.media.has_value() ||
         !snapshot.media->hasVideo ||
         !nativeVideoDecoder_) {
@@ -5048,7 +5076,6 @@ bool MainWindow::PrepareNativeEnhancedPlaybackBeforePlay(const PlaybackSessionSn
     const auto settings = controller_.Settings();
     const bool wantsEnhancedPlayback =
         NativeCmv4ToggleRequiresDecoderRestart(snapshot) &&
-        Cmv4ApproxActiveForPlayback(snapshot, settings.video) &&
         settings.video.dolbyVision != anvil::playback::DolbyVisionMode::Off;
     if (!wantsEnhancedPlayback) {
         return true;
@@ -5056,8 +5083,7 @@ bool MainWindow::PrepareNativeEnhancedPlaybackBeforePlay(const PlaybackSessionSn
 
     const bool enableDolbyVisionEnhancementDecode =
         MediaHasDolbyVisionEnhancementStream(snapshot.media) &&
-        settings.video.dolbyVision != anvil::playback::DolbyVisionMode::Off &&
-        Cmv4ApproxActiveForPlayback(snapshot, settings.video);
+        settings.video.dolbyVision != anvil::playback::DolbyVisionMode::Off;
     if (!enableDolbyVisionEnhancementDecode) {
         return true;
     }
@@ -5101,10 +5127,15 @@ void MainWindow::RefreshPausedNativeFrame(const PlaybackSessionSnapshot& snapsho
     if (closePending_) {
         return;
     }
-    if (backend_ != PlaybackBackend::NativeFfmpegD3D11 ||
+    if (backend_ != PlaybackBackend::NativeFfmpegD3D12 ||
         !snapshot.media.has_value() ||
         !snapshot.media->hasVideo ||
         !nativeVideoDecoder_) {
+        return;
+    }
+    if (snapshot.media->selectedDecodePath != L"ffmpeg_d3d12va") {
+        LogApp(LogLevel::Error,
+               L"paused frame refresh requires D3D12VA; CPU pixel fallback is disabled");
         return;
     }
     if (RuntimeStopInProgress()) {
@@ -5113,7 +5144,7 @@ void MainWindow::RefreshPausedNativeFrame(const PlaybackSessionSnapshot& snapsho
     }
     EnsureVideoHost();
     if (!videoHostReady_ || !d3dRenderer_ || !d3dRenderer_->IsReady()) {
-        if (d3dRenderer_ && d3dRenderer_->State() == D3D11RendererState::Initializing) {
+        if (d3dRenderer_ && d3dRenderer_->State() == VideoRendererState::Initializing) {
             QueuePausedNativeFrameRefresh(forceDecoderRestart);
             LogApp(LogLevel::Debug, L"paused frame refresh deferred while d3d initializes");
         } else {
@@ -5165,11 +5196,10 @@ void MainWindow::RefreshPausedNativeFrame(const PlaybackSessionSnapshot& snapsho
         d3dRenderer_->ResetRenderStats();
     }
     const bool preferDolbyVisionHdrOutput = snapshot.media->dolbyVisionDetected;
-    const bool preferHardwareDecode = snapshot.media->selectedDecodePath == L"ffmpeg_d3d11va";
+    const bool preferHardwareDecode = snapshot.media->selectedDecodePath == L"ffmpeg_d3d12va";
     const bool enableDolbyVisionEnhancementDecode =
         MediaHasDolbyVisionEnhancementStream(snapshot.media) &&
-        settings.video.dolbyVision != anvil::playback::DolbyVisionMode::Off &&
-        Cmv4ApproxActiveForPlayback(snapshot, settings.video);
+        settings.video.dolbyVision != anvil::playback::DolbyVisionMode::Off;
     if (videoHostReady_ && d3dRenderer_) {
         runtimeCleanupPending_.store(true, std::memory_order_release);
     }
@@ -5192,8 +5222,7 @@ void MainWindow::RefreshPausedNativeFrame(const PlaybackSessionSnapshot& snapsho
                                                      true,
                                                      preferDolbyVisionHdrOutput,
                                                      enableDolbyVisionEnhancementDecode,
-                                                     false,
-                                                    NativeAudioPacketSink{},
+                                                     NativeAudioPacketSink{},
                                                     windowLifetimeCookie_);
     if (started) {
         nativeFrameHoldVisible_ = true;
@@ -5660,7 +5689,7 @@ void MainWindow::StartPlayback() {
             systemDolbyVisionPlayer_.IsActive();
         const bool resumedNativeRuntime =
             before.state == PlaybackState::Paused &&
-            backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+            backend_ == PlaybackBackend::NativeFfmpegD3D12 &&
             !RuntimeStopInProgress() &&
             nativeVideoDecoder_ &&
             nativeVideoDecoder_->IsRunning() &&
@@ -5706,7 +5735,7 @@ void MainWindow::StartPlayback() {
             }
         } else {
             if (before.state == PlaybackState::Paused &&
-                backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+                backend_ == PlaybackBackend::NativeFfmpegD3D12 &&
                 nativeVideoDecoder_ &&
                 nativeVideoDecoder_->IsRunning()) {
                 LogApp(LogLevel::Debug,
@@ -5745,7 +5774,7 @@ void MainWindow::PausePlayback() {
         SetPlaybackTimer(false);
     } else if (systemDolbyVisionPlayer_.IsActive()) {
         systemDolbyVisionPlayer_.Pause();
-    } else if (backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+    } else if (backend_ == PlaybackBackend::NativeFfmpegD3D12 &&
         nativeVideoDecoder_ &&
         nativeVideoDecoder_->IsRunning() &&
         d3dRenderer_) {
@@ -5840,7 +5869,7 @@ void MainWindow::SeekRelative(const std::chrono::milliseconds delta) {
     } else if (after.state == PlaybackState::Paused &&
         after.media.has_value() &&
         after.media->hasVideo &&
-        backend_ == PlaybackBackend::NativeFfmpegD3D11) {
+        backend_ == PlaybackBackend::NativeFfmpegD3D12) {
         RefreshPausedNativeFrame(after);
     } else if (after.state == PlaybackState::Playing &&
                !(before.state == PlaybackState::Playing &&
@@ -5861,7 +5890,7 @@ void MainWindow::SeekToPosition(const std::chrono::milliseconds position) {
     } else if (after.state == PlaybackState::Paused &&
         after.media.has_value() &&
         after.media->hasVideo &&
-        backend_ == PlaybackBackend::NativeFfmpegD3D11) {
+        backend_ == PlaybackBackend::NativeFfmpegD3D12) {
         RefreshPausedNativeFrame(after);
     } else if (after.state == PlaybackState::Playing &&
                !(before.state == PlaybackState::Playing &&
@@ -5982,7 +6011,7 @@ void MainWindow::ToggleFullscreen() {
 }
 
 bool MainWindow::RefreshRateSyncEffective() const {
-    return refreshRateSyncEnabled_ && !controller_.Settings().video.frameInterpolationEnabled;
+    return refreshRateSyncEnabled_;
 }
 
 void MainWindow::SetFrameInterpolationEnabled(const bool enabled) {
@@ -5994,11 +6023,10 @@ void MainWindow::SetFrameInterpolationEnabled(const bool enabled) {
     controller_.ApplySettings(settings);
     SaveVideoBooleanSetting(L"FrameInterpolationEnabled", enabled);
 
-    refreshRateController_.Restore();
-    refreshRateSyncUnavailable_ = false;
     const auto snapshot = controller_.Snapshot();
-    if (!enabled && fullscreen_ && refreshRateSyncEnabled_ &&
+    if (fullscreen_ && refreshRateSyncEnabled_ &&
         snapshot.media.has_value() && snapshot.media->videoFrameRate > 0.0) {
+        refreshRateController_.Restore();
         refreshRateSyncUnavailable_ =
             !refreshRateController_.ApplyForWindow(
                 hwnd_, snapshot.media->videoFrameRate, refreshRateMaximumMultiple_);
@@ -6006,12 +6034,31 @@ void MainWindow::SetFrameInterpolationEnabled(const bool enabled) {
 
     LogApp(LogLevel::Info,
            L"frame interpolation requested=" + std::wstring(enabled ? L"true" : L"false") +
-               L" target=x2");
+               L" cadence=adaptive_refresh_matched");
     if (snapshot.state == PlaybackState::Playing && snapshot.media.has_value() && snapshot.media->hasVideo) {
-        RequestRuntimeStart(true, true);
+        const bool requiresPipelineRestart =
+            backend_ != PlaybackBackend::NativeFfmpegD3D12 ||
+            snapshot.media->dolbyVisionDetected ||
+            systemDolbyVisionPlayer_.IsActive() ||
+            !d3dRenderer_ || !nativeVideoDecoder_ || !nativeVideoDecoder_->IsRunning();
+        if (requiresPipelineRestart) {
+            RequestRuntimeStart(true, true);
+        } else {
+            // The decoder always publishes its bounded D3D12 look-ahead feed.
+            // Switching interpolation therefore only changes renderer policy;
+            // original playback and the audio clock remain uninterrupted while
+            // the model compiles in the background.
+            d3dRenderer_->ConfigureColorPipeline(
+                settings.video, CachedCapabilities().display,
+                snapshot.media->videoColor);
+            d3dRenderer_->ResetRenderStats();
+            lastNativeStatsLog_ = {};
+            LogApp(LogLevel::Info,
+                   L"frame interpolation switched live decoder_restart=false model=lazy_background");
+        }
     } else if (snapshot.state == PlaybackState::Paused &&
                snapshot.media.has_value() && snapshot.media->hasVideo &&
-               backend_ == PlaybackBackend::NativeFfmpegD3D11) {
+               backend_ == PlaybackBackend::NativeFfmpegD3D12) {
         RefreshPausedNativeFrame(snapshot, true);
     }
     MarkLayoutDirty();
@@ -6021,10 +6068,6 @@ void MainWindow::SetFrameInterpolationEnabled(const bool enabled) {
 }
 
 void MainWindow::SetRefreshRateSyncEnabled(const bool enabled) {
-    if (controller_.Settings().video.frameInterpolationEnabled) {
-        PostWebUiState();
-        return;
-    }
     refreshRateSyncOverridden_ = true;
     refreshRateSyncEnabled_ = enabled;
     if (!enabled) {
@@ -6048,10 +6091,6 @@ void MainWindow::SetRefreshRateSyncEnabled(const bool enabled) {
 }
 
 void MainWindow::SetRefreshRateMaximumMultiple(const bool enabled) {
-    if (controller_.Settings().video.frameInterpolationEnabled) {
-        PostWebUiState();
-        return;
-    }
     refreshRateMaximumMultipleOverridden_ = true;
     refreshRateMaximumMultiple_ = enabled;
     if (RefreshRateSyncEffective() && fullscreen_) {

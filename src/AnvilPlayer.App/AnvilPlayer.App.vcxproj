@@ -38,7 +38,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <AdditionalLibraryDirectories>$(SolutionDir)third_party\ffmpeg\lib;$(SolutionDir)third_party\webview2\lib\win-$(Platform);$(SolutionDir)third_party\onnxruntime-directml\lib\$(Platform);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>avformat.lib;avcodec.lib;avutil.lib;avfilter.lib;swscale.lib;swresample.lib;onnxruntime.lib;WebView2LoaderStatic.lib;advapi32.lib;comdlg32.lib;d3d11.lib;d3dcompiler.lib;dxgi.lib;dxguid.lib;dwmapi.lib;dcomp.lib;gdiplus.lib;shell32.lib;shlwapi.lib;ole32.lib;oleaut32.lib;runtimeobject.lib;mf.lib;mfplat.lib;mfuuid.lib;version.lib;mpr.lib;netapi32.lib;winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>avformat.lib;avcodec.lib;avutil.lib;avfilter.lib;swscale.lib;swresample.lib;onnxruntime.lib;DirectML.lib;WebView2LoaderStatic.lib;advapi32.lib;comdlg32.lib;d3d12.lib;d3dcompiler.lib;dxgi.lib;dxguid.lib;dwmapi.lib;dcomp.lib;gdiplus.lib;shell32.lib;shlwapi.lib;ole32.lib;oleaut32.lib;runtimeobject.lib;mf.lib;mfplat.lib;mfuuid.lib;version.lib;mpr.lib;netapi32.lib;winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Manifest>
       <AdditionalManifestFiles>app.manifest;%(AdditionalManifestFiles)</AdditionalManifestFiles>
@@ -59,18 +59,18 @@ if exist "$(SolutionDir)third_party\webview2-runtime\Microsoft.WebView2.FixedVer
   <ItemGroup>
     <ClCompile Include="src\app_arguments.cpp" />
     <ClCompile Include="src\application.cpp" />
-    <ClCompile Include="src\d3d11_video_renderer.cpp" />
+    <ClCompile Include="src\d3d12_video_renderer.cpp" />
+    <ClCompile Include="src\d3d12_dolby_vision.cpp" />
+    <ClCompile Include="src\d3d12_frame_graph.cpp" />
+    <ClCompile Include="src\d3d12_tensor_preprocessor.cpp" />
+    <ClCompile Include="src\directml_frame_interpolation_executor.cpp" />
+    <ClCompile Include="src\windows_ml_frame_interpolation_executor.cpp" />
     <ClCompile Include="src\display_refresh_rate.cpp" />
     <ClCompile Include="src\library_commands.cpp" />
     <ClCompile Include="src\library_window.cpp" />
     <ClCompile Include="src\embedded_ffplay.cpp" />
     <ClCompile Include="src\external_video_decoder.cpp" />
     <ClCompile Include="src\ffmpeg_video_decoder.cpp">
-      <Optimization Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">MaxSpeed</Optimization>
-      <InlineFunctionExpansion Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">AnySuitable</InlineFunctionExpansion>
-      <BasicRuntimeChecks Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Default</BasicRuntimeChecks>
-    </ClCompile>
-    <ClCompile Include="src\gpu_frame_interpolator.cpp">
       <Optimization Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">MaxSpeed</Optimization>
       <InlineFunctionExpansion Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">AnySuitable</InlineFunctionExpansion>
       <BasicRuntimeChecks Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Default</BasicRuntimeChecks>
@@ -101,12 +101,16 @@ if exist "$(SolutionDir)third_party\webview2-runtime\Microsoft.WebView2.FixedVer
     <ClInclude Include="include\AnvilPlayer\App\application.h" />
     <ClInclude Include="include\AnvilPlayer\App\color_math.h" />
     <ClInclude Include="include\AnvilPlayer\App\color_metadata_util.h" />
-    <ClInclude Include="include\AnvilPlayer\App\d3d11_video_renderer.h" />
+    <ClInclude Include="include\AnvilPlayer\App\d3d12_video_renderer.h" />
+    <ClInclude Include="include\AnvilPlayer\App\d3d12_dolby_vision.h" />
+    <ClInclude Include="include\AnvilPlayer\App\d3d12_frame_graph.h" />
+    <ClInclude Include="include\AnvilPlayer\App\d3d12_tensor_preprocessor.h" />
+    <ClInclude Include="include\AnvilPlayer\App\directml_frame_interpolation_executor.h" />
+    <ClInclude Include="include\AnvilPlayer\App\windows_ml_frame_interpolation_executor.h" />
     <ClInclude Include="include\AnvilPlayer\App\display_refresh_rate.h" />
     <ClInclude Include="include\AnvilPlayer\App\embedded_ffplay.h" />
     <ClInclude Include="include\AnvilPlayer\App\external_video_decoder.h" />
     <ClInclude Include="include\AnvilPlayer\App\ffmpeg_video_decoder.h" />
-    <ClInclude Include="include\AnvilPlayer\App\gpu_frame_interpolator.h" />
     <ClInclude Include="include\AnvilPlayer\App\hdr_tone_curve_math.h" />
     <ClInclude Include="include\AnvilPlayer\App\icon_painter.h" />
     <ClInclude Include="include\AnvilPlayer\App\library_commands.h" />
@@ -124,6 +128,7 @@ if exist "$(SolutionDir)third_party\webview2-runtime\Microsoft.WebView2.FixedVer
     <ClInclude Include="include\AnvilPlayer\App\ui_animation_math.h" />
     <ClInclude Include="include\AnvilPlayer\App\ui_draw.h" />
     <ClInclude Include="include\AnvilPlayer\App\ui_types.h" />
+    <ClInclude Include="include\AnvilPlayer\App\video_renderer_types.h" />
     <ClInclude Include="include\AnvilPlayer\App\wasapi_audio_player.h" />
     <ClInclude Include="include\AnvilPlayer\App\web_ui_host.h" />
     <ClInclude Include="include\AnvilPlayer\App\web_ui_json.h" />

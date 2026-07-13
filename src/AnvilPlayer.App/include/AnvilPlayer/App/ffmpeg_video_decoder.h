@@ -2,13 +2,12 @@
 
 #include "AnvilPlayer/App/color_metadata_util.h"
 #include "AnvilPlayer/App/log_sink_ptr.h"
-#include "AnvilPlayer/App/gpu_frame_interpolator.h"
 #include "AnvilPlayer/App/video_texture_sampling_math.h"
 #include "AnvilPlayer/Playback/DolbyVisionMetadata.h"
 #include "AnvilPlayer/Playback/Settings.h"
 #include "AnvilPlayer/Playback/Types.h"
 
-#include <d3d11.h>
+#include <d3d12.h>
 #include <dxgi.h>
 #include <windows.h>
 
@@ -18,7 +17,7 @@ extern "C" {
 #include <libavutil/buffer.h>
 #include <libavutil/frame.h>
 #include <libavutil/hwcontext.h>
-#include <libavutil/hwcontext_d3d11va.h>
+#include <libavutil/hwcontext_d3d12va.h>
 #include <libavutil/pixfmt.h>
 #include <libavutil/rational.h>
 #include <libswscale/swscale.h>
@@ -80,9 +79,8 @@ struct NativeYuvPlanes {
     }
 };
 
-// A decoded video frame: either a CPU-side BGRA buffer or a zero-copy D3D11
-// hardware texture (D3D11VA), or raw YUV planes (DV software path), or both.
-// The unit consumed by D3D11VideoRenderer.
+// A decoded video frame: a CPU-side buffer, a zero-copy D3D12 hardware
+// texture, or raw YUV planes for the Dolby Vision software path.
 struct NativeVideoFrame {
     int width = 0;
     int height = 0;
@@ -94,12 +92,17 @@ struct NativeVideoFrame {
     // Experimental Dolby Vision Profile 7 enhancement/FEL layer, packed as a
     // second P010 texture and sampled by the renderer as an overlay.
     NativeYuvPlanes enhancementYuv;
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> d3dTexture;
-    UINT d3dArraySlice = 0;
+    // Profile 7 enhancement layer decoded on the same D3D12 device. This
+    // replaces the CPU P010 packing path when D3D12VA exposes an EL surface.
+    std::shared_ptr<NativeVideoFrame> enhancementFrame;
     DXGI_FORMAT d3dFormat = DXGI_FORMAT_UNKNOWN;
     int d3dTextureWidth = 0;
     int d3dTextureHeight = 0;
     VideoTextureUvRect sourceUvRect;
+    Microsoft::WRL::ComPtr<ID3D12Resource> d3d12Texture;
+    UINT d3d12Subresource = 0;
+    Microsoft::WRL::ComPtr<ID3D12Fence> d3d12ReadyFence;
+    uint64_t d3d12ReadyFenceValue = 0;
     AVPixelFormat softwareFormat = AV_PIX_FMT_NONE;
     anvil::playback::VideoColorMetadata color;
     std::shared_ptr<const std::vector<std::uint8_t>> hdr10PlusPayload;
@@ -141,12 +144,21 @@ struct NativeVideoFrame {
         return enhancementYuv.HasData();
     }
 
-    bool HasD3DTexture() const {
-        return d3dTexture && width > 0 && height > 0 && d3dFormat != DXGI_FORMAT_UNKNOWN;
+    bool HasEnhancementD3D12Texture() const {
+        return enhancementFrame && enhancementFrame->HasD3D12Texture();
+    }
+
+    bool HasEnhancementSurface() const {
+        return HasEnhancementD3D12Texture() || HasEnhancementYuv();
+    }
+
+    bool HasD3D12Texture() const {
+        return d3d12Texture && width > 0 && height > 0 &&
+               d3dFormat != DXGI_FORMAT_UNKNOWN;
     }
 
     bool HasContent() const {
-        return HasD3DTexture() || HasPixels() || HasYuv();
+        return HasD3D12Texture() || HasPixels() || HasYuv();
     }
 };
 
@@ -178,11 +190,6 @@ struct NativeVideoQueueStats {
     uint64_t networkBytesPerSecond = 0;
     bool usingAudioClock = false;
     bool usingHardwareDecode = false;
-    bool frameInterpolationRequested = false;
-    bool frameInterpolationActive = false;
-    uint64_t interpolatedFrames = 0;
-    std::wstring frameInterpolationBackend = L"unavailable";
-    std::wstring frameInterpolationReason;
     std::wstring decoder = L"ffmpeg_software";
     std::wstring fallbackReason;
 };
@@ -209,14 +216,14 @@ struct NativeDecodeFailure {
 };
 
 // Native in-process FFmpeg video decoder. Demux+decode on a worker thread,
-// optional D3D11VA hardware decode (zero-copy via a shared device, with
-// CPU-transfer fallback), swscale -> BGRA for software frames, frame queue
-// with PTS-based scheduling against an audio clock (or wall-clock fallback).
+// D3D12VA hardware decode on the renderer-owned device, with a bounded frame
+// queue and PTS scheduling against an audio clock (or wall-clock fallback).
 // Posts kNativeVideoFrameReadyMessage to the notification window when a frame
 // is ready to render.
 class FfmpegVideoDecoder {
 public:
     using ClockCallback = std::function<std::optional<std::chrono::milliseconds>()>;
+    using FrameGraphInputCallback = std::function<void(const NativeVideoFrame&)>;
 
     explicit FfmpegVideoDecoder(LogSinkPtr logSink = nullptr);
     ~FfmpegVideoDecoder();
@@ -230,7 +237,7 @@ public:
                UINT failureMessage = 0,
                ClockCallback clockCallback = {},
                bool preferHardwareDecode = false,
-               ID3D11Device* sharedD3DDevice = nullptr,
+               ID3D12Device* sharedD3D12Device = nullptr,
                int selectedVideoTrackIndex = anvil::playback::kVideoTrackAuto,
                std::wstring preferredSubtitleLanguage = L"Auto",
                int selectedSubtitleTrackIndex = anvil::playback::kSubtitleTrackAuto,
@@ -240,7 +247,6 @@ public:
                bool oneShotFrame = false,
                bool preferDolbyVisionHdrOutput = false,
                bool enableDolbyVisionEnhancementDecode = false,
-               bool enableFrameInterpolation = false,
                NativeAudioPacketSink audioPacketSink = {},
                uint64_t notificationCookie = 0);
 
@@ -250,6 +256,7 @@ public:
     void Stop();
     bool Seek(std::chrono::milliseconds position);
     void SetPaused(bool paused, std::chrono::milliseconds position);
+    void SetFrameGraphInputCallback(FrameGraphInputCallback callback);
 
     bool IsRunning() const {
         return running_.load();
@@ -411,6 +418,7 @@ private:
     struct DolbyVisionEnhancementFrame {
         std::chrono::milliseconds pts{0};
         NativeYuvPlanes yuv;
+        NativeVideoFrame gpuFrame;
         std::shared_ptr<const anvil::playback::DolbyVisionFrameMetadata> dovi;
         std::wstring details;
     };
@@ -435,8 +443,8 @@ private:
     bool ConfigureAssSubtitleStream(AVFormatContext* formatCtx, const AVStream* stream);
     void AddAssFontAttachments(AVFormatContext* formatCtx);
     AVCodecContext* AllocateVideoCodecContext(const AVCodec* codec, const AVCodecParameters* codecpar) const;
-    bool ConfigureD3D11VA(const AVCodec* codec, AVCodecContext* codecCtx, AVBufferRef*& hwDeviceCtx);
-    int CreateD3D11VADeviceContext(AVBufferRef** device, std::wstring& deviceMode);
+    bool ConfigureD3D12VA(const AVCodec* codec, AVCodecContext* codecCtx, AVBufferRef*& hwDeviceCtx);
+    int CreateD3D12VADeviceContext(AVBufferRef** device, std::wstring& deviceMode);
 
     static AVPixelFormat ChooseHardwarePixelFormat(AVCodecContext* codecCtx, const AVPixelFormat* pixelFormats);
 
@@ -461,7 +469,7 @@ private:
                                        std::chrono::milliseconds pts,
                                        uint64_t& serial);
     bool EnsureDoviLibplaceboFilter(AVFrame* frame, AVRational timeBase);
-    bool TryBuildD3DTextureFrame(AVFrame* frame, std::chrono::milliseconds pts, uint64_t& serial, NativeVideoFrame& out);
+    bool TryBuildD3D12TextureFrame(AVFrame* frame, std::chrono::milliseconds pts, uint64_t& serial, NativeVideoFrame& out);
     bool PublishImmediateFrame(NativeVideoFrame&& frame);
     bool DecodeSubtitlePacket(AVCodecContext* subtitleCodecCtx, const AVPacket* packet, AVRational subtitleTimeBase);
     bool ApplyPendingSeek(AVFormatContext* formatCtx,
@@ -515,8 +523,6 @@ private:
 
     bool EnqueueFrame(NativeVideoFrame&& frame);
     bool EnqueuePresentationFrame(NativeVideoFrame&& frame);
-    void ResetFrameInterpolationPipeline();
-    void DisableFrameInterpolationForSession(const std::wstring& reason);
     void DrainQueuedFrames();
     void SchedulerLoop();
     void WakeScheduler();
@@ -555,8 +561,9 @@ private:
     LogSinkPtr logSink_;
     mutable std::mutex clockCallbackMutex_;
     ClockCallback clockCallback_;
-    Microsoft::WRL::ComPtr<ID3D11Device> sharedD3DDevice_;
+    Microsoft::WRL::ComPtr<ID3D12Device> sharedD3D12Device_;
     bool preferHardwareDecode_ = false;
+    AVHWDeviceType hardwareDeviceType_ = AV_HWDEVICE_TYPE_NONE;
     AVPixelFormat hardwarePixelFormat_ = AV_PIX_FMT_NONE;
     bool hardwareDecodeActive_ = false;
     bool hardwareFormatLogged_ = false;
@@ -581,14 +588,6 @@ private:
     uint64_t dolbyVisionLastDynamicMetadataFingerprint_ = 0;
     bool preferDolbyVisionHdrOutput_ = false;
     bool enableDolbyVisionEnhancementDecode_ = false;
-    bool frameInterpolationRequested_ = false;
-    bool frameInterpolationUnavailable_ = false;
-    std::unique_ptr<GpuFrameInterpolator> frameInterpolator_;
-    std::optional<NativeVideoFrame> frameInterpolationPreviousFrame_;
-    UINT32 frameInterpolationOverBudgetCount_ = 0;
-    std::uint64_t frameInterpolationGeneratedCount_ = 0;
-    double frameInterpolationAverageMilliseconds_ = 0.0;
-    bool frameInterpolationDiagnosticLogged_ = false;
     int selectedVideoTrackIndex_ = anvil::playback::kVideoTrackAuto;
     std::unique_ptr<DoviLibplaceboFilterState> doviLibplaceboFilter_;
     // Stream-level DV configuration (not present in per-frame metadata).
@@ -654,6 +653,8 @@ private:
     SeekRecoveryState seekRecovery_;
     mutable std::mutex mutex_;
     std::condition_variable frameQueueCv_;
+    mutable std::mutex frameGraphCallbackMutex_;
+    FrameGraphInputCallback frameGraphInputCallback_;
     NativeVideoFrame latestFrame_;
     std::deque<NativeVideoFrame> frameQueue_;
     std::vector<std::shared_ptr<std::vector<uint8_t>>> reusableBgraBuffers_;

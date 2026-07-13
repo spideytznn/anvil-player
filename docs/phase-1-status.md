@@ -1,4 +1,6 @@
-# Phase 1 Status
+# Phase 1 Status (Archived)
+
+> Superseded by `native-d3d12-frame-graph.md`.
 
 ## Implemented
 

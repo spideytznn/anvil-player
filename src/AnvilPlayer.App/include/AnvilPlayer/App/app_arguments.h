@@ -17,7 +17,7 @@ struct AppArguments {
     bool autoplay = false;
     bool webUiEnabled = true;
     anvil::playback::LogLevel logLevel = anvil::playback::DefaultLogLevel();
-    PlaybackBackend backend = PlaybackBackend::NativeFfmpegD3D11;
+    PlaybackBackend backend = PlaybackBackend::NativeFfmpegD3D12;
     int selectedVideoTrackIndex = anvil::playback::kVideoTrackAuto;
 };
 

@@ -27,8 +27,8 @@ std::wstring ToDisplayString(const HardwareDecodeMode mode) {
     switch (mode) {
     case HardwareDecodeMode::Auto:
         return L"Auto";
-    case HardwareDecodeMode::D3D11VA:
-        return L"D3D11VA";
+    case HardwareDecodeMode::D3D12VA:
+        return L"D3D12VA";
     case HardwareDecodeMode::Off:
         return L"Off";
     }

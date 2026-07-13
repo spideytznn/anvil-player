@@ -1045,7 +1045,7 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
                                const UINT failureMessage,
                                ClockCallback clockCallback,
                                const bool preferHardwareDecode,
-                               ID3D11Device* sharedD3DDevice,
+                               ID3D12Device* sharedD3D12Device,
                                const int selectedVideoTrackIndex,
                                std::wstring preferredSubtitleLanguage,
                                const int selectedSubtitleTrackIndex,
@@ -1055,7 +1055,6 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
                                const bool oneShotFrame,
                                const bool preferDolbyVisionHdrOutput,
                                const bool enableDolbyVisionEnhancementDecode,
-                               const bool enableFrameInterpolation,
                                NativeAudioPacketSink audioPacketSink,
                                const uint64_t notificationCookie) {
     Stop();
@@ -1066,10 +1065,11 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
     path_ = mediaPath;
     startPosition_ = startPosition;
     preferHardwareDecode_ = preferHardwareDecode;
-    sharedD3DDevice_.Reset();
-    if (sharedD3DDevice) {
-        sharedD3DDevice_ = sharedD3DDevice;
+    sharedD3D12Device_.Reset();
+    if (sharedD3D12Device) {
+        sharedD3D12Device_ = sharedD3D12Device;
     }
+    hardwareDeviceType_ = AV_HWDEVICE_TYPE_NONE;
     hardwarePixelFormat_ = AV_PIX_FMT_NONE;
     hardwareDecodeActive_ = false;
     hardwareFormatLogged_ = false;
@@ -1099,10 +1099,6 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
     oneShotFrame_ = oneShotFrame;
     preferDolbyVisionHdrOutput_ = preferDolbyVisionHdrOutput;
     enableDolbyVisionEnhancementDecode_ = enableDolbyVisionEnhancementDecode;
-    frameInterpolationRequested_ = enableFrameInterpolation && !oneShotFrame;
-    frameInterpolationUnavailable_ = false;
-    frameInterpolator_.reset();
-    frameInterpolationPreviousFrame_.reset();
     dolbyVisionEnhancementActive_ = false;
     dolbyVisionEnhancementFirstFrameLogged_ = false;
     dolbyVisionEnhancementDynamicMetadataLogged_ = false;
@@ -1127,8 +1123,6 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
     latestDolbyVisionEnhancementMetadataPts_ = std::chrono::milliseconds{0};
     dolbyVisionEnhancementFrames_.clear();
     pendingDolbyVisionBaseFrame_.reset();
-    ResetFrameInterpolationPipeline();
-    frameInterpolationUnavailable_ = false;
     subtitleCanvasWidth_ = 0;
     subtitleCanvasHeight_ = 0;
     subtitleCanvasLogged_ = false;
@@ -1176,9 +1170,11 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
         latestFrame_.serial = 0;
         latestFrame_.timelineSerial = 0;
         latestFrame_.width = latestFrame_.height = latestFrame_.stride = 0;
-        latestFrame_.d3dTexture.Reset();
         latestFrame_.hardwareFrameRef.reset();
-        latestFrame_.d3dArraySlice = 0;
+        latestFrame_.d3d12Texture.Reset();
+        latestFrame_.d3d12ReadyFence.Reset();
+        latestFrame_.d3d12Subresource = 0;
+        latestFrame_.d3d12ReadyFenceValue = 0;
         latestFrame_.d3dFormat = DXGI_FORMAT_UNKNOWN;
         latestFrame_.softwareFormat = AV_PIX_FMT_NONE;
         latestFrame_.color = {};
@@ -1189,11 +1185,8 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
         latestFrame_.subtitlesPrepared = false;
         frameQueue_.clear();
         stats_ = {};
-        stats_.decoder = preferHardwareDecode_ ? L"ffmpeg_d3d11va_pending" : L"ffmpeg_software";
-        stats_.frameInterpolationRequested = frameInterpolationRequested_;
-        stats_.frameInterpolationBackend = frameInterpolationRequested_
-                                               ? L"directml_rife_pending"
-                                               : L"disabled";
+        stats_.decoder = preferHardwareDecode_ ? L"ffmpeg_d3d12va_pending"
+                                               : L"ffmpeg_software";
         ResetSeekRecoveryLocked();
     }
     running_.store(true);
@@ -1246,7 +1239,6 @@ void FfmpegVideoDecoder::Stop() {
         decodeThread_.join();
     }
     running_.store(false);
-    ResetFrameInterpolationPipeline();
     {
         std::scoped_lock lock(mutex_);
         ResetSeekRecoveryLocked();
@@ -1275,7 +1267,7 @@ void FfmpegVideoDecoder::Stop() {
     latestDolbyVisionEnhancementMetadata_.reset();
     latestDolbyVisionEnhancementMetadataPts_ = std::chrono::milliseconds{0};
     doviLibplaceboFilter_.reset();
-    sharedD3DDevice_.Reset();
+    sharedD3D12Device_.Reset();
     subtitleAssRenderer_.reset();
     subtitleAssActive_ = false;
     subtitleAssExternalFullTrack_ = false;
@@ -1705,7 +1697,7 @@ bool FfmpegVideoDecoder::WaitForEnhancementPreroll(const std::chrono::millisecon
             const auto enhanced = std::find_if(frameQueue_.begin(), frameQueue_.end(), [minPts](const NativeVideoFrame& frame) {
                 constexpr std::chrono::milliseconds kBehindTolerance{120};
                 constexpr std::chrono::milliseconds kAheadTolerance{500};
-                return frame.HasEnhancementYuv() &&
+                return frame.HasEnhancementSurface() &&
                        frame.pts + kBehindTolerance >= minPts &&
                        frame.pts <= minPts + kAheadTolerance;
             });
@@ -1730,7 +1722,7 @@ bool FfmpegVideoDecoder::WaitForEnhancementPreroll(const std::chrono::millisecon
                 UpdateBufferedStatsLocked();
                 ready = true;
             } else if (!publishReadyFrame &&
-                       latestFrame_.HasEnhancementYuv() &&
+                       latestFrame_.HasEnhancementSurface() &&
                        closeToTarget(latestFrame_)) {
                 ready = true;
             } else if (!frameQueue_.empty()) {
@@ -2050,9 +2042,9 @@ void FfmpegVideoDecoder::DecodeLoop() {
                       std::wstring(L"dolby_vision_processing primary=") +
                           (ShouldUsePrimaryDoviLibplacebo() ? L"libplacebo" : L"renderer_fallback") +
                           L" reason=" +
-                          (ShouldUsePrimaryDoviLibplacebo()
-                               ? L"single_layer_profile_5_or_8"
-                               : L"profile_or_enhancement_layer_requires_future_merge"));
+                           (ShouldUsePrimaryDoviLibplacebo()
+                                ? L"single_layer_profile_5_or_8"
+                                : L"app_owned_d3d12_rpu_el_fel_reconstruction"));
         }
 
         if (enableDolbyVisionEnhancementDecode_ &&
@@ -2788,24 +2780,33 @@ bool FfmpegVideoDecoder::OpenVideoDecoder(const AVCodec* codec,
         return false;
     }
 
-    if (preferHardwareDecode_ && !dolbyVisionStream_ && !enableDolbyVisionEnhancementDecode_) {
-        hardwareConfigured = ConfigureD3D11VA(codec, codecCtx, hwDeviceCtx);
+    if (preferHardwareDecode_) {
+        hardwareConfigured = ConfigureD3D12VA(codec, codecCtx, hwDeviceCtx);
     } else {
         SetDecodeBackend(L"ffmpeg_software", false, {});
         LogThread(LogLevel::Info, L"decoder",
-                  L"selected=ffmpeg_software reason=" +
-                      std::wstring(dolbyVisionStream_
-                                       ? L"dolby_vision_software_decode_for_reshape"
-                                       : (enableDolbyVisionEnhancementDecode_
-                                              ? L"dolby_vision_el_overlay_requires_software_decode"
-                                              : L"hardware_decode_not_requested")));
+                  L"selected=ffmpeg_software reason=hardware_decode_not_requested");
+    }
+
+    if (preferHardwareDecode_ && !hardwareConfigured) {
+        LogThread(LogLevel::Error,
+                  L"decoder",
+                  L"d3d12va required; refusing CPU pixel fallback");
+        avcodec_free_context(&codecCtx);
+        return false;
     }
 
     int openError = avcodec_open2(codecCtx, codec, nullptr);
     if (openError >= 0) {
         if (hardwareConfigured) {
-            SetDecodeBackend(L"ffmpeg_d3d11va", true, {});
-            LogThread(LogLevel::Info, L"decoder", L"selected=ffmpeg_d3d11va handoff=zero_copy_or_cpu_transfer");
+            const std::wstring backend = L"ffmpeg_d3d12va";
+            SetDecodeBackend(backend, true, {});
+            LogThread(LogLevel::Info,
+                      L"decoder",
+                      L"selected=" + backend +
+                          (sharedD3D12Device_
+                               ? L" handoff=native_d3d12_zero_copy_only"
+                               : L" handoff=compatibility_cpu_transfer"));
         }
         return true;
     }
@@ -2816,8 +2817,9 @@ bool FfmpegVideoDecoder::OpenVideoDecoder(const AVCodec* codec,
         return false;
     }
 
-    const std::wstring reason = L"d3d11va_open_failed:" + FfmpegErrorString(openError);
-    LogThread(LogLevel::Warning, L"decoder", L"fallback=ffmpeg_software reason=" + reason);
+    const std::wstring hardwareName = L"d3d12va";
+    const std::wstring reason = hardwareName + L"_open_failed:" + FfmpegErrorString(openError);
+    LogThread(LogLevel::Error, L"decoder", L"selected=d3d12va failure=" + reason);
     SetDecodeBackend(L"ffmpeg_software", false, reason);
     avcodec_free_context(&codecCtx);
     if (hwDeviceCtx) {
@@ -2827,19 +2829,7 @@ bool FfmpegVideoDecoder::OpenVideoDecoder(const AVCodec* codec,
     hardwareDecodeActive_ = false;
     hardwareFormatLogged_ = false;
     zeroCopyFallbackLogged_ = false;
-
-    codecCtx = AllocateVideoCodecContext(codec, codecpar);
-    if (!codecCtx) {
-        return false;
-    }
-    openError = avcodec_open2(codecCtx, codec, nullptr);
-    if (openError < 0) {
-        LogThreadError(L"software avcodec_open2 failed: " + FfmpegErrorString(openError));
-        avcodec_free_context(&codecCtx);
-        return false;
-    }
-    LogThread(LogLevel::Info, L"decoder", L"selected=ffmpeg_software fallback_from=d3d11va");
-    return true;
+    return false;
 }
 
 bool FfmpegVideoDecoder::OpenDolbyVisionEnhancementDecoder(AVFormatContext* formatCtx,
@@ -2900,7 +2890,17 @@ bool FfmpegVideoDecoder::OpenDolbyVisionEnhancementDecoder(AVFormatContext* form
     }
     context->pkt_timebase = enhancementStream->time_base;
 
+    AVBufferRef* enhancementHwDevice = nullptr;
+    if (preferHardwareDecode_ && sharedD3D12Device_) {
+        if (!ConfigureD3D12VA(codec, context, enhancementHwDevice)) {
+            LogThread(LogLevel::Warning,
+                      L"decoder",
+                      L"dolby_vision_el d3d12va unavailable; falling back to software EL decode");
+        }
+    }
+
     const int openError = avcodec_open2(context, codec, nullptr);
+    av_buffer_unref(&enhancementHwDevice);
     if (openError < 0) {
         LogThread(LogLevel::Warning,
                   L"decoder",
@@ -3296,22 +3296,21 @@ AVCodecContext* FfmpegVideoDecoder::AllocateVideoCodecContext(const AVCodec* cod
     return context;
 }
 
-bool FfmpegVideoDecoder::ConfigureD3D11VA(const AVCodec* codec, AVCodecContext* codecCtx, AVBufferRef*& hwDeviceCtx) {
+bool FfmpegVideoDecoder::ConfigureD3D12VA(const AVCodec* codec,
+                                          AVCodecContext* codecCtx,
+                                          AVBufferRef*& hwDeviceCtx) {
     const AVCodecHWConfig* selectedConfig = nullptr;
     for (int index = 0;; ++index) {
         const AVCodecHWConfig* config = avcodec_get_hw_config(codec, index);
-        if (!config) {
-            break;
-        }
+        if (!config) break;
         if ((config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) &&
-            config->device_type == AV_HWDEVICE_TYPE_D3D11VA) {
+            config->device_type == AV_HWDEVICE_TYPE_D3D12VA) {
             selectedConfig = config;
             break;
         }
     }
-
     if (!selectedConfig) {
-        const std::wstring reason = L"codec_has_no_d3d11va_hw_device_config";
+        const std::wstring reason = L"codec_has_no_d3d12va_hw_device_config";
         SetDecodeBackend(L"ffmpeg_software", false, reason);
         LogThread(LogLevel::Warning, L"decoder", L"fallback=ffmpeg_software reason=" + reason);
         return false;
@@ -3319,64 +3318,51 @@ bool FfmpegVideoDecoder::ConfigureD3D11VA(const AVCodec* codec, AVCodecContext* 
 
     AVBufferRef* device = nullptr;
     std::wstring deviceMode;
-    const int deviceError = CreateD3D11VADeviceContext(&device, deviceMode);
+    const int deviceError = CreateD3D12VADeviceContext(&device, deviceMode);
     if (deviceError < 0 || !device) {
-        const std::wstring reason = L"d3d11va_device_create_failed:" + FfmpegErrorString(deviceError);
+        const std::wstring reason = L"d3d12va_device_create_failed:" + FfmpegErrorString(deviceError);
         SetDecodeBackend(L"ffmpeg_software", false, reason);
         LogThread(LogLevel::Warning, L"decoder", L"fallback=ffmpeg_software reason=" + reason);
         return false;
     }
-
     codecCtx->hw_device_ctx = av_buffer_ref(device);
     if (!codecCtx->hw_device_ctx) {
-        const std::wstring reason = L"av_buffer_ref_hw_device_failed";
         av_buffer_unref(&device);
-        SetDecodeBackend(L"ffmpeg_software", false, reason);
-        LogThread(LogLevel::Warning, L"decoder", L"fallback=ffmpeg_software reason=" + reason);
         return false;
     }
-
     hwDeviceCtx = device;
     hardwarePixelFormat_ = selectedConfig->pix_fmt;
+    hardwareDeviceType_ = AV_HWDEVICE_TYPE_D3D12VA;
     hardwareDecodeActive_ = false;
     hardwareFormatLogged_ = false;
     codecCtx->opaque = this;
     codecCtx->get_format = &FfmpegVideoDecoder::ChooseHardwarePixelFormat;
     LogThread(LogLevel::Info,
               L"decoder",
-              L"d3d11va candidate pix_fmt=" + PixelFormatName(hardwarePixelFormat_) +
+              L"d3d12va candidate pix_fmt=" + PixelFormatName(hardwarePixelFormat_) +
                   L" device=" + deviceMode);
     return true;
 }
 
-int FfmpegVideoDecoder::CreateD3D11VADeviceContext(AVBufferRef** device, std::wstring& deviceMode) {
-    if (!device) {
-        return AVERROR(EINVAL);
-    }
+int FfmpegVideoDecoder::CreateD3D12VADeviceContext(AVBufferRef** device,
+                                                    std::wstring& deviceMode) {
+    if (!device) return AVERROR(EINVAL);
     *device = nullptr;
-
-    if (!sharedD3DDevice_) {
+    if (!sharedD3D12Device_) {
         deviceMode = L"ffmpeg_owned";
-        return av_hwdevice_ctx_create(device, AV_HWDEVICE_TYPE_D3D11VA, nullptr, nullptr, 0);
+        return av_hwdevice_ctx_create(device, AV_HWDEVICE_TYPE_D3D12VA, nullptr, nullptr, 0);
     }
-
-    AVBufferRef* ref = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
-    if (!ref) {
-        return AVERROR(ENOMEM);
-    }
-
+    AVBufferRef* ref = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D12VA);
+    if (!ref) return AVERROR(ENOMEM);
     auto* hwctx = reinterpret_cast<AVHWDeviceContext*>(ref->data);
-    auto* d3dctx = reinterpret_cast<AVD3D11VADeviceContext*>(hwctx->hwctx);
-    d3dctx->device = sharedD3DDevice_.Get();
+    auto* d3dctx = reinterpret_cast<AVD3D12VADeviceContext*>(hwctx->hwctx);
+    d3dctx->device = sharedD3D12Device_.Get();
     d3dctx->device->AddRef();
-    d3dctx->BindFlags = D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE;
-
     const int initError = av_hwdevice_ctx_init(ref);
     if (initError < 0) {
         av_buffer_unref(&ref);
         return initError;
     }
-
     *device = ref;
     deviceMode = L"renderer_shared";
     return 0;
@@ -3395,17 +3381,18 @@ AVPixelFormat FfmpegVideoDecoder::ChooseHardwarePixelFormat(AVCodecContext* code
                 self->hardwareFormatLogged_ = true;
                 self->LogThread(LogLevel::Info,
                                 L"decoder",
-                                L"d3d11va format selected=" + PixelFormatName(*format));
+                                L"d3d12va format selected=" + PixelFormatName(*format));
             }
             return *format;
         }
     }
 
     self->hardwareDecodeActive_ = false;
-    self->SetDecodeBackend(L"ffmpeg_software", false, L"d3d11va_pix_fmt_not_offered");
+    const std::wstring unavailable = L"d3d12va_pix_fmt_not_offered";
+    self->SetDecodeBackend(L"ffmpeg_software", false, unavailable);
     self->LogThread(LogLevel::Warning,
                     L"decoder",
-                    L"fallback=ffmpeg_software reason=d3d11va_pix_fmt_not_offered");
+                    L"fallback=ffmpeg_software reason=" + unavailable);
     return avcodec_default_get_format(codecCtx, pixelFormats);
 }
 
@@ -3567,9 +3554,17 @@ bool FfmpegVideoDecoder::ReceiveDolbyVisionEnhancementFrames(AVCodecContext* cod
         }
 
         NativeYuvPlanes enhancementYuv;
+        NativeVideoFrame gpuEnhancement;
+        uint64_t enhancementSerial = 0;
         const auto packStart = std::chrono::steady_clock::now();
-        if (PackYuv420P10FrameToP010(frame, enhancementYuv, kEnhancementMemoryBudgetBytes)) {
-            const std::size_t incomingBytes = BufferCapacityBytes(enhancementYuv.data);
+        const bool gpuResident = TryBuildD3D12TextureFrame(
+            frame, pts, enhancementSerial, gpuEnhancement);
+        const bool cpuPacked = !gpuResident &&
+            PackYuv420P10FrameToP010(frame, enhancementYuv, kEnhancementMemoryBudgetBytes);
+        if (gpuResident || cpuPacked) {
+            const std::size_t incomingBytes = gpuResident
+                ? 0
+                : BufferCapacityBytes(enhancementYuv.data);
             std::size_t queuedBytes = 0;
             for (const auto& queuedFrame : dolbyVisionEnhancementFrames_) {
                 queuedBytes = SaturatingAddBytes(queuedBytes, BufferCapacityBytes(queuedFrame.yuv.data));
@@ -3620,6 +3615,7 @@ bool FfmpegVideoDecoder::ReceiveDolbyVisionEnhancementFrames(AVCodecContext* cod
             DolbyVisionEnhancementFrame queued;
             queued.pts = pts;
             queued.yuv = std::move(enhancementYuv);
+                queued.gpuFrame = std::move(gpuEnhancement);
                 queued.dovi = (metadata && metadata->valid) ? metadata : latestDolbyVisionEnhancementMetadata_;
                 queued.details = DoviFrameSummary(queued.dovi.get());
                 dolbyVisionEnhancementFrames_.push_back(std::move(queued));
@@ -3630,8 +3626,9 @@ bool FfmpegVideoDecoder::ReceiveDolbyVisionEnhancementFrames(AVCodecContext* cod
                     std::chrono::steady_clock::now() - packStart).count();
                 LogThread(LogLevel::Debug,
                           L"decoder",
-                          L"dolby_vision_el_packed bytes=" +
-                              std::to_wstring(incomingBytes) +
+                          L"dolby_vision_el_surface path=" +
+                              std::wstring(gpuResident ? L"d3d12va_zero_copy" : L"cpu_p010") +
+                              L" bytes=" + std::to_wstring(incomingBytes) +
                               L" pack_ms=" + std::to_wstring(packMs));
             }
         } else if (!dolbyVisionEnhancementFailureLogged_) {
@@ -3662,14 +3659,14 @@ bool FfmpegVideoDecoder::ReceiveDolbyVisionEnhancementFrames(AVCodecContext* cod
 }
 
 bool FfmpegVideoDecoder::ShouldUsePrimaryDoviLibplacebo() const {
-    if (!dolbyVisionStream_) {
+    if (!dolbyVisionStream_ || sharedD3D12Device_) {
         return false;
     }
 
     // Profiles 5 and 8 are the practical single-layer fallback targets:
     // libplacebo can consume the per-frame RPU and output display-ready SDR or
-    // HDR10/PQ. Profile 7 with EL/FEL stays on the explicit fallback path until
-    // BL+EL composition is implemented.
+    // HDR10/PQ. The native D3D12 path never reaches this fallback: it keeps
+    // BL/EL surfaces resident and reconstructs RPU+FEL in the frame graph.
     const bool singleLayer = dolbyVisionBlPresent_ && !dolbyVisionElPresent_;
     return singleLayer && (dolbyVisionProfile_ == 5 || dolbyVisionProfile_ == 8);
 }
@@ -4020,19 +4017,26 @@ void FfmpegVideoDecoder::AttachDolbyVisionEnhancementFrame(NativeVideoFrame& fra
     dolbyVisionEnhancementFrames_.pop_front();
 
     frame.enhancementYuv = std::move(matched.yuv);
-    frame.enhancementDovi = std::move(matched.dovi);
+    if (matched.gpuFrame.HasD3D12Texture()) {
+        frame.enhancementFrame =
+            std::make_shared<NativeVideoFrame>(std::move(matched.gpuFrame));
+    }
+    frame.enhancementDovi = matched.dovi && matched.dovi->valid
+        ? std::move(matched.dovi)
+        : frame.dovi;
     frame.enhancementMetadataDetails = std::move(matched.details);
     const bool enhancementMetadataValid = frame.enhancementDovi && frame.enhancementDovi->valid;
-    const bool enhancementSinglePartition =
-        enhancementMetadataValid && DoviSingleNlqPartition(*frame.enhancementDovi);
+    const bool enhancementNlq = enhancementMetadataValid &&
+        !frame.enhancementDovi->residualDisabled &&
+        frame.enhancementDovi->nlqMethod == DoviNlqMethod::LinearDeadzone;
     if (frame.dynamicMetadataPath.empty()) {
-        frame.dynamicMetadataPath = enhancementSinglePartition
+        frame.dynamicMetadataPath = enhancementNlq
                                         ? L"dolby_vision_p7_fel_nlq_merge"
-                                        : L"dolby_vision_p7_fel_mapping_only_multi_partition";
+                                        : L"dolby_vision_p7_mapping_only";
     } else if (frame.dynamicMetadataPath.find(L"fel_") == std::wstring::npos) {
-        frame.dynamicMetadataPath += enhancementSinglePartition
+        frame.dynamicMetadataPath += enhancementNlq
                                          ? L"+fel_nlq_merge"
-                                         : L"+fel_mapping_only_multi_partition";
+                                         : L"+fel_mapping_only";
     }
     if (!frame.enhancementMetadataDetails.empty()) {
         if (!frame.dynamicMetadataDetails.empty()) {
@@ -4041,28 +4045,13 @@ void FfmpegVideoDecoder::AttachDolbyVisionEnhancementFrame(NativeVideoFrame& fra
         frame.dynamicMetadataDetails += L"el=" + frame.enhancementMetadataDetails;
     }
 
-    if (frame.enhancementDovi && frame.enhancementDovi->valid &&
-        !DoviSingleNlqPartition(*frame.enhancementDovi) &&
-        !dolbyVisionMultiPartitionFallbackLogged_) {
-        dolbyVisionMultiPartitionFallbackLogged_ = true;
-        LogThread(LogLevel::Warning,
-                  L"decoder",
-                  L"dolby_vision_fel_multi_partition unsupported_via_ffmpeg_public_metadata partitions=" +
-                      std::to_wstring(frame.enhancementDovi->nlqNumXPartitions) +
-                      L"x" + std::to_wstring(frame.enhancementDovi->nlqNumYPartitions) +
-                      L" fallback=mapping_only residual=disabled");
-    }
-
     LogDolbyVisionCpuReferenceSample(frame);
 
     if (!dolbyVisionEnhancementOverlayLogged_) {
         dolbyVisionEnhancementOverlayLogged_ = true;
-        const bool singlePartition = frame.enhancementDovi &&
-                                     frame.enhancementDovi->valid &&
-                                     DoviSingleNlqPartition(*frame.enhancementDovi);
         const std::wstring mergeMode =
             frame.enhancementDovi && frame.enhancementDovi->valid
-                ? (singlePartition ? L"nlq_merge" : L"mapping_only_multi_partition")
+                ? (enhancementNlq ? L"nlq_merge" : L"mapping_only")
                 : L"experimental_overlay";
         LogThread(LogLevel::Info,
                   L"decoder",
@@ -4071,8 +4060,18 @@ void FfmpegVideoDecoder::AttachDolbyVisionEnhancementFrame(NativeVideoFrame& fra
                       std::to_wstring(pts.count()) +
                       L" el_pts_ms=" + std::to_wstring(matched.pts.count()) +
                       L" delta_ms=" + std::to_wstring(bestDelta.count()) +
-                      L" size=" + std::to_wstring(frame.enhancementYuv.width) +
-                      L"x" + std::to_wstring(frame.enhancementYuv.height));
+                      L" surface=" +
+                      std::wstring(frame.HasEnhancementD3D12Texture()
+                                       ? L"d3d12va"
+                                       : L"cpu_p010") +
+                      L" size=" +
+                      std::to_wstring(frame.HasEnhancementD3D12Texture()
+                                          ? frame.enhancementFrame->width
+                                          : frame.enhancementYuv.width) +
+                      L"x" +
+                      std::to_wstring(frame.HasEnhancementD3D12Texture()
+                                          ? frame.enhancementFrame->height
+                                          : frame.enhancementYuv.height));
     }
 }
 
@@ -4083,7 +4082,7 @@ bool FfmpegVideoDecoder::PublishPreparedDolbyVisionFrame(NativeVideoFrame&& fram
                   L"decoder",
                   L"dolby_vision_yuv_queue_ready serial=" + std::to_wstring(frame.serial) +
                       L" pts_ms=" + std::to_wstring(frame.pts.count()) +
-                      L" fel_overlay=" + (frame.HasEnhancementYuv() ? L"yes" : L"no") +
+                      L" fel_overlay=" + (frame.HasEnhancementSurface() ? L"yes" : L"no") +
                       L" subtitles_deferred=true");
     }
     const bool published = oneShotFrame_
@@ -4110,7 +4109,7 @@ void FfmpegVideoDecoder::TryPublishPendingDolbyVisionBaseFrame() {
 
     AttachDolbyVisionEnhancementFrame(*pendingDolbyVisionBaseFrame_,
                                       pendingDolbyVisionBaseFrame_->pts);
-    if (!pendingDolbyVisionBaseFrame_->HasEnhancementYuv()) {
+    if (!pendingDolbyVisionBaseFrame_->HasEnhancementSurface()) {
         // If the EL has already advanced beyond this BL PTS, that exact pair
         // cannot arrive later. Release the retained BL so the next decoded BL
         // can become the new synchronization candidate.
@@ -4175,8 +4174,17 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
     AVFrame* conversionFrame = frame;
     if (frame && frame->format == hardwarePixelFormat_ && hardwarePixelFormat_ != AV_PIX_FMT_NONE) {
         NativeVideoFrame textureFrame;
-        if (TryBuildD3DTextureFrame(frame, pts, serial, textureFrame)) {
+        const bool builtTexture = TryBuildD3D12TextureFrame(frame, pts, serial, textureFrame);
+        if (builtTexture) {
             textureFrame.timelineSerial = frameTimelineSerial;
+            if (dolbyVisionStream_) {
+                textureFrame.dolbyVisionRpu = ExtractDolbyVisionRpu(frame);
+                textureFrame.dovi = ExtractFrameDolbyVisionMetadata(frame);
+                if (textureFrame.dovi && textureFrame.dovi->valid) {
+                    textureFrame.dynamicMetadataPath = L"dolby_vision_d3d12_shader";
+                    textureFrame.dynamicMetadataDetails = DoviFrameSummary(textureFrame.dovi.get());
+                }
+            }
             if (!firstHardwareFrameLogged_) {
                 firstHardwareFrameLogged_ = true;
                 LogThread(LogLevel::Info,
@@ -4192,10 +4200,30 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
                               std::to_wstring(textureFrame.sourceUvRect.bottom) +
                               L" dxgi=" + DxgiFormatName(textureFrame.d3dFormat));
             }
-            if (oneShotFrame_) {
-                return PublishImmediateFrame(std::move(textureFrame));
+            const bool enhancementPath =
+                enableDolbyVisionEnhancementDecode_ && dolbyVisionEnhancementActive_;
+            AttachDolbyVisionEnhancementFrame(textureFrame, pts);
+            if (enhancementPath && !textureFrame.HasEnhancementSurface()) {
+                ++dolbyVisionEnhancementStartupMisses_;
+                if (!pendingDolbyVisionBaseFrame_.has_value()) {
+                    pendingDolbyVisionBaseFrame_ = std::move(textureFrame);
+                }
+                return true;
             }
-            return EnqueuePresentationFrame(std::move(textureFrame));
+            if (enhancementPath) {
+                dolbyVisionEnhancementStartupMisses_ = 0;
+                dolbyVisionEnhancementStartupFallbackLogged_ = false;
+                dolbyVisionEnhancementBaseOnlyDropLogged_ = false;
+            }
+            return PublishPreparedDolbyVisionFrame(std::move(textureFrame));
+        }
+
+        if (sharedD3D12Device_) {
+            LogThread(LogLevel::Error,
+                      L"decoder",
+                      L"d3d12va_zero_copy_failed reason=surface_export_failed "
+                      L"cpu_transfer_disabled=true");
+            return false;
         }
 
         if (!softwareFrame) {
@@ -4229,11 +4257,20 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
             ++stats_.hardwareFrames;
             ++stats_.cpuTransferFrames;
             stats_.usingHardwareDecode = true;
-            stats_.decoder = L"ffmpeg_d3d11va";
+            stats_.decoder = L"ffmpeg_d3d12va_cpu_transfer_compat";
         }
     }
 
     frame = conversionFrame;
+    if (sharedD3D12Device_ && preferHardwareDecode_ &&
+        frame->format != hardwarePixelFormat_) {
+        LogThread(LogLevel::Error,
+                  L"decoder",
+                  L"d3d12_native_pipeline_failed reason=software_frame_received "
+                  L"cpu_pixel_path_disabled=true format=" +
+                      PixelFormatName(static_cast<AVPixelFormat>(frame->format)));
+        return false;
+    }
     const int srcW = frame->width;
     const int srcH = frame->height;
     if (srcW <= 0 || srcH <= 0) {
@@ -4300,7 +4337,7 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
             queued.timelineSerial = frameTimelineSerial;
             RefreshFrameSubtitles(queued);
             AttachDolbyVisionEnhancementFrame(queued, pts);
-            if (enhancementOverlayPath && !queued.HasEnhancementYuv()) {
+            if (enhancementOverlayPath && !queued.HasEnhancementSurface()) {
                 bool hasRenderedFrame = false;
                 {
                     std::scoped_lock lock(mutex_);
@@ -4396,78 +4433,59 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
     return EnqueuePresentationFrame(std::move(queued));
 }
 
-bool FfmpegVideoDecoder::TryBuildD3DTextureFrame(AVFrame* frame, std::chrono::milliseconds pts, uint64_t& serial, NativeVideoFrame& out) {
-    if (!frame || !sharedD3DDevice_ || frame->format != hardwarePixelFormat_ || hardwarePixelFormat_ == AV_PIX_FMT_NONE) {
+bool FfmpegVideoDecoder::TryBuildD3D12TextureFrame(AVFrame* frame,
+                                                    std::chrono::milliseconds pts,
+                                                    uint64_t& serial,
+                                                    NativeVideoFrame& out) {
+    if (!frame || !sharedD3D12Device_ || frame->format != AV_PIX_FMT_D3D12) {
         return false;
     }
-
-    auto* texture = reinterpret_cast<ID3D11Texture2D*>(frame->data[0]);
-    if (!texture) {
-        LogZeroCopyFallbackOnce(L"missing_d3d11_texture");
+    auto* surface = reinterpret_cast<AVD3D12VAFrame*>(frame->data[0]);
+    if (!surface || !surface->texture) {
+        LogZeroCopyFallbackOnce(L"missing_d3d12_texture");
         return false;
     }
-
-    D3D11_TEXTURE2D_DESC desc{};
-    texture->GetDesc(&desc);
+    const D3D12_RESOURCE_DESC desc = surface->texture->GetDesc();
     if (!IsSupportedHardwareTextureFormat(desc.Format)) {
-        LogZeroCopyFallbackOnce(L"unsupported_texture_format:" + DxgiFormatName(desc.Format));
+        LogZeroCopyFallbackOnce(L"unsupported_d3d12_texture_format:" + DxgiFormatName(desc.Format));
         return false;
     }
-    if ((desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) == 0) {
-        LogZeroCopyFallbackOnce(L"texture_missing_shader_resource_bind");
+    Microsoft::WRL::ComPtr<ID3D12Device> textureDevice;
+    if (FAILED(surface->texture->GetDevice(IID_PPV_ARGS(&textureDevice))) ||
+        textureDevice.Get() != sharedD3D12Device_.Get()) {
+        LogZeroCopyFallbackOnce(L"d3d12_texture_device_mismatch");
         return false;
     }
-
+    AVFrame* retained = av_frame_alloc();
+    if (!retained) return false;
+    const int refError = av_frame_ref(retained, frame);
+    if (refError < 0) {
+        av_frame_free(&retained);
+        return false;
+    }
+    const int textureWidth = static_cast<int>(std::min<UINT64>(
+        desc.Width, static_cast<UINT64>(std::numeric_limits<int>::max())));
+    const int textureHeight = static_cast<int>(std::min<UINT>(
+        desc.Height, static_cast<UINT>(std::numeric_limits<int>::max())));
     const auto cropToInt = [](const std::size_t value) {
         return value <= static_cast<std::size_t>(std::numeric_limits<int>::max())
                    ? static_cast<int>(value)
                    : -1;
     };
-    const bool textureDimensionsFit =
-        desc.Width <= static_cast<UINT>(std::numeric_limits<int>::max()) &&
-        desc.Height <= static_cast<UINT>(std::numeric_limits<int>::max());
-    const int textureWidth = textureDimensionsFit ? static_cast<int>(desc.Width) : 0;
-    const int textureHeight = textureDimensionsFit ? static_cast<int>(desc.Height) : 0;
     const auto samplingRegion = BuildVideoTextureSamplingRegion(
-        frame->width,
-        frame->height,
-        textureWidth,
-        textureHeight,
-        cropToInt(frame->crop_left),
-        cropToInt(frame->crop_top),
-        cropToInt(frame->crop_right),
-        cropToInt(frame->crop_bottom));
+        frame->width, frame->height, textureWidth, textureHeight,
+        cropToInt(frame->crop_left), cropToInt(frame->crop_top),
+        cropToInt(frame->crop_right), cropToInt(frame->crop_bottom));
     if (!samplingRegion.valid) {
-        LogZeroCopyFallbackOnce(
-            L"invalid_visible_texture_region frame=" + std::to_wstring(frame->width) + L"x" +
-            std::to_wstring(frame->height) + L" texture=" + std::to_wstring(desc.Width) + L"x" +
-            std::to_wstring(desc.Height));
-        return false;
-    }
-
-    Microsoft::WRL::ComPtr<ID3D11Device> textureDevice;
-    texture->GetDevice(&textureDevice);
-    if (!textureDevice || textureDevice.Get() != sharedD3DDevice_.Get()) {
-        LogZeroCopyFallbackOnce(L"texture_device_mismatch");
-        return false;
-    }
-
-    AVFrame* retained = av_frame_alloc();
-    if (!retained) {
-        return false;
-    }
-    const int refError = av_frame_ref(retained, frame);
-    if (refError < 0) {
         av_frame_free(&retained);
-        LogZeroCopyFallbackOnce(L"av_frame_ref_failed:" + FfmpegErrorString(refError));
         return false;
     }
-
     out.width = samplingRegion.visibleWidth;
     out.height = samplingRegion.visibleHeight;
-    out.stride = 0;
-    out.d3dTexture = texture;
-    out.d3dArraySlice = static_cast<UINT>(reinterpret_cast<intptr_t>(frame->data[1]));
+    out.d3d12Texture = surface->texture;
+    out.d3d12Subresource = static_cast<UINT>(std::max(surface->subresource_index, 0));
+    out.d3d12ReadyFence = surface->sync_ctx.fence;
+    out.d3d12ReadyFenceValue = surface->sync_ctx.fence_value;
     out.d3dFormat = desc.Format;
     out.d3dTextureWidth = textureWidth;
     out.d3dTextureHeight = textureHeight;
@@ -4476,35 +4494,20 @@ bool FfmpegVideoDecoder::TryBuildD3DTextureFrame(AVFrame* frame, std::chrono::mi
     out.color = MergeFrameColorMetadata(frame, streamColorMetadata_);
     out.hdr10PlusPayload = ExtractHdr10PlusPayload(frame);
     out.hdr10Plus = ExtractHdr10PlusMetadata(frame);
-    if (out.hdr10Plus) {
-        hdr10PlusDetected_.store(true);
-        out.dynamicMetadataPath = L"hdr10plus_st2094_40";
-        out.dynamicMetadataDetails = Hdr10PlusFrameSummary(out.hdr10Plus.get());
-    }
     out.dolbyVisionRpu = ExtractDolbyVisionRpu(frame);
-    if (dolbyVisionStream_) {
-        out.dovi = ExtractFrameDolbyVisionMetadata(frame);
-        if (out.dovi && out.dovi->valid) {
-            out.dynamicMetadataPath = L"dolby_vision_shader";
-            out.dynamicMetadataDetails = DoviFrameSummary(out.dovi.get());
-        }
-    }
     out.hardwareFrameRef = std::shared_ptr<AVFrame>(retained, [](AVFrame* value) {
-        if (value) {
-            av_frame_free(&value);
-        }
+        if (value) av_frame_free(&value);
     });
     out.pts = pts;
     out.serial = ++serial;
     out.timelineSerial = CurrentTimelineSerial();
     RefreshFrameSubtitles(out);
-
     {
         std::scoped_lock lock(mutex_);
         ++stats_.hardwareFrames;
         ++stats_.zeroCopyFrames;
         stats_.usingHardwareDecode = true;
-        stats_.decoder = L"ffmpeg_d3d11va";
+        stats_.decoder = L"ffmpeg_d3d12va";
     }
     return true;
 }
@@ -4660,8 +4663,6 @@ bool FfmpegVideoDecoder::ApplyPendingSeek(AVFormatContext* formatCtx,
     latestDolbyVisionEnhancementMetadataPts_ = std::chrono::milliseconds{0};
     dolbyVisionEnhancementFrames_.clear();
     pendingDolbyVisionBaseFrame_.reset();
-    ResetFrameInterpolationPipeline();
-    frameInterpolationUnavailable_ = false;
     if (externalSubtitlesActive_) {
         subtitleCues_ = externalSubtitleCues_;
     } else {
@@ -4694,11 +4695,6 @@ bool FfmpegVideoDecoder::ApplyPendingSeek(AVFormatContext* formatCtx,
         stats_.driftMs = 0;
         stats_.rendered = 0;
         stats_.droppedStale = 0;
-        stats_.frameInterpolationActive = false;
-        stats_.frameInterpolationBackend = frameInterpolationRequested_
-                                               ? L"directml_rife_pending"
-                                               : L"disabled";
-        stats_.frameInterpolationReason.clear();
         BeginSeekRecoveryLocked(*target, prerollAfterSeek, seekTimelineSerial);
         UpdateBufferedStatsLocked();
     }
@@ -5383,7 +5379,7 @@ std::size_t FfmpegVideoDecoder::FrameQueueCostBytes(const NativeVideoFrame& fram
 }
 
 std::size_t FfmpegVideoDecoder::MaxQueueDepthForFrame(const NativeVideoFrame& frame) {
-    if (frame.HasD3DTexture()) {
+    if (frame.HasD3D12Texture()) {
         return kMaxHardwareQueuedFrames;
     }
     if (frame.HasYuv()) {
@@ -5527,206 +5523,35 @@ bool FfmpegVideoDecoder::SeekPrerollReadyLocked() const {
     return videoReady && stats_.readAheadDuration >= kSeekPrerollTimeoutMinReadAhead;
 }
 
-void FfmpegVideoDecoder::ResetFrameInterpolationPipeline() {
-    frameInterpolationPreviousFrame_.reset();
-    frameInterpolationOverBudgetCount_ = 0;
-    frameInterpolationGeneratedCount_ = 0;
-    frameInterpolationAverageMilliseconds_ = 0.0;
-    frameInterpolationDiagnosticLogged_ = false;
-    if (frameInterpolator_) {
-        frameInterpolator_->Reset();
-        frameInterpolator_.reset();
-    }
-}
-
-void FfmpegVideoDecoder::DisableFrameInterpolationForSession(const std::wstring& reason) {
-    frameInterpolationUnavailable_ = true;
-    ResetFrameInterpolationPipeline();
-    {
-        std::scoped_lock lock(mutex_);
-        stats_.frameInterpolationActive = false;
-        stats_.frameInterpolationBackend = L"unavailable";
-        stats_.frameInterpolationReason = reason;
-    }
-    LogThread(LogLevel::Warning,
-              L"decoder",
-              L"frame_interpolation unavailable reason=" + reason);
-}
-
 bool FfmpegVideoDecoder::EnqueuePresentationFrame(NativeVideoFrame&& frame) {
-    if (!frameInterpolationRequested_ || frameInterpolationUnavailable_ || oneShotFrame_) {
-        return EnqueueFrame(std::move(frame));
+    // The decoder publishes only original D3D12VA surfaces. Look-ahead,
+    // preprocessing, DirectML submission and generated-frame cadence are
+    // renderer Frame Graph responsibilities.
+    frame.frameRateNumerator = videoFrameRateNumerator_;
+    frame.frameRateDenominator = videoFrameRateDenominator_;
+    if (!frame.subtitlesPrepared) {
+        RefreshFrameSubtitles(frame);
     }
-
-    const bool hasDynamicMetadata =
-        frame.hdr10Plus ||
-        (frame.dovi && frame.dovi->valid) ||
-        (frame.enhancementDovi && frame.enhancementDovi->valid) ||
-        !frame.dynamicMetadataPath.empty();
-    if (hasDynamicMetadata) {
-        DisableFrameInterpolationForSession(L"dynamic_hdr_metadata_unsupported");
-        return EnqueueFrame(std::move(frame));
-    }
-    if (frame.color.IsHdr()) {
-        DisableFrameInterpolationForSession(L"hdr_transfer_unsupported_by_rife_model");
-        return EnqueueFrame(std::move(frame));
-    }
-    if (!frame.HasD3DTexture() || !sharedD3DDevice_) {
-        DisableFrameInterpolationForSession(L"gpu_texture_input_unavailable");
-        return EnqueueFrame(std::move(frame));
-    }
-    if (frame.d3dFormat != DXGI_FORMAT_NV12 && frame.d3dFormat != DXGI_FORMAT_P010) {
-        DisableFrameInterpolationForSession(L"gpu_texture_format_unsupported");
-        return EnqueueFrame(std::move(frame));
-    }
-
-    if (!frameInterpolationPreviousFrame_.has_value()) {
-        frameInterpolationPreviousFrame_ = frame;
-        return EnqueueFrame(std::move(frame));
-    }
-
-    const NativeVideoFrame& previous = *frameInterpolationPreviousFrame_;
-    const auto frameSpan = frame.pts - previous.pts;
-    const bool discontinuity =
-        previous.timelineSerial != frame.timelineSerial ||
-        frameSpan <= std::chrono::milliseconds{0} ||
-        frameSpan > std::chrono::milliseconds{250} ||
-        previous.d3dFormat != frame.d3dFormat ||
-        previous.d3dTextureWidth != frame.d3dTextureWidth ||
-        previous.d3dTextureHeight != frame.d3dTextureHeight;
-    if (discontinuity) {
-        ResetFrameInterpolationPipeline();
-        frameInterpolationPreviousFrame_ = frame;
-        return EnqueueFrame(std::move(frame));
-    }
-
-    if (!frameInterpolator_) {
-        D3D11_TEXTURE2D_DESC textureDesc{};
-        frame.d3dTexture->GetDesc(&textureDesc);
-        GpuFrameInterpolationConfig config{};
-        config.width = static_cast<UINT>(frame.width);
-        config.height = static_cast<UINT>(frame.height);
-        config.sourceFrameRateNumerator = videoFrameRateNumerator_;
-        config.sourceFrameRateDenominator = std::max<UINT32>(1, videoFrameRateDenominator_);
-        config.outputRateMultiplier = 2;
-        auto interpolator = std::make_unique<GpuFrameInterpolator>();
-        const auto capabilities = interpolator->Initialize(sharedD3DDevice_.Get(), config);
-        if (!capabilities.available) {
-            DisableFrameInterpolationForSession(
-                capabilities.unavailableReason.empty()
-                    ? L"gpu_backend_unavailable"
-                    : capabilities.unavailableReason);
-            return EnqueueFrame(std::move(frame));
-        }
-        frameInterpolator_ = std::move(interpolator);
-        {
-            std::scoped_lock lock(mutex_);
-            stats_.frameInterpolationActive = true;
-            stats_.frameInterpolationBackend = capabilities.backendName;
-            stats_.frameInterpolationReason.clear();
-        }
-        LogThread(LogLevel::Info,
-                  L"decoder",
-                  L"frame_interpolation active backend=" + capabilities.backendName +
-                      L" multiplier=2 zero_copy=" +
-                      std::wstring(capabilities.zeroCopy ? L"true" : L"false") +
-                      L" model_warmup_ms=" + std::to_wstring(capabilities.warmupMilliseconds) +
-                      L" size=" + std::to_wstring(config.width) + L"x" +
-                      std::to_wstring(config.height) +
-                      L" processing_size=" + std::to_wstring(capabilities.processingWidth) + L"x" +
-                      std::to_wstring(capabilities.processingHeight));
-    }
-
-    GpuInterpolationOutputSurface interpolatedSurface;
-    if (!frameInterpolator_->InterpolateMidpoint(
-            {previous.d3dTexture.Get(),
-             previous.d3dArraySlice,
-             previous.sourceUvRect,
-             previous.color},
-            {frame.d3dTexture.Get(),
-             frame.d3dArraySlice,
-             frame.sourceUvRect,
-             frame.color},
-            interpolatedSurface)) {
-        const std::wstring reason = frameInterpolator_->LastFailureReason();
-        DisableFrameInterpolationForSession(
-            reason.empty() ? L"gpu_interpolation_failed" : reason);
-        return EnqueueFrame(std::move(frame));
-    }
-
-    NativeVideoFrame interpolated = previous;
-    interpolated.width = interpolatedSurface.width;
-    interpolated.height = interpolatedSurface.height;
-    interpolated.stride = interpolatedSurface.stride;
-    interpolated.bgra = interpolatedSurface.bgra;
-    interpolated.d3dTexture.Reset();
-    interpolated.d3dArraySlice = 0;
-    interpolated.d3dFormat = DXGI_FORMAT_UNKNOWN;
-    interpolated.d3dTextureWidth = 0;
-    interpolated.d3dTextureHeight = 0;
-    interpolated.sourceUvRect = {};
-    interpolated.softwareFormat = AV_PIX_FMT_BGRA;
-    interpolated.hardwareFrameRef.reset();
-    interpolated.pts = previous.pts + frameSpan / 2;
-    interpolated.serial = frame.serial;
-    interpolated.subtitleText.clear();
-    interpolated.subtitleBitmaps.clear();
-    interpolated.subtitlesPrepared = false;
-    RefreshFrameSubtitles(interpolated, true);
-
-    const auto& diagnostics = interpolatedSurface.diagnostics;
-    const double sourceBudgetMs = static_cast<double>(frameSpan.count());
-    ++frameInterpolationGeneratedCount_;
-    frameInterpolationAverageMilliseconds_ = frameInterpolationGeneratedCount_ == 1
-                                                  ? diagnostics.totalMilliseconds
-                                                  : frameInterpolationAverageMilliseconds_ * 0.85 +
-                                                        diagnostics.totalMilliseconds * 0.15;
-    constexpr std::uint64_t kMinimumPerformanceSamples = 12;
-    constexpr double kPerformanceBudgetTolerance = 1.10;
-    if (frameInterpolationGeneratedCount_ >= kMinimumPerformanceSamples &&
-        frameInterpolationAverageMilliseconds_ > sourceBudgetMs * kPerformanceBudgetTolerance) {
-        ++frameInterpolationOverBudgetCount_;
-    } else {
-        frameInterpolationOverBudgetCount_ = 0;
-    }
-    if (!frameInterpolationDiagnosticLogged_ || frameInterpolationGeneratedCount_ % 120 == 0) {
-        frameInterpolationDiagnosticLogged_ = true;
-        std::wostringstream diagnostic;
-        diagnostic << std::fixed << std::setprecision(3)
-                   << L"frame_interpolation sample backend="
-                   << frameInterpolator_->Capabilities().backendName
-                   << L" inference_ms=" << diagnostics.inferenceMilliseconds
-                   << L" total_ms=" << diagnostics.totalMilliseconds
-                   << L" average_ms=" << frameInterpolationAverageMilliseconds_
-                   << L" budget_ms=" << sourceBudgetMs
-                   << L" source_delta=" << diagnostics.sourceDifference
-                   << L" midpoint_to_previous=" << diagnostics.midpointToPreviousDifference
-                   << L" midpoint_to_next=" << diagnostics.midpointToNextDifference
-                   << L" fingerprint=" << std::hex << diagnostics.outputFingerprint;
-        LogThread(LogLevel::Info, L"decoder", diagnostic.str());
-    }
-
-    if (!EnqueueFrame(std::move(interpolated))) {
-        return false;
-    }
+    FrameGraphInputCallback callback;
     {
-        std::scoped_lock lock(mutex_);
-        ++stats_.interpolatedFrames;
+        std::scoped_lock lock(frameGraphCallbackMutex_);
+        callback = frameGraphInputCallback_;
     }
-    if (frameInterpolationOverBudgetCount_ >= 6) {
-        DisableFrameInterpolationForSession(L"inference_exceeded_source_frame_budget");
-        return EnqueueFrame(std::move(frame));
+    if (callback && frame.HasD3D12Texture() &&
+        (frame.timelineSerial == 0 || frame.timelineSerial == CurrentTimelineSerial())) {
+        callback(frame);
     }
-    frameInterpolationPreviousFrame_ = frame;
     return EnqueueFrame(std::move(frame));
+}
+
+void FfmpegVideoDecoder::SetFrameGraphInputCallback(FrameGraphInputCallback callback) {
+    std::scoped_lock lock(frameGraphCallbackMutex_);
+    frameGraphInputCallback_ = std::move(callback);
 }
 
 bool FfmpegVideoDecoder::EnqueueFrame(NativeVideoFrame&& frame) {
     frame.frameRateNumerator = videoFrameRateNumerator_;
     frame.frameRateDenominator = videoFrameRateDenominator_;
-    if (frameInterpolationRequested_ && !frameInterpolationUnavailable_) {
-        frame.frameRateNumerator *= 2;
-    }
     if (!frame.subtitlesPrepared) {
         RefreshFrameSubtitles(frame);
     }

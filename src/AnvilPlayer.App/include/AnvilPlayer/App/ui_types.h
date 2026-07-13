@@ -4,7 +4,7 @@ namespace anvil::app {
 
 // Which runtime backend the player uses for the current session.
 enum class PlaybackBackend {
-    NativeFfmpegD3D11,
+    NativeFfmpegD3D12,
     EmbeddedFfplay,
     RawFrameBridge,
 };

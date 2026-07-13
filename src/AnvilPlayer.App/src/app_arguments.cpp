@@ -52,7 +52,7 @@ AppArguments ParseArguments(const int argumentCount, wchar_t** arguments) {
             continue;
         }
         if (argument == L"--native-playback") {
-            parsed.backend = PlaybackBackend::NativeFfmpegD3D11;
+            parsed.backend = PlaybackBackend::NativeFfmpegD3D12;
             continue;
         }
         if (argument == L"--external-playback") {

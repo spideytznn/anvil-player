@@ -1025,7 +1025,7 @@ bool MainWindow::ApplyVolume(const double volume, const bool restartExternalNow)
 
     controller_.SetVolume(static_cast<double>(nextPercent) / 100.0);
     const auto updated = controller_.Snapshot();
-    if (backend_ == PlaybackBackend::NativeFfmpegD3D11 ||
+    if (backend_ == PlaybackBackend::NativeFfmpegD3D12 ||
         backend_ == PlaybackBackend::RawFrameBridge) {
         audioPlayer_.SetVolume(updated.volume);
         systemDolbyVisionPlayer_.SetVolume(updated.volume);
@@ -1074,7 +1074,7 @@ void MainWindow::EndVolumeDrag(const POINT point) {
         ReleaseCapture();
     }
     if (volumeDragChanged_ &&
-        backend_ != PlaybackBackend::NativeFfmpegD3D11 &&
+        backend_ != PlaybackBackend::NativeFfmpegD3D12 &&
         backend_ != PlaybackBackend::RawFrameBridge) {
         RestartPlaybackIfPlaying();
     }
@@ -1510,7 +1510,7 @@ void MainWindow::ApplyLiveHdrToneCurveSettings() {
     if (d3dRenderer_ && snapshot.media.has_value()) {
         d3dRenderer_->ConfigureColorPipeline(settings.video, CachedCapabilities().display, snapshot.media->videoColor);
     }
-    if (backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+    if (backend_ == PlaybackBackend::NativeFfmpegD3D12 &&
         snapshot.state == PlaybackState::Paused &&
         heldNativeFrame_.has_value()) {
         RenderHeldNativeFrame();
@@ -1769,7 +1769,7 @@ void MainWindow::ApplySubtitleSelection(const int selectedTrackIndex) {
     if (updated.state == PlaybackState::Paused &&
         updated.media.has_value() &&
         updated.media->hasVideo &&
-        backend_ == PlaybackBackend::NativeFfmpegD3D11) {
+        backend_ == PlaybackBackend::NativeFfmpegD3D12) {
         RefreshPausedNativeFrame(updated, true);
     } else {
         RestartPlaybackIfPlaying();
@@ -1799,7 +1799,7 @@ void MainWindow::ApplyAudioSelection(const int selectedTrackIndex) {
     } else if (updated.state == PlaybackState::Paused &&
                updated.media.has_value() &&
                updated.media->hasAudio &&
-               backend_ == PlaybackBackend::NativeFfmpegD3D11) {
+               backend_ == PlaybackBackend::NativeFfmpegD3D12) {
         // Retire the complete shared-demux session. A later Resume is queued by
         // the existing runtime-stop state machine, so it cannot race a stale
         // WASAPI worker or silently switch to a second network demuxer.
@@ -1829,7 +1829,7 @@ void MainWindow::SetCurrentAudioPassthrough(const bool enabled) {
     } else if (updated.state == PlaybackState::Paused &&
                updated.media.has_value() &&
                updated.media->hasAudio &&
-               backend_ == PlaybackBackend::NativeFfmpegD3D11) {
+               backend_ == PlaybackBackend::NativeFfmpegD3D12) {
         StopRuntimeAsync(false);
     }
     MarkLayoutDirty();
@@ -1855,7 +1855,7 @@ void MainWindow::ApplySubtitleDelayDelta(const int deltaMs) {
     if (updated.state == PlaybackState::Paused &&
         updated.media.has_value() &&
         updated.media->hasVideo &&
-        backend_ == PlaybackBackend::NativeFfmpegD3D11) {
+        backend_ == PlaybackBackend::NativeFfmpegD3D12) {
         RefreshPausedNativeFrame(updated, true);
     } else {
         RestartPlaybackIfPlaying();
@@ -1903,7 +1903,7 @@ void MainWindow::ApplyLiveSubtitleStyleSettings() {
         d3dRenderer_->ConfigureSubtitleSettings(settings.subtitles);
     }
     const auto snapshot = controller_.Snapshot();
-    if (backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+    if (backend_ == PlaybackBackend::NativeFfmpegD3D12 &&
         snapshot.state == PlaybackState::Paused &&
         heldNativeFrame_.has_value()) {
         RenderHeldNativeFrame();
@@ -2001,7 +2001,7 @@ void MainWindow::ToggleDolbyVisionHdrOutput() {
 
     const auto snapshot = controller_.Snapshot();
     bool handledLive = false;
-    if (backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+    if (backend_ == PlaybackBackend::NativeFfmpegD3D12 &&
         snapshot.media.has_value() &&
         snapshot.media->hasVideo &&
         !NativeHdrOutputToggleRequiresDecoderRestart(snapshot)) {
@@ -2011,7 +2011,7 @@ void MainWindow::ToggleDolbyVisionHdrOutput() {
         if (snapshot.state == PlaybackState::Paused &&
             snapshot.media.has_value() &&
             snapshot.media->hasVideo &&
-            backend_ == PlaybackBackend::NativeFfmpegD3D11) {
+            backend_ == PlaybackBackend::NativeFfmpegD3D12) {
             RefreshPausedNativeFrame(snapshot);
         } else {
             RestartPlaybackIfPlaying();

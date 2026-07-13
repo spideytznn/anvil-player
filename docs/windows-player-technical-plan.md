@@ -1,4 +1,7 @@
-# Anvil Player Windows Technical Plan
+# Anvil Player Windows Technical Plan (Archived)
+
+> Superseded by `native-d3d12-frame-graph.md`. D3D11 milestones below are
+> historical and are not part of the current native runtime.
 
 ## 1. Product Goal
 

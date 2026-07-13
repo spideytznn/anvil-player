@@ -463,7 +463,7 @@ void TestHdrPlaybackPlanUsesStructuredColorMetadata() {
     capabilities.display.hdrEnabled = true;
 
     auto plan = anvil::playback::PlaybackPlanner::Build(media, settings, capabilities);
-    assert(plan.videoDecoder == L"ffmpeg_d3d11va");
+    assert(plan.videoDecoder == L"ffmpeg_d3d12va");
     assert(plan.videoMode == L"hdr10_output");
 
     media.videoColor.transfer = anvil::playback::VideoTransferCharacteristic::Hlg;
@@ -492,8 +492,8 @@ void TestDolbyVisionPlaybackPlanPrefersSystemExtensions() {
     capabilities.display.hdrEnabled = true;
 
     auto plan = anvil::playback::PlaybackPlanner::Build(media, settings, capabilities);
-    assert(plan.videoDecoder == L"ffmpeg_software");
-    assert(plan.videoReason == L"dolby_vision_software_decode_for_reshape");
+    assert(plan.videoDecoder == L"ffmpeg_d3d12va");
+    assert(plan.videoReason == L"hardware_decode_candidate");
     assert(plan.videoMode == L"dolby_vision_software_reshape");
 
     capabilities.codecs.dolbyVisionExtensionDetected = true;
@@ -506,7 +506,7 @@ void TestDolbyVisionPlaybackPlanPrefersSystemExtensions() {
 
     settings.video.dolbyVision = anvil::playback::DolbyVisionMode::Off;
     plan = anvil::playback::PlaybackPlanner::Build(media, settings, capabilities);
-    assert(plan.videoDecoder == L"ffmpeg_d3d11va");
+    assert(plan.videoDecoder == L"ffmpeg_d3d12va");
     assert(plan.videoMode == L"dolby_vision_disabled_tone_map");
 }
 

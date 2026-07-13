@@ -833,11 +833,11 @@ void MainWindow::UpdateVideoHost() {
                                  snapshot.media.has_value() &&
                                  snapshot.media->hasVideo &&
                                  nativeVideoDecoder_->Stats().buffering;
-    const bool nativePausedFrame = backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+    const bool nativePausedFrame = backend_ == PlaybackBackend::NativeFfmpegD3D12 &&
                                    snapshot.state == PlaybackState::Paused &&
                                    snapshot.media.has_value() &&
                                    snapshot.media->hasVideo;
-    const bool nativeHeldFrame = backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+    const bool nativeHeldFrame = backend_ == PlaybackBackend::NativeFfmpegD3D12 &&
                                  nativeFrameHoldVisible_ &&
                                  heldNativeFrame_.has_value();
     const bool nativeVideoVisible = systemDolbyVisionPlayer_.IsActive() ||
@@ -1152,7 +1152,7 @@ void MainWindow::UpdateBufferingOverlay(const NativeVideoQueueStats* statsOverri
     const bool nativeDecoderRunning = nativeVideoDecoder_ && nativeVideoDecoder_->IsRunning();
     const bool statePlaying = snapshot.state == PlaybackState::Playing;
     const bool hasVideoMedia = snapshot.media.has_value() && snapshot.media->hasVideo;
-    const bool nativeBuffering = backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+    const bool nativeBuffering = backend_ == PlaybackBackend::NativeFfmpegD3D12 &&
                                  nativeDecoderRunning &&
                                  statePlaying &&
                                  hasVideoMedia &&

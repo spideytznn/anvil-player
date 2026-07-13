@@ -369,7 +369,7 @@ void EmbeddedFfplayPlayer::ControlLoop() {
             std::wstring commandLine =
                 QuoteArgument(FfplayExecutablePath().wstring()) +
                 L" -hide_banner -loglevel warning -autoexit "
-                L"-hwaccel d3d11va -framedrop -noborder "
+                L"-hwaccel d3d12va -framedrop -noborder "
                 L"-window_title " + QuoteArgument(windowTitle) +
                 L" -x " + std::to_wstring(playbackWidth) +
                 L" -y " + std::to_wstring(playbackHeight) +

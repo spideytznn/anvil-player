@@ -92,9 +92,9 @@ const en = {
   resolution: 'Resolution',
   frameRate: 'Frame rate',
   frameInterpolation: 'GPU frame interpolation',
-  frameInterpolationHint: 'Motion-compensated 2x output · current video',
+  frameInterpolationHint: 'HDR-aware adaptive cadence matched to the display · current video',
   frameInterpolationDynamicHdrUnavailable: 'Dynamic HDR and Dolby Vision are not supported yet.',
-  refreshRateInterpolationBlocked: 'Unavailable while GPU frame interpolation is enabled',
+  refreshRateInterpolationBlocked: 'Refresh synchronization also drives interpolation cadence',
   refreshRateSync: 'Smart refresh-rate sync',
   refreshRateSyncHint: 'Current video only · applied in fullscreen',
   maximumRefreshMultiple: 'Maximum multiple',
@@ -1457,25 +1457,25 @@ function InspectorContent({
             ? `${t.frameInterpolationHint} · ${state.frameInterpolationBackend}`
             : t.frameInterpolationHint}
           enabled={state.frameInterpolationEnabled}
-          available={!state.dolbyVisionMedia && !state.hdrFormat.toLowerCase().includes('hdr10+')}
+          available
           unavailableHint={t.frameInterpolationDynamicHdrUnavailable}
           onChange={(enabled) => postNativeCommand({ type: 'command', command: 'setFrameInterpolation', enabled })}
           t={t}
         />
-        <div className={`refresh-rate-setting ${state.frameInterpolationEnabled ? 'is-unavailable' : ''}`}>
+        <div className="refresh-rate-setting">
           <div>
             <strong>{t.refreshRateSync}</strong>
-            <small>{state.frameInterpolationEnabled
-              ? t.refreshRateInterpolationBlocked
-              : state.refreshRateSyncActive && state.refreshRateSyncHz > 0
+            <small>{state.refreshRateSyncActive && state.refreshRateSyncHz > 0
               ? `${state.refreshRateSyncHz.toFixed(3).replace(/\.0+$/, '')} Hz`
-              : t.refreshRateSyncHint}</small>
+              : state.frameInterpolationEnabled
+                ? t.refreshRateInterpolationBlocked
+                : t.refreshRateSyncHint}</small>
           </div>
-          <label className={`refresh-rate-maximum ${state.refreshRateSyncEnabled && !state.frameInterpolationEnabled ? '' : 'is-disabled'}`}>
+          <label className={`refresh-rate-maximum ${state.refreshRateSyncEnabled ? '' : 'is-disabled'}`}>
             <input
               type="checkbox"
               checked={state.refreshRateMaximumMultiple}
-              disabled={!state.refreshRateSyncEnabled || state.frameInterpolationEnabled}
+              disabled={!state.refreshRateSyncEnabled}
               onChange={(event) => postNativeCommand({ type: 'command', command: 'setRefreshRateMaximumMultiple', enabled: event.currentTarget.checked })}
             />
             <span>{t.maximumRefreshMultiple}</span>
@@ -1486,8 +1486,6 @@ function InspectorContent({
             role="switch"
             aria-checked={state.refreshRateSyncEnabled}
             aria-label={t.refreshRateSync}
-            disabled={state.frameInterpolationEnabled}
-            aria-disabled={state.frameInterpolationEnabled}
             onClick={() => postNativeCommand({ type: 'command', command: 'setRefreshRateSync', enabled: !state.refreshRateSyncEnabled })}
           >
             <span className="refresh-rate-toggle-track" aria-hidden="true">

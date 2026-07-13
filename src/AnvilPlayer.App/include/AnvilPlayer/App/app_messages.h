@@ -55,7 +55,7 @@ constexpr int kDwmCornerDoNotRound = 1;
 constexpr int kDwmCornerRound = 2;
 
 // Runtime labels shown in the inspector / used in logs.
-constexpr wchar_t kNativeFfmpegD3D11RuntimeLabel[] = L"native ffmpeg + d3d11 software decode";
+constexpr wchar_t kNativeFfmpegD3D12RuntimeLabel[] = L"native ffmpeg + d3d12va resident pipeline";
 constexpr wchar_t kInternalPlaybackRuntimeLabel[] = L"in-player ffmpeg software decode";
 constexpr wchar_t kExternalPlaybackRuntimeLabel[] = L"external ffplay software decode";
 

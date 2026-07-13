@@ -9,7 +9,7 @@ bool Contains(const std::wstring& value, const std::wstring& needle) {
     return value.find(needle) != std::wstring::npos;
 }
 
-bool IsD3D11VaCandidate(const std::wstring& codec) {
+bool IsD3D12VaCandidate(const std::wstring& codec) {
     return Contains(codec, L"H.264") ||
            Contains(codec, L"HEVC") ||
            Contains(codec, L"AV1") ||
@@ -40,22 +40,13 @@ std::wstring ChooseVideoDecoder(const MediaDescriptor& media, const VideoSetting
         reason = L"hardware_decode_disabled";
         return L"ffmpeg_software";
     }
-    // Dolby Vision streams require the RPU side data (AV_FRAME_DATA_DOVI_METADATA)
-    // for correct reshaping. D3D11VA hardware decode does not reliably expose
-    // this side data, so force software decode for DV streams to guarantee the
-    // renderer receives the reshaping metadata. (Hardware DV decode is
-    // evaluated separately in Phase 5.)
-    if (media.dolbyVisionDetected && settings.dolbyVision != DolbyVisionMode::Off) {
-        reason = L"dolby_vision_software_decode_for_reshape";
+    if (settings.hardwareDecode == HardwareDecodeMode::D3D12VA && !IsD3D12VaCandidate(media.videoCodec)) {
+        reason = L"requested_d3d12va_but_codec_not_candidate";
         return L"ffmpeg_software";
     }
-    if (settings.hardwareDecode == HardwareDecodeMode::D3D11VA && !IsD3D11VaCandidate(media.videoCodec)) {
-        reason = L"requested_d3d11va_but_codec_not_candidate";
-        return L"ffmpeg_software";
-    }
-    if (IsD3D11VaCandidate(media.videoCodec)) {
+    if (IsD3D12VaCandidate(media.videoCodec)) {
         reason = L"hardware_decode_candidate";
-        return L"ffmpeg_d3d11va";
+        return L"ffmpeg_d3d12va";
     }
     reason = L"software_decode_compatibility_path";
     return L"ffmpeg_software";

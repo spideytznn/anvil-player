@@ -1,7 +1,8 @@
 #include "AnvilPlayer/Playback/CapabilityReport.h"
 
 #include <windows.h>
-#include <d3d11.h>
+#include <d3d12.h>
+#include <d3d12video.h>
 #include <dxgi1_6.h>
 #include <mfapi.h>
 #include <mfidl.h>
@@ -20,7 +21,7 @@
 #include <utility>
 #include <vector>
 
-#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "dxguid.lib")
 #pragma comment(lib, "mf.lib")
@@ -253,54 +254,63 @@ bool AnyActiveDisplayAdvancedColorEnabled() {
 }
 
 std::wstring DecoderProfileName(const GUID& profile) {
-    if (IsEqualGUID(profile, D3D11_DECODER_PROFILE_H264_VLD_NOFGT) ||
-        IsEqualGUID(profile, D3D11_DECODER_PROFILE_H264_VLD_FGT)) {
+    if (IsEqualGUID(profile, D3D12_VIDEO_DECODE_PROFILE_H264)) {
         return L"H.264";
     }
-    if (IsEqualGUID(profile, D3D11_DECODER_PROFILE_HEVC_VLD_MAIN)) {
+    if (IsEqualGUID(profile, D3D12_VIDEO_DECODE_PROFILE_HEVC_MAIN)) {
         return L"HEVC Main";
     }
-    if (IsEqualGUID(profile, D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10)) {
+    if (IsEqualGUID(profile, D3D12_VIDEO_DECODE_PROFILE_HEVC_MAIN10)) {
         return L"HEVC Main10";
     }
-    if (IsEqualGUID(profile, D3D11_DECODER_PROFILE_VP9_VLD_PROFILE0)) {
+    if (IsEqualGUID(profile, D3D12_VIDEO_DECODE_PROFILE_VP9)) {
         return L"VP9 Profile 0";
     }
-    if (IsEqualGUID(profile, D3D11_DECODER_PROFILE_VP9_VLD_10BIT_PROFILE2)) {
+    if (IsEqualGUID(profile, D3D12_VIDEO_DECODE_PROFILE_VP9_10BIT_PROFILE2)) {
         return L"VP9 Profile 2 10-bit";
     }
-    if (IsEqualGUID(profile, D3D11_DECODER_PROFILE_AV1_VLD_PROFILE0)) {
+    if (IsEqualGUID(profile, D3D12_VIDEO_DECODE_PROFILE_AV1_PROFILE0)) {
         return L"AV1 Profile 0";
     }
-    if (IsEqualGUID(profile, D3D11_DECODER_PROFILE_AV1_VLD_PROFILE1)) {
+    if (IsEqualGUID(profile, D3D12_VIDEO_DECODE_PROFILE_AV1_PROFILE1)) {
         return L"AV1 Profile 1";
     }
-    if (IsEqualGUID(profile, D3D11_DECODER_PROFILE_AV1_VLD_PROFILE2)) {
+    if (IsEqualGUID(profile, D3D12_VIDEO_DECODE_PROFILE_AV1_PROFILE2)) {
         return L"AV1 Profile 2";
     }
     return {};
 }
 
-void PopulateVideoDecodeProfiles(ID3D11Device* device, GpuCapabilities& gpu) {
-    ComPtr<ID3D11VideoDevice> videoDevice;
+void PopulateVideoDecodeProfiles(ID3D12Device* device, GpuCapabilities& gpu) {
+    ComPtr<ID3D12VideoDevice> videoDevice;
     if (FAILED(device->QueryInterface(IID_PPV_ARGS(&videoDevice)))) {
-        gpu.hardwareDecodeProfiles = {L"D3D11 video device unavailable"};
+        gpu.hardwareDecodeProfiles = {L"D3D12 video device unavailable"};
         return;
     }
-
-    const UINT count = videoDevice->GetVideoDecoderProfileCount();
-    for (UINT index = 0; index < count; ++index) {
-        GUID profile{};
-        if (SUCCEEDED(videoDevice->GetVideoDecoderProfile(index, &profile))) {
-            auto name = DecoderProfileName(profile);
-            if (!name.empty()) {
-                AddUnique(gpu.hardwareDecodeProfiles, std::move(name));
-            }
+    D3D12_FEATURE_DATA_VIDEO_DECODE_PROFILE_COUNT count{};
+    if (FAILED(videoDevice->CheckFeatureSupport(
+            D3D12_FEATURE_VIDEO_DECODE_PROFILE_COUNT, &count, sizeof(count))) ||
+        count.ProfileCount == 0) {
+        gpu.hardwareDecodeProfiles = {L"No D3D12 decode profiles reported"};
+        return;
+    }
+    std::vector<GUID> profiles(count.ProfileCount);
+    D3D12_FEATURE_DATA_VIDEO_DECODE_PROFILES query{};
+    query.ProfileCount = count.ProfileCount;
+    query.pProfiles = profiles.data();
+    if (FAILED(videoDevice->CheckFeatureSupport(
+            D3D12_FEATURE_VIDEO_DECODE_PROFILES, &query, sizeof(query)))) {
+        gpu.hardwareDecodeProfiles = {L"D3D12 decode profile query failed"};
+        return;
+    }
+    for (const GUID& profile : profiles) {
+        auto name = DecoderProfileName(profile);
+        if (!name.empty()) {
+            AddUnique(gpu.hardwareDecodeProfiles, std::move(name));
         }
     }
-
     if (gpu.hardwareDecodeProfiles.empty()) {
-        gpu.hardwareDecodeProfiles = {L"No mapped D3D11 profiles reported"};
+        gpu.hardwareDecodeProfiles = {L"No mapped D3D12 profiles reported"};
     }
 }
 
@@ -338,7 +348,7 @@ void PopulateDisplayCapabilities(IDXGIAdapter* adapter, DisplayCapabilities& dis
     }
 }
 
-bool TryPopulateD3D11(CapabilityReport& report) {
+bool TryPopulateD3D12(CapabilityReport& report) {
     const D3D_FEATURE_LEVEL requestedLevels[] = {
         D3D_FEATURE_LEVEL_12_1,
         D3D_FEATURE_LEVEL_12_0,
@@ -348,57 +358,53 @@ bool TryPopulateD3D11(CapabilityReport& report) {
         D3D_FEATURE_LEVEL_10_0,
     };
 
-    ComPtr<ID3D11Device> device;
-    ComPtr<ID3D11DeviceContext> context;
-    D3D_FEATURE_LEVEL createdLevel{};
-    HRESULT hr = D3D11CreateDevice(
-        nullptr,
-        D3D_DRIVER_TYPE_HARDWARE,
-        nullptr,
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-        requestedLevels,
-        static_cast<UINT>(sizeof(requestedLevels) / sizeof(requestedLevels[0])),
-        D3D11_SDK_VERSION,
-        &device,
-        &createdLevel,
-        &context);
-
-    if (FAILED(hr)) {
-        hr = D3D11CreateDevice(
-            nullptr,
-            D3D_DRIVER_TYPE_WARP,
-            nullptr,
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-            requestedLevels,
-            static_cast<UINT>(sizeof(requestedLevels) / sizeof(requestedLevels[0])),
-            D3D11_SDK_VERSION,
-            &device,
-            &createdLevel,
-            &context);
-    }
-
-    if (FAILED(hr)) {
-        report.gpu.adapterName = L"D3D11 device creation failed";
+    ComPtr<IDXGIFactory6> factory;
+    if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) {
+        report.gpu.adapterName = L"DXGI factory creation failed";
         report.gpu.d3dFeatureLevel = L"Unavailable";
         report.gpu.hardwareDecodeProfiles = {L"Unavailable"};
         return false;
     }
-
-    report.gpu.d3dFeatureLevel = FeatureLevelToString(createdLevel);
-    PopulateVideoDecodeProfiles(device.Get(), report.gpu);
-
-    ComPtr<IDXGIDevice> dxgiDevice;
-    if (SUCCEEDED(device.As(&dxgiDevice))) {
-        ComPtr<IDXGIAdapter> adapter;
-        if (SUCCEEDED(dxgiDevice->GetAdapter(&adapter))) {
-            DXGI_ADAPTER_DESC adapterDesc{};
-            if (SUCCEEDED(adapter->GetDesc(&adapterDesc))) {
-                report.gpu.adapterName = adapterDesc.Description;
-            }
-            PopulateDisplayCapabilities(adapter.Get(), report.display);
+    ComPtr<IDXGIAdapter1> adapter;
+    for (UINT index = 0;; ++index) {
+        ComPtr<IDXGIAdapter1> candidate;
+        const HRESULT result = factory->EnumAdapterByGpuPreference(
+            index, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&candidate));
+        if (result == DXGI_ERROR_NOT_FOUND) break;
+        if (FAILED(result)) continue;
+        DXGI_ADAPTER_DESC1 desc{};
+        candidate->GetDesc1(&desc);
+        if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0 &&
+            SUCCEEDED(D3D12CreateDevice(candidate.Get(), D3D_FEATURE_LEVEL_11_0,
+                                        __uuidof(ID3D12Device), nullptr))) {
+            adapter = candidate;
+            break;
         }
     }
-
+    if (!adapter) {
+        factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter));
+    }
+    ComPtr<ID3D12Device> device;
+    D3D_FEATURE_LEVEL createdLevel = D3D_FEATURE_LEVEL_11_0;
+    for (const D3D_FEATURE_LEVEL level : requestedLevels) {
+        if (SUCCEEDED(D3D12CreateDevice(adapter.Get(), level, IID_PPV_ARGS(&device)))) {
+            createdLevel = level;
+            break;
+        }
+    }
+    if (!device) {
+        report.gpu.adapterName = L"D3D12 device creation failed";
+        report.gpu.d3dFeatureLevel = L"Unavailable";
+        report.gpu.hardwareDecodeProfiles = {L"Unavailable"};
+        return false;
+    }
+    report.gpu.d3dFeatureLevel = FeatureLevelToString(createdLevel);
+    PopulateVideoDecodeProfiles(device.Get(), report.gpu);
+    DXGI_ADAPTER_DESC1 adapterDesc{};
+    if (SUCCEEDED(adapter->GetDesc1(&adapterDesc))) {
+        report.gpu.adapterName = adapterDesc.Description;
+    }
+    PopulateDisplayCapabilities(adapter.Get(), report.display);
     return true;
 }
 
@@ -610,7 +616,7 @@ private:
 
 CapabilityReport BuildCapabilityReport(const ComApartment& apartment) {
     CapabilityReport report = MakeConservativeReport();
-    TryPopulateD3D11(report);
+    TryPopulateD3D12(report);
     report.display.dolbyVisionSignalAvailable = ActiveDisplaySupportsDolbyVisionLowLatency();
     if (apartment.Available()) {
         PopulateMediaFoundationTransforms(report.codecs);

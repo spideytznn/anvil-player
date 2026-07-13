@@ -1,4 +1,7 @@
-# Native FFmpeg + D3D11 Handoff Plan
+# Native FFmpeg + D3D11 Handoff Plan (Archived)
+
+> Superseded by `native-d3d12-frame-graph.md`. This file is retained only as a
+> historical implementation record and does not describe the current runtime.
 
 This is a temporary handoff plan for replacing the current playback compatibility layer with an in-process FFmpeg video decode path and D3D11 renderer.
 

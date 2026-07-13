@@ -1856,8 +1856,8 @@ const settingsCopy: Record<UiLanguage, {
     dolbyVisionSystemPipelineExperimental: 'Dolby Vision passthrough (experimental)',
     dolbyVisionSystemPipelineExperimentalCaption: 'Force Dolby Vision sources through Windows MediaEngine and Dolby Vision Extensions. Disabled by default.',
     frameInterpolation: 'GPU frame interpolation',
-    frameInterpolationCaption: 'Global default. Use GPU motion compensation to generate intermediate frames at 2x the source rate.',
-    frameInterpolationRefreshBlocked: 'Refresh-rate sync keeps its saved preference but is temporarily unavailable while interpolation is enabled.',
+    frameInterpolationCaption: 'Global default. HDR-aware GPU interpolation adapts 2x–5x output to the active display cadence.',
+    frameInterpolationRefreshBlocked: 'Refresh-rate sync supplies the target cadence for adaptive interpolation.',
     refreshRateSync: 'Smart refresh-rate sync',
     refreshRateSyncCaption: 'Global default. In fullscreen, select the highest refresh rate that is an integer multiple of the video frame rate.',
     refreshRateSyncRequirement: 'Create the exact required mode in the GPU control panel first, such as 23.976 Hz or 119.880 Hz.',
@@ -2175,20 +2175,20 @@ function LibrarySettingsPage(props: {
         </label>
         <p>{t.refreshRateSyncCaption}</p>
         <p className="library-settings-warning">{props.frameInterpolationEnabled ? t.frameInterpolationRefreshBlocked : t.refreshRateSyncRequirement}</p>
-        <div className={`library-refresh-sync-controls ${props.frameInterpolationEnabled ? 'is-disabled' : ''}`}>
+        <div className="library-refresh-sync-controls">
           <div className="library-setting-options" role="group" aria-label={t.refreshRateSync}>
-            <button className={props.refreshRateSyncEnabled ? 'is-selected' : ''} type="button" disabled={props.frameInterpolationEnabled} onClick={() => props.onRefreshRateSyncChange(true)}>
+            <button className={props.refreshRateSyncEnabled ? 'is-selected' : ''} type="button" onClick={() => props.onRefreshRateSyncChange(true)}>
               <span>{t.enabled}</span>
             </button>
-            <button className={!props.refreshRateSyncEnabled ? 'is-selected' : ''} type="button" disabled={props.frameInterpolationEnabled} onClick={() => props.onRefreshRateSyncChange(false)}>
+            <button className={!props.refreshRateSyncEnabled ? 'is-selected' : ''} type="button" onClick={() => props.onRefreshRateSyncChange(false)}>
               <span>{t.disabled}</span>
             </button>
           </div>
-          <label className={`library-checkbox-option ${props.refreshRateSyncEnabled && !props.frameInterpolationEnabled ? '' : 'is-disabled'}`}>
+          <label className={`library-checkbox-option ${props.refreshRateSyncEnabled ? '' : 'is-disabled'}`}>
             <input
               type="checkbox"
               checked={props.refreshRateMaximumMultiple}
-              disabled={!props.refreshRateSyncEnabled || props.frameInterpolationEnabled}
+              disabled={!props.refreshRateSyncEnabled}
               onChange={(event) => props.onRefreshRateMaximumMultipleChange(event.currentTarget.checked)}
             />
             <span>{t.maximumRefreshMultiple}</span>

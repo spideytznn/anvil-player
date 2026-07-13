@@ -19,7 +19,7 @@ enum class PlaybackState {
 
 enum class HardwareDecodeMode {
     Auto,
-    D3D11VA,
+    D3D12VA,
     Off,
 };
 

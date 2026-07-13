@@ -430,7 +430,7 @@ void MainWindow::PaintTransportOverlay(HWND overlay) {
 bool MainWindow::UsesGpuFullscreenUiOverlay() const {
     return fullscreen_ &&
            webUiActive_ &&
-           backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+           backend_ == PlaybackBackend::NativeFfmpegD3D12 &&
            d3dRenderer_.has_value() &&
            d3dRenderer_->IsReady() &&
            videoHost_;
@@ -516,7 +516,7 @@ void MainWindow::QueueGpuFullscreenUiOverlay(const bool forceImmediatePresent) {
     ReleaseDC(hwnd_, windowDc);
 
     const RECT hostBounds = PlaybackSurfaceBounds();
-    auto overlay = std::make_shared<D3D11UiOverlayBitmap>();
+    auto overlay = std::make_shared<VideoUiOverlayBitmap>();
     overlay->width = width;
     overlay->height = height;
     overlay->destinationX = clippedBounds.left - hostBounds.left;
@@ -611,7 +611,7 @@ void MainWindow::QueueGpuFullscreenSubtitleMenuOverlay(const bool forceImmediate
         nativeVideoDecoder_->IsRunning() &&
         !nativeVideoDecoder_->Stats().buffering;
     const RECT hostBounds = PlaybackSurfaceBounds();
-    auto overlay = std::make_shared<D3D11UiOverlayBitmap>();
+    auto overlay = std::make_shared<VideoUiOverlayBitmap>();
     overlay->width = width;
     overlay->height = height;
     overlay->destinationX = clippedBounds.left - hostBounds.left;
@@ -1368,7 +1368,7 @@ void MainWindow::DrawVideoSurface(HDC hdc, const PlaybackSessionSnapshot& snapsh
                     DrawDecodedVideoFrame(hdc, videoSurface_, frame);
                 });
             if (!drewDecodedFrame &&
-                !(backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+                !(backend_ == PlaybackBackend::NativeFfmpegD3D12 &&
                   nativeVideoDecoder_ &&
                   nativeVideoDecoder_->IsRunning()) &&
                 !snapshot.media->previewImagePath.empty()) {
@@ -1392,7 +1392,7 @@ void MainWindow::DrawVideoSurface(HDC hdc, const PlaybackSessionSnapshot& snapsh
         HFONT titleFont = CreateUiFont(compactSurface ? Scale(18) : Scale(22), FW_SEMIBOLD);
         HFONT bodyFont = CreateUiFont(compactSurface ? Scale(12) : Scale(13), FW_NORMAL);
         HFONT smallFont = CreateUiFont(Scale(11), FW_NORMAL);
-        const bool nativeActive = (backend_ == PlaybackBackend::NativeFfmpegD3D11) &&
+        const bool nativeActive = (backend_ == PlaybackBackend::NativeFfmpegD3D12) &&
                                   nativeVideoDecoder_ && nativeVideoDecoder_->IsRunning();
         const bool drewDecodedFrame =
             backend_ == PlaybackBackend::RawFrameBridge &&
@@ -1510,7 +1510,7 @@ void MainWindow::DrawTransport(HDC hdc, const PlaybackSessionSnapshot& snapshot)
     }
 
     double bufferedRatio = progressRatio;
-    if (backend_ == PlaybackBackend::NativeFfmpegD3D11 &&
+    if (backend_ == PlaybackBackend::NativeFfmpegD3D12 &&
         nativeVideoDecoder_ &&
         snapshot.media.has_value() &&
         snapshot.media->duration.count() > 0) {
