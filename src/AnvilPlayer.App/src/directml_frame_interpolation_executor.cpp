@@ -197,7 +197,7 @@ std::filesystem::path DirectMlFrameInterpolationExecutor::DefaultModelPath() {
     const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
     if (length == 0 || length >= path.size()) return {};
     return std::filesystem::path(path.data()).parent_path() /
-        L"assets" / L"models" / L"rife_v4.25_lite_fp16.onnx";
+        L"assets" / L"models" / L"rife_v4.25_fp16.onnx";
 }
 
 std::size_t DirectMlFrameInterpolationExecutor::OutputBufferBytes(
