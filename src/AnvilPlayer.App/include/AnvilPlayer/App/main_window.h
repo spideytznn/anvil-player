@@ -329,6 +329,9 @@ private:
                             bool waitForPreroll = true);
     bool SeekNativeRuntime(const anvil::playback::PlaybackSessionSnapshot& snapshot);
     void ResumeNativeSeekPrerollAudio(std::chrono::milliseconds position);
+    void UpdateNativeNetworkRebufferAudio(
+        const anvil::playback::PlaybackSessionSnapshot& snapshot,
+        const NativeVideoQueueStats& stats);
     bool PrepareNativeEnhancedPlaybackBeforePlay(const anvil::playback::PlaybackSessionSnapshot& snapshot);
     bool CaptureLatestNativeFrame();
     bool ReplaceHeldNativeFrame(const NativeVideoFrame& frame);
@@ -478,6 +481,7 @@ private:
     bool videoHostReady_ = false;
     bool videoHostInitializationFailureHandled_ = false;
     bool rendererDeviceRecoveryPending_ = false;
+    bool rendererDeviceRecoveryWaitLogged_ = false;
     unsigned int rendererDeviceRecoveryAttempts_ = 0;
     std::chrono::steady_clock::time_point lastRendererDeviceLossAt_{};
     bool gpuFullscreenUiOverlayActive_ = false;
@@ -501,6 +505,7 @@ private:
     bool pendingPausedFrameRefresh_ = false;
     bool heldNativeFrameNeedsPresent_ = false;
     bool nativeSeekPrerollHoldingAudio_ = false;
+    bool nativeNetworkRebufferHoldingAudio_ = false;
     bool systemDolbyVisionFallbackForCurrentMedia_ = false;
     bool systemDolbyVisionPlayingLogged_ = false;
     std::chrono::steady_clock::time_point systemDolbyVisionStartedAt_{};
@@ -528,7 +533,7 @@ private:
     std::optional<std::chrono::milliseconds> deferredRuntimePosition_;
     bool deferredPausedFrameRefresh_ = false;
     bool deferredPausedFrameRefreshForceRestart_ = false;
-    double pendingStartPositionRatio_ = 0.0;  // 0..1, seek here after next openPath playback start
+    double pendingStartPositionRatio_ = 0.0;  // 0..1, commit before the next OpenPath runtime starts
     UINT_PTR nativeColorSettingsRefreshSerial_ = 0;
     bool nativeColorSettingsRefreshRequiresDecoderRefresh_ = false;
     std::optional<NativeVideoFrame> heldNativeFrame_;

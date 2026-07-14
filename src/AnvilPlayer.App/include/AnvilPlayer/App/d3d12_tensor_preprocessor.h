@@ -24,8 +24,7 @@ struct TensorShape {
     bool IsValid() const noexcept { return width != 0 && height != 0; }
 };
 
-// Selects the smallest fixed inference bucket that contains the decoded
-// picture. The model may crop its result back to the real display dimensions.
+// Selects a source-resolution inference extent capped at aligned 1080p.
 TensorShape SelectInterpolationTensorShape(UINT width, UINT height) noexcept;
 
 struct TensorPreprocessResult {
@@ -61,6 +60,7 @@ public:
     // used by the HDR interpolation model.
     TensorPreprocessResult SubmitScRgbPair(ID3D12Resource* first,
                                            ID3D12Resource* second,
+                                           TensorShape outputShape,
                                            float interpolationT,
                                            uint64_t epoch,
                                            const GpuFencePoint& orderingDependency = {});
@@ -73,6 +73,7 @@ public:
                                            uint64_t epoch,
                                            const GpuFencePoint& orderingDependency = {});
     bool RetainUntil(ID3D12Resource* tensor, const GpuFencePoint& completion);
+    bool ReleaseRetained(ID3D12Resource* tensor, const GpuFencePoint& completion);
 
 private:
     static constexpr std::size_t kSlotCount = 8;
@@ -86,6 +87,7 @@ private:
         void* doviConstantsMapping = nullptr;
         std::size_t outputBytes = 0;
         GpuFencePoint completion;
+        bool retained = false;
         Microsoft::WRL::ComPtr<ID3D12Resource> firstTexture;
         Microsoft::WRL::ComPtr<ID3D12Resource> secondTexture;
         Microsoft::WRL::ComPtr<ID3D12Resource> firstEnhancementTexture;

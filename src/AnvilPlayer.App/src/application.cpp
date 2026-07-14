@@ -4,7 +4,9 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <memory>
 #include <new>
@@ -186,9 +188,18 @@ void Application::OpenInPlayer(const std::filesystem::path& path,
                                const double startPositionRatio,
                                const int audioTrackIndex,
                                const int subtitleTrackIndex) {
+    const double validatedStartPositionRatio = std::isfinite(startPositionRatio)
+        ? std::clamp(startPositionRatio, 0.0, 0.99)
+        : 0.0;
+    if (logSink_) {
+        logSink_->Write(
+            anvil::playback::LogLevel::Info, L"library",
+            L"playback request path=" + path.wstring() +
+                L" start_ratio=" + std::to_wstring(validatedStartPositionRatio));
+    }
     if ((player_ && player_->IsClosing()) || PlayerReaperPreventsCreation()) {
         pendingPlayerOpenPath_ = path;
-        pendingPlayerOpenRatio_ = startPositionRatio;
+        pendingPlayerOpenRatio_ = validatedStartPositionRatio;
         pendingPlayerAudioTrackIndex_ = audioTrackIndex;
         pendingPlayerSubtitleTrackIndex_ = subtitleTrackIndex;
         ArmPlayerReaperPollIfNeeded();
@@ -200,9 +211,9 @@ void Application::OpenInPlayer(const std::filesystem::path& path,
     }
     player_->MoveToMonitorOf(library_ ? library_->Handle() : nullptr);
     BringWindowToForeground(player_->Handle());
-    // OpenInitialPath consumes pendingStartPositionRatio_ during playback start
-    // to resume from a saved position.
-    player_->SetPendingStartPositionRatio(startPositionRatio);
+    // OpenInitialPath consumes pendingStartPositionRatio_ before playback starts
+    // so every runtime receives the same saved position in its first snapshot.
+    player_->SetPendingStartPositionRatio(validatedStartPositionRatio);
     player_->SetPendingMediaTrackSelections(audioTrackIndex, subtitleTrackIndex);
     player_->OpenInitialPath(path, true);
 }

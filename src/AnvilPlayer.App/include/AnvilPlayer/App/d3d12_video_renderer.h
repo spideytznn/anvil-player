@@ -78,7 +78,7 @@ public:
     int EffectiveDisplayPeakNits() const noexcept {
         return effectiveDisplayPeakNits_.load(std::memory_order_acquire);
     }
-    void Render(const NativeVideoFrame& frame);
+    bool Render(const NativeVideoFrame& frame);
     void QueueFrameGraphInput(const NativeVideoFrame& frame);
     bool RetireFrame(NativeVideoFrame&& frame) noexcept;
     void Clear();
@@ -98,6 +98,12 @@ private:
     };
     struct GeneratedFrameSlot {
         Microsoft::WRL::ComPtr<ID3D12Resource> output;
+        Microsoft::WRL::ComPtr<ID3D12Resource> inputTensor;
+        // Full presentation-resolution libplacebo endpoints. RIFE still runs at
+        // its latency-oriented tensor size, while final HDR luminance is sampled
+        // from these immutable originals so fullscreen scaling cannot pulse.
+        Microsoft::WRL::ComPtr<ID3D12Resource> luminanceLeft;
+        Microsoft::WRL::ComPtr<ID3D12Resource> luminanceRight;
         std::size_t capacityBytes = 0;
         TensorShape shape;
         int displayWidth = 0;
@@ -145,6 +151,19 @@ private:
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
     };
 
+    struct YuvFrameUploadCache {
+        Microsoft::WRL::ComPtr<ID3D12Resource> texture;
+        Microsoft::WRL::ComPtr<ID3D12Resource> upload;
+        void* mappedUpload = nullptr;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        UINT width = 0;
+        UINT height = 0;
+        UINT64 uploadCapacity = 0;
+        std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 2> footprints{};
+        std::array<UINT, 2> rowCounts{};
+        std::array<UINT64, 2> rowSizes{};
+    };
+
     void RenderThreadMain();
     bool InitializeGpu();
     void StartMlInitialization();
@@ -170,6 +189,10 @@ private:
     bool Resize(UINT width, UINT height);
     bool RenderFrame(const NativeVideoFrame& frame);
     bool RenderPixelFrame(const NativeVideoFrame& frame);
+    bool PrepareSoftwareYuvUpload(const NativeYuvPlanes& planes,
+                                  YuvFrameUploadCache& cache,
+                                  NativeVideoFrame& residentFrame);
+    void RecordSoftwareYuvUpload(const YuvFrameUploadCache& cache);
     bool TryRenderDolbyVisionWithLibplacebo(
         const NativeVideoFrame& frame,
         UINT backBufferIndex,
@@ -184,11 +207,10 @@ private:
     int InterpolationMultiplier(const NativeVideoFrame& first,
                                 const NativeVideoFrame& second) const;
     void RetireGeneratedSlot(std::size_t slotIndex, bool consumeStatus);
-    void RecordGeneratedDeadline(bool met);
     bool EnsureGeneratedOutput(std::size_t slotIndex, TensorShape shape);
     std::optional<std::size_t> AcquireGeneratedSlot();
-    bool DrawOverlays(const NativeVideoFrame* frame,
-                      const D3D12_VIEWPORT& videoViewport,
+    void BindPresentedSubtitles(const NativeVideoFrame& frame);
+    bool DrawOverlays(const D3D12_VIEWPORT& videoViewport,
                       UINT backBufferIndex);
     bool EnsureTextSubtitleBitmap(const std::wstring& text,
                                   const D3D12_VIEWPORT& videoViewport);
@@ -204,6 +226,7 @@ private:
     std::atomic<HWND> host_{nullptr};
     std::atomic<VideoRendererState> state_{VideoRendererState::Stopped};
     std::atomic_bool stopped_{true};
+    std::atomic_bool deviceLossReported_{false};
     std::atomic<ID3D12Device*> publishedDevice_{nullptr};
     std::thread renderThread_;
     mutable std::mutex commandMutex_;
@@ -335,33 +358,34 @@ private:
     std::thread mlInitializationThread_;
     std::unique_ptr<NativeVideoFrame> tensorPreviousFrame_;
     Microsoft::WRL::ComPtr<ID3D12Resource> tensorPreviousDoviTarget_;
+    Microsoft::WRL::ComPtr<ID3D12Resource> tensorPreviousDoviLuminanceTarget_;
+    uint64_t tensorPreviousDoviTargetTimeline_ = 0;
+    uint64_t tensorPreviousDoviTargetFrameSerial_ = 0;
     std::map<std::pair<uint64_t, uint64_t>, GpuFencePoint> sourceComputeCompletions_;
     std::map<std::pair<uint64_t, uint64_t>, GpuFencePoint> sourceGraphicsCompletions_;
     std::chrono::milliseconds presentedOriginalPts_{0};
     uint64_t presentedOriginalTimeline_ = 0;
     std::chrono::steady_clock::time_point presentedOriginalAt_{};
-    std::wstring presentedOriginalSubtitleText_;
-    std::vector<NativeSubtitleBitmap> presentedOriginalSubtitleBitmaps_;
-    bool presentedOriginalSubtitlesPrepared_ = false;
+    // Subtitle state belongs to the presentation timeline, not to original or
+    // generated video frames. Both paths read this one post-interpolation
+    // overlay snapshot after the latest original frame has been presented.
+    std::wstring presentedSubtitleText_;
+    std::vector<NativeSubtitleBitmap> presentedSubtitleBitmaps_;
+    int presentedSubtitleSourceWidth_ = 0;
+    int presentedSubtitleSourceHeight_ = 0;
     bool tensorPreprocessorLogged_ = false;
     bool directMlSubmitLogged_ = false;
     bool generatedPresentLogged_ = false;
     bool dolbyVisionD3D12Logged_ = false;
     bool dolbyVisionPipelineWaitLogged_ = false;
-    static constexpr int kMaximumInterpolationMultiplier = 5;
-    int adaptiveMultiplierCap_ = kMaximumInterpolationMultiplier;
-    int adaptiveDeadlineSamples_ = 0;
-    int adaptiveDeadlineHits_ = 0;
-    int adaptiveStableWindows_ = 0;
-    std::chrono::steady_clock::time_point adaptiveCalibrationStartedAt_{};
-    bool adaptiveCadenceLocked_ = false;
     static constexpr std::size_t kGeneratedSlotCount = 8;
     static constexpr UINT kMaxOverlayTextures = 32;
     std::array<GeneratedFrameSlot, kGeneratedSlotCount> generatedSlots_{};
     std::deque<std::size_t> pendingGeneratedSlots_;
     std::array<std::array<OverlayTextureCache, kMaxOverlayTextures>, kBufferCount>
         overlayTextureCaches_{};
-    std::array<OverlayTextureCache, kMaxOverlayTextures> subtitleTextureCaches_{};
+    std::array<std::array<OverlayTextureCache, kMaxOverlayTextures>, kBufferCount>
+        subtitleTextureCaches_{};
     std::shared_ptr<const std::vector<uint8_t>> textSubtitlePixels_;
     std::wstring textSubtitleText_;
     D3D12_VIEWPORT textSubtitleViewport_{};
@@ -372,6 +396,7 @@ private:
     int textSubtitleOffsetYPx_ = 0;
     uint64_t textSubtitleSerial_ = 0;
     std::array<PixelFrameUploadCache, kBufferCount> pixelFrameUploadCaches_{};
+    std::array<std::array<YuvFrameUploadCache, 2>, kBufferCount> yuvFrameUploadCaches_{};
     UINT width_ = 1;
     UINT height_ = 1;
     std::array<std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>>, kBufferCount> transients_;
@@ -381,11 +406,14 @@ private:
     bool hlgInterpolationColorPathLogged_ = false;
     bool dolbyVisionInterpolationColorBypassLogged_ = false;
     bool dolbyVisionInterpolationColorPathLogged_ = false;
+    bool dolbyVisionImmutableEndpointLogged_ = false;
     bool hdr10PlusInterpolationBypassLogged_ = false;
     bool dolbyVisionDynamicTrimLogged_ = false;
-    bool interpolatedSubtitleCompositionLogged_ = false;
-    bool interpolatedSubtitlePresentationSyncLogged_ = false;
-    bool sharedSubtitleTextureLogged_ = false;
+    bool independentSubtitleCompositionLogged_ = false;
+    bool perBackBufferSubtitleTextureLogged_ = false;
+    bool dolbyVisionInterpolationLuminanceGuardLogged_ = false;
+    UINT loggedDoviLuminanceReferenceWidth_ = 0;
+    UINT loggedDoviLuminanceReferenceHeight_ = 0;
     uint64_t loggedDoviTrimFingerprint_ = 0;
     uint64_t loggedHdr10PlusFingerprint_ = 0;
     uint64_t loggedHdrToneCurveFingerprint_ = 0;

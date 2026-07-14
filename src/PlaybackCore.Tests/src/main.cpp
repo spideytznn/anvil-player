@@ -4,6 +4,8 @@
 #include "AnvilPlayer/Playback/PlayerController.h"
 #include "AnvilPlayer/Playback/PlaybackPlan.h"
 #include "AnvilPlayer/App/color_metadata_util.h"
+#include "AnvilPlayer/App/playback_timing_math.h"
+#include "AnvilPlayer/App/software_yuv_upload_layout.h"
 #include "AnvilPlayer/App/video_texture_sampling_math.h"
 
 extern "C" {
@@ -66,6 +68,116 @@ void TestVideoTextureSamplingRegion() {
     assert(!anvil::app::BuildVideoTextureSamplingRegion(3840, 2160, 3839, 2160).valid);
     assert(!anvil::app::BuildVideoTextureSamplingRegion(0, 2160, 3840, 2160).valid);
     assert(!anvil::app::BuildVideoTextureSamplingRegion(3840, 2160, 3840, 2160, -1, 0).valid);
+}
+
+void TestSoftwareYuvUploadLayoutContract() {
+    using anvil::app::BuildSoftwareYuvUploadLayout;
+    using anvil::app::SoftwareYuvTextureFormat;
+
+    const auto nv12 = BuildSoftwareYuvUploadLayout(4, 2, 4, 4, 8, 12);
+    assert(nv12.valid);
+    assert(nv12.format == SoftwareYuvTextureFormat::Nv12);
+    assert(nv12.lumaOffset == 0);
+    assert(nv12.chromaOffset == 8);
+    assert(nv12.lumaRowBytes == 4);
+    assert(nv12.chromaRowBytes == 4);
+    assert(nv12.lumaRows == 2);
+    assert(nv12.chromaRows == 1);
+
+    const auto paddedP010 = BuildSoftwareYuvUploadLayout(4, 2, 12, 12, 10, 36);
+    assert(paddedP010.valid);
+    assert(paddedP010.format == SoftwareYuvTextureFormat::P010);
+    assert(paddedP010.chromaOffset == 24);
+    assert(paddedP010.lumaRowBytes == 8);
+    assert(paddedP010.chromaRowBytes == 8);
+
+    assert(!BuildSoftwareYuvUploadLayout(3, 2, 6, 6, 10, 18).valid);
+    assert(!BuildSoftwareYuvUploadLayout(4, 3, 8, 8, 10, 40).valid);
+    assert(!BuildSoftwareYuvUploadLayout(4, 2, 7, 8, 10, 24).valid);
+    assert(!BuildSoftwareYuvUploadLayout(4, 2, 8, 7, 10, 24).valid);
+    assert(!BuildSoftwareYuvUploadLayout(4, 2, 8, 8, 12, 24).valid);
+    assert(!BuildSoftwareYuvUploadLayout(4, 2, 8, 8, 10, 23).valid);
+}
+
+void TestWasapiEndpointClockMath() {
+    using namespace std::chrono_literals;
+
+    const auto normal = anvil::app::EndpointClockMediaPosition(
+        5s, 100, 144100, 48000, 1.0);
+    assert(normal == 8s);
+
+    const auto doubleRate = anvil::app::EndpointClockMediaPosition(
+        5s, 100, 144100, 48000, 2.0);
+    assert(doubleRate == 11s);
+    assert(anvil::app::EndpointClockMediaPosition(5s, 100, 100, 48000, 1.0) == 5s);
+    assert(anvil::app::EndpointClockMediaPosition(5s, 100, 200, 0, 1.0) == 5s);
+}
+
+void TestNetworkRebufferPolicyHysteresis() {
+    using anvil::app::EvaluateNetworkRebuffer;
+    using anvil::app::NetworkRebufferPolicyInput;
+    using anvil::app::NetworkRebufferTransition;
+    using namespace std::chrono_literals;
+
+    NetworkRebufferPolicyInput input;
+    input.networkSource = true;
+    input.renderedFrames = 12;
+    assert(EvaluateNetworkRebuffer(input) == NetworkRebufferTransition::Enter);
+
+    input.buffering = true;
+    input.decodedFrameDepth = 1;
+    assert(EvaluateNetworkRebuffer(input) == NetworkRebufferTransition::Hold);
+
+    input.decodedFrameDepth = 2;
+    input.packetDepth = 5;
+    input.readAheadDuration = 1000ms;
+    assert(EvaluateNetworkRebuffer(input) == NetworkRebufferTransition::Exit);
+
+    input.readAheadDuration = 0ms;
+    input.packetDepth = 0;
+    input.decodedFrameDepth = 1;
+    input.decodedFrameCapacity = 1;
+    assert(EvaluateNetworkRebuffer(input) == NetworkRebufferTransition::Exit);
+
+    input.decodedFrameDepth = 0;
+    input.paused = true;
+    assert(EvaluateNetworkRebuffer(input) == NetworkRebufferTransition::Exit);
+
+    input = {};
+    input.renderedFrames = 12;
+    assert(EvaluateNetworkRebuffer(input) == NetworkRebufferTransition::None);
+}
+
+void TestFixed2xInterpolationRespectsRefreshCeiling() {
+    using anvil::app::Fixed2xInterpolationMultiplier;
+
+    assert(Fixed2xInterpolationMultiplier(24.0, 48.0) == 2);
+    assert(Fixed2xInterpolationMultiplier(24000.0 / 1001.0,
+                                          48000.0 / 1001.0) == 2);
+    assert(Fixed2xInterpolationMultiplier(30000.0 / 1001.0,
+                                          60000.0 / 1001.0) == 2);
+    assert(Fixed2xInterpolationMultiplier(30.0, 60000.0 / 1001.0) == 1);
+    assert(Fixed2xInterpolationMultiplier(60.0, 120.0) == 2);
+    assert(Fixed2xInterpolationMultiplier(60.0, 60.0) == 1);
+    assert(Fixed2xInterpolationMultiplier(0.0, 120.0) == 1);
+}
+
+void TestInterpolationTensorExtentUsesSourceResolutionUpTo1080p() {
+    using anvil::app::SelectCapped1080pInterpolationExtent;
+
+    const auto uhd = SelectCapped1080pInterpolationExtent(3840, 2160);
+    assert(uhd.width == 1920 && uhd.height == 1088);
+    const auto fullHd = SelectCapped1080pInterpolationExtent(1920, 1080);
+    assert(fullHd.width == 1920 && fullHd.height == 1088);
+    const auto hd = SelectCapped1080pInterpolationExtent(1280, 720);
+    assert(hd.width == 1280 && hd.height == 736);
+    const auto sd = SelectCapped1080pInterpolationExtent(854, 480);
+    assert(sd.width == 864 && sd.height == 480);
+    const auto ultrawide = SelectCapped1080pInterpolationExtent(2560, 1080);
+    assert(ultrawide.width == 1920 && ultrawide.height == 800);
+    const auto portrait = SelectCapped1080pInterpolationExtent(1080, 1920);
+    assert(portrait.width == 608 && portrait.height == 1088);
+    assert(SelectCapped1080pInterpolationExtent(0, 1080).width == 0);
 }
 
 std::filesystem::path MakeTempMediaFile() {
@@ -144,6 +256,25 @@ void TestOpenAndTransport() {
     snapshot = controller.Snapshot();
     assert(snapshot.state == PlaybackState::Stopped);
     assert(snapshot.position.count() == 0);
+
+    std::filesystem::remove(path);
+}
+
+void TestStartupResumePositionSurvivesPlay() {
+    using namespace std::chrono_literals;
+
+    PlayerController controller;
+    const auto path = MakeTempMediaFile();
+    assert(controller.OpenMedia(path));
+
+    constexpr auto resumePosition = 30min;
+    controller.Seek(resumePosition);
+    controller.Play();
+
+    const auto snapshot = controller.Snapshot();
+    assert(snapshot.state == PlaybackState::Playing);
+    assert(snapshot.position >= resumePosition);
+    assert(snapshot.position < resumePosition + 1s);
 
     std::filesystem::remove(path);
 }
@@ -612,8 +743,14 @@ void TestHdr10PlusFrameMetadataExtraction() {
 
 int main() {
     TestVideoTextureSamplingRegion();
+    TestSoftwareYuvUploadLayoutContract();
+    TestWasapiEndpointClockMath();
+    TestNetworkRebufferPolicyHysteresis();
+    TestFixed2xInterpolationRespectsRefreshCeiling();
+    TestInterpolationTensorExtentUsesSourceResolutionUpTo1080p();
     TestCapabilityProbeDoesNotBlockRepeatedPrepare();
     TestOpenAndTransport();
+    TestStartupResumePositionSurvivesPlay();
     TestSeekAndVolumeClamp();
     TestMissingFileLogsError();
     TestPrepareCommitKeepsControllerResponsive();

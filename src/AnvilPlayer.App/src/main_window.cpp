@@ -1752,6 +1752,7 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
             }
             const auto snapshot = controller_.Snapshot();
             const auto stats = nativeVideoDecoder_->Stats();
+            UpdateNativeNetworkRebufferAudio(snapshot, stats);
             const bool nativeBuffering = snapshot.state == PlaybackState::Playing && stats.buffering;
             if (!nativeBuffering) {
                 if (nativeSeekPrerollHoldingAudio_ && !stats.seekRecoveryAudioHandoffReady) {
@@ -1763,12 +1764,14 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
             const bool shouldRenderFrame =
                 (snapshot.state == PlaybackState::Playing || pendingPausedFrameRefresh_) &&
                 !nativeBuffering;
+            bool latestFrameAccepted = false;
             const bool submittedLatestFrame =
                 shouldRenderFrame && d3dRenderer_ &&
                 nativeVideoDecoder_->VisitLatestFrame([&](const NativeVideoFrame& frame) {
-                    d3dRenderer_->Render(frame);
-                    (void)ReplaceHeldNativeFrame(frame);
-                });
+                    latestFrameAccepted = d3dRenderer_->Render(frame);
+                    if (latestFrameAccepted) (void)ReplaceHeldNativeFrame(frame);
+                }) &&
+                latestFrameAccepted;
             if (submittedLatestFrame) {
                 heldNativeFrameNeedsPresent_ = false;
                 nativeFrameHoldVisible_ = false;
@@ -1908,7 +1911,11 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
         if (static_cast<uint64_t>(wParam) != windowLifetimeCookie_) {
             return 0;
         }
-        TryFinishClose();
+        if (closePending_) {
+            TryFinishClose();
+        } else if (rendererDeviceRecoveryPending_ && !RuntimeStopInProgress()) {
+            ContinueRuntimeAfterAsyncStop();
+        }
         return 0;
     case kRenderInitializationCompleteMessage: {
         if (static_cast<uint64_t>(wParam) != windowLifetimeCookie_ || !d3dRenderer_) {
@@ -2064,9 +2071,14 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
                     ContinueRuntimeAfterAsyncStop();
                 }
             }
+            if (!closePending_ && rendererDeviceRecoveryPending_ &&
+                !RuntimeStopInProgress()) {
+                ContinueRuntimeAfterAsyncStop();
+            }
             if (closePending_) {
                 TryFinishClose();
-            } else if (!RuntimeStopInProgress() && !runtimeStopRetryPending_) {
+            } else if (!RuntimeStopInProgress() && !runtimeStopRetryPending_ &&
+                       !rendererDeviceRecoveryPending_) {
                 KillTimer(hwnd_, kAsyncCompletionPollTimer);
             }
             return 0;
@@ -2305,6 +2317,9 @@ void MainWindow::MaybeLogNativeSchedulerStats(const NativeVideoQueueStats& stats
                     L" buffered_ms=" + std::to_wstring(stats.bufferedDuration.count()) +
                     L" read_ahead_ms=" + std::to_wstring(stats.readAheadDuration.count()) +
                     L" buffering=" + std::wstring(stats.buffering ? L"true" : L"false") +
+                    L" network_rebuffering=" +
+                        std::wstring(stats.networkRebuffering ? L"true" : L"false") +
+                    L" network_rebuffers=" + std::to_wstring(stats.networkRebufferCount) +
                     L" net_kbps=" + std::to_wstring(stats.networkBytesPerSecond / 1024) +
                    L" rendered=" + std::to_wstring(stats.rendered) +
                    L" interpolation_active=" +
@@ -2333,6 +2348,7 @@ void MainWindow::MaybeLogNativeSchedulerStats(const NativeVideoQueueStats& stats
     std::wstring renderMessage =
         L"frames=" + std::to_wstring(renderStats.frames) +
         L" hw_frames=" + std::to_wstring(renderStats.hardwareFrames) +
+        L" software_yuv_frames=" + std::to_wstring(renderStats.softwareYuvFrames) +
         L" generated_frames=" + std::to_wstring(renderStats.generatedFrames) +
         L" generated_submitted=" + std::to_wstring(renderStats.generatedSubmitted) +
         L" generated_dropped_not_ready=" +
@@ -2359,6 +2375,12 @@ void MainWindow::MaybeLogNativeSchedulerStats(const NativeVideoQueueStats& stats
     if (renderStats.bgraFrames > 0) {
         renderMessage +=
             L" bgra_upload_avg_ms=" + FormatAverageMilliseconds(renderStats.bgraUploadUs, renderStats.bgraFrames);
+    }
+    if (renderStats.softwareYuvFrames > 0) {
+        renderMessage +=
+            L" yuv_upload_avg_ms=" +
+            FormatAverageMilliseconds(renderStats.yuvUploadUs,
+                                      renderStats.softwareYuvFrames);
     }
     if (renderStats.subtitleFrames > 0 || renderStats.subtitleSurfaceRebuilds > 0) {
         const uint64_t subtitleCount = std::max<uint64_t>(1, renderStats.subtitleFrames);
@@ -2834,10 +2856,12 @@ void MainWindow::UpdateUiAnimations() {
             nativeVideoDecoder_ &&
             nativeVideoDecoder_->IsRunning() &&
             d3dRenderer_) {
+            bool frameAccepted = false;
             if (nativeVideoDecoder_->VisitLatestFrame([&](const NativeVideoFrame& frame) {
-                    d3dRenderer_->Render(frame);
-                    (void)ReplaceHeldNativeFrame(frame);
-                })) {
+                    frameAccepted = d3dRenderer_->Render(frame);
+                    if (frameAccepted) (void)ReplaceHeldNativeFrame(frame);
+                }) &&
+                frameAccepted) {
                 heldNativeFrameNeedsPresent_ = false;
                 nativeFrameHoldVisible_ = false;
             }
@@ -3342,6 +3366,7 @@ void MainWindow::OnPlaybackTimerTick() {
                 }
             } else {
                 const auto stats = nativeVideoDecoder_->Stats();
+                UpdateNativeNetworkRebufferAudio(current, stats);
                 nativeBuffering = stats.buffering;
                 if (nativeBuffering) {
                     controller_.SyncClock(stats.clockPosition);
@@ -3599,15 +3624,17 @@ bool MainWindow::ApplyNativeColorSettingsLive(const PlaybackSessionSnapshot& sna
         return true;
     }
 
+    bool latestFrameAccepted = false;
     const bool haveLatestFrame =
         nativeVideoDecoder_ &&
         nativeVideoDecoder_->VisitLatestFrame([&](const NativeVideoFrame& frame) {
             if (!frame.HasContent()) {
                 return;
             }
-            d3dRenderer_->Render(frame);
-            (void)ReplaceHeldNativeFrame(frame);
-        });
+            latestFrameAccepted = d3dRenderer_->Render(frame);
+            if (latestFrameAccepted) (void)ReplaceHeldNativeFrame(frame);
+        }) &&
+        latestFrameAccepted;
     if (haveLatestFrame) {
         heldNativeFrameNeedsPresent_ = false;
         if (snapshot.state == PlaybackState::Paused) {
@@ -4067,6 +4094,7 @@ void MainWindow::StopRuntimeAsync(const bool clearVideoFrame) {
     }
 
     nativeSeekPrerollHoldingAudio_ = false;
+    nativeNetworkRebufferHoldingAudio_ = false;
     ResetNativeBufferingWatchdog();
     runtimeStopWorkerDone_.store(false);
     runtimeStopAsyncClearFrame_.store(clearVideoFrame);
@@ -4177,6 +4205,54 @@ void MainWindow::ResumeNativeSeekPrerollAudio(const std::chrono::milliseconds po
     LogApp(resumed ? LogLevel::Debug : LogLevel::Warning,
            L"native seek preroll resume audio=" + std::wstring(resumed ? L"true" : L"false") +
                L" position=" + FormatTimecode(resumePosition));
+}
+
+void MainWindow::UpdateNativeNetworkRebufferAudio(
+    const PlaybackSessionSnapshot& snapshot,
+    const NativeVideoQueueStats& stats) {
+    if (stats.networkRebuffering) {
+        if (nativeNetworkRebufferHoldingAudio_ ||
+            snapshot.state != PlaybackState::Playing ||
+            !snapshot.media.has_value() ||
+            !snapshot.media->hasAudio ||
+            !IsNetworkMediaPath(snapshot.media->path) ||
+            !audioPlayer_.IsRunning()) {
+            return;
+        }
+        const auto settings = controller_.Settings();
+        if (settings.audio.selectedTrackIndex == anvil::playback::kAudioTrackOff) {
+            return;
+        }
+        audioPlayer_.HoldPacketStream(stats.clockPosition);
+        nativeNetworkRebufferHoldingAudio_ = true;
+        LogApp(LogLevel::Info,
+               L"native network rebuffer hold audio position=" +
+                   FormatTimecode(stats.clockPosition));
+        return;
+    }
+
+    if (!nativeNetworkRebufferHoldingAudio_) {
+        return;
+    }
+    nativeNetworkRebufferHoldingAudio_ = false;
+    if (nativeSeekPrerollHoldingAudio_ ||
+        snapshot.state != PlaybackState::Playing ||
+        !snapshot.media.has_value() ||
+        !snapshot.media->hasAudio ||
+        !audioPlayer_.IsRunning()) {
+        return;
+    }
+    const auto settings = controller_.Settings();
+    if (settings.audio.selectedTrackIndex == anvil::playback::kAudioTrackOff) {
+        return;
+    }
+
+    audioPlayer_.SetPlaybackRate(snapshot.playbackRate);
+    const bool resumed = audioPlayer_.ResumePacketStream();
+    LogApp(resumed ? LogLevel::Info : LogLevel::Warning,
+           L"native network rebuffer resume audio=" +
+               std::wstring(resumed ? L"true" : L"false") +
+               L" position=" + FormatTimecode(stats.clockPosition));
 }
 
 void MainWindow::FinishRuntimeStopVisuals(const bool clearVideoFrame) {
@@ -4300,6 +4376,7 @@ void MainWindow::HandleRendererDeviceLost(const HRESULT reason) {
     }
 
     rendererDeviceRecoveryPending_ = true;
+    rendererDeviceRecoveryWaitLogged_ = false;
     videoHostReady_ = false;
     videoHostInitializationFailureHandled_ = false;
     const auto snapshot = controller_.Snapshot();
@@ -4309,6 +4386,10 @@ void MainWindow::HandleRendererDeviceLost(const HRESULT reason) {
                snapshot.media.has_value() && snapshot.media->hasVideo) {
         QueuePausedNativeFrameRefresh(true);
     }
+    if (d3dRenderer_) {
+        d3dRenderer_->RequestStop(
+            hwnd_, kRenderThreadStoppedMessage, windowLifetimeCookie_);
+    }
     StopRuntimeAsync(true);
 }
 
@@ -4317,7 +4398,11 @@ bool MainWindow::RecreateRendererAfterDeviceLoss() {
         return true;
     }
     if (d3dRenderer_ && !d3dRenderer_->IsStopped()) {
-        LogApp(LogLevel::Debug, L"d3d device recovery waiting for render worker shutdown");
+        if (!rendererDeviceRecoveryWaitLogged_) {
+            rendererDeviceRecoveryWaitLogged_ = true;
+            LogApp(LogLevel::Debug,
+                   L"d3d device recovery waiting for render worker shutdown");
+        }
         return false;
     }
 
@@ -4328,6 +4413,7 @@ bool MainWindow::RecreateRendererAfterDeviceLoss() {
     videoHostReady_ = false;
     videoHostInitializationFailureHandled_ = false;
     rendererDeviceRecoveryPending_ = false;
+    rendererDeviceRecoveryWaitLogged_ = false;
     EnsureVideoHost();
     const bool accepted = d3dRenderer_->State() == VideoRendererState::Initializing ||
                           d3dRenderer_->State() == VideoRendererState::Ready;
@@ -4506,9 +4592,21 @@ void MainWindow::RequestRuntimeStart(const bool restart, const bool waitForPrero
 }
 
 void MainWindow::ContinueRuntimeAfterAsyncStop() {
-    if (rendererDeviceRecoveryPending_ && !RecreateRendererAfterDeviceLoss()) {
-        FailPlaybackRuntime(L"Failed to recreate the graphics device");
-        return;
+    if (rendererDeviceRecoveryPending_) {
+        if (d3dRenderer_ && !d3dRenderer_->IsStopped()) {
+            if (!rendererDeviceRecoveryWaitLogged_) {
+                rendererDeviceRecoveryWaitLogged_ = true;
+                LogApp(LogLevel::Debug,
+                       L"d3d device recovery waiting for render worker shutdown");
+            }
+            SetTimer(hwnd_, kAsyncCompletionPollTimer,
+                     kAsyncCompletionPollTimerMs, nullptr);
+            return;
+        }
+        if (!RecreateRendererAfterDeviceLoss()) {
+            FailPlaybackRuntime(L"Failed to recreate the graphics device");
+            return;
+        }
     }
     const bool startRequested = deferredRuntimeStart_;
     bool restart = deferredRuntimeRestart_;
@@ -4606,7 +4704,9 @@ void MainWindow::RenderHeldNativeFrame(const bool logRepaint) {
         return;
     }
 
-    if (heldNativeFrame_.has_value() && heldNativeFrame_->HasContent()) {
+    bool submitted = false;
+    const bool hasHeldContent = heldNativeFrame_.has_value() && heldNativeFrame_->HasContent();
+    if (hasHeldContent) {
         if (logRepaint) {
             LogApp(LogLevel::Debug,
                    L"repainting cached native frame pixels=" +
@@ -4614,11 +4714,14 @@ void MainWindow::RenderHeldNativeFrame(const bool logRepaint) {
                        L" texture=" +
                        std::wstring(heldNativeFrame_->HasD3D12Texture() ? L"true" : L"false"));
         }
-        d3dRenderer_->Render(*heldNativeFrame_);
+        submitted = d3dRenderer_->Render(*heldNativeFrame_);
+        if (!submitted && logRepaint) {
+            LogApp(LogLevel::Warning, L"cached native frame repaint was rejected");
+        }
     } else if (logRepaint) {
         LogApp(LogLevel::Debug, L"no cached native frame available to repaint");
     }
-    heldNativeFrameNeedsPresent_ = false;
+    heldNativeFrameNeedsPresent_ = hasHeldContent && !submitted;
 }
 
 bool MainWindow::StartRuntime(const PlaybackSessionSnapshot& snapshot,
@@ -4789,6 +4892,7 @@ bool MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
         return false;
     }
     nativeSeekPrerollHoldingAudio_ = false;
+    nativeNetworkRebufferHoldingAudio_ = false;
     bool videoStarted = true;
     bool audioStarted = true;
     bool preferDolbyVisionHdrOutput = false;
@@ -5043,6 +5147,7 @@ bool MainWindow::SeekNativeRuntime(const PlaybackSessionSnapshot& snapshot) {
         return false;
     }
     ResetNativeBufferingWatchdog();
+    nativeNetworkRebufferHoldingAudio_ = false;
     const auto runtimeSettings = controller_.Settings();
     const bool useSharedNetworkDemuxer =
         snapshot.media->hasVideo &&
@@ -5358,17 +5463,23 @@ void MainWindow::CompleteOpenPath(PlaybackSupervisor::OpenCompletion completion)
         EnsureLayout();
     }
     if (opened && completion.autoplay) {
-        StartPlayback();
         const double startRatio = std::exchange(pendingStartPositionRatio_, 0.0);
         if (startRatio > 0.001) {
             const auto snapshot = controller_.Snapshot();
             if (snapshot.media.has_value() && snapshot.media->duration.count() > 0) {
-                SeekToPosition(std::chrono::milliseconds{
+                const auto startPosition = std::chrono::milliseconds{
                     static_cast<long long>(static_cast<double>(snapshot.media->duration.count()) *
-                                           std::clamp(startRatio, 0.0, 0.99))});
-                LogApp(LogLevel::Info, L"resume from ratio=" + std::to_wstring(startRatio));
+                                           std::clamp(startRatio, 0.0, 0.99))};
+                // Commit the resume point before Play snapshots the session and
+                // starts the asynchronous video/audio runtimes. Seeking after
+                // StartPlayback races the initial zero-position runtime start.
+                controller_.Seek(startPosition);
+                LogApp(LogLevel::Info,
+                       L"resume startup position=" + FormatTimecode(startPosition) +
+                           L" ratio=" + std::to_wstring(startRatio));
             }
         }
+        StartPlayback();
         return;
     }
     InvalidateRect(hwnd_, nullptr, FALSE);
@@ -5710,6 +5821,7 @@ void MainWindow::StartPlayback() {
         return;
     }
     nativeSeekPrerollHoldingAudio_ = false;
+    nativeNetworkRebufferHoldingAudio_ = false;
     deferredPausedFrameRefresh_ = false;
     deferredPausedFrameRefreshForceRestart_ = false;
     const auto before = controller_.Snapshot();
@@ -5806,6 +5918,7 @@ void MainWindow::StartPlayback() {
 
 void MainWindow::PausePlayback() {
     nativeSeekPrerollHoldingAudio_ = false;
+    nativeNetworkRebufferHoldingAudio_ = false;
     ClearDeferredRuntimeStart();
     controller_.Pause();
     if (RuntimeStopInProgress()) {
@@ -5826,20 +5939,21 @@ void MainWindow::PausePlayback() {
         const bool hadHeldFrame = heldNativeFrame_.has_value() && heldNativeFrame_->HasContent();
         nativeVideoDecoder_->SetPaused(true, snapshot.position);
         bool hasCpuPixels = false;
+        bool pauseFrameSubmitted = false;
         if (nativeVideoDecoder_->VisitLatestFrame([&](const NativeVideoFrame& frame) {
                 hasCpuPixels = frame.HasPixels();
                 if (!hadHeldFrame) {
-                    d3dRenderer_->Render(frame);
+                    pauseFrameSubmitted = d3dRenderer_->Render(frame);
                 }
                 (void)ReplaceHeldNativeFrame(frame);
             })) {
             nativeFrameHoldVisible_ = true;
-            heldNativeFrameNeedsPresent_ = false;
+            heldNativeFrameNeedsPresent_ = !hadHeldFrame && !pauseFrameSubmitted;
             LogApp(LogLevel::Debug,
                    L"captured native pause freeze frame pixels=" +
                        std::wstring(hasCpuPixels ? L"true" : L"false") +
                        L" rendered=" +
-                       std::wstring(!hadHeldFrame ? L"true" : L"false"));
+                       std::wstring(pauseFrameSubmitted ? L"true" : L"false"));
         }
         audioPlayer_.HoldPacketStream(snapshot.position);
     } else {

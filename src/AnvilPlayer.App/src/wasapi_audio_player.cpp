@@ -1,5 +1,6 @@
 #include "AnvilPlayer/App/wasapi_audio_player.h"
 
+#include "AnvilPlayer/App/playback_timing_math.h"
 #include "AnvilPlayer/App/string_util.h"
 
 #include <ksmedia.h>
@@ -618,14 +619,29 @@ void WasapiAudioPlayer::SetPlaybackRate(const double rate) {
         std::scoped_lock lock(clockMutex_);
         if (clockValid_ && clockRunning_) {
             const uint64_t playedFrames = PlayedFramesFromCounters(clockSubmittedFrames_, clockPaddingFrames_);
-            const uint64_t deltaFrames = playedFrames >= clockAnchorPlayedFrames_
-                                             ? playedFrames - clockAnchorPlayedFrames_
-                                             : 0;
-            clockPosition_ = clockAnchorPosition_ +
-                             FramesToMediaDuration(deltaFrames, clockSampleRate_, clockPlaybackRate_);
-            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - clockUpdatedAt_);
-            clockPosition_ += ScaleDuration(std::min(elapsed, std::chrono::milliseconds{100}), clockPlaybackRate_);
+            UINT64 endpointPosition = 0;
+            UINT64 qpcPosition = 0;
+            if (endpointClock_ && endpointClockAnchorValid_ && endpointClockFrequency_ != 0 &&
+                SUCCEEDED(endpointClock_->GetPosition(&endpointPosition, &qpcPosition)) &&
+                endpointPosition >= endpointClockAnchor_) {
+                clockPosition_ = EndpointClockMediaPosition(clockAnchorPosition_,
+                                                            endpointClockAnchor_,
+                                                            endpointPosition,
+                                                            endpointClockFrequency_,
+                                                            clockPlaybackRate_);
+                endpointClockAnchor_ = endpointPosition;
+            } else {
+                const uint64_t deltaFrames = playedFrames >= clockAnchorPlayedFrames_
+                                                 ? playedFrames - clockAnchorPlayedFrames_
+                                                 : 0;
+                clockPosition_ = clockAnchorPosition_ +
+                                 FramesToMediaDuration(deltaFrames, clockSampleRate_, clockPlaybackRate_);
+                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - clockUpdatedAt_);
+                clockPosition_ += ScaleDuration(std::min(elapsed, std::chrono::milliseconds{100}),
+                                                clockPlaybackRate_);
+                endpointClockAnchorValid_ = false;
+            }
             clockAnchorPosition_ = clockPosition_;
             clockAnchorPlayedFrames_ = playedFrames;
             clockUpdatedAt_ = std::chrono::steady_clock::now();
@@ -647,6 +663,19 @@ std::optional<std::chrono::milliseconds> WasapiAudioPlayer::PlaybackClock() cons
     std::scoped_lock lock(clockMutex_);
     if (!clockValid_ || !clockRunning_) {
         return std::nullopt;
+    }
+
+    UINT64 endpointPosition = 0;
+    UINT64 qpcPosition = 0;
+    if (endpointClock_ && endpointClockAnchorValid_ && endpointClockFrequency_ != 0 &&
+        SUCCEEDED(endpointClock_->GetPosition(&endpointPosition, &qpcPosition)) &&
+        endpointPosition >= endpointClockAnchor_) {
+        return std::max(clockPosition_,
+                        EndpointClockMediaPosition(clockAnchorPosition_,
+                                                   endpointClockAnchor_,
+                                                   endpointPosition,
+                                                   endpointClockFrequency_,
+                                                   clockPlaybackRate_));
     }
 
     auto position = clockPosition_;
@@ -695,6 +724,7 @@ void WasapiAudioPlayer::PlaybackLoop(const uint64_t workerGeneration) {
             SignalStart(false, workerGeneration);
         }
         SetPlaybackClockRunning(false);
+        DetachEndpointClock();
         if (swrCtx) swr_free(&swrCtx);
         if (frame) av_frame_free(&frame);
         if (packet) av_packet_free(&packet);
@@ -720,6 +750,7 @@ void WasapiAudioPlayer::PlaybackLoop(const uint64_t workerGeneration) {
         }
         audioClientStarted = false;
         SetPlaybackClockRunning(false);
+        DetachEndpointClock();
         renderClient.Reset();
         audioClient.Reset();
         outputFormat = {};
@@ -852,6 +883,7 @@ void WasapiAudioPlayer::PlaybackLoop(const uint64_t workerGeneration) {
                                               bitstreamEvent,
                                               failureReason)) {
                     useBitstream = true;
+                    AttachEndpointClock(audioClient.Get());
                     SetPassthroughRuntime(true, L"active", codecName);
                     LogInfo(L"audio passthrough active codec=" + codecName +
                             L" carrier=" + std::to_wstring(outputFormat.sampleRate) + L"Hz/" +
@@ -1079,6 +1111,7 @@ void WasapiAudioPlayer::PlaybackLoop(const uint64_t workerGeneration) {
         if (!InitializeWasapi(audioClient, renderClient, outputFormat, bufferFrameCount)) {
             break;
         }
+        AttachEndpointClock(audioClient.Get());
 
         packet = av_packet_alloc();
         frame = av_frame_alloc();
@@ -2188,12 +2221,48 @@ void WasapiAudioPlayer::ResetPlaybackClock(const std::chrono::milliseconds posit
     clockPaddingFrames_ = 0;
     clockSampleRate_ = 0;
     clockUpdatedAt_ = std::chrono::steady_clock::now();
+    endpointClockAnchor_ = 0;
+    endpointClockAnchorValid_ = false;
 }
 
 void WasapiAudioPlayer::SetPlaybackClockRunning(const bool running) {
     std::scoped_lock lock(clockMutex_);
     clockRunning_ = running && clockValid_;
     clockUpdatedAt_ = std::chrono::steady_clock::now();
+}
+
+bool WasapiAudioPlayer::AttachEndpointClock(IAudioClient* audioClient) {
+    Microsoft::WRL::ComPtr<IAudioClock> endpointClock;
+    UINT64 frequency = 0;
+    const HRESULT serviceResult = audioClient
+                                      ? audioClient->GetService(IID_PPV_ARGS(&endpointClock))
+                                      : E_POINTER;
+    const HRESULT frequencyResult = SUCCEEDED(serviceResult)
+                                        ? endpointClock->GetFrequency(&frequency)
+                                        : serviceResult;
+    if (FAILED(serviceResult) || FAILED(frequencyResult) || frequency == 0) {
+        DetachEndpointClock();
+        LogInfo(L"audio clock source=submitted_padding reason=endpoint_clock_unavailable");
+        return false;
+    }
+
+    {
+        std::scoped_lock lock(clockMutex_);
+        endpointClock_ = std::move(endpointClock);
+        endpointClockFrequency_ = frequency;
+        endpointClockAnchor_ = 0;
+        endpointClockAnchorValid_ = false;
+    }
+    LogInfo(L"audio clock source=wasapi_endpoint frequency=" + std::to_wstring(frequency));
+    return true;
+}
+
+void WasapiAudioPlayer::DetachEndpointClock() {
+    std::scoped_lock lock(clockMutex_);
+    endpointClock_.Reset();
+    endpointClockFrequency_ = 0;
+    endpointClockAnchor_ = 0;
+    endpointClockAnchorValid_ = false;
 }
 
 void WasapiAudioPlayer::UpdatePlaybackClock(const WasapiFormat& outputFormat,
@@ -2206,20 +2275,36 @@ void WasapiAudioPlayer::UpdatePlaybackClock(const WasapiFormat& outputFormat,
     std::scoped_lock lock(clockMutex_);
     const uint64_t playedFrames = PlayedFramesFromCounters(submittedFrames, paddingFrames);
     if (!clockValid_ || clockSampleRate_ != outputFormat.sampleRate) {
-        clockAnchorPosition_ = startPosition_;
-        clockAnchorPlayedFrames_ = 0;
+        clockAnchorPlayedFrames_ = playedFrames;
         clockPlaybackRate_ = std::clamp(playbackRate_.load(), 0.25, 4.0);
+        endpointClockAnchorValid_ = false;
     }
     clockSubmittedFrames_ = submittedFrames;
     clockPaddingFrames_ = paddingFrames;
     clockSampleRate_ = outputFormat.sampleRate;
-    const uint64_t deltaFrames = playedFrames >= clockAnchorPlayedFrames_
-                                     ? playedFrames - clockAnchorPlayedFrames_
-                                     : 0;
     clockValid_ = true;
     clockRunning_ = true;
-    clockPosition_ = clockAnchorPosition_ +
-                     FramesToMediaDuration(deltaFrames, outputFormat.sampleRate, clockPlaybackRate_);
+    UINT64 endpointPosition = 0;
+    UINT64 qpcPosition = 0;
+    if (endpointClock_ && endpointClockFrequency_ != 0 &&
+        SUCCEEDED(endpointClock_->GetPosition(&endpointPosition, &qpcPosition))) {
+        if (!endpointClockAnchorValid_ || endpointPosition < endpointClockAnchor_) {
+            clockAnchorPosition_ = clockPosition_;
+            endpointClockAnchor_ = endpointPosition;
+            endpointClockAnchorValid_ = true;
+        }
+        clockPosition_ = EndpointClockMediaPosition(clockAnchorPosition_,
+                                                    endpointClockAnchor_,
+                                                    endpointPosition,
+                                                    endpointClockFrequency_,
+                                                    clockPlaybackRate_);
+    } else {
+        const uint64_t deltaFrames = playedFrames >= clockAnchorPlayedFrames_
+                                         ? playedFrames - clockAnchorPlayedFrames_
+                                         : 0;
+        clockPosition_ = clockAnchorPosition_ +
+                         FramesToMediaDuration(deltaFrames, outputFormat.sampleRate, clockPlaybackRate_);
+    }
     clockUpdatedAt_ = std::chrono::steady_clock::now();
 }
 

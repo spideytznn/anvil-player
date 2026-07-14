@@ -1,5 +1,7 @@
 #include "AnvilPlayer/App/d3d12_tensor_preprocessor.h"
 
+#include "AnvilPlayer/App/playback_timing_math.h"
+
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -73,15 +75,9 @@ bool IsSupportedFrame(const NativeVideoFrame& frame) noexcept {
 }  // namespace
 
 TensorShape SelectInterpolationTensorShape(const UINT width, const UINT height) noexcept {
-    // Model resolution is deliberately below presentation resolution. Running
-    // RIFE at 1920x1088 took roughly 0.5 s on a 1080p Intel Arc playback path,
-    // missing every deadline and starving original frames. Composition scales
-    // the FP16 result back to the display size, so use a latency-oriented tier
-    // and reserve the larger buckets for genuinely larger sources.
-    if (width <= 1920 && height <= 1088) return {960, 544};
-    if (width <= 3840 && height <= 2176) return {1280, 736};
-    if (width <= 7680 && height <= 4352) return {1920, 1088};
-    return {};
+    const InterpolationTensorExtent extent =
+        SelectCapped1080pInterpolationExtent(width, height);
+    return {extent.width, extent.height};
 }
 
 bool D3D12TensorPreprocessor::Initialize(ID3D12Device* device,
@@ -651,8 +647,8 @@ bool D3D12TensorPreprocessor::EnsureOutput(Slot& slot, const std::size_t bytes) 
 
 D3D12TensorPreprocessor::Slot* D3D12TensorPreprocessor::AcquireSlot() {
     for (Slot& slot : slots_) {
-        if (!slot.completion.IsValid() ||
-            slot.completion.fence->GetCompletedValue() >= slot.completion.value) {
+        if (!slot.retained && (!slot.completion.IsValid() ||
+            slot.completion.fence->GetCompletedValue() >= slot.completion.value)) {
             slot.completion = {};
             slot.firstTexture.Reset();
             slot.secondTexture.Reset();
@@ -674,6 +670,21 @@ bool D3D12TensorPreprocessor::RetainUntil(ID3D12Resource* tensor,
     for (Slot& slot : slots_) {
         if (slot.output.Get() == tensor) {
             slot.completion = completion;
+            slot.retained = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool D3D12TensorPreprocessor::ReleaseRetained(
+    ID3D12Resource* tensor,
+    const GpuFencePoint& completion) {
+    if (!tensor) return false;
+    for (Slot& slot : slots_) {
+        if (slot.output.Get() == tensor) {
+            slot.completion = completion;
+            slot.retained = false;
             return true;
         }
     }
@@ -936,6 +947,7 @@ TensorPreprocessResult D3D12TensorPreprocessor::SubmitPair(
 TensorPreprocessResult D3D12TensorPreprocessor::SubmitScRgbPair(
     ID3D12Resource* first,
     ID3D12Resource* second,
+    const TensorShape outputShape,
     const float interpolationT,
     const uint64_t epoch,
     const GpuFencePoint& orderingDependency) {
@@ -959,7 +971,7 @@ TensorPreprocessResult D3D12TensorPreprocessor::SubmitScRgbPair(
         result.reason = L"unsupported_scrgb_tensor_input";
         return result;
     }
-    const TensorShape shape{static_cast<UINT>(firstDesc.Width), firstDesc.Height};
+    const TensorShape shape = outputShape;
     if (!shape.IsValid()) {
         result.reason = L"invalid_scrgb_tensor_shape";
         return result;
@@ -1077,7 +1089,8 @@ TensorPreprocessResult D3D12TensorPreprocessor::SubmitPixelPair(
     const auto supported = [](const NativeVideoFrame& frame) {
         return frame.HasPixels() && frame.stride >= frame.width * 4 &&
             (frame.softwareFormat == AV_PIX_FMT_X2BGR10LE ||
-             frame.softwareFormat == AV_PIX_FMT_BGRA);
+             frame.softwareFormat == AV_PIX_FMT_BGRA ||
+             frame.softwareFormat == AV_PIX_FMT_NONE);
     };
     if (!supported(first) || !supported(second)) {
         result.reason = L"unsupported_rgb_tensor_input";
@@ -1085,18 +1098,10 @@ TensorPreprocessResult D3D12TensorPreprocessor::SubmitPixelPair(
     }
     const UINT maxWidth = static_cast<UINT>(std::max(first.width, second.width));
     const UINT maxHeight = static_cast<UINT>(std::max(first.height, second.height));
-    // CPU libplacebo output would otherwise be uploaded twice at full 4K for
-    // every pair. The model output is scaled for presentation anyway, so
-    // downsample the authoritative RGB endpoints before upload and leave the
-    // original presentation frames untouched.
-    const double sourceFps = second.frameRateNumerator != 0 &&
-            second.frameRateDenominator != 0
-        ? static_cast<double>(second.frameRateNumerator) /
-            static_cast<double>(second.frameRateDenominator)
-        : 0.0;
-    const TensorShape shape = maxWidth <= 3840 && maxHeight <= 2176
-        ? (sourceFps >= 47.5 ? TensorShape{640, 368} : TensorShape{960, 544})
-        : SelectInterpolationTensorShape(maxWidth, maxHeight);
+    // Pixel-backed and decode-surface inputs share one resolution contract:
+    // retain the source extent up to 1080p and proportionally cap larger
+    // sources. Presentation keeps using the original full-resolution frame.
+    const TensorShape shape = SelectInterpolationTensorShape(maxWidth, maxHeight);
     if (!shape.IsValid()) {
         result.reason = L"no_tensor_shape_bucket";
         return result;

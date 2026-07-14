@@ -2,6 +2,7 @@
 
 #include "AnvilPlayer/App/color_metadata_util.h"
 #include "AnvilPlayer/App/log_sink_ptr.h"
+#include "AnvilPlayer/App/playback_timing_math.h"
 #include "AnvilPlayer/App/video_texture_sampling_math.h"
 #include "AnvilPlayer/Playback/DolbyVisionMetadata.h"
 #include "AnvilPlayer/Playback/Settings.h"
@@ -184,6 +185,8 @@ struct NativeVideoQueueStats {
     int frameCadenceMs = 0;
     int earlyToleranceMs = 0;
     bool buffering = false;
+    bool networkRebuffering = false;
+    uint64_t networkRebufferCount = 0;
     bool seekRecoveryActive = false;
     bool seekRecoveryAudioHandoffReady = true;
     uint64_t timelineSerial = 0;
@@ -519,6 +522,7 @@ private:
     static std::size_t MaxQueueDepthForFrame(const NativeVideoFrame& frame);
     bool HasQueueCapacityLocked(const NativeVideoFrame& frame) const;
     void UpdateBufferedStatsLocked();
+    NetworkRebufferTransition UpdateNetworkRebufferStateLocked();
     bool SeekPrerollReadyLocked() const;
 
     bool EnqueueFrame(NativeVideoFrame&& frame);
@@ -660,6 +664,8 @@ private:
     std::deque<NativeVideoFrame> frameQueue_;
     std::vector<std::shared_ptr<std::vector<uint8_t>>> reusableBgraBuffers_;
     NativeVideoQueueStats stats_;
+    bool networkSource_ = false;
+    bool networkRebuffering_ = false;
     // Window-facing telemetry is opportunistic. If a decode/scheduler worker
     // is rendering subtitles or retiring a queue, Stats() returns this last
     // completed snapshot instead of making the message pump wait on mutex_.
@@ -679,6 +685,8 @@ private:
     std::atomic<uint64_t> activeTimelineSerial_{1};
     mutable std::atomic<int> interruptReturnCount_{0};
     std::atomic_bool playbackPaused_{false};
+    std::atomic_bool networkInputEnded_{false};
+    std::atomic_bool networkRebufferingSnapshot_{false};
     std::atomic_bool enhancementPrerollWaitActive_{false};
     std::atomic<int> seekFastResumeFramesRemaining_{0};
     std::atomic_bool seekFastResumeLogged_{false};

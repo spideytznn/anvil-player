@@ -28,6 +28,7 @@ enum class VideoRendererState : uint32_t {
 struct VideoRenderStats {
     uint64_t frames = 0;
     uint64_t hardwareFrames = 0;
+    uint64_t softwareYuvFrames = 0;
     uint64_t generatedFrames = 0;
     uint64_t generatedSubmitted = 0;
     uint64_t generatedDroppedNotReady = 0;
@@ -47,6 +48,7 @@ struct VideoRenderStats {
     uint64_t colorPipelineUs = 0;
     uint64_t hardwarePrepareUs = 0;
     uint64_t bgraUploadUs = 0;
+    uint64_t yuvUploadUs = 0;
     uint64_t subtitleUs = 0;
     uint64_t presentUs = 0;
     uint64_t maxPresentUs = 0;

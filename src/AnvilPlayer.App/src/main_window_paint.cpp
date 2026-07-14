@@ -2532,7 +2532,7 @@ void MainWindow::DrawSettingsContent(HDC hdc, const PlayerSettings& settings, RE
     DrawField(hdc, L"Dolby Vision", ToDisplayString(settings.video.dolbyVision), cursor);
     if (!dolbyVisionMedia) {
         DrawField(hdc,
-                  L"Display metadata passthrough",
+                  L"Display metadata passthrough (Beta)",
                   settings.video.displayMetadataPassthrough ? L"On" : L"Off",
                   cursor);
     }

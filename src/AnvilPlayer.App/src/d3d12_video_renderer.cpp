@@ -1,5 +1,7 @@
 #include "AnvilPlayer/App/d3d12_video_renderer.h"
 
+#include "AnvilPlayer/App/playback_timing_math.h"
+#include "AnvilPlayer/App/software_yuv_upload_layout.h"
 #include "AnvilPlayer/App/string_util.h"
 
 #include <gdiplus.h>
@@ -11,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <new>
 #include <sstream>
 #include <utility>
 
@@ -67,8 +70,8 @@ int QueryMonitorPeakNits(IDXGIFactory4* factory, const HMONITOR monitor) {
 
 double EffectiveRefreshRate(const DWORD nominalFrequency) noexcept {
     // EnumDisplaySettings reports NTSC-compatible modes using nominal integer
-    // labels. Restore their effective rates before applying a strict floor so
-    // 23.976 -> 119.88 can still select the exact x5 cadence.
+    // labels. Restore their effective rates before enforcing the fixed 2x
+    // refresh-rate ceiling.
     switch (nominalFrequency) {
     case 23: return 24000.0 / 1001.0;
     case 29: return 30000.0 / 1001.0;
@@ -113,9 +116,10 @@ struct TensorCompositionConstants {
     float trimB[4]{};
     float trimC[4]{};
     float hdrToneCurve[20]{};
+    float endpointReference[4]{};
 };
 
-static_assert(sizeof(TensorCompositionConstants) == 40 * sizeof(UINT));
+static_assert(sizeof(TensorCompositionConstants) == 44 * sizeof(UINT));
 
 static_assert(sizeof(CompositionConstants) == 60 * sizeof(UINT));
 
@@ -167,6 +171,28 @@ int CountSubtitleLines(const std::wstring& text) noexcept {
 bool SameViewport(const D3D12_VIEWPORT& lhs, const D3D12_VIEWPORT& rhs) noexcept {
     return lhs.TopLeftX == rhs.TopLeftX && lhs.TopLeftY == rhs.TopLeftY &&
            lhs.Width == rhs.Width && lhs.Height == rhs.Height;
+}
+
+D3D12_VIEWPORT AspectFitVideoViewport(const int videoWidth, const int videoHeight,
+                                      const UINT outputWidth,
+                                      const UINT outputHeight) noexcept {
+    const float sourceAspect = static_cast<float>(std::max(1, videoWidth)) /
+        static_cast<float>(std::max(1, videoHeight));
+    const float outputAspect = static_cast<float>(std::max<UINT>(1, outputWidth)) /
+        static_cast<float>(std::max<UINT>(1, outputHeight));
+    D3D12_VIEWPORT viewport{};
+    if (sourceAspect > outputAspect) {
+        viewport.Width = static_cast<float>(outputWidth);
+        viewport.Height = viewport.Width / sourceAspect;
+        viewport.TopLeftY = (static_cast<float>(outputHeight) - viewport.Height) * 0.5f;
+    } else {
+        viewport.Height = static_cast<float>(outputHeight);
+        viewport.Width = viewport.Height * sourceAspect;
+        viewport.TopLeftX = (static_cast<float>(outputWidth) - viewport.Width) * 0.5f;
+    }
+    viewport.MinDepth = 0.0f;
+    viewport.MaxDepth = 1.0f;
+    return viewport;
 }
 
 float SourcePeakNits(const anvil::playback::VideoColorMetadata& color) {
@@ -433,6 +459,7 @@ bool D3D12VideoRenderer::BeginInitialize(const HWND host,
     completionMessage_ = completionMessage;
     completionCookie_ = completionCookie;
     deviceLostMessage_ = deviceLostMessage;
+    deviceLossReported_.store(false, std::memory_order_release);
     stopRequested_ = false;
     stopped_.store(false);
     state_.store(VideoRendererState::Initializing);
@@ -581,9 +608,22 @@ VideoRenderStats D3D12VideoRenderer::TakeRenderStats() const {
     return publishedStats_;
 }
 
-void D3D12VideoRenderer::Render(const NativeVideoFrame& frame) {
-    if (!IsReady() || (!frame.HasD3D12Texture() && !frame.HasPixels())) {
-        return;
+bool D3D12VideoRenderer::Render(const NativeVideoFrame& frame) {
+    if (!IsReady() ||
+        (!frame.HasD3D12Texture() && !frame.HasPixels() && !frame.HasYuv())) {
+        return false;
+    }
+    const auto hasValidSoftwareLayout = [](const NativeYuvPlanes& planes) {
+        return planes.data && BuildSoftwareYuvUploadLayout(
+            planes.width, planes.height, planes.yStride, planes.uvStride,
+            planes.bitDepth, planes.data->size()).valid;
+    };
+    if ((!frame.HasD3D12Texture() && frame.HasYuv() &&
+         !hasValidSoftwareLayout(frame.yuv)) ||
+        (!frame.HasEnhancementD3D12Texture() && frame.HasEnhancementYuv() &&
+         !hasValidSoftwareLayout(frame.enhancementYuv))) {
+        Log(LogLevel::Warning, L"d3d12 frame mailbox rejected invalid software YUV");
+        return false;
     }
     try {
         auto pending = std::make_unique<NativeVideoFrame>(frame);
@@ -592,8 +632,10 @@ void D3D12VideoRenderer::Render(const NativeVideoFrame& frame) {
             pendingFrame_ = std::move(pending);
         }
         commandCv_.notify_one();
+        return true;
     } catch (...) {
         Log(LogLevel::Warning, L"d3d12 frame mailbox allocation failed");
+        return false;
     }
 }
 
@@ -707,7 +749,9 @@ void D3D12VideoRenderer::RenderThreadMain() {
         } else if (repeat && currentFrame_) {
             RenderLastFrame();
         }
+        if (deviceLossReported_.load(std::memory_order_acquire)) break;
         ProcessReadyGeneratedFrame();
+        if (deviceLossReported_.load(std::memory_order_acquire)) break;
     }
 
     publishedDevice_.store(nullptr);
@@ -918,7 +962,7 @@ bool D3D12VideoRenderer::CreateSwapChain(const UINT width, const UINT height) {
     srvDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(device_->CreateDescriptorHeap(&srvDesc, IID_PPV_ARGS(&srvHeap_)))) return false;
     srvIncrement_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    srvDesc.NumDescriptors = kBufferCount;
+    srvDesc.NumDescriptors = kBufferCount * 4;
     if (FAILED(device_->CreateDescriptorHeap(&srvDesc, IID_PPV_ARGS(&tensorSrvHeap_)))) return false;
     srvDesc.NumDescriptors = kBufferCount * kMaxOverlayTextures;
     if (FAILED(device_->CreateDescriptorHeap(&srvDesc, IID_PPV_ARGS(&overlaySrvHeap_)))) return false;
@@ -2347,7 +2391,7 @@ float4 main(float4 position : SV_POSITION,float2 uv : TEXCOORD0) : SV_Target {
 
     D3D12_DESCRIPTOR_RANGE tensorRange{};
     tensorRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    tensorRange.NumDescriptors = 1;
+    tensorRange.NumDescriptors = 4;
     tensorRange.BaseShaderRegister = 0;
     tensorRange.OffsetInDescriptorsFromTableStart = 0;
     D3D12_ROOT_PARAMETER tensorParameters[2]{};
@@ -2357,11 +2401,21 @@ float4 main(float4 position : SV_POSITION,float2 uv : TEXCOORD0) : SV_Target {
     tensorParameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     tensorParameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     tensorParameters[1].Constants.ShaderRegister = 0;
-    tensorParameters[1].Constants.Num32BitValues = 40;
+    tensorParameters[1].Constants.Num32BitValues = 44;
     tensorParameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_ROOT_SIGNATURE_DESC tensorRootDesc{};
     tensorRootDesc.NumParameters = static_cast<UINT>(std::size(tensorParameters));
     tensorRootDesc.pParameters = tensorParameters;
+    D3D12_STATIC_SAMPLER_DESC tensorSampler{};
+    tensorSampler.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    tensorSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    tensorSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    tensorSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    tensorSampler.ShaderRegister = 0;
+    tensorSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    tensorSampler.MaxLOD = D3D12_FLOAT32_MAX;
+    tensorRootDesc.NumStaticSamplers = 1;
+    tensorRootDesc.pStaticSamplers = &tensorSampler;
     tensorRootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     rootBlob.Reset();
     errors.Reset();
@@ -2374,6 +2428,10 @@ float4 main(float4 position : SV_POSITION,float2 uv : TEXCOORD0) : SV_Target {
     }
     constexpr char tensorPixelShader[] = R"(
 ByteAddressBuffer generated : register(t0);
+ByteAddressBuffer endpoints : register(t1);
+Texture2D<float4> leftEndpointReference : register(t2);
+Texture2D<float4> rightEndpointReference : register(t3);
+SamplerState endpointLinearClamp : register(s0);
 cbuffer TensorCompositionConstants : register(b0) {
     uint2 tensorSize;
     float hdrOutput;
@@ -2386,6 +2444,7 @@ cbuffer TensorCompositionConstants : register(b0) {
     float4 trimB;
     float4 trimC;
     float4 hdrToneCurve[5];
+    float4 endpointReference;
 };
 float load_half(uint plane, uint2 position) {
     uint element = (plane * tensorSize.y + position.y) * tensorSize.x + position.x;
@@ -2397,6 +2456,18 @@ float load_half(uint plane, uint2 position) {
 float3 load_rgb(uint2 position) {
     return float3(load_half(0, position), load_half(1, position), load_half(2, position));
 }
+float load_endpoint_half(uint plane, uint2 position) {
+    uint element = (plane * tensorSize.y + position.y) * tensorSize.x + position.x;
+    uint byteOffset = element * 2;
+    uint packed = endpoints.Load(byteOffset & ~3u);
+    uint value = (byteOffset & 2u) != 0 ? packed >> 16 : packed & 0xffffu;
+    return f16tof32(value);
+}
+float3 load_endpoint_rgb(uint firstPlane, uint2 position) {
+    return float3(load_endpoint_half(firstPlane, position),
+                  load_endpoint_half(firstPlane + 1, position),
+                  load_endpoint_half(firstPlane + 2, position));
+}
 float3 sample_rgb(float2 uv) {
     float2 p = saturate(uv) * float2(tensorSize) - 0.5;
     int2 p0 = int2(floor(p));
@@ -2407,6 +2478,19 @@ float3 sample_rgb(float2 uv) {
     uint2 d = uint2(clamp(p0 + int2(1, 1), int2(0, 0), int2(tensorSize) - 1));
     return lerp(lerp(load_rgb(a), load_rgb(b), f.x),
                 lerp(load_rgb(c), load_rgb(d), f.x), f.y);
+}
+float3 sample_endpoint_rgb(float2 uv, uint firstPlane) {
+    float2 p = saturate(uv) * float2(tensorSize) - 0.5;
+    int2 p0 = int2(floor(p));
+    float2 f = frac(p);
+    uint2 a = uint2(clamp(p0, int2(0, 0), int2(tensorSize) - 1));
+    uint2 b = uint2(clamp(p0 + int2(1, 0), int2(0, 0), int2(tensorSize) - 1));
+    uint2 c = uint2(clamp(p0 + int2(0, 1), int2(0, 0), int2(tensorSize) - 1));
+    uint2 d = uint2(clamp(p0 + int2(1, 1), int2(0, 0), int2(tensorSize) - 1));
+    return lerp(lerp(load_endpoint_rgb(firstPlane, a),
+                     load_endpoint_rgb(firstPlane, b), f.x),
+                lerp(load_endpoint_rgb(firstPlane, c),
+                     load_endpoint_rgb(firstPlane, d), f.x), f.y);
 }
 float3 pq_to_nits(float3 v) {
     const float m1 = 2610.0 / 16384.0, m2 = 2523.0 / 32.0;
@@ -2518,6 +2602,38 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_Target {
     }
     if (inputTransfer == 4) {
         float3 mappedNits=pq_to_nits(generatedRgb);
+        // RIFE is not constrained to preserve HDR energy. Plane 6 holds the
+        // exact interpolation time used for this inference, so the original
+        // DV endpoints can provide a stable exposure reference. Never replace
+        // the generated luma with an endpoint cross-fade: luma carries most of
+        // the motion structure and doing so makes valid interpolation look like
+        // ordinary playback. Apply only a small bounded exposure correction.
+        float3 leftNits;
+        float3 rightNits;
+        if(endpointReference.x>=0.5) {
+            // These are the same presentation-resolution scRGB endpoints used
+            // by the original DV path (linear BT.709, 1.0 = 80 nits). Sampling
+            // them here prevents a 4K original from alternating with a
+            // low-resolution tensor-derived luminance field in fullscreen.
+            leftNits=rec709_to_rec2020(
+                max(leftEndpointReference.SampleLevel(endpointLinearClamp,saturate(uv),0).rgb,0.0)*80.0);
+            rightNits=rec709_to_rec2020(
+                max(rightEndpointReference.SampleLevel(endpointLinearClamp,saturate(uv),0).rgb,0.0)*80.0);
+        } else {
+            leftNits=pq_to_nits(sample_endpoint_rgb(uv,0));
+            rightNits=pq_to_nits(sample_endpoint_rgb(uv,3));
+        }
+        float3 weights=float3(0.2627,0.6780,0.0593);
+        float generatedLuma=max(dot(mappedNits,weights),0.0);
+        float interpolationT=saturate(load_endpoint_half(6,uint2(0,0)));
+        float3 referenceNits=lerp(leftNits,rightNits,interpolationT);
+        float referenceLuma=max(dot(referenceNits,weights),0.0);
+        if(generatedLuma>0.0001) {
+            float logExposureDelta=clamp(
+                log2(max(referenceLuma,0.01)/max(generatedLuma,0.01)),
+                -0.35,0.35);
+            mappedNits*=exp2(logExposureDelta*0.25);
+        }
         if (hdrOutput >= 0.5) return float4(nits_to_pq(max(mappedNits,0.0)),1.0);
         mappedNits=rec2020_to_rec709(mappedNits);
         return float4(linear_to_srgb(max(mappedNits,0.0)/100.0),1.0);
@@ -3056,7 +3172,10 @@ bool D3D12VideoRenderer::TryRenderDolbyVisionWithLibplacebo(
         2, doviConstantBuffers_[backBufferIndex]->GetGPUVirtualAddress());
     commandList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     commandList_->DrawInstanced(3, 1, 0, 0);
-    DrawOverlays(&frame, viewport, backBufferIndex);
+    BindPresentedSubtitles(frame);
+    const D3D12_VIEWPORT subtitleViewport = AspectFitVideoViewport(
+        frame.width, frame.height, width_, height_);
+    DrawOverlays(subtitleViewport, backBufferIndex);
 
     const std::array<D3D12_RESOURCE_BARRIER, 2> endBarriers{
         TransitionBarrier(libplaceboTargets_[backBufferIndex].Get(),
@@ -3227,20 +3346,8 @@ bool D3D12VideoRenderer::RenderPixelFrame(const NativeVideoFrame& frame) {
     constexpr float clearColor[4]{};
     commandList_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     commandList_->ClearRenderTargetView(rtv, clearColor, 0, nullptr);
-    const float sourceAspect = static_cast<float>(frame.width) / std::max(1, frame.height);
-    const float outputAspect = static_cast<float>(width_) / std::max<UINT>(1, height_);
-    D3D12_VIEWPORT viewport{};
-    if (sourceAspect > outputAspect) {
-        viewport.Width = static_cast<float>(width_);
-        viewport.Height = viewport.Width / sourceAspect;
-        viewport.TopLeftY = (static_cast<float>(height_) - viewport.Height) * 0.5f;
-    } else {
-        viewport.Height = static_cast<float>(height_);
-        viewport.Width = viewport.Height * sourceAspect;
-        viewport.TopLeftX = (static_cast<float>(width_) - viewport.Width) * 0.5f;
-    }
-    viewport.MinDepth = 0.0f;
-    viewport.MaxDepth = 1.0f;
+    const D3D12_VIEWPORT viewport = AspectFitVideoViewport(
+        frame.width, frame.height, width_, height_);
     const D3D12_RECT scissor{0, 0, static_cast<LONG>(width_), static_cast<LONG>(height_)};
     commandList_->RSSetViewports(1, &viewport);
     commandList_->RSSetScissorRects(1, &scissor);
@@ -3337,7 +3444,8 @@ bool D3D12VideoRenderer::RenderPixelFrame(const NativeVideoFrame& frame) {
         2, doviConstantBuffers_[backBufferIndex]->GetGPUVirtualAddress());
     commandList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     commandList_->DrawInstanced(3, 1, 0, 0);
-    DrawOverlays(&frame, viewport, backBufferIndex);
+    BindPresentedSubtitles(frame);
+    DrawOverlays(viewport, backBufferIndex);
 
     const std::array endBarriers{
         TransitionBarrier(cache.texture.Get(),
@@ -3384,16 +3492,160 @@ bool D3D12VideoRenderer::RenderPixelFrame(const NativeVideoFrame& frame) {
     return true;
 }
 
+bool D3D12VideoRenderer::PrepareSoftwareYuvUpload(
+    const NativeYuvPlanes& planes,
+    YuvFrameUploadCache& cache,
+    NativeVideoFrame& residentFrame) {
+    if (!planes.data) return false;
+    const SoftwareYuvUploadLayout layout = BuildSoftwareYuvUploadLayout(
+        planes.width, planes.height, planes.yStride, planes.uvStride,
+        planes.bitDepth, planes.data->size());
+    if (!layout.valid) {
+        Log(LogLevel::Warning, L"software YUV frame rejected because its layout is invalid");
+        return false;
+    }
+
+    const DXGI_FORMAT textureFormat = layout.format == SoftwareYuvTextureFormat::Nv12
+        ? DXGI_FORMAT_NV12
+        : DXGI_FORMAT_P010;
+    D3D12_RESOURCE_DESC textureDesc{};
+    textureDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    textureDesc.Width = static_cast<UINT64>(planes.width);
+    textureDesc.Height = static_cast<UINT>(planes.height);
+    textureDesc.DepthOrArraySize = 1;
+    textureDesc.MipLevels = 1;
+    textureDesc.Format = textureFormat;
+    textureDesc.SampleDesc.Count = 1;
+    textureDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+    const bool recreate = !cache.texture || !cache.upload || !cache.mappedUpload ||
+        cache.width != static_cast<UINT>(planes.width) ||
+        cache.height != static_cast<UINT>(planes.height) ||
+        cache.format != textureFormat;
+    if (recreate) {
+        if (cache.upload && cache.mappedUpload) cache.upload->Unmap(0, nullptr);
+        cache = {};
+
+        D3D12_HEAP_PROPERTIES defaultHeap{};
+        defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        if (FAILED(device_->CreateCommittedResource(
+                &defaultHeap, D3D12_HEAP_FLAG_NONE, &textureDesc,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                IID_PPV_ARGS(&cache.texture)))) {
+            Log(LogLevel::Warning, L"software YUV texture allocation failed");
+            return false;
+        }
+
+        UINT64 uploadBytes = 0;
+        device_->GetCopyableFootprints(
+            &textureDesc, 0, 2, 0, cache.footprints.data(), cache.rowCounts.data(),
+            cache.rowSizes.data(), &uploadBytes);
+        if (uploadBytes == 0 ||
+            cache.rowCounts[0] < static_cast<UINT>(layout.lumaRows) ||
+            cache.rowCounts[1] < static_cast<UINT>(layout.chromaRows) ||
+            cache.rowSizes[0] < layout.lumaRowBytes ||
+            cache.rowSizes[1] < layout.chromaRowBytes) {
+            cache = {};
+            Log(LogLevel::Warning, L"software YUV texture footprint is incompatible");
+            return false;
+        }
+
+        D3D12_RESOURCE_DESC uploadDesc{};
+        uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        uploadDesc.Width = uploadBytes;
+        uploadDesc.Height = 1;
+        uploadDesc.DepthOrArraySize = 1;
+        uploadDesc.MipLevels = 1;
+        uploadDesc.SampleDesc.Count = 1;
+        uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_HEAP_PROPERTIES uploadHeap{};
+        uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        if (FAILED(device_->CreateCommittedResource(
+                &uploadHeap, D3D12_HEAP_FLAG_NONE, &uploadDesc,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                IID_PPV_ARGS(&cache.upload)))) {
+            cache.texture.Reset();
+            Log(LogLevel::Warning, L"software YUV upload allocation failed");
+            return false;
+        }
+        const D3D12_RANGE noRead{0, 0};
+        if (FAILED(cache.upload->Map(0, &noRead, &cache.mappedUpload))) {
+            cache = {};
+            Log(LogLevel::Warning, L"software YUV upload mapping failed");
+            return false;
+        }
+        cache.format = textureFormat;
+        cache.width = static_cast<UINT>(planes.width);
+        cache.height = static_cast<UINT>(planes.height);
+        cache.uploadCapacity = uploadBytes;
+    }
+
+    const std::array sourceOffsets{layout.lumaOffset, layout.chromaOffset};
+    const std::array sourceStrides{
+        static_cast<std::size_t>(planes.yStride),
+        static_cast<std::size_t>(planes.uvStride)};
+    const std::array sourceRowBytes{layout.lumaRowBytes, layout.chromaRowBytes};
+    const std::array sourceRowCounts{
+        static_cast<UINT>(layout.lumaRows),
+        static_cast<UINT>(layout.chromaRows)};
+    const std::uint8_t* source = planes.data->data();
+    auto* upload = static_cast<std::uint8_t*>(cache.mappedUpload);
+    for (std::size_t plane = 0; plane < 2; ++plane) {
+        auto* destination = upload + cache.footprints[plane].Offset;
+        for (UINT row = 0; row < cache.rowCounts[plane]; ++row) {
+            auto* destinationRow = destination + static_cast<std::size_t>(row) *
+                cache.footprints[plane].Footprint.RowPitch;
+            std::memset(destinationRow, 0,
+                        static_cast<std::size_t>(cache.rowSizes[plane]));
+            if (row < sourceRowCounts[plane]) {
+                std::memcpy(destinationRow,
+                            source + sourceOffsets[plane] +
+                                static_cast<std::size_t>(row) * sourceStrides[plane],
+                            sourceRowBytes[plane]);
+            }
+        }
+    }
+
+    residentFrame.width = planes.width;
+    residentFrame.height = planes.height;
+    residentFrame.d3dFormat = textureFormat;
+    residentFrame.d3dTextureWidth = planes.width;
+    residentFrame.d3dTextureHeight = planes.height;
+    residentFrame.sourceUvRect = {};
+    residentFrame.d3d12Texture = cache.texture;
+    residentFrame.d3d12Subresource = 0;
+    residentFrame.d3d12ReadyFence.Reset();
+    residentFrame.d3d12ReadyFenceValue = 0;
+    return true;
+}
+
+void D3D12VideoRenderer::RecordSoftwareYuvUpload(
+    const YuvFrameUploadCache& cache) {
+    for (UINT plane = 0; plane < 2; ++plane) {
+        D3D12_TEXTURE_COPY_LOCATION destination{};
+        destination.pResource = cache.texture.Get();
+        destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        destination.SubresourceIndex = plane;
+        D3D12_TEXTURE_COPY_LOCATION source{};
+        source.pResource = cache.upload.Get();
+        source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        source.PlacedFootprint = cache.footprints[plane];
+        commandList_->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    }
+}
+
 bool D3D12VideoRenderer::RenderFrame(const NativeVideoFrame& frame) {
     RefreshDisplayPeakNits();
     WaitForFrameLatencyObject();
     if (frame.HasPixels()) {
         return RenderPixelFrame(frame);
     }
-    if (!frame.HasD3D12Texture() ||
-        (frame.d3dFormat != DXGI_FORMAT_NV12 &&
-         frame.d3dFormat != DXGI_FORMAT_P010 &&
-         frame.d3dFormat != DXGI_FORMAT_P016)) {
+    const bool softwareBase = !frame.HasD3D12Texture() && frame.HasYuv();
+    if (!softwareBase &&
+        (!frame.HasD3D12Texture() ||
+         (frame.d3dFormat != DXGI_FORMAT_NV12 &&
+          frame.d3dFormat != DXGI_FORMAT_P010 &&
+          frame.d3dFormat != DXGI_FORMAT_P016))) {
         Log(LogLevel::Warning, L"d3d12 compositor rejected non-resident or unsupported frame");
         return false;
     }
@@ -3402,12 +3654,47 @@ bool D3D12VideoRenderer::RenderFrame(const NativeVideoFrame& frame) {
     if (!WaitForBackBuffer(backBufferIndex)) return false;
     inFlightFrames_[backBufferIndex].reset();
     transients_[backBufferIndex].clear();
+
+    const bool softwareEnhancement =
+        !frame.HasEnhancementD3D12Texture() && frame.HasEnhancementYuv();
+    NativeVideoFrame residentFrame;
+    NativeVideoFrame residentEnhancement;
+    YuvFrameUploadCache* baseUpload = nullptr;
+    YuvFrameUploadCache* enhancementUpload = nullptr;
+    if (softwareBase || softwareEnhancement) {
+        residentFrame = frame;
+        if (softwareBase) {
+            baseUpload = &yuvFrameUploadCaches_[backBufferIndex][0];
+            if (!PrepareSoftwareYuvUpload(frame.yuv, *baseUpload, residentFrame)) {
+                return false;
+            }
+        }
+        if (softwareEnhancement) {
+            enhancementUpload = &yuvFrameUploadCaches_[backBufferIndex][1];
+            if (!PrepareSoftwareYuvUpload(
+                    frame.enhancementYuv, *enhancementUpload, residentEnhancement)) {
+                return false;
+            }
+            try {
+                residentFrame.enhancementFrame =
+                    std::make_shared<NativeVideoFrame>(std::move(residentEnhancement));
+            } catch (const std::bad_alloc&) {
+                Log(LogLevel::Warning,
+                    L"software YUV enhancement frame allocation failed");
+                return false;
+            }
+        }
+    }
+    const NativeVideoFrame& renderFrame = softwareBase || softwareEnhancement
+        ? residentFrame
+        : frame;
     const bool requiresDolbyVisionPipeline =
-        (frame.dovi && frame.dovi->valid) ||
-        (frame.enhancementDovi && frame.enhancementDovi->valid) ||
-        frame.HasEnhancementD3D12Texture();
-    if (requiresDolbyVisionPipeline && libplaceboBridge_ &&
-        TryRenderDolbyVisionWithLibplacebo(frame, backBufferIndex, startedAt)) {
+        (renderFrame.dovi && renderFrame.dovi->valid) ||
+        (renderFrame.enhancementDovi && renderFrame.enhancementDovi->valid) ||
+        renderFrame.HasEnhancementD3D12Texture();
+    if (!baseUpload && !enhancementUpload && requiresDolbyVisionPipeline &&
+        libplaceboBridge_ &&
+        TryRenderDolbyVisionWithLibplacebo(renderFrame, backBufferIndex, startedAt)) {
         return true;
     }
     ID3D12PipelineState* compositionPipeline = yuvPipeline_.Get();
@@ -3437,12 +3724,15 @@ bool D3D12VideoRenderer::RenderFrame(const NativeVideoFrame& frame) {
         return false;
     }
 
-    const D3D12_RESOURCE_DESC sourceDesc = frame.d3d12Texture->GetDesc();
+    if (baseUpload) RecordSoftwareYuvUpload(*baseUpload);
+    if (enhancementUpload) RecordSoftwareYuvUpload(*enhancementUpload);
+
+    const D3D12_RESOURCE_DESC sourceDesc = renderFrame.d3d12Texture->GetDesc();
     const UINT arraySize = std::max<UINT>(1, sourceDesc.DepthOrArraySize);
-    const UINT plane0 = std::min(frame.d3d12Subresource, arraySize - 1);
+    const UINT plane0 = std::min(renderFrame.d3d12Subresource, arraySize - 1);
     const UINT plane1 = plane0 + arraySize;
-    const NativeVideoFrame* enhancement = frame.HasEnhancementD3D12Texture()
-        ? frame.enhancementFrame.get() : nullptr;
+    const NativeVideoFrame* enhancement = renderFrame.HasEnhancementD3D12Texture()
+        ? renderFrame.enhancementFrame.get() : nullptr;
     UINT enhancementPlane0 = 0;
     UINT enhancementPlane1 = 0;
     if (enhancement) {
@@ -3455,17 +3745,25 @@ bool D3D12VideoRenderer::RenderFrame(const NativeVideoFrame& frame) {
         TransitionBarrier(backBuffers_[backBufferIndex].Get(),
                           D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                           D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET),
-        TransitionBarrier(frame.d3d12Texture.Get(), plane0, D3D12_RESOURCE_STATE_COMMON,
+        TransitionBarrier(renderFrame.d3d12Texture.Get(), plane0,
+                          baseUpload ? D3D12_RESOURCE_STATE_COPY_DEST
+                                     : D3D12_RESOURCE_STATE_COMMON,
                           D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
-        TransitionBarrier(frame.d3d12Texture.Get(), plane1, D3D12_RESOURCE_STATE_COMMON,
+        TransitionBarrier(renderFrame.d3d12Texture.Get(), plane1,
+                          baseUpload ? D3D12_RESOURCE_STATE_COPY_DEST
+                                     : D3D12_RESOURCE_STATE_COMMON,
                           D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)};
     if (enhancement) {
         beginBarriers.push_back(TransitionBarrier(
             enhancement->d3d12Texture.Get(), enhancementPlane0,
-            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+            enhancementUpload ? D3D12_RESOURCE_STATE_COPY_DEST
+                              : D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
         beginBarriers.push_back(TransitionBarrier(
             enhancement->d3d12Texture.Get(), enhancementPlane1,
-            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+            enhancementUpload ? D3D12_RESOURCE_STATE_COPY_DEST
+                              : D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
     }
     commandList_->ResourceBarrier(static_cast<UINT>(beginBarriers.size()), beginBarriers.data());
 
@@ -3486,13 +3784,16 @@ bool D3D12VideoRenderer::RenderFrame(const NativeVideoFrame& frame) {
         view.Texture2DArray.PlaneSlice = planeSlice;
         device_->CreateShaderResourceView(source.d3d12Texture.Get(), &view, handle);
     };
-    const bool highBitDepth = frame.d3dFormat == DXGI_FORMAT_P010 ||
-                              frame.d3dFormat == DXGI_FORMAT_P016;
-    makeSrv(frame, highBitDepth ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM, 0, srvCpu);
+    const bool highBitDepth = renderFrame.d3dFormat == DXGI_FORMAT_P010 ||
+                              renderFrame.d3dFormat == DXGI_FORMAT_P016;
+    makeSrv(renderFrame, highBitDepth ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM,
+            0, srvCpu);
     srvCpu.ptr += srvIncrement_;
-    makeSrv(frame, highBitDepth ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R8G8_UNORM, 1, srvCpu);
+    makeSrv(renderFrame,
+            highBitDepth ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R8G8_UNORM,
+            1, srvCpu);
     srvCpu.ptr += srvIncrement_;
-    const NativeVideoFrame& enhancementSource = enhancement ? *enhancement : frame;
+    const NativeVideoFrame& enhancementSource = enhancement ? *enhancement : renderFrame;
     const bool enhancementHighBitDepth = enhancementSource.d3dFormat == DXGI_FORMAT_P010 ||
                                          enhancementSource.d3dFormat == DXGI_FORMAT_P016;
     makeSrv(enhancementSource,
@@ -3506,20 +3807,8 @@ bool D3D12VideoRenderer::RenderFrame(const NativeVideoFrame& frame) {
     constexpr float clearColor[4]{};
     commandList_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     commandList_->ClearRenderTargetView(rtv, clearColor, 0, nullptr);
-    const float sourceAspect = static_cast<float>(frame.width) / std::max(1, frame.height);
-    const float outputAspect = static_cast<float>(width_) / std::max<UINT>(1, height_);
-    D3D12_VIEWPORT viewport{};
-    if (sourceAspect > outputAspect) {
-        viewport.Width = static_cast<float>(width_);
-        viewport.Height = viewport.Width / sourceAspect;
-        viewport.TopLeftY = (static_cast<float>(height_) - viewport.Height) * 0.5f;
-    } else {
-        viewport.Height = static_cast<float>(height_);
-        viewport.Width = viewport.Height * sourceAspect;
-        viewport.TopLeftX = (static_cast<float>(width_) - viewport.Width) * 0.5f;
-    }
-    viewport.MinDepth = 0.0f;
-    viewport.MaxDepth = 1.0f;
+    const D3D12_VIEWPORT viewport = AspectFitVideoViewport(
+        renderFrame.width, renderFrame.height, width_, height_);
     const D3D12_RECT scissor{0, 0, static_cast<LONG>(width_), static_cast<LONG>(height_)};
     commandList_->RSSetViewports(1, &viewport);
     commandList_->RSSetScissorRects(1, &scissor);
@@ -3531,41 +3820,43 @@ bool D3D12VideoRenderer::RenderFrame(const NativeVideoFrame& frame) {
     commandList_->SetGraphicsRootDescriptorTable(0, srvGpu);
 
     CompositionConstants constants{};
-    constants.sourceUv[0] = frame.sourceUvRect.left;
-    constants.sourceUv[1] = frame.sourceUvRect.top;
-    constants.sourceUv[2] = frame.sourceUvRect.right;
-    constants.sourceUv[3] = frame.sourceUvRect.bottom;
+    constants.sourceUv[0] = renderFrame.sourceUvRect.left;
+    constants.sourceUv[1] = renderFrame.sourceUvRect.top;
+    constants.sourceUv[2] = renderFrame.sourceUvRect.right;
+    constants.sourceUv[3] = renderFrame.sourceUvRect.bottom;
     const VideoTextureUvRect enhancementRect = enhancement
-        ? enhancement->sourceUvRect : frame.sourceUvRect;
+        ? enhancement->sourceUvRect : renderFrame.sourceUvRect;
     constants.enhancementSourceUv[0] = enhancementRect.left;
     constants.enhancementSourceUv[1] = enhancementRect.top;
     constants.enhancementSourceUv[2] = enhancementRect.right;
     constants.enhancementSourceUv[3] = enhancementRect.bottom;
-    constants.matrix = MatrixMode(frame.color.matrix);
+    constants.matrix = MatrixMode(renderFrame.color.matrix);
     const auto* reconstructionMetadata =
-        enhancement && frame.enhancementDovi && frame.enhancementDovi->valid
-            ? frame.enhancementDovi.get()
-            : (frame.dovi && frame.dovi->valid ? frame.dovi.get() : nullptr);
+        enhancement && renderFrame.enhancementDovi && renderFrame.enhancementDovi->valid
+            ? renderFrame.enhancementDovi.get()
+            : (renderFrame.dovi && renderFrame.dovi->valid
+                   ? renderFrame.dovi.get()
+                   : nullptr);
     constants.range = reconstructionMetadata
         ? (reconstructionMetadata->blVideoFullRange ? 1u : 0u)
-        : (frame.color.range == VideoColorRange::Full ? 1u : 0u);
-    constants.transfer = TransferMode(frame.color.transfer);
+        : (renderFrame.color.range == VideoColorRange::Full ? 1u : 0u);
+    constants.transfer = TransferMode(renderFrame.color.transfer);
     constants.primaries = (highBitDepth ? 1u : 0u) |
-        (frame.color.primaries == VideoColorPrimaries::Bt2020 ? 2u : 0u) |
+        (renderFrame.color.primaries == VideoColorPrimaries::Bt2020 ? 2u : 0u) |
         ToneMappingModeBits(videoSettings_.toneMapping);
-    const bool nativeHlg = WantsNativeHlgOutput(frame);
+    const bool nativeHlg = WantsNativeHlgOutput(renderFrame);
     const bool hdrOutput = SetHdrOutputState(
-        frame, !nativeHlg &&
-                   HdrOutputEnabled(frame, videoSettings_, displayCapabilities_,
-                                    hdr10ColorSpaceSupported_));
+        renderFrame, !nativeHlg &&
+                         HdrOutputEnabled(renderFrame, videoSettings_, displayCapabilities_,
+                                          hdr10ColorSpaceSupported_));
     constants.hdrOutput = nativeHlg ? 2.0f : (hdrOutput ? 1.0f : 0.0f);
-    constants.sourcePeakNits = FrameSourcePeakNits(frame);
+    constants.sourcePeakNits = FrameSourcePeakNits(renderFrame);
     constants.targetPeakNits = TargetPeakNits(videoSettings_, displayCapabilities_);
-    constants.padding = InitialHdrProcessingFlags(frame, videoSettings_, hdrOutput);
-    FillHdr10PlusConstants(constants, frame,
+    constants.padding = InitialHdrProcessingFlags(renderFrame, videoSettings_, hdrOutput);
+    FillHdr10PlusConstants(constants, renderFrame,
                            !nvidiaHdrOutput_.Hdr10PlusGamingActive());
     const uint64_t hdrToneCurveFingerprint = FillHdrToneCurveConstants(
-        constants.hdrToneCurve, constants.padding, frame, videoSettings_, hdrOutput);
+        constants.hdrToneCurve, constants.padding, renderFrame, videoSettings_, hdrOutput);
     if (hdrToneCurveFingerprint != 0 &&
         hdrToneCurveFingerprint != loggedHdrToneCurveFingerprint_) {
         loggedHdrToneCurveFingerprint_ = hdrToneCurveFingerprint;
@@ -3573,20 +3864,25 @@ bool D3D12VideoRenderer::RenderFrame(const NativeVideoFrame& frame) {
     }
     commandList_->SetGraphicsRoot32BitConstants(1, 60, &constants, 0);
     DoviShaderConstantsPair doviConstants{};
-    FillDoviShaderConstants(doviConstants, 0, frame, constants.targetPeakNits);
+    FillDoviShaderConstants(doviConstants, 0, renderFrame, constants.targetPeakNits);
     std::memcpy(doviConstantMappings_[backBufferIndex], &doviConstants,
                 sizeof(doviConstants));
     commandList_->SetGraphicsRootConstantBufferView(
         2, doviConstantBuffers_[backBufferIndex]->GetGPUVirtualAddress());
     commandList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     commandList_->DrawInstanced(3, 1, 0, 0);
-    DrawOverlays(&frame, viewport, backBufferIndex);
+    BindPresentedSubtitles(frame);
+    DrawOverlays(viewport, backBufferIndex);
 
     std::vector<D3D12_RESOURCE_BARRIER> endBarriers{
-        TransitionBarrier(frame.d3d12Texture.Get(), plane0,
-                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-        TransitionBarrier(frame.d3d12Texture.Get(), plane1,
-                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+        TransitionBarrier(renderFrame.d3d12Texture.Get(), plane0,
+                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                          baseUpload ? D3D12_RESOURCE_STATE_COPY_DEST
+                                     : D3D12_RESOURCE_STATE_COMMON),
+        TransitionBarrier(renderFrame.d3d12Texture.Get(), plane1,
+                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                          baseUpload ? D3D12_RESOURCE_STATE_COPY_DEST
+                                     : D3D12_RESOURCE_STATE_COMMON),
         TransitionBarrier(backBuffers_[backBufferIndex].Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                           D3D12_RESOURCE_STATE_RENDER_TARGET,
                           nativeHlg ? D3D12_RESOURCE_STATE_COPY_SOURCE
@@ -3594,19 +3890,23 @@ bool D3D12VideoRenderer::RenderFrame(const NativeVideoFrame& frame) {
     if (enhancement) {
         endBarriers.insert(endBarriers.end() - 1, TransitionBarrier(
             enhancement->d3d12Texture.Get(), enhancementPlane0,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON));
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            enhancementUpload ? D3D12_RESOURCE_STATE_COPY_DEST
+                              : D3D12_RESOURCE_STATE_COMMON));
         endBarriers.insert(endBarriers.end() - 1, TransitionBarrier(
             enhancement->d3d12Texture.Get(), enhancementPlane1,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON));
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            enhancementUpload ? D3D12_RESOURCE_STATE_COPY_DEST
+                              : D3D12_RESOURCE_STATE_COMMON));
     }
     commandList_->ResourceBarrier(static_cast<UINT>(endBarriers.size()), endBarriers.data());
     if (FAILED(commandList_->Close())) return false;
     GpuFencePoint decodeDependency;
-    decodeDependency.fence = frame.d3d12ReadyFence;
-    decodeDependency.value = frame.d3d12ReadyFenceValue;
+    decodeDependency.fence = renderFrame.d3d12ReadyFence;
+    decodeDependency.value = renderFrame.d3d12ReadyFenceValue;
     GpuFencePoint frameComputeDependency;
     const auto computeCompletion = sourceComputeCompletions_.find(
-        {frame.timelineSerial, frame.serial});
+        {renderFrame.timelineSerial, renderFrame.serial});
     if (computeCompletion != sourceComputeCompletions_.end()) {
         frameComputeDependency = computeCompletion->second;
         sourceComputeCompletions_.erase(computeCompletion);
@@ -3624,7 +3924,7 @@ bool D3D12VideoRenderer::RenderFrame(const NativeVideoFrame& frame) {
         Log(LogLevel::Error, L"frame graph composite submit failed reason=" + graphSubmit.reason);
         return false;
     }
-    sourceGraphicsCompletions_[{frame.timelineSerial, frame.serial}] =
+    sourceGraphicsCompletions_[{renderFrame.timelineSerial, renderFrame.serial}] =
         graphSubmit.completion;
     if (!dolbyVisionD3D12Logged_ && doviConstants.signalMeta[0][0] > 0.5f) {
         dolbyVisionD3D12Logged_ = true;
@@ -3646,7 +3946,13 @@ bool D3D12VideoRenderer::RenderFrame(const NativeVideoFrame& frame) {
     {
         std::scoped_lock lock(statsMutex_);
         ++renderStats_.frames;
-        ++renderStats_.hardwareFrames;
+        if (baseUpload || enhancementUpload) {
+            ++renderStats_.softwareYuvFrames;
+            renderStats_.yuvUploadUs +=
+                static_cast<uint64_t>(std::max<int64_t>(0, elapsed));
+        } else {
+            ++renderStats_.hardwareFrames;
+        }
         renderStats_.totalRenderUs += static_cast<uint64_t>(std::max<int64_t>(0, elapsed));
         renderStats_.maxRenderUs = std::max(renderStats_.maxRenderUs,
                                             static_cast<uint64_t>(std::max<int64_t>(0, elapsed)));
@@ -3678,22 +3984,7 @@ int D3D12VideoRenderer::InterpolationMultiplier(const NativeVideoFrame& first,
             refreshHz = EffectiveRefreshRate(mode.dmDisplayFrequency);
         }
     }
-    int multiplier = 1;
-    if (sourceFps > 1.0 && refreshHz > 1.0) {
-        // Never synthesize a cadence above the active refresh rate. The small
-        // tolerance matches the display refresh-rate controller's exact-mode
-        // comparison without rounding a genuinely fractional ratio upwards.
-        const int refreshLimited = static_cast<int>(
-            std::floor((refreshHz + 0.015) / sourceFps));
-        multiplier = std::clamp(refreshLimited, 1,
-                                kMaximumInterpolationMultiplier);
-    }
-    const uint64_t sourcePixels = static_cast<uint64_t>(std::max(0, second.width)) *
-        static_cast<uint64_t>(std::max(0, second.height));
-    // Every source below 8K may request the refresh-limited maximum. Keep a
-    // conservative ceiling only at 8K and above.
-    if (sourcePixels >= k8KPixelCount) multiplier = std::min(multiplier, 2);
-    return std::min(multiplier, adaptiveMultiplierCap_);
+    return Fixed2xInterpolationMultiplier(sourceFps, refreshHz);
 }
 
 void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
@@ -3702,6 +3993,10 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
     if (!interpolationRequested_.load(std::memory_order_acquire) || !executor ||
         !executor->IsReady() || (!frame.HasD3D12Texture() && !frame.HasPixels())) {
         tensorPreviousFrame_.reset();
+        tensorPreviousDoviTarget_.Reset();
+        tensorPreviousDoviLuminanceTarget_.Reset();
+        tensorPreviousDoviTargetTimeline_ = 0;
+        tensorPreviousDoviTargetFrameSerial_ = 0;
         sourceComputeCompletions_.clear();
         sourceGraphicsCompletions_.clear();
         return;
@@ -3712,7 +4007,6 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
         frame.HasEnhancementD3D12Texture();
     const bool libplaceboDolbyVisionInput = dolbyVisionFrame && frame.HasD3D12Texture() &&
         libplaceboBridge_ && libplaceboBridge_->IsReady();
-    const bool libplaceboPixelDolbyVisionInput = dolbyVisionFrame && frame.HasPixels();
     dolbyVisionInterpolationColorBypassLogged_ = false;
     if (frame.hdr10Plus && frame.hdr10Plus->valid) {
         if (!hdr10PlusInterpolationBypassLogged_) {
@@ -3734,12 +4028,28 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
         frame.pts - tensorPreviousFrame_->pts <=
             std::max(std::chrono::milliseconds{250}, nominalInterval * 3);
     if (!continuous && tensorPreviousFrame_) {
+        Log(LogLevel::Info,
+            L"interpolation timeline discontinuity old=" +
+                std::to_wstring(tensorPreviousFrame_->timelineSerial) + L" new=" +
+                std::to_wstring(frame.timelineSerial) +
+                L" endpoint_cache=invalidated");
         frameGraph_.AdvanceEpoch();
         tensorPreviousFrame_.reset();
+        // The cached target is immutable and keyed to the old endpoint. Never
+        // render a new timeline into it while an earlier preprocess dispatch
+        // can still be reading it on the compute queue.
+        tensorPreviousDoviTarget_.Reset();
+        tensorPreviousDoviLuminanceTarget_.Reset();
+        tensorPreviousDoviTargetTimeline_ = 0;
+        tensorPreviousDoviTargetFrameSerial_ = 0;
         sourceComputeCompletions_.clear();
         sourceGraphicsCompletions_.clear();
     }
     if (!tensorPreviousFrame_) {
+        tensorPreviousDoviTarget_.Reset();
+        tensorPreviousDoviLuminanceTarget_.Reset();
+        tensorPreviousDoviTargetTimeline_ = 0;
+        tensorPreviousDoviTargetFrameSerial_ = 0;
         try {
             tensorPreviousFrame_ = std::make_unique<NativeVideoFrame>(frame);
         } catch (...) {
@@ -3749,11 +4059,17 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
     }
 
     const NativeVideoFrame& first = *tensorPreviousFrame_;
+    const bool pixelInterpolationInput = first.HasPixels() && frame.HasPixels();
+    const bool libplaceboPixelDolbyVisionInput =
+        dolbyVisionFrame && pixelInterpolationInput;
     const int multiplier = InterpolationMultiplier(first, frame);
     if (multiplier <= 1) {
         sourceComputeCompletions_.clear();
         sourceGraphicsCompletions_.clear();
         tensorPreviousDoviTarget_.Reset();
+        tensorPreviousDoviLuminanceTarget_.Reset();
+        tensorPreviousDoviTargetTimeline_ = 0;
+        tensorPreviousDoviTargetFrameSerial_ = 0;
         try {
             tensorPreviousFrame_ = std::make_unique<NativeVideoFrame>(frame);
         } catch (...) {
@@ -3765,19 +4081,15 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
         return;
     }
     if (!executor->CanSubmit()) {
-        // A requested intermediate frame that cannot even enter the inference
-        // queue is also a missed cadence deadline. Previously these misses were
-        // invisible to the adaptive cap, so the UI kept reporting x5 while the
-        // renderer delivered only a fraction of the requested frames.
-        for (int sample = 1; sample < multiplier; ++sample) {
-            RecordGeneratedDeadline(false);
-        }
         // Keep only the newest endpoint while inference is saturated. Most
         // importantly, do not enqueue preprocessing on the shared resource:
         // original frames must continue directly to graphics without waiting
         // behind old ML work.
         sourceGraphicsCompletions_.erase({first.timelineSerial, first.serial});
         tensorPreviousDoviTarget_.Reset();
+        tensorPreviousDoviLuminanceTarget_.Reset();
+        tensorPreviousDoviTargetTimeline_ = 0;
+        tensorPreviousDoviTargetFrameSerial_ = 0;
         try {
             tensorPreviousFrame_ = std::make_unique<NativeVideoFrame>(frame);
         } catch (...) {
@@ -3811,18 +4123,24 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
     takeGraphicsDependency(frame);
 
     Microsoft::WRL::ComPtr<ID3D12Resource> currentDoviTarget;
+    Microsoft::WRL::ComPtr<ID3D12Resource> currentDoviLuminanceTarget;
+    TensorShape doviShape{};
     if (libplaceboDolbyVisionInput) {
-        const TensorShape doviShape = SelectInterpolationTensorShape(
+        doviShape = SelectInterpolationTensorShape(
             static_cast<UINT>(std::max(first.width, frame.width)),
             static_cast<UINT>(std::max(first.height, frame.height)));
-        const auto createTarget = [&](Microsoft::WRL::ComPtr<ID3D12Resource>& target) {
+        const UINT endpointWidth = std::max<UINT>(1, width_);
+        const UINT endpointHeight = std::max<UINT>(1, height_);
+        const auto createTarget = [&](
+            Microsoft::WRL::ComPtr<ID3D12Resource>& target,
+            const UINT targetWidth, const UINT targetHeight) {
             if (!doviShape.IsValid()) return false;
             D3D12_HEAP_PROPERTIES heap{};
             heap.Type = D3D12_HEAP_TYPE_DEFAULT;
             D3D12_RESOURCE_DESC desc{};
             desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-            desc.Width = doviShape.width;
-            desc.Height = doviShape.height;
+            desc.Width = targetWidth;
+            desc.Height = targetHeight;
             desc.DepthOrArraySize = 1;
             desc.MipLevels = 1;
             desc.Format = kLibplaceboTargetFormat;
@@ -3840,15 +4158,50 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
             frame, videoSettings_, displayCapabilities_, hdr10ColorSpaceSupported_);
         const float targetPeakNits = TargetPeakNits(videoSettings_, displayCapabilities_);
         const auto renderEndpoint = [&](const NativeVideoFrame& endpoint,
-                                        Microsoft::WRL::ComPtr<ID3D12Resource>& target) {
-            return (target || createTarget(target)) &&
+                                        Microsoft::WRL::ComPtr<ID3D12Resource>& target,
+                                        const UINT targetWidth,
+                                        const UINT targetHeight) {
+            return (target || createTarget(target, targetWidth, targetHeight)) &&
                 libplaceboBridge_->RenderDolbyVision(
-                    endpoint, target.Get(), doviShape.width, doviShape.height,
+                    endpoint, target.Get(), targetWidth, targetHeight,
                     hdrOutput, targetPeakNits, orderingDependency.fence.Get(),
                     orderingDependency.value, true);
         };
-        if (!renderEndpoint(first, tensorPreviousDoviTarget_) ||
-            !renderEndpoint(frame, currentDoviTarget)) {
+        const D3D12_RESOURCE_DESC cachedTensorDesc = tensorPreviousDoviTarget_
+            ? tensorPreviousDoviTarget_->GetDesc() : D3D12_RESOURCE_DESC{};
+        const D3D12_RESOURCE_DESC cachedLuminanceDesc =
+            tensorPreviousDoviLuminanceTarget_
+                ? tensorPreviousDoviLuminanceTarget_->GetDesc()
+                : D3D12_RESOURCE_DESC{};
+        const bool cachedFirstEndpoint = tensorPreviousDoviTarget_ &&
+            tensorPreviousDoviLuminanceTarget_ &&
+            tensorPreviousDoviTargetTimeline_ == first.timelineSerial &&
+            tensorPreviousDoviTargetFrameSerial_ == first.serial &&
+            cachedTensorDesc.Width == doviShape.width &&
+            cachedTensorDesc.Height == doviShape.height &&
+            cachedLuminanceDesc.Width == endpointWidth &&
+            cachedLuminanceDesc.Height == endpointHeight;
+        if (cachedFirstEndpoint && !dolbyVisionImmutableEndpointLogged_) {
+            dolbyVisionImmutableEndpointLogged_ = true;
+            Log(LogLevel::Info,
+                L"Dolby Vision interpolation endpoint cache="
+                L"immutable_per_frame timeline_guard=enabled");
+        }
+        if (!cachedFirstEndpoint) {
+            tensorPreviousDoviTarget_.Reset();
+            tensorPreviousDoviLuminanceTarget_.Reset();
+            tensorPreviousDoviTargetTimeline_ = 0;
+            tensorPreviousDoviTargetFrameSerial_ = 0;
+        }
+        if ((!cachedFirstEndpoint &&
+             (!renderEndpoint(first, tensorPreviousDoviTarget_,
+                              doviShape.width, doviShape.height) ||
+              !renderEndpoint(first, tensorPreviousDoviLuminanceTarget_,
+                              endpointWidth, endpointHeight))) ||
+            !renderEndpoint(frame, currentDoviTarget,
+                            doviShape.width, doviShape.height) ||
+            !renderEndpoint(frame, currentDoviLuminanceTarget,
+                            endpointWidth, endpointHeight)) {
             Log(LogLevel::Warning,
                 L"Dolby Vision interpolation skipped reason=libplacebo_tensor_endpoint_failed");
             ResetInterpolationState();
@@ -3874,7 +4227,6 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
             L"Dolby Vision interpolation active color_source=decoder_libplacebo_rgb "
             L"tensor_domain=sdr_encoded_or_bt2020_pq");
     }
-    int submittedSamples = 0;
     for (int sample = 1; sample < multiplier; ++sample) {
         if (!executor->CanSubmit()) break;
         const std::optional<std::size_t> generatedSlot = AcquireGeneratedSlot();
@@ -3885,8 +4237,9 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
         if (libplaceboDolbyVisionInput) {
             preprocess = tensorPreprocessor_.SubmitScRgbPair(
                 tensorPreviousDoviTarget_.Get(), currentDoviTarget.Get(),
-                interpolationT, frameGraph_.CurrentEpoch(), orderingDependency);
-        } else if (libplaceboPixelDolbyVisionInput) {
+                doviShape, interpolationT, frameGraph_.CurrentEpoch(),
+                orderingDependency);
+        } else if (pixelInterpolationInput) {
             preprocess = tensorPreprocessor_.SubmitPixelPair(
                 first, frame, interpolationT, frameGraph_.CurrentEpoch(), orderingDependency);
         } else {
@@ -3902,7 +4255,7 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
             break;
         }
         orderingDependency = preprocess.tensor.ready;
-        if (!libplaceboDolbyVisionInput && !libplaceboPixelDolbyVisionInput) {
+        if (!libplaceboDolbyVisionInput && !pixelInterpolationInput) {
             sourceComputeCompletions_[{first.timelineSerial, first.serial}] =
                 preprocess.tensor.ready;
             sourceComputeCompletions_[{frame.timelineSerial, frame.serial}] =
@@ -3921,8 +4274,22 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
             }
             break;
         }
-        tensorPreprocessor_.RetainUntil(preprocess.tensor.resource.Get(), inference.completion);
+        if (!tensorPreprocessor_.RetainUntil(
+                preprocess.tensor.resource.Get(), inference.completion)) {
+            generatedSlots_[*generatedSlot].reusable = inference.completion;
+            Log(LogLevel::Warning,
+                L"ML inference skipped reason=tensor_endpoint_retention_failed");
+            break;
+        }
         output.shape = preprocess.shape;
+        output.inputTensor = preprocess.tensor.resource;
+        if (libplaceboDolbyVisionInput) {
+            output.luminanceLeft = tensorPreviousDoviLuminanceTarget_;
+            output.luminanceRight = currentDoviLuminanceTarget;
+        } else {
+            output.luminanceLeft.Reset();
+            output.luminanceRight.Reset();
+        }
         output.displayWidth = frame.width;
         output.displayHeight = frame.height;
         output.leftPts = first.pts;
@@ -3938,22 +4305,12 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
         output.completionStatusConsumed = false;
         try {
             output.overlayFrame = std::make_unique<NativeVideoFrame>(frame);
-            // Subtitles are presentation overlays, never interpolation input.
-            // Hold the left endpoint's subtitle snapshot across every generated
-            // frame, then switch once at the next original frame. Using the
-            // right endpoint here made subtitle state alternate at cue and ASS
-            // animation boundaries, which was visible as a one-frame flash.
-            output.overlayFrame->subtitleText = first.subtitleText;
-            output.overlayFrame->subtitleBitmaps = first.subtitleBitmaps;
-            output.overlayFrame->subtitlesPrepared = first.subtitlesPrepared;
-            if (!interpolatedSubtitleCompositionLogged_ &&
-                (!first.subtitleText.empty() || !first.subtitleBitmaps.empty() ||
-                 !frame.subtitleText.empty() || !frame.subtitleBitmaps.empty())) {
-                interpolatedSubtitleCompositionLogged_ = true;
-                Log(LogLevel::Info,
-                    L"interpolated subtitle composition active stage=post_ml "
-                    L"snapshot=left_endpoint");
-            }
+            // The retained frame supplies only color/HDR presentation metadata.
+            // Subtitle pixels and timing live in the renderer-level presentation
+            // overlay and must never be copied into an interpolation slot.
+            output.overlayFrame->subtitleText.clear();
+            output.overlayFrame->subtitleBitmaps.clear();
+            output.overlayFrame->subtitlesPrepared = false;
         } catch (...) {
             output.overlayFrame.reset();
         }
@@ -3974,25 +4331,11 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
             ? generatedDovi->sourceMaxNits : SourcePeakNits(frame.color);
         if (presentedOriginalTimeline_ == first.timelineSerial &&
             presentedOriginalPts_ == first.pts) {
-            if (output.overlayFrame) {
-                try {
-                    output.overlayFrame->subtitleText = presentedOriginalSubtitleText_;
-                    output.overlayFrame->subtitleBitmaps =
-                        presentedOriginalSubtitleBitmaps_;
-                    output.overlayFrame->subtitlesPrepared =
-                        presentedOriginalSubtitlesPrepared_;
-                } catch (...) {
-                    output.overlayFrame->subtitleText.clear();
-                    output.overlayFrame->subtitleBitmaps.clear();
-                    output.overlayFrame->subtitlesPrepared = false;
-                }
-            }
             output.anchored = true;
             output.dueAt = presentedOriginalAt_ + (output.targetPts - output.leftPts);
         }
         output.pending = true;
         pendingGeneratedSlots_.push_back(*generatedSlot);
-        ++submittedSamples;
         {
             std::scoped_lock lock(statsMutex_);
             ++renderStats_.generatedSubmitted;
@@ -4016,14 +4359,17 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
                     L" layout=fp16_nchw_7 domain=sdr_encoded_or_bt2020_pq variable_t=true");
         }
     }
-    const int missedSubmissions = (multiplier - 1) - submittedSamples;
-    for (int missed = 0; missed < missedSubmissions; ++missed) {
-        RecordGeneratedDeadline(false);
-    }
     if (libplaceboDolbyVisionInput) {
         tensorPreviousDoviTarget_ = std::move(currentDoviTarget);
+        tensorPreviousDoviLuminanceTarget_ =
+            std::move(currentDoviLuminanceTarget);
+        tensorPreviousDoviTargetTimeline_ = frame.timelineSerial;
+        tensorPreviousDoviTargetFrameSerial_ = frame.serial;
     } else {
         tensorPreviousDoviTarget_.Reset();
+        tensorPreviousDoviLuminanceTarget_.Reset();
+        tensorPreviousDoviTargetTimeline_ = 0;
+        tensorPreviousDoviTargetFrameSerial_ = 0;
     }
     try {
         tensorPreviousFrame_ = std::make_unique<NativeVideoFrame>(frame);
@@ -4038,48 +4384,11 @@ void D3D12VideoRenderer::AnchorGeneratedFrames(
     presentedOriginalPts_ = original.pts;
     presentedOriginalTimeline_ = original.timelineSerial;
     presentedOriginalAt_ = presentedAt;
-    try {
-        presentedOriginalSubtitleText_ = original.subtitleText;
-        presentedOriginalSubtitleBitmaps_ = original.subtitleBitmaps;
-        presentedOriginalSubtitlesPrepared_ = original.subtitlesPrepared;
-    } catch (...) {
-        presentedOriginalSubtitleText_.clear();
-        presentedOriginalSubtitleBitmaps_.clear();
-        presentedOriginalSubtitlesPrepared_ = false;
-    }
-
-    const auto subtitleFingerprint = [](const NativeVideoFrame& frame) {
-        uint64_t fingerprint = static_cast<uint64_t>(frame.subtitleBitmaps.size());
-        for (const NativeSubtitleBitmap& bitmap : frame.subtitleBitmaps) {
-            fingerprint ^= bitmap.serial + 0x9e3779b97f4a7c15ull +
-                (fingerprint << 6) + (fingerprint >> 2);
-        }
-        return fingerprint;
-    };
     for (const std::size_t slotIndex : pendingGeneratedSlots_) {
         GeneratedFrameSlot& slot = generatedSlots_[slotIndex];
         if (!slot.pending ||
             slot.timelineSerial != original.timelineSerial || slot.leftPts != original.pts) {
             continue;
-        }
-        if (slot.overlayFrame) {
-            const bool changed = slot.overlayFrame->subtitleText != original.subtitleText ||
-                subtitleFingerprint(*slot.overlayFrame) != subtitleFingerprint(original);
-            try {
-                slot.overlayFrame->subtitleText = original.subtitleText;
-                slot.overlayFrame->subtitleBitmaps = original.subtitleBitmaps;
-                slot.overlayFrame->subtitlesPrepared = original.subtitlesPrepared;
-            } catch (...) {
-                slot.overlayFrame->subtitleText.clear();
-                slot.overlayFrame->subtitleBitmaps.clear();
-                slot.overlayFrame->subtitlesPrepared = false;
-            }
-            if (changed && !interpolatedSubtitlePresentationSyncLogged_) {
-                interpolatedSubtitlePresentationSyncLogged_ = true;
-                Log(LogLevel::Info,
-                    L"interpolated subtitle snapshot synchronized stage=presentation "
-                    L"source=displayed_left_endpoint");
-            }
         }
         if (!slot.anchored) {
             slot.anchored = true;
@@ -4173,7 +4482,6 @@ void D3D12VideoRenderer::ProcessReadyGeneratedFrame() {
             continue;
         }
         const bool presented = RenderGeneratedFrame(slotIndex);
-        RecordGeneratedDeadline(presented);
         if (!presented) {
             Log(LogLevel::Warning, L"generated tensor composite failed");
         }
@@ -4198,7 +4506,6 @@ void D3D12VideoRenderer::ProcessGeneratedBefore(const NativeVideoFrame& nextOrig
         // not present ready-but-late frames in a burst immediately before the
         // original; that inflated the measured multiplier while looking more
         // juddery than a lower, evenly paced cadence.
-        RecordGeneratedDeadline(false);
         {
             std::scoped_lock lock(statsMutex_);
             ++renderStats_.generatedDroppedNotReady;
@@ -4206,66 +4513,6 @@ void D3D12VideoRenderer::ProcessGeneratedBefore(const NativeVideoFrame& nextOrig
         }
         RetireGeneratedSlot(slotIndex, false);
         pendingGeneratedSlots_.pop_front();
-    }
-}
-
-void D3D12VideoRenderer::RecordGeneratedDeadline(const bool met) {
-    constexpr auto kStartupGrace = std::chrono::milliseconds{750};
-    constexpr auto kCalibrationLimit = std::chrono::milliseconds{4500};
-    constexpr int kDeadlineWindowSamples = 24;
-    constexpr int kDeadlineWindowMissLimit = 3;
-    constexpr int kStableWindowsRequired = 3;
-
-    const auto now = std::chrono::steady_clock::now();
-    if (adaptiveCalibrationStartedAt_ == std::chrono::steady_clock::time_point{}) {
-        adaptiveCalibrationStartedAt_ = now;
-        adaptiveDeadlineSamples_ = 0;
-        adaptiveDeadlineHits_ = 0;
-        return;
-    }
-    if (adaptiveCadenceLocked_) return;
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now - adaptiveCalibrationStartedAt_);
-    if (elapsed < kStartupGrace) {
-        // Resource allocation and the first DirectML dispatch are deliberately
-        // excluded. Counting that one-off warm-up made fast 1080p content fall
-        // from x5 to x2 before steady-state throughput could be observed.
-        adaptiveDeadlineSamples_ = 0;
-        adaptiveDeadlineHits_ = 0;
-        return;
-    }
-
-    ++adaptiveDeadlineSamples_;
-    if (met) ++adaptiveDeadlineHits_;
-    if (adaptiveDeadlineSamples_ < kDeadlineWindowSamples &&
-        elapsed < kCalibrationLimit) {
-        return;
-    }
-
-    const int missed = adaptiveDeadlineSamples_ - adaptiveDeadlineHits_;
-    if (missed >= kDeadlineWindowMissLimit && adaptiveMultiplierCap_ > 2) {
-        --adaptiveMultiplierCap_;
-        adaptiveStableWindows_ = 0;
-        Log(LogLevel::Info,
-            L"adaptive interpolation cadence reduced cap=x" +
-                std::to_wstring(adaptiveMultiplierCap_) +
-                L" deadline_misses=" + std::to_wstring(missed) + L"/" +
-                std::to_wstring(adaptiveDeadlineSamples_));
-    } else if (missed <= 1) {
-        ++adaptiveStableWindows_;
-    } else {
-        adaptiveStableWindows_ = 0;
-    }
-    adaptiveDeadlineSamples_ = 0;
-    adaptiveDeadlineHits_ = 0;
-
-    if (adaptiveStableWindows_ >= kStableWindowsRequired ||
-        elapsed >= kCalibrationLimit) {
-        adaptiveCadenceLocked_ = true;
-        Log(LogLevel::Info,
-            L"adaptive interpolation cadence settled cap=x" +
-                std::to_wstring(adaptiveMultiplierCap_) +
-                L" elapsed_ms=" + std::to_wstring(elapsed.count()));
     }
 }
 
@@ -4280,6 +4527,14 @@ void D3D12VideoRenderer::RetireGeneratedSlot(const std::size_t slotIndex,
         executor->TakeCompletionError(slot.ready.value);
         slot.completionStatusConsumed = true;
     }
+    if (slot.inputTensor) {
+        const GpuFencePoint completion = slot.reusable.IsValid()
+            ? slot.reusable : slot.ready;
+        tensorPreprocessor_.ReleaseRetained(slot.inputTensor.Get(), completion);
+        slot.inputTensor.Reset();
+    }
+    slot.luminanceLeft.Reset();
+    slot.luminanceRight.Reset();
     slot.pending = false;
     slot.anchored = false;
     slot.overlayFrame.reset();
@@ -4290,17 +4545,37 @@ bool D3D12VideoRenderer::RenderGeneratedFrame(const std::size_t slotIndex) {
         return false;
     }
     GeneratedFrameSlot& slot = generatedSlots_[slotIndex];
-    if (!slot.output || !slot.shape.IsValid()) return false;
+    if (!slot.output || !slot.inputTensor || !slot.shape.IsValid()) return false;
+    // A generated frame may only be presented while its displayed left
+    // endpoint is still the renderer's timeline authority. Subtitle state is
+    // deliberately not part of this slot and is composed independently below.
+    if (!slot.overlayFrame || presentedOriginalTimeline_ != slot.timelineSerial ||
+        presentedOriginalPts_ != slot.leftPts) {
+        return false;
+    }
     WaitForFrameLatencyObject();
     const UINT backBufferIndex = swapChain_->GetCurrentBackBufferIndex();
     if (!WaitForBackBuffer(backBufferIndex)) return false;
     inFlightFrames_[backBufferIndex].reset();
     transients_[backBufferIndex].clear();
+    const bool fullResolutionEndpointLuma =
+        slot.luminanceLeft && slot.luminanceRight && slot.inputTransfer == 4u;
+    if (fullResolutionEndpointLuma) {
+        try {
+            // The slot is retired as soon as its frame is presented. Keep the
+            // sampled endpoint resources alive until this backbuffer's fence is
+            // complete, just like other command-list transients.
+            transients_[backBufferIndex].push_back(slot.luminanceLeft);
+            transients_[backBufferIndex].push_back(slot.luminanceRight);
+        } catch (...) {
+            return false;
+        }
+    }
     if (FAILED(allocators_[backBufferIndex]->Reset()) ||
         FAILED(commandList_->Reset(allocators_[backBufferIndex].Get(), tensorPipeline_.Get()))) {
         return false;
     }
-    std::array<D3D12_RESOURCE_BARRIER, 2> beginBarriers{
+    std::array<D3D12_RESOURCE_BARRIER, 5> beginBarriers{
         TransitionBarrier(backBuffers_[backBufferIndex].Get(),
                           D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                           D3D12_RESOURCE_STATE_PRESENT,
@@ -4308,12 +4583,27 @@ bool D3D12VideoRenderer::RenderGeneratedFrame(const std::size_t slotIndex) {
         TransitionBarrier(slot.output.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                           D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+        TransitionBarrier(slot.inputTensor.Get(),
+                          D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
     };
-    commandList_->ResourceBarrier(static_cast<UINT>(beginBarriers.size()), beginBarriers.data());
+    UINT beginBarrierCount = 3;
+    if (fullResolutionEndpointLuma) {
+        beginBarriers[beginBarrierCount++] = TransitionBarrier(
+            slot.luminanceLeft.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        beginBarriers[beginBarrierCount++] = TransitionBarrier(
+            slot.luminanceRight.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
+    commandList_->ResourceBarrier(beginBarrierCount, beginBarriers.data());
 
     D3D12_CPU_DESCRIPTOR_HANDLE srvCpu =
         tensorSrvHeap_->GetCPUDescriptorHandleForHeapStart();
-    srvCpu.ptr += static_cast<SIZE_T>(backBufferIndex) * srvIncrement_;
+    srvCpu.ptr += static_cast<SIZE_T>(backBufferIndex * 4) * srvIncrement_;
     D3D12_SHADER_RESOURCE_VIEW_DESC view{};
     view.Format = DXGI_FORMAT_R32_TYPELESS;
     view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -4321,27 +4611,31 @@ bool D3D12VideoRenderer::RenderGeneratedFrame(const std::size_t slotIndex) {
     view.Buffer.NumElements = static_cast<UINT>(slot.capacityBytes / sizeof(UINT));
     view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
     device_->CreateShaderResourceView(slot.output.Get(), &view, srvCpu);
+    srvCpu.ptr += srvIncrement_;
+    view.Buffer.NumElements = static_cast<UINT>(
+        slot.inputTensor->GetDesc().Width / sizeof(UINT));
+    device_->CreateShaderResourceView(slot.inputTensor.Get(), &view, srvCpu);
+    srvCpu.ptr += srvIncrement_;
+    D3D12_SHADER_RESOURCE_VIEW_DESC endpointView{};
+    endpointView.Format = kLibplaceboTargetFormat;
+    endpointView.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    endpointView.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    endpointView.Texture2D.MipLevels = 1;
+    device_->CreateShaderResourceView(
+        fullResolutionEndpointLuma ? slot.luminanceLeft.Get() : nullptr,
+        &endpointView, srvCpu);
+    srvCpu.ptr += srvIncrement_;
+    device_->CreateShaderResourceView(
+        fullResolutionEndpointLuma ? slot.luminanceRight.Get() : nullptr,
+        &endpointView, srvCpu);
 
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
     rtv.ptr += static_cast<SIZE_T>(backBufferIndex) * rtvIncrement_;
     constexpr float clearColor[4]{};
     commandList_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     commandList_->ClearRenderTargetView(rtv, clearColor, 0, nullptr);
-    const float sourceAspect = static_cast<float>(std::max(1, slot.displayWidth)) /
-        static_cast<float>(std::max(1, slot.displayHeight));
-    const float outputAspect = static_cast<float>(width_) / std::max<UINT>(1, height_);
-    D3D12_VIEWPORT viewport{};
-    if (sourceAspect > outputAspect) {
-        viewport.Width = static_cast<float>(width_);
-        viewport.Height = viewport.Width / sourceAspect;
-        viewport.TopLeftY = (static_cast<float>(height_) - viewport.Height) * 0.5f;
-    } else {
-        viewport.Height = static_cast<float>(height_);
-        viewport.Width = viewport.Height * sourceAspect;
-        viewport.TopLeftX = (static_cast<float>(width_) - viewport.Width) * 0.5f;
-    }
-    viewport.MinDepth = 0.0f;
-    viewport.MaxDepth = 1.0f;
+    const D3D12_VIEWPORT viewport = AspectFitVideoViewport(
+        slot.displayWidth, slot.displayHeight, width_, height_);
     const D3D12_RECT scissor{0, 0, static_cast<LONG>(width_), static_cast<LONG>(height_)};
     commandList_->RSSetViewports(1, &viewport);
     commandList_->RSSetScissorRects(1, &scissor);
@@ -4350,7 +4644,7 @@ bool D3D12VideoRenderer::RenderGeneratedFrame(const std::size_t slotIndex) {
     commandList_->SetDescriptorHeaps(1, heaps);
     D3D12_GPU_DESCRIPTOR_HANDLE srvGpu =
         tensorSrvHeap_->GetGPUDescriptorHandleForHeapStart();
-    srvGpu.ptr += static_cast<UINT64>(backBufferIndex) * srvIncrement_;
+    srvGpu.ptr += static_cast<UINT64>(backBufferIndex * 4) * srvIncrement_;
     commandList_->SetGraphicsRootDescriptorTable(0, srvGpu);
     TensorCompositionConstants constants{};
     constants.tensorWidth = slot.shape.width;
@@ -4372,6 +4666,36 @@ bool D3D12VideoRenderer::RenderGeneratedFrame(const std::size_t slotIndex) {
         ? slot.inputTransfer
         : (generatedSource ? TransferMode(generatedSource->color.transfer)
                            : TransferMode(mediaColor_.transfer));
+    constants.endpointReference[0] = fullResolutionEndpointLuma ? 1.0f : 0.0f;
+    const D3D12_RESOURCE_DESC referenceDesc = fullResolutionEndpointLuma
+        ? slot.luminanceLeft->GetDesc() : D3D12_RESOURCE_DESC{};
+    const bool luminanceReferenceChanged =
+        fullResolutionEndpointLuma &&
+        (referenceDesc.Width != loggedDoviLuminanceReferenceWidth_ ||
+         referenceDesc.Height != loggedDoviLuminanceReferenceHeight_);
+    if (constants.transfer == 4u &&
+        (!dolbyVisionInterpolationLuminanceGuardLogged_ || luminanceReferenceChanged)) {
+        dolbyVisionInterpolationLuminanceGuardLogged_ = true;
+        if (fullResolutionEndpointLuma) {
+            loggedDoviLuminanceReferenceWidth_ = static_cast<UINT>(referenceDesc.Width);
+            loggedDoviLuminanceReferenceHeight_ = referenceDesc.Height;
+            Log(LogLevel::Info,
+                L"Dolby Vision interpolation luminance contract="
+                L"motion_preserving_full_resolution_exposure_guard "
+                L"domain=display_mapped_bt2020_pq "
+                L"reference=" + std::to_wstring(referenceDesc.Width) + L"x" +
+                std::to_wstring(referenceDesc.Height) + L" tensor=" +
+                std::to_wstring(slot.shape.width) + L"x" +
+                std::to_wstring(slot.shape.height));
+        } else {
+            loggedDoviLuminanceReferenceWidth_ = 0;
+            loggedDoviLuminanceReferenceHeight_ = 0;
+            Log(LogLevel::Info,
+                L"Dolby Vision interpolation luminance contract="
+                L"motion_preserving_temporal_exposure_guard "
+                L"domain=display_mapped_bt2020_pq");
+        }
+    }
     constants.primaries =
         (generatedSource &&
                  generatedSource->color.primaries == VideoColorPrimaries::Bt2020
@@ -4402,13 +4726,17 @@ bool D3D12VideoRenderer::RenderGeneratedFrame(const std::size_t slotIndex) {
             Log(LogLevel::Info, L"HDR custom tone curve active pipeline=interpolated");
         }
     }
-    commandList_->SetGraphicsRoot32BitConstants(1, 40, &constants, 0);
+    commandList_->SetGraphicsRoot32BitConstants(1, 44, &constants, 0);
     commandList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     commandList_->DrawInstanced(3, 1, 0, 0);
-    DrawOverlays(slot.overlayFrame.get(), viewport, backBufferIndex);
+    DrawOverlays(viewport, backBufferIndex);
 
-    std::array<D3D12_RESOURCE_BARRIER, 2> endBarriers{
+    std::array<D3D12_RESOURCE_BARRIER, 5> endBarriers{
         TransitionBarrier(slot.output.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+        TransitionBarrier(slot.inputTensor.Get(),
+                          D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                           D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         TransitionBarrier(backBuffers_[backBufferIndex].Get(),
@@ -4416,17 +4744,32 @@ bool D3D12VideoRenderer::RenderGeneratedFrame(const std::size_t slotIndex) {
                           D3D12_RESOURCE_STATE_RENDER_TARGET,
                           D3D12_RESOURCE_STATE_PRESENT),
     };
-    commandList_->ResourceBarrier(static_cast<UINT>(endBarriers.size()), endBarriers.data());
+    UINT endBarrierCount = 3;
+    if (fullResolutionEndpointLuma) {
+        endBarriers[endBarrierCount++] = TransitionBarrier(
+            slot.luminanceLeft.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_COMMON);
+        endBarriers[endBarrierCount++] = TransitionBarrier(
+            slot.luminanceRight.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_COMMON);
+    }
+    commandList_->ResourceBarrier(endBarrierCount, endBarriers.data());
     if (FAILED(commandList_->Close())) return false;
     const std::array dependencies{slot.ready};
     SubmitResult graphSubmit = frameGraph_.Submit(
         GpuFrameQueue::Graphics, commandList_.Get(), dependencies);
     if (!graphSubmit.accepted) return false;
+    // Both the generated output and retained endpoint tensor are sampled by
+    // this submission. Publish their reuse fence before Present, because a
+    // presentation failure must not allow either resource to be recycled while
+    // the graphics queue is still consuming it.
+    slot.reusable = graphSubmit.completion;
     if (!PresentComposedFrame(
             backBufferIndex, graphSubmit.completion, false)) {
         return false;
     }
-    slot.reusable = graphSubmit.completion;
     if (!generatedPresentLogged_) {
         generatedPresentLogged_ = true;
         Log(LogLevel::Info,
@@ -4546,8 +4889,17 @@ bool D3D12VideoRenderer::EnsureTextSubtitleBitmap(
     return true;
 }
 
-bool D3D12VideoRenderer::DrawOverlays(const NativeVideoFrame* frame,
-                                      const D3D12_VIEWPORT& videoViewport,
+void D3D12VideoRenderer::BindPresentedSubtitles(const NativeVideoFrame& frame) {
+    // Keep subtitle composition outside the interpolation slots. A generated
+    // video frame reuses this latest presentation-timeline snapshot instead of
+    // carrying either endpoint's subtitle state through the ML pipeline.
+    presentedSubtitleText_ = frame.subtitleText;
+    presentedSubtitleBitmaps_ = frame.subtitleBitmaps;
+    presentedSubtitleSourceWidth_ = frame.width;
+    presentedSubtitleSourceHeight_ = frame.height;
+}
+
+bool D3D12VideoRenderer::DrawOverlays(const D3D12_VIEWPORT& videoViewport,
                                       const UINT backBufferIndex) {
     if (!overlayPipeline_ || !overlayRootSignature_ || !overlaySrvHeap_ ||
         backBufferIndex >= kBufferCount) {
@@ -4580,54 +4932,52 @@ bool D3D12VideoRenderer::DrawOverlays(const NativeVideoFrame* frame,
     const std::size_t subtitleItemLimit = kMaxOverlayTextures -
         std::min<std::size_t>(activeUiOverlayCount, kMaxOverlayTextures);
     bool hasDrawableSubtitleBitmap = false;
-    if (frame) {
-        for (const NativeSubtitleBitmap& bitmap : frame->subtitleBitmaps) {
-            if (!bitmap.HasPixels() || items.size() >= subtitleItemLimit) continue;
-            hasDrawableSubtitleBitmap = true;
-            const int canvasWidth = std::max(1, bitmap.canvasWidth > 0
-                                                    ? bitmap.canvasWidth
-                                                    : frame->width);
-            const int canvasHeight = std::max(1, bitmap.canvasHeight > 0
-                                                     ? bitmap.canvasHeight
-                                                     : frame->height);
-            DrawItem item;
-            item.pixels = bitmap.bgra;
-            item.width = bitmap.width;
-            item.height = bitmap.height;
-            item.stride = bitmap.stride;
-            item.serial = bitmap.serial;
-            const float rawX = videoViewport.TopLeftX +
-                videoViewport.Width * bitmap.x / canvasWidth;
-            const float rawY = videoViewport.TopLeftY +
-                videoViewport.Height * bitmap.y / canvasHeight;
-            const float rawWidth = videoViewport.Width * bitmap.width / canvasWidth;
-            const float rawHeight = videoViewport.Height * bitmap.height / canvasHeight;
-            const float scale = static_cast<float>(
-                std::clamp(activeSubtitleSettings_.fontScale, 0.5, 2.0));
-            const float pivotX = videoViewport.TopLeftX + videoViewport.Width * 0.5f;
-            const float pivotY = videoViewport.TopLeftY + videoViewport.Height;
-            item.x = pivotX + (rawX - pivotX) * scale +
-                static_cast<float>(activeSubtitleSettings_.offsetXPx);
-            item.y = pivotY + (rawY - pivotY) * scale +
-                static_cast<float>(activeSubtitleSettings_.offsetYPx);
-            item.displayWidth = rawWidth * scale;
-            item.displayHeight = rawHeight * scale;
-            item.subtitle = true;
-            items.push_back(std::move(item));
-        }
-        if (!hasDrawableSubtitleBitmap && items.size() < subtitleItemLimit &&
-            EnsureTextSubtitleBitmap(frame->subtitleText, videoViewport)) {
-            DrawItem item;
-            item.pixels = textSubtitlePixels_;
-            item.width = static_cast<int>(width_);
-            item.height = static_cast<int>(height_);
-            item.stride = static_cast<int>(width_ * 4);
-            item.serial = textSubtitleSerial_;
-            item.displayWidth = static_cast<float>(width_);
-            item.displayHeight = static_cast<float>(height_);
-            item.subtitle = true;
-            items.push_back(std::move(item));
-        }
+    for (const NativeSubtitleBitmap& bitmap : presentedSubtitleBitmaps_) {
+        if (!bitmap.HasPixels() || items.size() >= subtitleItemLimit) continue;
+        hasDrawableSubtitleBitmap = true;
+        const int canvasWidth = std::max(
+            1, bitmap.canvasWidth > 0 ? bitmap.canvasWidth
+                                     : presentedSubtitleSourceWidth_);
+        const int canvasHeight = std::max(
+            1, bitmap.canvasHeight > 0 ? bitmap.canvasHeight
+                                      : presentedSubtitleSourceHeight_);
+        DrawItem item;
+        item.pixels = bitmap.bgra;
+        item.width = bitmap.width;
+        item.height = bitmap.height;
+        item.stride = bitmap.stride;
+        item.serial = bitmap.serial;
+        const float rawX = videoViewport.TopLeftX +
+            videoViewport.Width * bitmap.x / canvasWidth;
+        const float rawY = videoViewport.TopLeftY +
+            videoViewport.Height * bitmap.y / canvasHeight;
+        const float rawWidth = videoViewport.Width * bitmap.width / canvasWidth;
+        const float rawHeight = videoViewport.Height * bitmap.height / canvasHeight;
+        const float scale = static_cast<float>(
+            std::clamp(activeSubtitleSettings_.fontScale, 0.5, 2.0));
+        const float pivotX = videoViewport.TopLeftX + videoViewport.Width * 0.5f;
+        const float pivotY = videoViewport.TopLeftY + videoViewport.Height;
+        item.x = pivotX + (rawX - pivotX) * scale +
+            static_cast<float>(activeSubtitleSettings_.offsetXPx);
+        item.y = pivotY + (rawY - pivotY) * scale +
+            static_cast<float>(activeSubtitleSettings_.offsetYPx);
+        item.displayWidth = rawWidth * scale;
+        item.displayHeight = rawHeight * scale;
+        item.subtitle = true;
+        items.push_back(std::move(item));
+    }
+    if (!hasDrawableSubtitleBitmap && items.size() < subtitleItemLimit &&
+        EnsureTextSubtitleBitmap(presentedSubtitleText_, videoViewport)) {
+        DrawItem item;
+        item.pixels = textSubtitlePixels_;
+        item.width = static_cast<int>(width_);
+        item.height = static_cast<int>(height_);
+        item.stride = static_cast<int>(width_ * 4);
+        item.serial = textSubtitleSerial_;
+        item.displayWidth = static_cast<float>(width_);
+        item.displayHeight = static_cast<float>(height_);
+        item.subtitle = true;
+        items.push_back(std::move(item));
     }
     for (std::size_t slotIndex = 0;
          slotIndex < activeOverlaySlots_.size() && items.size() < kMaxOverlayTextures;
@@ -4685,18 +5035,17 @@ bool D3D12VideoRenderer::DrawOverlays(const NativeVideoFrame* frame,
     for (UINT itemIndex = 0; itemIndex < static_cast<UINT>(items.size()); ++itemIndex) {
         const DrawItem& item = items[itemIndex];
         OverlayTextureCache& cache = item.subtitle
-            ? subtitleTextureCaches_[subtitleItemIndex++]
+            ? subtitleTextureCaches_[backBufferIndex][subtitleItemIndex++]
             : overlayTextureCaches_[backBufferIndex][item.overlaySlotIndex];
         const void* sourceIdentity = item.pixels.get();
         const bool identityChanged = cache.sourceIdentity != sourceIdentity ||
             cache.sourceSerial != item.serial;
-        // Subtitle textures are shared by every swap-chain back buffer. When
-        // the PGS/ASS content changes, allocate a new immutable texture instead
-        // of mutating one that may still be sampled by the other back buffer.
+        // Subtitle textures are owned by the current back buffer. The caller
+        // waited for that buffer's fence before recording, so changing a cue can
+        // never mutate a texture still sampled by the other back buffer.
         const bool dimensionsChanged = !cache.texture ||
             cache.width != static_cast<UINT>(item.width) ||
-            cache.height != static_cast<UINT>(item.height) ||
-            (item.subtitle && identityChanged);
+            cache.height != static_cast<UINT>(item.height);
         const bool contentChanged = dimensionsChanged || identityChanged;
         D3D12_RESOURCE_DESC textureDesc{};
         textureDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -4709,21 +5058,7 @@ bool D3D12VideoRenderer::DrawOverlays(const NativeVideoFrame* frame,
         D3D12_HEAP_PROPERTIES defaultHeap{};
         defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
         if (dimensionsChanged) {
-            if (item.subtitle) {
-                if (cache.texture) {
-                    transients_[backBufferIndex].push_back(std::move(cache.texture));
-                }
-                if (cache.upload && cache.mappedUpload) {
-                    cache.upload->Unmap(0, nullptr);
-                }
-                cache.mappedUpload = nullptr;
-                if (cache.upload) {
-                    transients_[backBufferIndex].push_back(std::move(cache.upload));
-                }
-                cache.uploadCapacity = 0;
-            } else {
-                cache.texture.Reset();
-            }
+            cache.texture.Reset();
             cache.sourceIdentity = nullptr;
             cache.sourceSerial = 0;
             if (FAILED(device_->CreateCommittedResource(
@@ -4841,10 +5176,26 @@ bool D3D12VideoRenderer::DrawOverlays(const NativeVideoFrame* frame,
         drewSubtitle = drewSubtitle || item.subtitle;
     }
     if (drewSubtitle) {
-        if (!sharedSubtitleTextureLogged_) {
-            sharedSubtitleTextureLogged_ = true;
+        if (!independentSubtitleCompositionLogged_) {
+            independentSubtitleCompositionLogged_ = true;
             Log(LogLevel::Info,
-                L"subtitle texture cache active mode=shared_immutable_across_backbuffers");
+                L"subtitle composition active mode=independent_post_interpolation "
+                L"authority=presented_timeline viewport=aspect_fit output=" +
+                    std::to_wstring(width_) + L"x" + std::to_wstring(height_) +
+                    L" video_rect=" +
+                    std::to_wstring(static_cast<int>(std::lround(
+                        videoViewport.TopLeftX))) + L"," +
+                    std::to_wstring(static_cast<int>(std::lround(
+                        videoViewport.TopLeftY))) + L"," +
+                    std::to_wstring(static_cast<int>(std::lround(
+                        videoViewport.Width))) + L"x" +
+                    std::to_wstring(static_cast<int>(std::lround(
+                        videoViewport.Height))));
+        }
+        if (!perBackBufferSubtitleTextureLogged_) {
+            perBackBufferSubtitleTextureLogged_ = true;
+            Log(LogLevel::Info,
+                L"subtitle texture cache active mode=per_backbuffer_fence_owned");
         }
         std::scoped_lock lock(statsMutex_);
         ++renderStats_.subtitleFrames;
@@ -5007,6 +5358,9 @@ bool D3D12VideoRenderer::SetHdrOutputState(const NativeVideoFrame& frame,
 void D3D12VideoRenderer::ResetInterpolationState() {
     tensorPreviousFrame_.reset();
     tensorPreviousDoviTarget_.Reset();
+    tensorPreviousDoviLuminanceTarget_.Reset();
+    tensorPreviousDoviTargetTimeline_ = 0;
+    tensorPreviousDoviTargetFrameSerial_ = 0;
     sourceComputeCompletions_.clear();
     sourceGraphicsCompletions_.clear();
     for (const std::size_t slotIndex : pendingGeneratedSlots_) {
@@ -5017,13 +5371,10 @@ void D3D12VideoRenderer::ResetInterpolationState() {
     directMlSubmitLogged_ = false;
     generatedPresentLogged_ = false;
     dolbyVisionInterpolationColorPathLogged_ = false;
+    dolbyVisionInterpolationLuminanceGuardLogged_ = false;
+    loggedDoviLuminanceReferenceWidth_ = 0;
+    loggedDoviLuminanceReferenceHeight_ = 0;
     hlgInterpolationColorPathLogged_ = false;
-    adaptiveMultiplierCap_ = kMaximumInterpolationMultiplier;
-    adaptiveDeadlineSamples_ = 0;
-    adaptiveDeadlineHits_ = 0;
-    adaptiveStableWindows_ = 0;
-    adaptiveCalibrationStartedAt_ = {};
-    adaptiveCadenceLocked_ = false;
     frameGraph_.AdvanceEpoch();
     {
         std::scoped_lock lock(statsMutex_);
@@ -5034,6 +5385,10 @@ void D3D12VideoRenderer::ResetInterpolationState() {
 
 void D3D12VideoRenderer::ClearFrame() {
     currentFrame_.reset();
+    presentedSubtitleText_.clear();
+    presentedSubtitleBitmaps_.clear();
+    presentedSubtitleSourceWidth_ = 0;
+    presentedSubtitleSourceHeight_ = 0;
     swapChainHdr_ = false;
     nativeHlgComposition_ = false;
     SelectCompositionSwapChain(false);
@@ -5116,6 +5471,12 @@ void D3D12VideoRenderer::ReleaseGpu() {
     libplaceboRenderFailureLogged_ = false;
     tensorPreviousFrame_.reset();
     tensorPreviousDoviTarget_.Reset();
+    tensorPreviousDoviLuminanceTarget_.Reset();
+    tensorPreviousDoviTargetTimeline_ = 0;
+    tensorPreviousDoviTargetFrameSerial_ = 0;
+    dolbyVisionInterpolationLuminanceGuardLogged_ = false;
+    loggedDoviLuminanceReferenceWidth_ = 0;
+    loggedDoviLuminanceReferenceHeight_ = 0;
     sourceComputeCompletions_.clear();
     sourceGraphicsCompletions_.clear();
     tensorPreprocessor_.Reset();
@@ -5127,17 +5488,31 @@ void D3D12VideoRenderer::ReleaseGpu() {
             cache = {};
         }
     }
-    for (OverlayTextureCache& cache : subtitleTextureCaches_) {
-        if (cache.upload && cache.mappedUpload) cache.upload->Unmap(0, nullptr);
-        cache = {};
+    for (auto& backBufferCaches : subtitleTextureCaches_) {
+        for (OverlayTextureCache& cache : backBufferCaches) {
+            if (cache.upload && cache.mappedUpload) cache.upload->Unmap(0, nullptr);
+            cache = {};
+        }
     }
     textSubtitlePixels_.reset();
     textSubtitleText_.clear();
     textSubtitleSurfaceWidth_ = 0;
     textSubtitleSurfaceHeight_ = 0;
+    presentedSubtitleText_.clear();
+    presentedSubtitleBitmaps_.clear();
+    presentedSubtitleSourceWidth_ = 0;
+    presentedSubtitleSourceHeight_ = 0;
+    independentSubtitleCompositionLogged_ = false;
+    perBackBufferSubtitleTextureLogged_ = false;
     for (PixelFrameUploadCache& cache : pixelFrameUploadCaches_) {
         if (cache.upload && cache.mappedUpload) cache.upload->Unmap(0, nullptr);
         cache = {};
+    }
+    for (auto& backBufferCaches : yuvFrameUploadCaches_) {
+        for (YuvFrameUploadCache& cache : backBufferCaches) {
+            if (cache.upload && cache.mappedUpload) cache.upload->Unmap(0, nullptr);
+            cache = {};
+        }
     }
     for (auto& frame : inFlightFrames_) frame.reset();
     for (auto& target : libplaceboTargets_) target.Reset();
@@ -5201,12 +5576,26 @@ void D3D12VideoRenderer::NotifyInitialization(const VideoRendererState state) co
 
 bool D3D12VideoRenderer::DeviceLost(const HRESULT result, const wchar_t* operation) {
     if (!IsDeviceRemoved(result)) return false;
+    if (deviceLossReported_.exchange(true, std::memory_order_acq_rel)) {
+        return true;
+    }
     HRESULT reason = result;
     if (device_) {
         const HRESULT removedReason = device_->GetDeviceRemovedReason();
         if (FAILED(removedReason)) reason = removedReason;
     }
-    Log(LogLevel::Error, std::wstring(operation) + L" lost d3d12 device");
+    Log(LogLevel::Error,
+        std::wstring(operation) + L" lost d3d12 device reason=0x" +
+            [&reason]() {
+                std::wostringstream stream;
+                stream << std::hex << static_cast<unsigned long>(reason);
+                return stream.str();
+            }());
+    {
+        std::scoped_lock lock(commandMutex_);
+        stopRequested_ = true;
+    }
+    commandCv_.notify_one();
     if (completionWindow_ && deviceLostMessage_) {
         PostMessageW(completionWindow_, deviceLostMessage_,
                      static_cast<WPARAM>(completionCookie_), static_cast<LPARAM>(reason));

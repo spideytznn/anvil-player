@@ -1063,6 +1063,10 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
     }
 
     path_ = mediaPath;
+    networkSource_ = IsNetworkMediaPath(mediaPath);
+    networkInputEnded_.store(false);
+    networkRebuffering_ = false;
+    networkRebufferingSnapshot_.store(false);
     startPosition_ = startPosition;
     preferHardwareDecode_ = preferHardwareDecode;
     sharedD3D12Device_.Reset();
@@ -1210,6 +1214,8 @@ bool FfmpegVideoDecoder::Start(const std::filesystem::path& mediaPath,
 
 void FfmpegVideoDecoder::RequestStop() {
     stopping_.store(true);
+    networkInputEnded_.store(true);
+    networkRebufferingSnapshot_.store(false);
     pendingSeekMs_.store(-1);
     pendingSeekInterruptsEnabled_.store(false);
     ioInterruptAfterSteadyMs_.store(0);
@@ -1242,6 +1248,7 @@ void FfmpegVideoDecoder::Stop() {
     running_.store(false);
     {
         std::scoped_lock lock(mutex_);
+        networkRebuffering_ = false;
         ResetSeekRecoveryLocked();
     }
     {
@@ -1312,11 +1319,13 @@ bool FfmpegVideoDecoder::Seek(const std::chrono::milliseconds position) {
         const auto fallbackReason = stats_.fallbackReason;
         const bool usingHardware = stats_.usingHardwareDecode;
         const uint64_t networkBytesPerSecond = stats_.networkBytesPerSecond;
+        const uint64_t networkRebufferCount = stats_.networkRebufferCount;
         stats_ = {};
         stats_.decoder = decoder;
         stats_.fallbackReason = fallbackReason;
         stats_.usingHardwareDecode = usingHardware;
         stats_.networkBytesPerSecond = networkBytesPerSecond;
+        stats_.networkRebufferCount = networkRebufferCount;
         stats_.clockPosition = clamped;
         BeginSeekRecoveryLocked(clamped, prerollAfterSeek, seekTimelineSerial);
         UpdateBufferedStatsLocked();
@@ -1340,6 +1349,7 @@ void FfmpegVideoDecoder::SetPaused(const bool paused, const std::chrono::millise
         }
         ApplyPendingClockResetLocked();
         UpdateBufferedStatsLocked();
+        UpdateNetworkRebufferStateLocked();
     }
     WakeScheduler();
     frameQueueCv_.notify_all();
@@ -1429,6 +1439,9 @@ void FfmpegVideoDecoder::BeginSeekRecoveryLocked(const std::chrono::milliseconds
                                                  const bool prerollAfterSeek,
                                                  const uint64_t timelineSerial) {
     seekRecovery_ = {};
+    networkRebuffering_ = false;
+    networkRebufferingSnapshot_.store(false);
+    stats_.networkRebuffering = false;
     seekPrerollPending_.store(prerollAfterSeek);
     stats_.seekRecoveryActive = prerollAfterSeek;
     stats_.seekRecoveryAudioHandoffReady = !prerollAfterSeek;
@@ -1457,7 +1470,7 @@ void FfmpegVideoDecoder::ResetSeekRecoveryLocked() {
     seekRecoveryActiveSnapshot_.store(false);
     seekAudioHandoffReadySnapshot_.store(true);
     stats_.timelineSerial = CurrentTimelineSerial();
-    stats_.buffering = false;
+    stats_.buffering = networkRebuffering_;
 }
 
 void FfmpegVideoDecoder::ApplyPendingClockResetLocked() {
@@ -1641,6 +1654,8 @@ NativeVideoQueueStats FfmpegVideoDecoder::Stats() const {
     // never resume shared-demux audio before seek visual warm-up completes.
     snapshot.seekRecoveryActive = seekRecoveryActiveSnapshot_.load();
     snapshot.seekRecoveryAudioHandoffReady = seekAudioHandoffReadySnapshot_.load();
+    snapshot.networkRebuffering = networkRebufferingSnapshot_.load();
+    snapshot.buffering = snapshot.seekRecoveryActive || snapshot.networkRebuffering;
     return snapshot;
 }
 
@@ -2144,6 +2159,7 @@ void FfmpegVideoDecoder::DecodeLoop() {
         std::size_t packetQueueBytes = 0;
         std::chrono::milliseconds packetTimelineEnd = startPosition_;
         bool inputEof = false;
+        networkInputEnded_.store(false);
         bool packetBudgetExceeded = false;
         bool readFrameWaitLogged = false;
         bool firstReadFrameLogged = false;
@@ -2314,6 +2330,7 @@ void FfmpegVideoDecoder::DecodeLoop() {
                 }
                 packetBudgetExceeded = true;
                 inputEof = true;
+                networkInputEnded_.store(true);
                 av_packet_unref(source);
                 return false;
             }
@@ -2433,6 +2450,7 @@ void FfmpegVideoDecoder::DecodeLoop() {
                     }
                     if (!HasPendingSeek()) {
                         inputEof = true;
+                        networkInputEnded_.store(true);
                     }
                     break;
                 }
@@ -2629,6 +2647,7 @@ void FfmpegVideoDecoder::DecodeLoop() {
             if (HasPendingSeek()) {
                 clearPacketQueue();
                 inputEof = false;
+                networkInputEnded_.store(false);
                 packetBudgetExceeded = false;
                 if (!ApplyPendingSeek(formatCtx,
                                       codecCtx,
@@ -4481,6 +4500,7 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
     queued.height = srcH;
     queued.stride = stride;
     queued.bgra = std::move(pixels);
+    queued.softwareFormat = AV_PIX_FMT_BGRA;
     queued.color = MergeFrameColorMetadata(frame, streamColorMetadata_);
     queued.hdr10PlusPayload = ExtractHdr10PlusPayload(frame);
     queued.hdr10Plus = ExtractHdr10PlusMetadata(frame);
@@ -5533,6 +5553,67 @@ void FfmpegVideoDecoder::UpdateBufferedStatsLocked() {
                                                          stats_.bufferedEnd - decodedStart)));
 }
 
+NetworkRebufferTransition FfmpegVideoDecoder::UpdateNetworkRebufferStateLocked() {
+    std::size_t decodedFrameCapacity = 4;
+    if (!frameQueue_.empty()) {
+        decodedFrameCapacity = MaxQueueDepthForFrame(frameQueue_.front());
+        // Memory-bounded software queues can fill before their nominal frame
+        // count limit. Treat the frames already retained as the recovery
+        // watermark so buffering cannot wait for an impossible extra frame.
+        if (!HasQueueCapacityLocked(frameQueue_.back())) {
+            decodedFrameCapacity = frameQueue_.size();
+        }
+    }
+    const NetworkRebufferTransition transition = EvaluateNetworkRebuffer({
+        .networkSource = networkSource_,
+        .paused = playbackPaused_.load(),
+        .inputEnded = networkInputEnded_.load(),
+        .seekPending = HasPendingSeek(),
+        .buffering = networkRebuffering_,
+        .renderedFrames = stats_.rendered,
+        .decodedFrameDepth = frameQueue_.size(),
+        .decodedFrameCapacity = decodedFrameCapacity,
+        .packetDepth = stats_.packetQueueDepth,
+        .bufferedDuration = stats_.bufferedDuration,
+        .readAheadDuration = stats_.readAheadDuration,
+    });
+
+    if (transition == NetworkRebufferTransition::Enter) {
+        networkRebuffering_ = true;
+        networkRebufferingSnapshot_.store(true);
+        stats_.networkRebuffering = true;
+        stats_.buffering = true;
+        ++stats_.networkRebufferCount;
+        LogThread(LogLevel::Info,
+                  L"decoder",
+                  L"network_rebuffer enter clock_ms=" +
+                      std::to_wstring(stats_.clockPosition.count()) +
+                      L" count=" + std::to_wstring(stats_.networkRebufferCount));
+    } else if (transition == NetworkRebufferTransition::Hold) {
+        stats_.networkRebuffering = true;
+        stats_.buffering = true;
+    } else if (transition == NetworkRebufferTransition::Exit) {
+        networkRebuffering_ = false;
+        networkRebufferingSnapshot_.store(false);
+        stats_.networkRebuffering = false;
+        stats_.buffering = seekPrerollPending_.load();
+        fallbackClockAnchor_.reset();
+        if (!frameQueue_.empty()) {
+            fallbackClockBasePts_ = frameQueue_.front().pts;
+        }
+        LogThread(LogLevel::Info,
+                  L"decoder",
+                  L"network_rebuffer exit frames=" + std::to_wstring(frameQueue_.size()) +
+                      L" packets=" + std::to_wstring(stats_.packetQueueDepth) +
+                      L" buffered_ms=" + std::to_wstring(stats_.bufferedDuration.count()) +
+                      L" read_ahead_ms=" + std::to_wstring(stats_.readAheadDuration.count()));
+    } else {
+        stats_.networkRebuffering = networkRebuffering_;
+        stats_.buffering = seekPrerollPending_.load() || networkRebuffering_;
+    }
+    return transition;
+}
+
 bool FfmpegVideoDecoder::SeekPrerollReadyLocked() const {
     if (!seekPrerollPending_.load() || playbackPaused_.load()) {
         return true;
@@ -5681,7 +5762,7 @@ bool FfmpegVideoDecoder::EnqueueFrame(NativeVideoFrame&& frame) {
             }
             if (HasQueueCapacityLocked(frame)) {
                 frameQueue_.push_back(std::move(frame));
-                stats_.buffering = seekPrerollPending_.load();
+                stats_.buffering = seekPrerollPending_.load() || networkRebuffering_;
                 UpdateBufferedStatsLocked();
                 queued = true;
             } else if (playbackPaused_.load()) {
@@ -5771,6 +5852,7 @@ void FfmpegVideoDecoder::ScheduleDueFrames() {
         }
         if (frameQueue_.empty()) {
             UpdateBufferedStatsLocked();
+            UpdateNetworkRebufferStateLocked();
             return;
         }
     }
@@ -5798,6 +5880,16 @@ void FfmpegVideoDecoder::ScheduleDueFrames() {
         queueChanged = frameQueue_.size() != queueDepthBeforeStaleDrop;
         if (frameQueue_.empty()) {
             UpdateBufferedStatsLocked();
+            UpdateNetworkRebufferStateLocked();
+            if (queueChanged) {
+                frameQueueCv_.notify_all();
+            }
+            return;
+        }
+
+        UpdateBufferedStatsLocked();
+        UpdateNetworkRebufferStateLocked();
+        if (networkRebuffering_) {
             if (queueChanged) {
                 frameQueueCv_.notify_all();
             }
@@ -5902,6 +5994,7 @@ void FfmpegVideoDecoder::ScheduleDueFrames() {
             latestFrame_ = frameToPublish;
             UpdateBufferedStatsLocked();
             UpdateSeekRecoveryAfterPublishLocked(frameToPublish.pts, std::chrono::steady_clock::now());
+            UpdateNetworkRebufferStateLocked();
             publishedQueueDepth = stats_.queueDepth;
         }
     }

@@ -885,7 +885,7 @@ function DetailPanelContent(props: {
   canScrapeMetadata: boolean
   isScrapingMetadata: boolean
   canEditMetadata: boolean
-  onPlayIntent: (item: MediaItem, audioTrackIndex: number, subtitleTrackIndex: number) => void
+  onPlayIntent: (item: MediaItem, audioTrackIndex: number, subtitleTrackIndex: number, startPositionRatio: number) => void
   onTrailerIntent: (item: MediaItem, signal: AbortSignal) => Promise<string[]>
   onRemoveFromLibrary: (item: MediaItem) => void
   onToggleFavorite: (item: MediaItem) => void
@@ -1109,12 +1109,17 @@ function DetailPanelContent(props: {
     return () => observer.disconnect()
   }, [overviewExpanded, props.item.id, props.item.overview])
 
-  function playMediaAndCloseTrailer(item: MediaItem, audioTrackIndex: number, subtitleTrackIndex: number): void {
+  function playMediaAndCloseTrailer(
+    item: MediaItem,
+    audioTrackIndex: number,
+    subtitleTrackIndex: number,
+    startPositionRatio = item.progress
+  ): void {
     setTrailerPlaying(false)
     setTrailerPlaybackStarted(false)
     setTrailerMuted(false)
     postNativeCommand({ type: 'command', command: 'setLibraryWebViewMuted', muted: false })
-    props.onPlayIntent(item, audioTrackIndex, subtitleTrackIndex)
+    props.onPlayIntent(item, audioTrackIndex, subtitleTrackIndex, startPositionRatio)
   }
 
   return (
@@ -1269,7 +1274,8 @@ function DetailPanelContent(props: {
                   ? -2
                   : selectedSubtitleStreamId === 'subtitle-off'
                     ? -1
-                    : selectedSubtitleStream ? streamIndex(selectedSubtitleStream.id, -2) : -2
+                    : selectedSubtitleStream ? streamIndex(selectedSubtitleStream.id, -2) : -2,
+              props.item.progress
             )}
           >
             <Play size={17} />
@@ -1488,7 +1494,7 @@ function DetailPanelContent(props: {
               <div className="library-episode-version-picker">
                 <span>{props.language === 'zh' ? `${expandedEpisode.title} · 选择版本` : `${expandedEpisode.title} · Select version`}</span>
                 <div>
-                  <button className="library-episode-version-play" type="button" onClick={() => selectedEpisodeVersion && playMediaAndCloseTrailer(selectedEpisodeVersion, -2, -2)}>
+                  <button className="library-episode-version-play" type="button" onClick={() => selectedEpisodeVersion && playMediaAndCloseTrailer(selectedEpisodeVersion, -2, -2, expandedEpisode.item?.progress ?? selectedEpisodeVersion.progress)}>
                     <Play size={14} />{props.language === 'zh' ? '播放' : 'Play'}
                   </button>
                   <ToolbarSelect
@@ -1788,7 +1794,7 @@ const settingsCopy: Record<UiLanguage, {
     displayPassthroughCaption: '全局默认。播放器会根据片源规格选择显示输出，并在停止播放时恢复。',
     autoDisplayFormat: '自动匹配显示格式',
     autoDisplayFormatCaption: '根据片源自动切换 Windows 与播放器 HDR，播放结束后恢复原始显示状态。',
-    displayMetadataPassthrough: '显示元数据直通',
+    displayMetadataPassthrough: '显示元数据直通（Beta）',
     displayMetadataPassthroughCaption: '向电视传递 HDR 母版色域、MaxCLL 和 MaxFALL 元数据。',
     hdrDisplayPeak: 'HDR 显示峰值',
     hdrDisplayPeakCaption: '全局默认。自动读取 Windows 当前显示器峰值，读取失败时使用 1000 尼特。直通开启时由显示设备负责。',
@@ -1797,7 +1803,7 @@ const settingsCopy: Record<UiLanguage, {
     dolbyVisionSystemPipelineExperimental: '杜比视界直通（实验性）',
     dolbyVisionSystemPipelineExperimentalCaption: '强制杜比视界片源使用 Windows MediaEngine 与 Dolby Vision Extensions；默认关闭。',
     frameInterpolation: 'GPU 补帧',
-    frameInterpolationCaption: '全局默认。使用显卡运动补偿生成中间帧，并根据当前显示刷新率自适应选择 2x–5x 输出。',
+    frameInterpolationCaption: '全局默认。使用显卡运动补偿生成中间帧，在不超过当前显示刷新率时固定输出 2x。',
     frameInterpolationRefreshBlocked: 'GPU 补帧开启时，刷新率同步会保留原设置但暂时失效。',
     refreshRateSync: '智能刷新率同步',
     refreshRateSyncCaption: '全局默认。播放视频进入全屏时，自动选择与帧率整数倍匹配的最高刷新率。',
@@ -1847,7 +1853,7 @@ const settingsCopy: Record<UiLanguage, {
     displayPassthroughCaption: 'Global default. Match the display output to the source and restore it when playback stops.',
     autoDisplayFormat: 'Automatically match display format',
     autoDisplayFormatCaption: 'Switch Windows and player HDR for the current media, then restore the original display state.',
-    displayMetadataPassthrough: 'Display metadata passthrough',
+    displayMetadataPassthrough: 'Display metadata passthrough (Beta)',
     displayMetadataPassthroughCaption: 'Pass HDR mastering primaries, MaxCLL, and MaxFALL metadata to the TV.',
     hdrDisplayPeak: 'HDR display peak',
     hdrDisplayPeakCaption: 'Global default. Auto reads the current Windows display and falls back to 1000 nits. Passthrough delegates this work to the display.',
@@ -1856,8 +1862,8 @@ const settingsCopy: Record<UiLanguage, {
     dolbyVisionSystemPipelineExperimental: 'Dolby Vision passthrough (experimental)',
     dolbyVisionSystemPipelineExperimentalCaption: 'Force Dolby Vision sources through Windows MediaEngine and Dolby Vision Extensions. Disabled by default.',
     frameInterpolation: 'GPU frame interpolation',
-    frameInterpolationCaption: 'Global default. HDR-aware GPU interpolation adapts 2x–5x output to the active display cadence.',
-    frameInterpolationRefreshBlocked: 'Refresh-rate sync supplies the target cadence for adaptive interpolation.',
+    frameInterpolationCaption: 'Global default. GPU interpolation uses fixed 2x output when it stays within the active display refresh rate.',
+    frameInterpolationRefreshBlocked: 'Refresh-rate sync is unavailable while fixed 2x interpolation is enabled.',
     refreshRateSync: 'Smart refresh-rate sync',
     refreshRateSyncCaption: 'Global default. In fullscreen, select the highest refresh rate that is an integer multiple of the video frame rate.',
     refreshRateSyncRequirement: 'Create the exact required mode in the GPU control panel first, such as 23.976 Hz or 119.880 Hz.',
@@ -4502,9 +4508,17 @@ export default function LibraryApp(): JSX.Element {
     }
   }
 
-  async function playMediaItem(item: MediaItem, audioTrackIndex = -2, subtitleTrackIndex = -2): Promise<void> {
+  async function playMediaItem(
+    item: MediaItem,
+    audioTrackIndex = -2,
+    subtitleTrackIndex = -2,
+    requestedStartPositionRatio = item.progress
+  ): Promise<void> {
     const source = sourceFor(item.sourceId)
-    debugLibraryPlayback(`play click id=${item.id} title=${item.title} source=${source.name} kind=${source.kind}`)
+    const startPositionRatio = Number.isFinite(requestedStartPositionRatio)
+      ? Math.max(0, Math.min(0.99, requestedStartPositionRatio))
+      : 0
+    debugLibraryPlayback(`play click id=${item.id} title=${item.title} source=${source.name} kind=${source.kind} startRatio=${startPositionRatio.toFixed(6)}`)
     if (source.kind !== 'Emby') {
       const localPlayableItem = item.path
         ? item
@@ -4541,11 +4555,11 @@ export default function LibraryApp(): JSX.Element {
           type: 'command',
           command: 'requestPlayback',
           path: playablePath,
-          startPositionRatio: item.progress > 0 && item.progress < 1 ? item.progress : undefined,
+          startPositionRatio,
           audioTrackIndex,
           subtitleTrackIndex
         })
-        debugLibraryPlayback(`play local requestPlayback posted id=${localPlayableItem.id} path=${localPlayableItem.path ?? ''}`)
+        debugLibraryPlayback(`play local requestPlayback posted id=${localPlayableItem.id} path=${localPlayableItem.path ?? ''} startRatio=${startPositionRatio.toFixed(6)}`)
       }, 0)
       setPlayIntent(`Opening ${localPlayableItem.title}`)
       return
@@ -4575,11 +4589,11 @@ export default function LibraryApp(): JSX.Element {
           type: 'command',
           command: 'requestPlayback',
           path: target.url,
-          startPositionRatio: item.progress > 0 && item.progress < 1 ? item.progress : undefined,
+          startPositionRatio,
           audioTrackIndex,
           subtitleTrackIndex
         })
-        debugLibraryPlayback(`play requestPlayback posted targetId=${target.itemId}`)
+        debugLibraryPlayback(`play requestPlayback posted targetId=${target.itemId} startRatio=${startPositionRatio.toFixed(6)}`)
       }, 0)
       setPlayIntent(`Opening ${target.title}`)
     } catch (error) {
@@ -6132,7 +6146,7 @@ export default function LibraryApp(): JSX.Element {
             setSelectedId('')
             setPlayIntent('')
           }}
-          onPlayIntent={(item, audioTrackIndex, subtitleTrackIndex) => { void playMediaItem(item, audioTrackIndex, subtitleTrackIndex) }}
+          onPlayIntent={(item, audioTrackIndex, subtitleTrackIndex, startPositionRatio) => { void playMediaItem(item, audioTrackIndex, subtitleTrackIndex, startPositionRatio) }}
           onTrailerIntent={resolveMediaTrailer}
           onRemoveFromLibrary={(item) => { void removeMediaFromLibrary(item) }}
           onToggleFavorite={(item) => { void updateLibraryFlags(item, { favorite: !item.favorite }) }}

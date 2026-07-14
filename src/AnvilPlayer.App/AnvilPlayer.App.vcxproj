@@ -126,8 +126,10 @@ if exist "$(SolutionDir)third_party\webview2-runtime\Microsoft.WebView2.FixedVer
     <ClInclude Include="include\AnvilPlayer\App\main_window.h" />
     <ClInclude Include="include\AnvilPlayer\App\nvidia_hdr_output.h" />
     <ClInclude Include="include\AnvilPlayer\App\playback_supervisor.h" />
+    <ClInclude Include="include\AnvilPlayer\App\playback_timing_math.h" />
     <ClInclude Include="include\AnvilPlayer\App\rect_util.h" />
     <ClInclude Include="include\AnvilPlayer\App\single_instance.h" />
+    <ClInclude Include="include\AnvilPlayer\App\software_yuv_upload_layout.h" />
     <ClInclude Include="include\AnvilPlayer\App\string_util.h" />
     <ClInclude Include="include\AnvilPlayer\App\subtitle_util.h" />
     <ClInclude Include="include\AnvilPlayer\App\system_dolby_vision_player.h" />

@@ -105,7 +105,8 @@ public:
     std::wstring PassthroughReason() const;
     std::wstring PassthroughCodec() const;
 
-    // Returns the audio playback position, advancing at the current playback rate.
+    // Returns the audio playback position from the WASAPI endpoint clock, with
+    // the submitted/padding counters retained as a compatibility fallback.
     std::optional<std::chrono::milliseconds> PlaybackClock() const;
 
 private:
@@ -258,6 +259,8 @@ private:
     void ResetPlaybackClock();
     void ResetPlaybackClock(std::chrono::milliseconds position);
     void SetPlaybackClockRunning(bool running);
+    bool AttachEndpointClock(IAudioClient* audioClient);
+    void DetachEndpointClock();
     void UpdatePlaybackClock(const WasapiFormat& outputFormat,
                              uint64_t submittedFrames,
                              UINT32 paddingFrames);
@@ -316,6 +319,10 @@ private:
     UINT32 clockPaddingFrames_ = 0;
     UINT32 clockSampleRate_ = 0;
     std::chrono::steady_clock::time_point clockUpdatedAt_{};
+    Microsoft::WRL::ComPtr<IAudioClock> endpointClock_;
+    uint64_t endpointClockFrequency_ = 0;
+    uint64_t endpointClockAnchor_ = 0;
+    bool endpointClockAnchorValid_ = false;
     mutable std::mutex workerMutex_;
     std::thread playbackThread_;
 };
