@@ -164,8 +164,8 @@ ONNX Runtime DirectML
 - ONNX Runtime executes the frame-interpolation model through DirectML.
 - License and notices: see ONNXRUNTIME-LICENSE.txt and ONNXRUNTIME-NOTICES.txt.
 
-RIFE 4.25 Lite
-- The bundled optical-flow frame-interpolation model is derived from Practical-RIFE.
+RIFE 4.25
+- The bundled full optical-flow frame-interpolation model is derived from Practical-RIFE.
 - License: see assets/models/RIFE-LICENSE.txt.
 "@
 Set-Content -LiteralPath (Join-Path $appStage 'THIRD-PARTY-NOTICES.txt') -Value $notice -Encoding UTF8
