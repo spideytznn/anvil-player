@@ -13,6 +13,7 @@
 #include "AnvilPlayer/Playback/CapabilityReport.h"
 #include "AnvilPlayer/Playback/Settings.h"
 
+#include <d3d11_4.h>
 #include <d3d12.h>
 #include <d3dcompiler.h>
 #include <dcomp.h>
@@ -34,7 +35,7 @@ namespace anvil::app {
 
 // Native D3D12 renderer. FFmpeg D3D12VA surfaces stay resident on the single
 // application device. The graphics queue waits on the decoder fence, samples
-// the NV12/P010 planes directly and writes the final RGB10 SDR/HDR10 target.
+// NV12/P010/P016 planes directly and writes the final RGB10 SDR/HDR10 target.
 class D3D12VideoRenderer {
 public:
     explicit D3D12VideoRenderer(LogSinkPtr logSink = nullptr);
@@ -151,6 +152,16 @@ private:
     bool CreateDolbyVisionPipeline();
     void ResetInterpolationState();
     bool CreateSwapChain(UINT width, UINT height);
+    bool CreateComposition();
+    bool EnsureHlgPresentationResources(UINT width, UINT height,
+                                        DXGI_COLOR_SPACE_TYPE colorSpace);
+    void ReleaseHlgPresentationResources();
+    bool WantsNativeHlgOutput(const NativeVideoFrame& frame);
+    bool PresentComposedFrame(UINT backBufferIndex,
+                              const GpuFencePoint& graphicsCompletion,
+                              bool nativeHlg);
+    bool SelectCompositionSwapChain(bool hlg);
+    bool WaitForHlgBackBuffer(UINT index);
     bool ConfigureFramePacing();
     void WaitForFrameLatencyObject();
     void RefreshDisplayPeakNits();
@@ -179,6 +190,8 @@ private:
     bool DrawOverlays(const NativeVideoFrame* frame,
                       const D3D12_VIEWPORT& videoViewport,
                       UINT backBufferIndex);
+    bool EnsureTextSubtitleBitmap(const std::wstring& text,
+                                  const D3D12_VIEWPORT& videoViewport);
     bool RenderLastFrame();
     void ClearFrame();
     bool WaitForBackBuffer(UINT index);
@@ -215,6 +228,7 @@ private:
     std::atomic<int> detectedDisplayPeakNits_{0};
     std::atomic<int> effectiveDisplayPeakNits_{1000};
     anvil::playback::SubtitleSettings subtitleSettings_;
+    anvil::playback::SubtitleSettings activeSubtitleSettings_;
     std::array<OverlaySlot, 2> overlaySlots_{};
     std::array<OverlaySlot, 2> activeOverlaySlots_{};
     HWND completionWindow_ = nullptr;
@@ -243,6 +257,7 @@ private:
     Microsoft::WRL::ComPtr<IDCompositionDevice> compositionDevice_;
     Microsoft::WRL::ComPtr<IDCompositionTarget> compositionTarget_;
     Microsoft::WRL::ComPtr<IDCompositionVisual> compositionVisual_;
+    bool useComposition_ = false;
     static constexpr UINT kBufferCount = 2;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kBufferCount> backBuffers_;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kBufferCount> libplaceboTargets_;
@@ -252,6 +267,40 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Fence> fence_;
     HANDLE fenceEvent_ = nullptr;
     uint64_t nextFenceValue_ = 1;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> hlgCopyCommandList_;
+    Microsoft::WRL::ComPtr<IDXGISwapChain3> hlgSwapChain_;
+    Microsoft::WRL::ComPtr<IDCompositionSurface> hlgCompositionSurface_;
+    HANDLE hlgCompositionSurfaceHandle_ = nullptr;
+    Microsoft::WRL::ComPtr<ID3D11Device> hlgD3D11Device_;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> hlgD3D11Context_;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext4> hlgD3D11Context4_;
+    Microsoft::WRL::ComPtr<ID3D11VideoDevice> hlgD3D11VideoDevice_;
+    Microsoft::WRL::ComPtr<ID3D11VideoContext1> hlgD3D11VideoContext_;
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorEnumerator>
+        hlgVideoProcessorEnumerator_;
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessor> hlgVideoProcessor_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> hlgSharedRgbTexture_;
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> hlgVideoInputView_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> hlgD3D11BackBuffer_;
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> hlgVideoOutputView_;
+    Microsoft::WRL::ComPtr<ID3D12Resource> hlgSharedRgbResource_;
+    Microsoft::WRL::ComPtr<ID3D12Fence> hlgSharedFence12_;
+    Microsoft::WRL::ComPtr<ID3D11Fence> hlgSharedFence11_;
+    std::array<Microsoft::WRL::ComPtr<ID3D12CommandAllocator>, kBufferCount>
+        hlgAllocators_;
+    std::array<uint64_t, kBufferCount> hlgBufferFenceValues_{};
+    uint64_t hlgSharedFenceValue_ = 1;
+    uint64_t hlgSharedAvailableFenceValue_ = 0;
+    UINT hlgWidth_ = 0;
+    UINT hlgHeight_ = 0;
+    DXGI_COLOR_SPACE_TYPE hlgColorSpace_ =
+        DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020;
+    bool hlgStudioColorSpaceSupported_ = false;
+    bool hlgFullColorSpaceSupported_ = false;
+    bool hlgInitializationAttempted_ = false;
+    bool hlgCompositionSelected_ = false;
+    bool nativeHlgComposition_ = false;
+    bool hlgFailureLogged_ = false;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> rtvHeap_;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> srvHeap_;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> tensorSrvHeap_;
@@ -313,6 +362,15 @@ private:
     std::array<std::array<OverlayTextureCache, kMaxOverlayTextures>, kBufferCount>
         overlayTextureCaches_{};
     std::array<OverlayTextureCache, kMaxOverlayTextures> subtitleTextureCaches_{};
+    std::shared_ptr<const std::vector<uint8_t>> textSubtitlePixels_;
+    std::wstring textSubtitleText_;
+    D3D12_VIEWPORT textSubtitleViewport_{};
+    UINT textSubtitleSurfaceWidth_ = 0;
+    UINT textSubtitleSurfaceHeight_ = 0;
+    double textSubtitleFontScale_ = 1.0;
+    int textSubtitleOffsetXPx_ = 0;
+    int textSubtitleOffsetYPx_ = 0;
+    uint64_t textSubtitleSerial_ = 0;
     std::array<PixelFrameUploadCache, kBufferCount> pixelFrameUploadCaches_{};
     UINT width_ = 1;
     UINT height_ = 1;

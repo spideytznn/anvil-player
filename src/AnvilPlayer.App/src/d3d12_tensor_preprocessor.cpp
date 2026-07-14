@@ -65,7 +65,9 @@ D3D12_RESOURCE_BARRIER TransitionBarrier(ID3D12Resource* resource,
 
 bool IsSupportedFrame(const NativeVideoFrame& frame) noexcept {
     return frame.HasD3D12Texture() &&
-           (frame.d3dFormat == DXGI_FORMAT_NV12 || frame.d3dFormat == DXGI_FORMAT_P010);
+           (frame.d3dFormat == DXGI_FORMAT_NV12 ||
+            frame.d3dFormat == DXGI_FORMAT_P010 ||
+            frame.d3dFormat == DXGI_FORMAT_P016);
 }
 
 }  // namespace
@@ -738,7 +740,8 @@ TensorPreprocessResult D3D12TensorPreprocessor::SubmitPair(
         const D3D12_RESOURCE_DESC sourceDesc = frame.d3d12Texture->GetDesc();
         const UINT arraySize = std::max<UINT>(1, sourceDesc.DepthOrArraySize);
         const UINT arraySlice = std::min(frame.d3d12Subresource, arraySize - 1);
-        const bool tenBit = frame.d3dFormat == DXGI_FORMAT_P010;
+        const bool highBitDepth = frame.d3dFormat == DXGI_FORMAT_P010 ||
+                                  frame.d3dFormat == DXGI_FORMAT_P016;
         D3D12_SHADER_RESOURCE_VIEW_DESC view{};
         view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
@@ -746,11 +749,11 @@ TensorPreprocessResult D3D12TensorPreprocessor::SubmitPair(
         view.Texture2DArray.FirstArraySlice = arraySlice;
         view.Texture2DArray.ArraySize = 1;
         view.Texture2DArray.PlaneSlice = 0;
-        view.Format = tenBit ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM;
+        view.Format = highBitDepth ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM;
         device_->CreateShaderResourceView(frame.d3d12Texture.Get(), &view, cpu);
         cpu.ptr += descriptorIncrement_;
         view.Texture2DArray.PlaneSlice = 1;
-        view.Format = tenBit ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R8G8_UNORM;
+        view.Format = highBitDepth ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R8G8_UNORM;
         device_->CreateShaderResourceView(frame.d3d12Texture.Get(), &view, cpu);
         cpu.ptr += descriptorIncrement_;
     };
@@ -817,9 +820,11 @@ TensorPreprocessResult D3D12TensorPreprocessor::SubmitPair(
         modes[0] = MatrixMode(frame.color.matrix);
         modes[1] = frame.color.range == VideoColorRange::Full ? 1u : 0u;
         modes[2] = TransferMode(frame.color.transfer);
-        const UINT tenBit = frame.d3dFormat == DXGI_FORMAT_P010 ? 1u : 0u;
+        const UINT highBitDepth =
+            frame.d3dFormat == DXGI_FORMAT_P010 || frame.d3dFormat == DXGI_FORMAT_P016
+                ? 1u : 0u;
         const UINT bt2020 = frame.color.primaries == VideoColorPrimaries::Bt2020 ? 2u : 0u;
-        modes[3] = tenBit | bt2020;
+        modes[3] = highBitDepth | bt2020;
     };
     fillFrameConstants(first, constants.firstSourceUv, constants.firstModes);
     fillFrameConstants(second, constants.secondSourceUv, constants.secondModes);

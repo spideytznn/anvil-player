@@ -510,6 +510,11 @@ bool SetDisplayHdrState(const LUID adapterId, const UINT32 targetId, const bool 
 MainWindow::MainWindow(std::shared_ptr<anvil::playback::InMemoryLogSink> logSink)
     : controller_(std::move(logSink)) {
     auto settings = controller_.Settings();
+    if (const auto value = LoadVideoBooleanSetting(L"HardwareDecodeEnabled")) {
+        settings.video.hardwareDecode =
+            *value ? anvil::playback::HardwareDecodeMode::D3D12VA
+                   : anvil::playback::HardwareDecodeMode::Off;
+    }
     settings.video.frameInterpolationEnabled =
         LoadVideoBooleanSetting(L"FrameInterpolationEnabled").value_or(false);
     if (const auto value = LoadVideoBooleanSetting(L"DisplayMetadataPassthrough")) {
@@ -921,6 +926,12 @@ std::wstring MainWindow::BuildWebUiStateJson() const {
     json << L"\"sidebarCollapsed\":" << (inspectorCollapsed_ ? L"true" : L"false") << L",";
     json << L"\"fullscreen\":" << (fullscreen_ ? L"true" : L"false") << L",";
     json << L"\"customTitleBar\":true,";
+    json << L"\"hardwareDecodeEnabled\":"
+         << (settings.video.hardwareDecode !=
+                     anvil::playback::HardwareDecodeMode::Off
+                 ? L"true"
+                 : L"false")
+         << L",";
     json << L"\"frameInterpolationEnabled\":"
          << (settings.video.frameInterpolationEnabled ? L"true" : L"false") << L",";
     json << L"\"frameInterpolationActive\":"
@@ -1107,6 +1118,9 @@ void MainWindow::HandleWebUiMessage(const std::wstring_view message) {
         ToggleSidebar();
     } else if (MessageContains(message, L"\"command\":\"toggleFullscreen\"")) {
         ToggleFullscreen();
+    } else if (MessageContains(message, L"\"command\":\"setHardwareDecode\"")) {
+        SetHardwareDecodeEnabled(
+            MessageContains(message, L"\"enabled\":true"));
     } else if (MessageContains(message, L"\"command\":\"setFrameInterpolation\"")) {
         SetFrameInterpolationEnabled(MessageContains(message, L"\"enabled\":true"));
     } else if (MessageContains(message, L"\"command\":\"setRefreshRateSync\"")) {
@@ -4906,11 +4920,6 @@ bool MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
     }
     lastNativeStatsLog_ = {};
     if (snapshot.media->hasVideo) {
-        if (snapshot.media->selectedDecodePath != L"ffmpeg_d3d12va") {
-            LogApp(LogLevel::Error,
-                   L"native D3D12 pipeline requires a D3D12VA decode plan; CPU pixel fallback is disabled");
-            return false;
-        }
         if (d3dRenderer_) {
             const auto& settings = runtimeSettings;
             d3dRenderer_->ConfigureColorPipeline(settings.video, CachedCapabilities().display, snapshot.media->videoColor);
@@ -4919,7 +4928,9 @@ bool MainWindow::StartNativeRuntime(const PlaybackSessionSnapshot& snapshot,
         }
         const auto& settings = runtimeSettings;
         preferDolbyVisionHdrOutput = snapshot.media->dolbyVisionDetected;
-        const bool preferHardwareDecode = snapshot.media->selectedDecodePath == L"ffmpeg_d3d12va";
+        const bool preferHardwareDecode =
+            settings.video.hardwareDecode !=
+            anvil::playback::HardwareDecodeMode::Off;
         enableDolbyVisionEnhancementDecode =
             MediaHasDolbyVisionEnhancementStream(snapshot.media) &&
             settings.video.dolbyVision != anvil::playback::DolbyVisionMode::Off;
@@ -5168,11 +5179,6 @@ void MainWindow::RefreshPausedNativeFrame(const PlaybackSessionSnapshot& snapsho
         !nativeVideoDecoder_) {
         return;
     }
-    if (snapshot.media->selectedDecodePath != L"ffmpeg_d3d12va") {
-        LogApp(LogLevel::Error,
-               L"paused frame refresh requires D3D12VA; CPU pixel fallback is disabled");
-        return;
-    }
     if (RuntimeStopInProgress()) {
         QueuePausedNativeFrameRefresh(forceDecoderRestart);
         return;
@@ -5231,7 +5237,9 @@ void MainWindow::RefreshPausedNativeFrame(const PlaybackSessionSnapshot& snapsho
         d3dRenderer_->ResetRenderStats();
     }
     const bool preferDolbyVisionHdrOutput = snapshot.media->dolbyVisionDetected;
-    const bool preferHardwareDecode = snapshot.media->selectedDecodePath == L"ffmpeg_d3d12va";
+    const bool preferHardwareDecode =
+        settings.video.hardwareDecode !=
+        anvil::playback::HardwareDecodeMode::Off;
     const bool enableDolbyVisionEnhancementDecode =
         MediaHasDolbyVisionEnhancementStream(snapshot.media) &&
         settings.video.dolbyVision != anvil::playback::DolbyVisionMode::Off;
@@ -6052,6 +6060,37 @@ bool MainWindow::RefreshRateSyncEffective() const {
            !controller_.Settings().video.frameInterpolationEnabled;
 }
 
+void MainWindow::SetHardwareDecodeEnabled(const bool enabled) {
+    auto settings = controller_.Settings();
+    const bool current =
+        settings.video.hardwareDecode !=
+        anvil::playback::HardwareDecodeMode::Off;
+    if (current == enabled) return;
+    settings.video.hardwareDecode =
+        enabled ? anvil::playback::HardwareDecodeMode::D3D12VA
+                : anvil::playback::HardwareDecodeMode::Off;
+    controller_.ApplySettings(settings);
+    SaveVideoBooleanSetting(L"HardwareDecodeEnabled", enabled);
+    LogApp(LogLevel::Info,
+           L"video decode mode=" +
+               std::wstring(enabled ? L"hardware_d3d12va" : L"software") +
+               L" apply=restart_session");
+
+    const auto snapshot = controller_.Snapshot();
+    if (snapshot.media.has_value() && snapshot.media->hasVideo) {
+        if (snapshot.state == PlaybackState::Playing) {
+            RequestRuntimeStart(true, true);
+        } else if (snapshot.state == PlaybackState::Paused &&
+                   backend_ == PlaybackBackend::NativeFfmpegD3D12) {
+            RefreshPausedNativeFrame(snapshot, true);
+        }
+    }
+    MarkLayoutDirty();
+    EnsureLayout();
+    UpdateVideoHost();
+    PostWebUiState(true);
+}
+
 void MainWindow::SetFrameInterpolationEnabled(const bool enabled) {
     auto settings = controller_.Settings();
     if (settings.video.frameInterpolationEnabled == enabled) {
@@ -6180,6 +6219,8 @@ void MainWindow::ApplyGlobalRefreshRatePreferences() {
 }
 
 void MainWindow::ApplyGlobalVideoPassthroughPreferences() {
+    const bool hardwareDecode =
+        LoadVideoBooleanSetting(L"HardwareDecodeEnabled").value_or(true);
     const bool frameInterpolation =
         LoadVideoBooleanSetting(L"FrameInterpolationEnabled").value_or(false);
     const bool autoDisplayFormat = LoadVideoBooleanSetting(L"AutoDisplayFormat").value_or(false);
@@ -6188,6 +6229,7 @@ void MainWindow::ApplyGlobalVideoPassthroughPreferences() {
         LoadVideoBooleanSetting(L"DolbyVisionSystemPipelineExperimental").value_or(false);
     const int displayPeakBrightnessNits =
         LoadVideoDwordSetting(L"DisplayPeakBrightnessNits").value_or(0);
+    SetHardwareDecodeEnabled(hardwareDecode);
     SetFrameInterpolationEnabled(frameInterpolation);
     SetAutomaticDisplayFormat(autoDisplayFormat);
     if (!autoDisplayFormat) {

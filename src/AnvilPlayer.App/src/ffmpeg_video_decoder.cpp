@@ -2784,18 +2784,15 @@ bool FfmpegVideoDecoder::OpenVideoDecoder(const AVCodec* codec,
 
     if (preferHardwareDecode_) {
         hardwareConfigured = ConfigureD3D12VA(codec, codecCtx, hwDeviceCtx);
+        if (!hardwareConfigured) {
+            // The native D3D12 compositor also accepts CPU BGRA frames. Keep
+            // playback available when the codec or driver has no D3D12VA path.
+            preferHardwareDecode_ = false;
+        }
     } else {
         SetDecodeBackend(L"ffmpeg_software", false, {});
         LogThread(LogLevel::Info, L"decoder",
                   L"selected=ffmpeg_software reason=hardware_decode_not_requested");
-    }
-
-    if (preferHardwareDecode_ && !hardwareConfigured) {
-        LogThread(LogLevel::Error,
-                  L"decoder",
-                  L"d3d12va required; refusing CPU pixel fallback");
-        avcodec_free_context(&codecCtx);
-        return false;
     }
 
     int openError = avcodec_open2(codecCtx, codec, nullptr);
@@ -2821,7 +2818,7 @@ bool FfmpegVideoDecoder::OpenVideoDecoder(const AVCodec* codec,
 
     const std::wstring hardwareName = L"d3d12va";
     const std::wstring reason = hardwareName + L"_open_failed:" + FfmpegErrorString(openError);
-    LogThread(LogLevel::Error, L"decoder", L"selected=d3d12va failure=" + reason);
+    LogThread(LogLevel::Warning, L"decoder", L"fallback=ffmpeg_software reason=" + reason);
     SetDecodeBackend(L"ffmpeg_software", false, reason);
     avcodec_free_context(&codecCtx);
     if (hwDeviceCtx) {
@@ -2831,7 +2828,20 @@ bool FfmpegVideoDecoder::OpenVideoDecoder(const AVCodec* codec,
     hardwareDecodeActive_ = false;
     hardwareFormatLogged_ = false;
     zeroCopyFallbackLogged_ = false;
-    return false;
+    preferHardwareDecode_ = false;
+
+    codecCtx = AllocateVideoCodecContext(codec, codecpar);
+    if (!codecCtx) {
+        return false;
+    }
+    openError = avcodec_open2(codecCtx, codec, nullptr);
+    if (openError < 0) {
+        LogThreadError(L"software avcodec_open2 failed: " + FfmpegErrorString(openError));
+        avcodec_free_context(&codecCtx);
+        return false;
+    }
+    LogThread(LogLevel::Info, L"decoder", L"selected=ffmpeg_software fallback_from=d3d12va");
+    return true;
 }
 
 bool FfmpegVideoDecoder::OpenDolbyVisionEnhancementDecoder(AVFormatContext* formatCtx,
@@ -4299,14 +4309,6 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
             return PublishPreparedDolbyVisionFrame(std::move(textureFrame));
         }
 
-        if (sharedD3D12Device_) {
-            LogThread(LogLevel::Error,
-                      L"decoder",
-                      L"d3d12va_zero_copy_failed reason=surface_export_failed "
-                      L"cpu_transfer_disabled=true");
-            return false;
-        }
-
         if (!softwareFrame) {
             LogThread(LogLevel::Warning,
                       L"decoder",
@@ -4343,15 +4345,6 @@ bool FfmpegVideoDecoder::PublishFrame(AVFrame* frame, AVFrame* softwareFrame, Sw
     }
 
     frame = conversionFrame;
-    if (sharedD3D12Device_ && preferHardwareDecode_ &&
-        frame->format != hardwarePixelFormat_) {
-        LogThread(LogLevel::Error,
-                  L"decoder",
-                  L"d3d12_native_pipeline_failed reason=software_frame_received "
-                  L"cpu_pixel_path_disabled=true format=" +
-                      PixelFormatName(static_cast<AVPixelFormat>(frame->format)));
-        return false;
-    }
     const int srcW = frame->width;
     const int srcH = frame->height;
     if (srcW <= 0 || srcH <= 0) {

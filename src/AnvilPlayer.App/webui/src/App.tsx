@@ -91,6 +91,8 @@ const en = {
   audio: 'Audio',
   resolution: 'Resolution',
   frameRate: 'Frame rate',
+  hardwareDecode: 'Hardware decoding',
+  hardwareDecodeHint: 'Use D3D12VA when available. Turn off to force FFmpeg software decoding; changing this restarts the video session.',
   frameInterpolation: 'GPU frame interpolation',
   frameInterpolationHint: 'HDR-aware adaptive cadence matched to the display · current video',
   frameInterpolationActual: 'Actual',
@@ -190,6 +192,8 @@ const en = {
 } as const
 
 const zh: Record<keyof typeof en, string> = {
+  hardwareDecode: '硬件解码',
+  hardwareDecodeHint: '开启时优先使用 D3D12VA；关闭时强制使用 FFmpeg 软件解码。切换会重启当前视频会话。',
   appTitle: 'Anvil Player',
   none: '无',
   noMediaLoaded: '未加载媒体',
@@ -1428,6 +1432,14 @@ function InspectorContent({
           <SlidersHorizontal size={15} />
           <span>{t.settings}</span>
         </div>
+        <PassthroughSetting
+          label={t.hardwareDecode}
+          hint={t.hardwareDecodeHint}
+          enabled={state.hardwareDecodeEnabled}
+          available
+          onChange={(enabled) => postNativeCommand({ type: 'command', command: 'setHardwareDecode', enabled })}
+          t={t}
+        />
         <PassthroughSetting
           label={t.autoDisplayFormat}
           hint={t.autoDisplayFormatHint}

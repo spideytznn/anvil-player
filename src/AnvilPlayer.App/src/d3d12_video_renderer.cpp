@@ -2,6 +2,8 @@
 
 #include "AnvilPlayer/App/string_util.h"
 
+#include <gdiplus.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -17,6 +19,7 @@ namespace {
 
 using anvil::playback::HdrOutputMode;
 using anvil::playback::LogLevel;
+using anvil::playback::ToneMappingMode;
 using anvil::playback::VideoColorPrimaries;
 using anvil::playback::VideoColorRange;
 using anvil::playback::VideoMatrixCoefficients;
@@ -132,6 +135,38 @@ UINT TransferMode(const VideoTransferCharacteristic transfer) {
     if (transfer == VideoTransferCharacteristic::Pq) return 2;
     if (transfer == VideoTransferCharacteristic::Hlg) return 3;
     return 1;
+}
+
+UINT ToneMappingModeBits(const ToneMappingMode mode) noexcept {
+    UINT value = 1;
+    switch (mode) {
+    case ToneMappingMode::Auto:
+        value = 0;
+        break;
+    case ToneMappingMode::Balanced:
+        value = 1;
+        break;
+    case ToneMappingMode::PreserveHighlights:
+        value = 2;
+        break;
+    case ToneMappingMode::BrightRoom:
+        value = 3;
+        break;
+    }
+    // modes.w bit 0 is high bit depth and bit 1 is BT.2020. Preserve that
+    // layout and carry the user tone-map selection in bits 2-3.
+    return value << 2;
+}
+
+int CountSubtitleLines(const std::wstring& text) noexcept {
+    return text.empty()
+        ? 0
+        : static_cast<int>(std::count(text.begin(), text.end(), L'\n')) + 1;
+}
+
+bool SameViewport(const D3D12_VIEWPORT& lhs, const D3D12_VIEWPORT& rhs) noexcept {
+    return lhs.TopLeftX == rhs.TopLeftX && lhs.TopLeftY == rhs.TopLeftY &&
+           lhs.Width == rhs.Width && lhs.Height == rhs.Height;
 }
 
 float SourcePeakNits(const anvil::playback::VideoColorMetadata& color) {
@@ -469,8 +504,12 @@ void D3D12VideoRenderer::ConfigureColorPipeline(
 
 void D3D12VideoRenderer::ConfigureSubtitleSettings(
     const anvil::playback::SubtitleSettings& settings) {
-    std::scoped_lock lock(commandMutex_);
-    subtitleSettings_ = settings;
+    {
+        std::scoped_lock lock(commandMutex_);
+        subtitleSettings_ = settings;
+        pendingPresent_ = true;
+    }
+    commandCv_.notify_one();
 }
 
 void D3D12VideoRenderer::ConfigureUiOverlay(
@@ -640,6 +679,7 @@ void D3D12VideoRenderer::RenderThreadMain() {
             resetInterpolation = std::exchange(pendingInterpolationReset_, false);
             retiredFrames_.clear();
             activeOverlaySlots_ = overlaySlots_;
+            activeSubtitleSettings_ = subtitleSettings_;
         }
 
         if (resetInterpolation) {
@@ -893,19 +933,56 @@ bool D3D12VideoRenderer::CreateSwapChain(const UINT width, const UINT height) {
     desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     desc.Scaling = DXGI_SCALING_STRETCH;
     desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-    desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
     Microsoft::WRL::ComPtr<IDXGISwapChain1> swapChain1;
-    HRESULT createResult = factory_->CreateSwapChainForHwnd(
-        queue_.Get(), host_.load(), &desc, nullptr, nullptr, &swapChain1);
-    swapChainWaitable_ = SUCCEEDED(createResult);
-    if (FAILED(createResult)) {
+    const auto resetComposition = [this, &swapChain1]() {
+        swapChain1.Reset();
+        swapChain_.Reset();
+        compositionVisual_.Reset();
+        compositionTarget_.Reset();
+        compositionDevice_.Reset();
+        useComposition_ = false;
+    };
+    const auto tryComposition = [&](const UINT flags) {
+        desc.Flags = flags;
+        HRESULT result = factory_->CreateSwapChainForComposition(
+            queue_.Get(), &desc, nullptr, &swapChain1);
+        if (FAILED(result) || FAILED(swapChain1.As(&swapChain_)) ||
+            !CreateComposition()) {
+            resetComposition();
+            return false;
+        }
+        useComposition_ = true;
+        swapChainWaitable_ =
+            (flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) != 0;
+        Log(LogLevel::Info,
+            L"d3d12 swap chain created path=direct_composition waitable=" +
+                std::wstring(swapChainWaitable_ ? L"true" : L"false"));
+        return true;
+    };
+    bool created =
+        tryComposition(DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) ||
+        tryComposition(0);
+    HRESULT createResult = S_OK;
+    if (!created) {
+        resetComposition();
+        desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        createResult = factory_->CreateSwapChainForHwnd(
+            queue_.Get(), host_.load(), &desc, nullptr, nullptr, &swapChain1);
+        swapChainWaitable_ = SUCCEEDED(createResult);
+    }
+    if (!created && FAILED(createResult)) {
         desc.Flags = 0;
         swapChain1.Reset();
         createResult = factory_->CreateSwapChainForHwnd(
             queue_.Get(), host_.load(), &desc, nullptr, nullptr, &swapChain1);
     }
-    if (FAILED(createResult) || FAILED(swapChain1.As(&swapChain_))) {
+    if (!created &&
+        (FAILED(createResult) || FAILED(swapChain1.As(&swapChain_)))) {
         return false;
+    }
+    if (!created) {
+        Log(LogLevel::Warning,
+            L"d3d12 DirectComposition unavailable; native P010 HLG presentation disabled");
     }
     ConfigureFramePacing();
     factory_->MakeWindowAssociation(host_.load(), DXGI_MWA_NO_ALT_ENTER);
@@ -964,6 +1041,665 @@ bool D3D12VideoRenderer::CreateSwapChain(const UINT width, const UINT height) {
         rtv.ptr += rtvIncrement_;
     }
     return CreateLibplaceboTargets(width, height);
+}
+
+bool D3D12VideoRenderer::CreateComposition() {
+    const HWND window = host_.load(std::memory_order_acquire);
+    if (!swapChain_ || !window || !IsWindow(window)) return false;
+    // This device only owns visuals and swap-chain content. Passing nullptr is
+    // the most compatible option for a D3D12 renderer because the original
+    // DCompositionCreateDevice entry point accepts only IDXGIDevice (D3D11).
+    HRESULT result = DCompositionCreateDevice(
+        nullptr, IID_PPV_ARGS(&compositionDevice_));
+    if (FAILED(result) || !compositionDevice_) return false;
+    result = compositionDevice_->CreateTargetForHwnd(
+        window, TRUE, &compositionTarget_);
+    if (FAILED(result) || !compositionTarget_) return false;
+    result = compositionDevice_->CreateVisual(&compositionVisual_);
+    if (FAILED(result) || !compositionVisual_) return false;
+    result = compositionVisual_->SetContent(swapChain_.Get());
+    if (FAILED(result)) return false;
+    result = compositionTarget_->SetRoot(compositionVisual_.Get());
+    if (FAILED(result)) return false;
+    return SUCCEEDED(compositionDevice_->Commit());
+}
+
+bool D3D12VideoRenderer::EnsureHlgPresentationResources(
+    const UINT width,
+    const UINT height,
+    const DXGI_COLOR_SPACE_TYPE requestedColorSpace) {
+    hlgInitializationAttempted_ = true;
+    if (!useComposition_ || !compositionDevice_ || !compositionVisual_ ||
+        !device_ || !adapter_ || width == 0 || height == 0) {
+        return false;
+    }
+    const bool compatibleColorSpace =
+        hlgColorSpace_ == requestedColorSpace ||
+        (requestedColorSpace ==
+                 DXGI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020 &&
+         !hlgFullColorSpaceSupported_ && hlgStudioColorSpaceSupported_) ||
+        (requestedColorSpace ==
+                 DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020 &&
+         !hlgStudioColorSpaceSupported_ && hlgFullColorSpaceSupported_);
+    if (hlgSwapChain_ && hlgVideoProcessor_ && hlgSharedRgbResource_ &&
+        hlgWidth_ == ((width + 1u) & ~1u) &&
+        hlgHeight_ == ((height + 1u) & ~1u) &&
+        compatibleColorSpace) {
+        return true;
+    }
+    ReleaseHlgPresentationResources();
+
+    hlgWidth_ = (width + 1u) & ~1u;
+    hlgHeight_ = (height + 1u) & ~1u;
+
+    D3D_FEATURE_LEVEL featureLevels[]{
+        D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+    D3D_FEATURE_LEVEL obtainedFeatureLevel{};
+    HRESULT result = D3D11CreateDevice(
+        adapter_.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+        featureLevels, static_cast<UINT>(std::size(featureLevels)),
+        D3D11_SDK_VERSION, &hlgD3D11Device_, &obtainedFeatureLevel,
+        &hlgD3D11Context_);
+    if (FAILED(result) || !hlgD3D11Device_ || !hlgD3D11Context_ ||
+        FAILED(hlgD3D11Context_.As(&hlgD3D11Context4_)) ||
+        FAILED(hlgD3D11Device_.As(&hlgD3D11VideoDevice_)) ||
+        FAILED(hlgD3D11Context_.As(&hlgD3D11VideoContext_))) {
+        Log(LogLevel::Warning,
+            L"HLG native unavailable reason=native_d3d11_video_device");
+        ReleaseHlgPresentationResources();
+        return false;
+    }
+
+    DXGI_SWAP_CHAIN_DESC1 desc{};
+    desc.Width = hlgWidth_;
+    desc.Height = hlgHeight_;
+    desc.Format = DXGI_FORMAT_P010;
+    desc.SampleDesc.Count = 1;
+    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    desc.BufferCount = kBufferCount;
+    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+    desc.Scaling = DXGI_SCALING_STRETCH;
+    desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+    desc.Flags = DXGI_SWAP_CHAIN_FLAG_YUV_VIDEO |
+                 DXGI_SWAP_CHAIN_FLAG_FULLSCREEN_VIDEO;
+
+    const auto logSwapChainResult = [this](
+                                       const wchar_t* path,
+                                       const DXGI_SWAP_CHAIN_DESC1& candidate,
+                                       const HRESULT createResult,
+                                       const HRESULT interfaceResult) {
+        std::wostringstream message;
+        message << L"HLG P010 swap chain path=" << path
+                << L" flags=0x" << std::hex << candidate.Flags
+                << L" alpha=" << std::dec << candidate.AlphaMode
+                << L" create=0x" << std::hex
+                << static_cast<unsigned long>(createResult)
+                << L" interface=0x"
+                << static_cast<unsigned long>(interfaceResult);
+        Log(FAILED(createResult) || FAILED(interfaceResult)
+                ? LogLevel::Warning
+                : LogLevel::Info,
+            message.str());
+    };
+    const auto adoptSwapChain = [&](const wchar_t* path,
+                                    const DXGI_SWAP_CHAIN_DESC1& candidate,
+                                    const HRESULT createResult,
+                                    IDXGISwapChain1* swapChain) {
+        HRESULT interfaceResult = E_NOINTERFACE;
+        if (SUCCEEDED(createResult) && swapChain) {
+            interfaceResult = swapChain->QueryInterface(
+                IID_PPV_ARGS(&hlgSwapChain_));
+        }
+        logSwapChainResult(
+            path, candidate, createResult, interfaceResult);
+        if (FAILED(createResult) || FAILED(interfaceResult)) {
+            hlgSwapChain_.Reset();
+            return false;
+        }
+        return true;
+    };
+    const auto createMediaSwapChain = [&](IDXGIFactoryMedia* factoryMedia,
+                                          const wchar_t* path) {
+        Microsoft::WRL::ComPtr<IDXGISwapChain1> swapChain;
+        const HRESULT createResult =
+            factoryMedia->CreateSwapChainForCompositionSurfaceHandle(
+                hlgD3D11Device_.Get(), hlgCompositionSurfaceHandle_, &desc,
+                nullptr, &swapChain);
+        return adoptSwapChain(path, desc, createResult, swapChain.Get());
+    };
+
+    Microsoft::WRL::ComPtr<IDXGIFactoryMedia> factoryMedia;
+    result = adapter_->GetParent(IID_PPV_ARGS(&factoryMedia));
+    if (FAILED(result) || !factoryMedia) {
+        Log(LogLevel::Warning,
+            L"HLG native unavailable reason=dxgi_factory_media");
+        ReleaseHlgPresentationResources();
+        return false;
+    }
+    result = DCompositionCreateSurfaceHandle(
+        COMPOSITIONOBJECT_ALL_ACCESS, nullptr,
+        &hlgCompositionSurfaceHandle_);
+    if (FAILED(result) || !hlgCompositionSurfaceHandle_) {
+        hlgCompositionSurfaceHandle_ = nullptr;
+        Log(LogLevel::Warning,
+            L"HLG native unavailable reason=composition_surface_handle");
+        ReleaseHlgPresentationResources();
+        return false;
+    }
+    bool mediaSwapChain = createMediaSwapChain(
+        factoryMedia.Get(), L"native_d3d11_media_fullscreen_yuv");
+    if (!mediaSwapChain) {
+        desc.Flags = DXGI_SWAP_CHAIN_FLAG_YUV_VIDEO;
+        mediaSwapChain = createMediaSwapChain(
+            factoryMedia.Get(), L"native_d3d11_media_yuv");
+    }
+    if (!mediaSwapChain) {
+        desc.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
+        mediaSwapChain = createMediaSwapChain(
+            factoryMedia.Get(), L"native_d3d11_media_yuv_unspecified_alpha");
+    }
+    if (!mediaSwapChain || !hlgSwapChain_) {
+        Log(LogLevel::Warning,
+            L"HLG native unavailable reason=p010_native_d3d11_media_swap_chain");
+        ReleaseHlgPresentationResources();
+        return false;
+    }
+    result = compositionDevice_->CreateSurfaceFromHandle(
+        hlgCompositionSurfaceHandle_, &hlgCompositionSurface_);
+    if (FAILED(result) || !hlgCompositionSurface_) {
+        Log(LogLevel::Warning,
+            L"HLG native unavailable reason=composition_surface_import");
+        ReleaseHlgPresentationResources();
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<IDXGIOutput4> targetOutput4;
+    const HWND host = host_.load(std::memory_order_acquire);
+    const HMONITOR targetMonitor = host
+                                       ? MonitorFromWindow(
+                                             host, MONITOR_DEFAULTTONEAREST)
+                                       : nullptr;
+    for (UINT outputIndex = 0;; ++outputIndex) {
+        Microsoft::WRL::ComPtr<IDXGIOutput> candidate;
+        if (adapter_->EnumOutputs(outputIndex, &candidate) ==
+            DXGI_ERROR_NOT_FOUND) {
+            break;
+        }
+        DXGI_OUTPUT_DESC outputDesc{};
+        if (!candidate || FAILED(candidate->GetDesc(&outputDesc)) ||
+            (targetMonitor && outputDesc.Monitor != targetMonitor)) {
+            continue;
+        }
+        candidate.As(&targetOutput4);
+        break;
+    }
+    const auto colorSpaceSupported = [this, &targetOutput4](
+                                         const DXGI_COLOR_SPACE_TYPE colorSpace) {
+        UINT swapSupport = 0;
+        const HRESULT swapResult =
+            hlgSwapChain_->CheckColorSpaceSupport(colorSpace, &swapSupport);
+        UINT overlaySupport = 0;
+        const HRESULT overlayResult = targetOutput4
+                                          ? targetOutput4->CheckOverlayColorSpaceSupport(
+                                                DXGI_FORMAT_P010, colorSpace,
+                                                hlgD3D11Device_.Get(),
+                                                &overlaySupport)
+                                          : E_NOINTERFACE;
+        constexpr UINT kPresentSupport =
+            DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT |
+            DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_OVERLAY_PRESENT;
+        const bool supported =
+            (SUCCEEDED(swapResult) &&
+             (swapSupport & kPresentSupport) != 0) ||
+            (SUCCEEDED(overlayResult) &&
+             (overlaySupport &
+              DXGI_OVERLAY_COLOR_SPACE_SUPPORT_FLAG_PRESENT) != 0);
+        std::wostringstream message;
+        message << L"HLG color space=" << colorSpace
+                << L" swap=0x" << std::hex << swapSupport
+                << L" swap_hr=0x"
+                << static_cast<unsigned long>(swapResult)
+                << L" overlay=0x" << overlaySupport
+                << L" overlay_hr=0x"
+                << static_cast<unsigned long>(overlayResult)
+                << L" supported=" << std::boolalpha << supported;
+        Log(LogLevel::Info, message.str());
+        return supported;
+    };
+    hlgStudioColorSpaceSupported_ = colorSpaceSupported(
+        DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020);
+    hlgFullColorSpaceSupported_ = colorSpaceSupported(
+        DXGI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020);
+    if (!hlgStudioColorSpaceSupported_ && !hlgFullColorSpaceSupported_) {
+        // A few drivers under-report media-overlay color spaces. A successful
+        // SetColorSpace1 is authoritative and lets those drivers continue;
+        // failures retain the conservative HDR10 fallback.
+        const HRESULT probeResult =
+            hlgSwapChain_->SetColorSpace1(requestedColorSpace);
+        std::wostringstream message;
+        message << L"HLG color space direct probe value="
+                << requestedColorSpace << L" hr=0x" << std::hex
+                << static_cast<unsigned long>(probeResult);
+        Log(SUCCEEDED(probeResult) ? LogLevel::Info : LogLevel::Warning,
+            message.str());
+        if (SUCCEEDED(probeResult)) {
+            hlgStudioColorSpaceSupported_ =
+                requestedColorSpace ==
+                DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020;
+            hlgFullColorSpaceSupported_ =
+                requestedColorSpace ==
+                DXGI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020;
+        } else {
+            Log(LogLevel::Warning,
+                L"HLG native unavailable reason=hlg_color_space_support");
+            ReleaseHlgPresentationResources();
+            return false;
+        }
+    }
+    hlgColorSpace_ =
+        requestedColorSpace == DXGI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020 &&
+                hlgFullColorSpaceSupported_
+            ? requestedColorSpace
+            : (hlgStudioColorSpaceSupported_
+                   ? DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020
+                   : DXGI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020);
+    if (FAILED(hlgSwapChain_->SetColorSpace1(hlgColorSpace_))) {
+        ReleaseHlgPresentationResources();
+        return false;
+    }
+
+    D3D12_HEAP_PROPERTIES sharedHeap{};
+    sharedHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC sharedDesc{};
+    sharedDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    sharedDesc.Width = width;
+    sharedDesc.Height = height;
+    sharedDesc.DepthOrArraySize = 1;
+    sharedDesc.MipLevels = 1;
+    sharedDesc.Format = kCompositionFormat;
+    sharedDesc.SampleDesc.Count = 1;
+    sharedDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    sharedDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    result = device_->CreateCommittedResource(
+        &sharedHeap, D3D12_HEAP_FLAG_SHARED, &sharedDesc,
+        D3D12_RESOURCE_STATE_COMMON, nullptr,
+        IID_PPV_ARGS(&hlgSharedRgbResource_));
+    if (FAILED(result)) {
+        std::wostringstream message;
+        message << L"HLG native unavailable reason=shared_rgb10_resource hr=0x"
+                << std::hex << static_cast<unsigned long>(result);
+        Log(LogLevel::Warning,
+            message.str());
+        ReleaseHlgPresentationResources();
+        return false;
+    }
+    HANDLE sharedTextureHandle = nullptr;
+    result = device_->CreateSharedHandle(
+        hlgSharedRgbResource_.Get(), nullptr, GENERIC_ALL,
+        nullptr, &sharedTextureHandle);
+    Microsoft::WRL::ComPtr<ID3D11Device1> d3d11Device1;
+    if (SUCCEEDED(result)) result = hlgD3D11Device_.As(&d3d11Device1);
+    if (SUCCEEDED(result) && sharedTextureHandle) {
+        result = d3d11Device1->OpenSharedResource1(
+            sharedTextureHandle, IID_PPV_ARGS(&hlgSharedRgbTexture_));
+    }
+    if (sharedTextureHandle) CloseHandle(sharedTextureHandle);
+    if (FAILED(result) || !hlgSharedRgbTexture_) {
+        Log(LogLevel::Warning,
+            L"HLG native unavailable reason=open_shared_rgb10_in_d3d11");
+        ReleaseHlgPresentationResources();
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<ID3D11Device5> d3d11Device5;
+    HANDLE sharedFenceHandle = nullptr;
+    result = device_->CreateFence(
+        0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&hlgSharedFence12_));
+    if (SUCCEEDED(result)) {
+        result = device_->CreateSharedHandle(
+            hlgSharedFence12_.Get(), nullptr, GENERIC_ALL,
+            nullptr, &sharedFenceHandle);
+    }
+    if (SUCCEEDED(result)) result = hlgD3D11Device_.As(&d3d11Device5);
+    if (SUCCEEDED(result) && d3d11Device5 && sharedFenceHandle) {
+        result = d3d11Device5->OpenSharedFence(
+            sharedFenceHandle, IID_PPV_ARGS(&hlgSharedFence11_));
+    }
+    if (sharedFenceHandle) CloseHandle(sharedFenceHandle);
+    if (FAILED(result) || !hlgSharedFence12_ || !hlgSharedFence11_) {
+        Log(LogLevel::Warning,
+            L"HLG native unavailable reason=d3d11_d3d12_shared_fence");
+        ReleaseHlgPresentationResources();
+        return false;
+    }
+
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC content{};
+    content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+    content.InputFrameRate = {60, 1};
+    content.InputWidth = width;
+    content.InputHeight = height;
+    content.OutputFrameRate = {60, 1};
+    content.OutputWidth = hlgWidth_;
+    content.OutputHeight = hlgHeight_;
+    content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+    result = hlgD3D11VideoDevice_->CreateVideoProcessorEnumerator(
+        &content, &hlgVideoProcessorEnumerator_);
+    UINT inputSupport = 0;
+    UINT outputSupport = 0;
+    if (SUCCEEDED(result)) {
+        result = hlgVideoProcessorEnumerator_->CheckVideoProcessorFormat(
+            kCompositionFormat, &inputSupport);
+    }
+    if (SUCCEEDED(result)) {
+        result = hlgVideoProcessorEnumerator_->CheckVideoProcessorFormat(
+            DXGI_FORMAT_P010, &outputSupport);
+    }
+    if (FAILED(result) ||
+        (inputSupport & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT) == 0 ||
+        (outputSupport & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT) == 0 ||
+        FAILED(hlgD3D11VideoDevice_->CreateVideoProcessor(
+            hlgVideoProcessorEnumerator_.Get(), 0, &hlgVideoProcessor_))) {
+        Log(LogLevel::Warning,
+            L"HLG native unavailable reason=native_d3d11_video_processor");
+        ReleaseHlgPresentationResources();
+        return false;
+    }
+
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inputViewDesc{};
+    inputViewDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+    result = hlgD3D11VideoDevice_->CreateVideoProcessorInputView(
+        hlgSharedRgbTexture_.Get(), hlgVideoProcessorEnumerator_.Get(),
+        &inputViewDesc, &hlgVideoInputView_);
+    if (SUCCEEDED(result)) {
+        result = hlgSwapChain_->GetBuffer(
+            0, IID_PPV_ARGS(&hlgD3D11BackBuffer_));
+    }
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC outputViewDesc{};
+    outputViewDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+    if (SUCCEEDED(result)) {
+        result = hlgD3D11VideoDevice_->CreateVideoProcessorOutputView(
+            hlgD3D11BackBuffer_.Get(), hlgVideoProcessorEnumerator_.Get(),
+            &outputViewDesc, &hlgVideoOutputView_);
+    }
+    if (FAILED(result) || !hlgVideoInputView_ || !hlgVideoOutputView_) {
+        Log(LogLevel::Warning,
+            L"HLG native unavailable reason=native_d3d11_video_processor_views");
+        ReleaseHlgPresentationResources();
+        return false;
+    }
+
+    for (UINT index = 0; index < kBufferCount; ++index) {
+        if (FAILED(device_->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                IID_PPV_ARGS(&hlgAllocators_[index])))) {
+            ReleaseHlgPresentationResources();
+            return false;
+        }
+    }
+    if (FAILED(device_->CreateCommandList(
+            0, D3D12_COMMAND_LIST_TYPE_DIRECT, hlgAllocators_[0].Get(),
+            nullptr, IID_PPV_ARGS(&hlgCopyCommandList_)))) {
+        ReleaseHlgPresentationResources();
+        return false;
+    }
+    hlgCopyCommandList_->Close();
+    hlgSharedFenceValue_ = 1;
+    hlgSharedAvailableFenceValue_ = 0;
+    Log(LogLevel::Info,
+        L"HLG native ready path=d3d12_rgb10_subtitle_ui_shared_to_native_d3d11_p010_present color_space=" +
+            std::wstring(
+                hlgColorSpace_ ==
+                        DXGI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020
+                    ? L"ycbcr_full_hlg_bt2020"
+                    : L"ycbcr_studio_hlg_bt2020"));
+    return true;
+}
+
+void D3D12VideoRenderer::ReleaseHlgPresentationResources() {
+    if (hlgCompositionSelected_) SelectCompositionSwapChain(false);
+    if (fence_ && fenceEvent_) {
+        for (UINT index = 0; index < kBufferCount; ++index) {
+            WaitForHlgBackBuffer(index);
+        }
+    }
+    if (hlgSharedFence12_ && fenceEvent_ &&
+        hlgSharedAvailableFenceValue_ != 0 &&
+        hlgSharedFence12_->GetCompletedValue() <
+            hlgSharedAvailableFenceValue_ &&
+        SUCCEEDED(hlgSharedFence12_->SetEventOnCompletion(
+            hlgSharedAvailableFenceValue_, fenceEvent_))) {
+        WaitForSingleObject(fenceEvent_, 2000);
+    }
+    hlgCopyCommandList_.Reset();
+    for (auto& allocator : hlgAllocators_) allocator.Reset();
+    hlgBufferFenceValues_.fill(0);
+    hlgVideoOutputView_.Reset();
+    hlgVideoInputView_.Reset();
+    hlgVideoProcessor_.Reset();
+    hlgVideoProcessorEnumerator_.Reset();
+    hlgD3D11BackBuffer_.Reset();
+    hlgSharedRgbResource_.Reset();
+    hlgSharedRgbTexture_.Reset();
+    hlgSharedFence11_.Reset();
+    hlgSharedFence12_.Reset();
+    hlgSwapChain_.Reset();
+    hlgCompositionSurface_.Reset();
+    if (hlgCompositionSurfaceHandle_) {
+        CloseHandle(hlgCompositionSurfaceHandle_);
+        hlgCompositionSurfaceHandle_ = nullptr;
+    }
+    hlgD3D11VideoContext_.Reset();
+    hlgD3D11VideoDevice_.Reset();
+    hlgD3D11Context4_.Reset();
+    hlgD3D11Context_.Reset();
+    hlgD3D11Device_.Reset();
+    hlgSharedFenceValue_ = 1;
+    hlgSharedAvailableFenceValue_ = 0;
+    hlgWidth_ = 0;
+    hlgHeight_ = 0;
+    hlgStudioColorSpaceSupported_ = false;
+    hlgFullColorSpaceSupported_ = false;
+    hlgCompositionSelected_ = false;
+    nativeHlgComposition_ = false;
+}
+
+bool D3D12VideoRenderer::WantsNativeHlgOutput(
+    const NativeVideoFrame& frame) {
+    if (!videoSettings_.displayMetadataPassthrough ||
+        videoSettings_.hdrOutput == HdrOutputMode::ForceSdr ||
+        videoSettings_.frameInterpolationEnabled ||
+        frame.color.transfer != VideoTransferCharacteristic::Hlg ||
+        frame.color.primaries != VideoColorPrimaries::Bt2020 ||
+        !useComposition_) {
+        nativeHlgComposition_ = false;
+        return false;
+    }
+    const DXGI_COLOR_SPACE_TYPE requested =
+        frame.color.range == VideoColorRange::Full
+            ? DXGI_COLOR_SPACE_YCBCR_FULL_GHLG_TOPLEFT_P2020
+            : DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020;
+    if (hlgInitializationAttempted_ && !hlgSwapChain_) {
+        nativeHlgComposition_ = false;
+        return false;
+    }
+    const bool ready = EnsureHlgPresentationResources(width_, height_, requested);
+    nativeHlgComposition_ = ready;
+    if (!ready && !hlgFailureLogged_) {
+        hlgFailureLogged_ = true;
+        Log(LogLevel::Warning,
+            L"HLG native passthrough unavailable fallback=rgb10_hdr10");
+    }
+    return ready;
+}
+
+bool D3D12VideoRenderer::SelectCompositionSwapChain(const bool hlg) {
+    if (!useComposition_) return !hlg;
+    if (!compositionVisual_ || !compositionDevice_) return false;
+    if (hlgCompositionSelected_ == hlg) return true;
+    IUnknown* selected = nullptr;
+    if (hlg) {
+        selected = hlgCompositionSurface_
+                       ? static_cast<IUnknown*>(hlgCompositionSurface_.Get())
+                       : static_cast<IUnknown*>(hlgSwapChain_.Get());
+    } else {
+        selected = static_cast<IUnknown*>(swapChain_.Get());
+    }
+    if (!selected || FAILED(compositionVisual_->SetContent(selected)) ||
+        FAILED(compositionDevice_->Commit())) {
+        return false;
+    }
+    hlgCompositionSelected_ = hlg;
+    Log(LogLevel::Info,
+        L"d3d12 composition content=" +
+            std::wstring(hlg ? L"hlg_p010" : L"rgb10"));
+    return true;
+}
+
+bool D3D12VideoRenderer::PresentComposedFrame(
+    const UINT backBufferIndex,
+    const GpuFencePoint& graphicsCompletion,
+    const bool nativeHlg) {
+    if (!nativeHlg) {
+        nativeHlgComposition_ = false;
+        if (!SelectCompositionSwapChain(false)) return false;
+        const HRESULT presentResult = swapChain_->Present(1, 0);
+        if (FAILED(presentResult)) {
+            return !DeviceLost(presentResult, L"Present");
+        }
+        const uint64_t fenceValue = nextFenceValue_++;
+        if (FAILED(queue_->Signal(fence_.Get(), fenceValue))) return false;
+        bufferFenceValues_[backBufferIndex] = fenceValue;
+        return true;
+    }
+    if (!hlgSwapChain_ || !hlgVideoProcessor_ || !hlgCopyCommandList_ ||
+        !hlgSharedRgbResource_ || !hlgSharedFence12_ ||
+        !hlgSharedFence11_ || !hlgD3D11Context4_ ||
+        !hlgD3D11VideoContext_ || !hlgVideoInputView_ ||
+        !hlgVideoOutputView_ || !graphicsCompletion.IsValid()) {
+        return false;
+    }
+    if (backBufferIndex >= kBufferCount ||
+        !WaitForHlgBackBuffer(backBufferIndex)) {
+        Log(LogLevel::Warning,
+            L"HLG native present failed reason=copy_allocator_wait");
+        return false;
+    }
+    HRESULT hlgResult = queue_->Wait(
+        graphicsCompletion.fence.Get(), graphicsCompletion.value);
+    if (SUCCEEDED(hlgResult) && hlgSharedAvailableFenceValue_ != 0) {
+        hlgResult = queue_->Wait(
+            hlgSharedFence12_.Get(), hlgSharedAvailableFenceValue_);
+    }
+    if (SUCCEEDED(hlgResult)) {
+        hlgResult = hlgAllocators_[backBufferIndex]->Reset();
+    }
+    if (SUCCEEDED(hlgResult)) {
+        hlgResult = hlgCopyCommandList_->Reset(
+            hlgAllocators_[backBufferIndex].Get(), nullptr);
+    }
+    if (FAILED(hlgResult)) {
+        std::wostringstream message;
+        message << L"HLG native present failed reason=copy_setup hr=0x"
+                << std::hex << static_cast<unsigned long>(hlgResult);
+        Log(LogLevel::Warning, message.str());
+        return false;
+    }
+    const std::array beginBarriers{
+        TransitionBarrier(
+            hlgSharedRgbResource_.Get(),
+            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_COPY_DEST)};
+    hlgCopyCommandList_->ResourceBarrier(
+        static_cast<UINT>(beginBarriers.size()), beginBarriers.data());
+    hlgCopyCommandList_->CopyResource(
+        hlgSharedRgbResource_.Get(), backBuffers_[backBufferIndex].Get());
+    const std::array endBarriers{
+        TransitionBarrier(
+            backBuffers_[backBufferIndex].Get(),
+            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_PRESENT),
+        TransitionBarrier(
+            hlgSharedRgbResource_.Get(),
+            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_COMMON)};
+    hlgCopyCommandList_->ResourceBarrier(
+        static_cast<UINT>(endBarriers.size()), endBarriers.data());
+    if (FAILED(hlgCopyCommandList_->Close())) return false;
+    ID3D12CommandList* commandLists[]{hlgCopyCommandList_.Get()};
+    queue_->ExecuteCommandLists(1, commandLists);
+    const uint64_t rgbReadyFenceValue = hlgSharedFenceValue_++;
+    const uint64_t copyFenceValue = nextFenceValue_++;
+    hlgResult = queue_->Signal(
+        hlgSharedFence12_.Get(), rgbReadyFenceValue);
+    if (SUCCEEDED(hlgResult)) {
+        hlgResult = queue_->Signal(fence_.Get(), copyFenceValue);
+    }
+    if (SUCCEEDED(hlgResult)) {
+        hlgResult = hlgD3D11Context4_->Wait(
+            hlgSharedFence11_.Get(), rgbReadyFenceValue);
+    }
+    if (FAILED(hlgResult)) {
+        std::wostringstream message;
+        message << L"HLG native present failed reason=cross_api_wait hr=0x"
+                << std::hex << static_cast<unsigned long>(hlgResult);
+        Log(LogLevel::Warning, message.str());
+        return false;
+    }
+
+    const RECT sourceRect{
+        0, 0, static_cast<LONG>(width_), static_cast<LONG>(height_)};
+    const RECT outputRect{
+        0, 0, static_cast<LONG>(hlgWidth_), static_cast<LONG>(hlgHeight_)};
+    hlgD3D11VideoContext_->VideoProcessorSetStreamFrameFormat(
+        hlgVideoProcessor_.Get(), 0,
+        D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+    hlgD3D11VideoContext_->VideoProcessorSetStreamSourceRect(
+        hlgVideoProcessor_.Get(), 0, TRUE, &sourceRect);
+    hlgD3D11VideoContext_->VideoProcessorSetStreamDestRect(
+        hlgVideoProcessor_.Get(), 0, TRUE, &outputRect);
+    hlgD3D11VideoContext_->VideoProcessorSetOutputTargetRect(
+        hlgVideoProcessor_.Get(), TRUE, &outputRect);
+    hlgD3D11VideoContext_->VideoProcessorSetStreamAutoProcessingMode(
+        hlgVideoProcessor_.Get(), 0, FALSE);
+    hlgD3D11VideoContext_->VideoProcessorSetStreamColorSpace1(
+        hlgVideoProcessor_.Get(), 0,
+        DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020);
+    hlgD3D11VideoContext_->VideoProcessorSetOutputColorSpace1(
+        hlgVideoProcessor_.Get(), hlgColorSpace_);
+    D3D11_VIDEO_PROCESSOR_STREAM stream{};
+    stream.Enable = TRUE;
+    stream.pInputSurface = hlgVideoInputView_.Get();
+    if (FAILED(hlgD3D11VideoContext_->VideoProcessorBlt(
+            hlgVideoProcessor_.Get(), hlgVideoOutputView_.Get(),
+            0, 1, &stream))) {
+        Log(LogLevel::Warning,
+            L"HLG native present failed reason=d3d11_video_processor_blt");
+        return false;
+    }
+    const uint64_t rgbConsumedFenceValue = hlgSharedFenceValue_++;
+    if (FAILED(hlgD3D11Context4_->Signal(
+            hlgSharedFence11_.Get(), rgbConsumedFenceValue))) {
+        Log(LogLevel::Warning,
+            L"HLG native present failed reason=cross_api_signal");
+        return false;
+    }
+    hlgSharedAvailableFenceValue_ = rgbConsumedFenceValue;
+    if (!SelectCompositionSwapChain(true)) {
+        Log(LogLevel::Warning,
+            L"HLG native present failed reason=composition_select");
+        return false;
+    }
+    const HRESULT presentResult = hlgSwapChain_->Present(1, 0);
+    if (FAILED(presentResult)) {
+        return !DeviceLost(presentResult, L"HLG Present");
+    }
+    bufferFenceValues_[backBufferIndex] = copyFenceValue;
+    hlgBufferFenceValues_[backBufferIndex] = copyFenceValue;
+    return true;
 }
 
 bool D3D12VideoRenderer::CreatePipeline() {
@@ -1086,10 +1822,14 @@ float3 linear_to_srgb(float3 v) {
 float3 sdr_tone_map_nits(float3 nits,float sourcePeak,float3 weights) {
     nits=max(nits,0.0);
     float luma=max(dot(nits,weights),0.000001);
-    float working=luma*0.80;
-    const float target=100.0,knee=45.0,shoulder=55.0;
-    if(working<=knee) return nits*0.80;
-    float peak=max(max(sourcePeak*0.80,working),target+1.0);
+    uint toneMapMode=(modes.w>>2)&3;
+    float exposure=toneMapMode==2?0.72:(toneMapMode==3?0.95:0.80);
+    float target=100.0;
+    float knee=target*(toneMapMode==2?0.40:(toneMapMode==3?0.55:0.45));
+    float shoulder=max(target-knee,0.0001);
+    float working=luma*exposure;
+    if(working<=knee) return nits*exposure;
+    float peak=max(max(sourcePeak*exposure,working),target+1.0);
     float mapped=knee+shoulder*log(1.0+(working-knee)/shoulder)/
         max(log(1.0+(peak-knee)/shoulder),0.0001);
     return nits*(min(mapped,target)/luma);
@@ -1142,7 +1882,8 @@ float3 apply_hdr_display_mapping(float3 sourceNits) {
     if(flags<2.0 || peak<=0.0001) return nits;
     float target=max(tone.z,100.0),source=max(tone.y,peak);
     if(source<=target+1.0) return nits;
-    float knee=target*0.65;
+    uint toneMapMode=(modes.w>>2)&3;
+    float knee=target*(toneMapMode==2?0.55:(toneMapMode==3?0.75:0.65));
     if(peak<=knee) return nits;
     float shoulder=max(target-knee,1.0);
     float denominator=max(1.0-exp(-(source-knee)/shoulder),0.0001);
@@ -1280,6 +2021,12 @@ float3 hlg_to_nits(float3 v) {
     float sceneLuma=max(dot(scene,float3(0.2627,0.6780,0.0593)),0.000001);
     return scene*pow(sceneLuma,0.2)*max(tone.z,1000.0);
 }
+float3 hlg_to_g22_bt2020(float3 v) {
+    const float a=0.17883277,b=0.28466892,c=0.55991073;
+    v=saturate(v);
+    float3 scene=lerp((exp((v-c)/a)+b)/12.0,v*v/3.0,step(v,0.5));
+    return pow(saturate(scene),1.0/2.2);
+}
 float3 rec2020_to_scrgb(float3 v) {
     return mul(float3x3(1.6605, -0.5876, -0.0728,
                        -0.1246, 1.1329, -0.0083,
@@ -1303,9 +2050,13 @@ float3 linear_to_srgb(float3 v) {
 }
 float3 sdr_tone_map_nits(float3 nits,float sourcePeak,float3 weights) {
     nits=max(nits,0.0); float luma=max(dot(nits,weights),0.000001);
-    float working=luma*0.80; const float target=100.0,knee=45.0,shoulder=55.0;
-    if(working<=knee) return nits*0.80;
-    float peak=max(max(sourcePeak*0.80,working),target+1.0);
+    uint toneMapMode=(modes.w>>2)&3;
+    float exposure=toneMapMode==2?0.72:(toneMapMode==3?0.95:0.80);
+    float target=100.0;
+    float knee=target*(toneMapMode==2?0.40:(toneMapMode==3?0.55:0.45));
+    float shoulder=max(target-knee,0.0001); float working=luma*exposure;
+    if(working<=knee) return nits*exposure;
+    float peak=max(max(sourcePeak*exposure,working),target+1.0);
     float mapped=knee+shoulder*log(1.0+(working-knee)/shoulder)/
         max(log(1.0+(peak-knee)/shoulder),0.0001);
     return nits*(min(mapped,target)/luma);
@@ -1355,7 +2106,8 @@ float3 apply_hdr_display_mapping(float3 sourceNits) {
     if(flags<2.0 || peak<=0.0001) return nits;
     float target=max(tone.z,100.0),source=max(tone.y,peak);
     if(source<=target+1.0) return nits;
-    float knee=target*0.65;
+    uint toneMapMode=(modes.w>>2)&3;
+    float knee=target*(toneMapMode==2?0.55:(toneMapMode==3?0.75:0.65));
     if(peak<=knee) return nits;
     float shoulder=max(target-knee,1.0);
     float denominator=max(1.0-exp(-(source-knee)/shoulder),0.0001);
@@ -1367,6 +2119,10 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_Target {
     float3 encoded = yuv_to_rgb(
         sourceY.Sample(linearClamp, float3(sampleUv, 0.0)),
         sourceUv.Sample(linearClamp, float3(sampleUv, 0.0)));
+    // RGB10 is the subtitle/UI composition surface for native HLG. The video
+    // processor performs the only RGB-to-P010 conversion after this pass.
+    if (tone.x > 1.5 && modes.z == 3)
+        return float4(hlg_to_g22_bt2020(encoded),1.0);
     if (tone.x < 0.5 && modes.z == 1 && (modes.w & 2) == 0)
         return float4(saturate(encoded),1.0);
     float3 linearNits = modes.z == 2 ? pq_to_nits(encoded) :
@@ -1430,11 +2186,25 @@ float3 linear_to_srgb(float3 v) {
     return lerp(1.055*pow(v,1.0/2.4)-0.055,12.92*v,
                 step(v,float3(0.0031308,0.0031308,0.0031308)));
 }
+float3 hlg_to_scene(float3 v) {
+    const float a=0.17883277,b=0.28466892,c=0.55991073;
+    v=saturate(v);
+    return lerp((exp((v-c)/a)+b)/12.0,v*v/3.0,step(v,0.5));
+}
+float3 hlg_to_nits(float3 v) {
+    float3 scene=max(hlg_to_scene(v),0.0);
+    float luma=max(dot(scene,float3(0.2627,0.6780,0.0593)),0.000001);
+    return scene*pow(luma,0.2)*max(tone.z,1000.0);
+}
 float3 sdr_tone_map_nits(float3 nits,float sourcePeak) {
     nits=max(nits,0.0); float luma=max(dot(nits,float3(0.2627,0.6780,0.0593)),0.000001);
-    float working=luma*0.80; const float target=100.0,knee=45.0,shoulder=55.0;
-    if(working<=knee) return nits*0.80;
-    float peak=max(max(sourcePeak*0.80,working),target+1.0);
+    uint toneMapMode=(modes.w>>2)&3;
+    float exposure=toneMapMode==2?0.72:(toneMapMode==3?0.95:0.80);
+    float target=100.0;
+    float knee=target*(toneMapMode==2?0.40:(toneMapMode==3?0.55:0.45));
+    float shoulder=max(target-knee,0.0001); float working=luma*exposure;
+    if(working<=knee) return nits*exposure;
+    float peak=max(max(sourcePeak*exposure,working),target+1.0);
     float mapped=knee+shoulder*log(1.0+(working-knee)/shoulder)/
         max(log(1.0+(peak-knee)/shoulder),0.0001);
     return nits*(min(mapped,target)/luma);
@@ -1484,7 +2254,8 @@ float3 apply_hdr_display_mapping(float3 sourceNits) {
     if(flags<2.0 || peak<=0.0001) return nits;
     float target=max(tone.z,100.0),source=max(tone.y,peak);
     if(source<=target+1.0) return nits;
-    float knee=target*0.65;
+    uint toneMapMode=(modes.w>>2)&3;
+    float knee=target*(toneMapMode==2?0.55:(toneMapMode==3?0.75:0.65));
     if(peak<=knee) return nits;
     float shoulder=max(target-knee,1.0);
     float denominator=max(1.0-exp(-(source-knee)/shoulder),0.0001);
@@ -1499,6 +2270,15 @@ float4 main(float4 position : SV_POSITION,float2 uv : TEXCOORD0) : SV_Target {
         displayUv.x>doviTrimD[0].x || displayUv.y>doviTrimD[0].y))
         return float4(0,0,0,1);
     float3 encoded=source.Sample(linearClamp,lerp(sourceRect.xy,sourceRect.zw,displayUv)).rgb;
+    if(modes.z==3) {
+        if(tone.x>1.5)
+            return float4(pow(saturate(hlg_to_scene(encoded)),1.0/2.2),1.0);
+        float3 nits=hlg_to_nits(encoded);
+        if(tone.x>=0.5)
+            return float4(nits_to_pq(max(nits,0.0)),1.0);
+        nits=rec2020_to_rec709(sdr_tone_map_nits(nits,tone.y));
+        return float4(linear_to_srgb(max(nits,0.0)/100.0),1.0);
+    }
     if(modes.z==2) {
         float3 nits=apply_hdr10plus(pq_to_nits(encoded));
         if(doviSignalMeta[0].x>0.5)
@@ -1661,9 +2441,13 @@ float3 rec709_to_rec2020(float3 v) {
 }
 float3 sdr_tone_map_nits(float3 nits,float sourcePeak) {
     nits=max(nits,0.0); float luma=max(dot(nits,float3(0.2627,0.6780,0.0593)),0.000001);
-    float working=luma*0.80; const float target=100.0,knee=45.0,shoulder=55.0;
-    if(working<=knee) return nits*0.80;
-    float peak=max(max(sourcePeak*0.80,working),target+1.0);
+    uint toneMapMode=(inputPrimaries>>2)&3;
+    float exposure=toneMapMode==2?0.72:(toneMapMode==3?0.95:0.80);
+    float target=100.0;
+    float knee=target*(toneMapMode==2?0.40:(toneMapMode==3?0.55:0.45));
+    float shoulder=max(target-knee,0.0001); float working=luma*exposure;
+    if(working<=knee) return nits*exposure;
+    float peak=max(max(sourcePeak*exposure,working),target+1.0);
     float mapped=knee+shoulder*log(1.0+(working-knee)/shoulder)/
         max(log(1.0+(peak-knee)/shoulder),0.0001);
     return nits*(min(mapped,target)/luma);
@@ -1698,7 +2482,8 @@ float3 apply_hdr_display_mapping(float3 sourceNits) {
     if(flags<2.0 || peak<=0.0001) return nits;
     float target=max(targetPeakNits,100.0),source=max(sourcePeakNits,peak);
     if(source<=target+1.0) return nits;
-    float knee=target*0.65;
+    uint toneMapMode=(inputPrimaries>>2)&3;
+    float knee=target*(toneMapMode==2?0.55:(toneMapMode==3?0.75:0.65));
     if(peak<=knee) return nits;
     float shoulder=max(target-knee,1.0);
     float denominator=max(1.0-exp(-(source-knee)/shoulder),0.0001);
@@ -1824,6 +2609,9 @@ float3 nits_to_pq(float3 nits) {
     float3 y=pow(max(nits/10000.0,0.0),m1);
     return pow((c1+c2*y)/(1.0+c3*y),m2);
 }
+float3 linear_to_g22(float3 linearRgb) {
+    return pow(saturate(linearRgb),1.0/2.2);
+}
 float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_Target {
     float4 color = source.Sample(linearClamp, saturate(uv));
     float alpha;
@@ -1842,7 +2630,13 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_Target {
     }
     if (alpha <= 0.00001) return 0.0;
     if (hdrComposition < 0.5) return float4(straight * alpha, alpha);
-    float3 nits2020=rec709_to_rec2020(srgb_to_linear(straight))*max(sdrWhiteNits,1.0);
+    float3 linear2020=rec709_to_rec2020(srgb_to_linear(straight));
+    if (hdrComposition > 1.5) {
+        float3 g22=linear_to_g22(
+            linear2020*max(sdrWhiteNits,1.0)/1000.0);
+        return float4(g22*alpha,alpha);
+    }
+    float3 nits2020=linear2020*max(sdrWhiteNits,1.0);
     return float4(nits_to_pq(nits2020)*alpha,alpha);
 })";
     Microsoft::WRL::ComPtr<ID3DBlob> overlayPs;
@@ -1972,6 +2766,9 @@ bool D3D12VideoRenderer::Resize(const UINT width, const UINT height) {
     for (UINT index = 0; index < kBufferCount; ++index) {
         if (!WaitForBackBuffer(index)) return false;
     }
+    ReleaseHlgPresentationResources();
+    hlgInitializationAttempted_ = false;
+    hlgFailureLogged_ = false;
     for (auto& target : libplaceboTargets_) target.Reset();
     for (auto& buffer : backBuffers_) buffer.Reset();
     if (frameLatencyWaitable_) {
@@ -2093,7 +2890,10 @@ bool D3D12VideoRenderer::ConfigureFramePacing() {
 }
 
 void D3D12VideoRenderer::WaitForFrameLatencyObject() {
-    if (!frameLatencyWaitable_) return;
+    // While the P010 media swap chain is selected, the ordinary RGB swap
+    // chain is intentionally not presented and its waitable object will not
+    // advance. The media Present call provides the pacing for this path.
+    if (!frameLatencyWaitable_ || nativeHlgComposition_) return;
     const auto waitStartedAt = std::chrono::steady_clock::now();
     const DWORD waitResult = WaitForSingleObjectEx(
         frameLatencyWaitable_, kFrameLatencyWaitTimeoutMs, TRUE);
@@ -2229,6 +3029,7 @@ bool D3D12VideoRenderer::TryRenderDolbyVisionWithLibplacebo(
     constants.sourceUv[2] = 1.0f;
     constants.sourceUv[3] = 1.0f;
     constants.transfer = 4u;  // libplacebo scRGB intermediate
+    constants.primaries = ToneMappingModeBits(videoSettings_.toneMapping);
     constants.hdrOutput = hdrOutput ? 1.0f : 0.0f;
     constants.sourcePeakNits = FrameSourcePeakNits(frame);
     constants.targetPeakNits = targetPeakNits;
@@ -2279,11 +3080,10 @@ bool D3D12VideoRenderer::TryRenderDolbyVisionWithLibplacebo(
     sourceGraphicsCompletions_[{frame.timelineSerial, frame.serial}] =
         graphSubmit.completion;
 
-    const HRESULT presentResult = swapChain_->Present(1, 0);
-    if (FAILED(presentResult)) return !DeviceLost(presentResult, L"Present");
-    const uint64_t fenceValue = nextFenceValue_++;
-    if (FAILED(queue_->Signal(fence_.Get(), fenceValue))) return false;
-    bufferFenceValues_[backBufferIndex] = fenceValue;
+    if (!PresentComposedFrame(
+            backBufferIndex, graphSubmit.completion, false)) {
+        return false;
+    }
     inFlightFrames_[backBufferIndex] = std::make_unique<NativeVideoFrame>(frame);
     AnchorGeneratedFrames(frame, std::chrono::steady_clock::now());
 
@@ -2455,11 +3255,15 @@ bool D3D12VideoRenderer::RenderPixelFrame(const NativeVideoFrame& frame) {
     constants.sourceUv[2] = 1.0f;
     constants.sourceUv[3] = 1.0f;
     constants.transfer = packedPq ? 2u : TransferMode(frame.color.transfer);
-    constants.primaries = frame.color.primaries == VideoColorPrimaries::Bt2020 ? 2u : 0u;
+    constants.primaries =
+        (frame.color.primaries == VideoColorPrimaries::Bt2020 ? 2u : 0u) |
+        ToneMappingModeBits(videoSettings_.toneMapping);
+    const bool nativeHlg = WantsNativeHlgOutput(frame);
     const bool hdrOutput = SetHdrOutputState(
-        frame, HdrOutputEnabled(frame, videoSettings_, displayCapabilities_,
-                                hdr10ColorSpaceSupported_));
-    constants.hdrOutput = hdrOutput ? 1.0f : 0.0f;
+        frame, !nativeHlg &&
+                   HdrOutputEnabled(frame, videoSettings_, displayCapabilities_,
+                                    hdr10ColorSpaceSupported_));
+    constants.hdrOutput = nativeHlg ? 2.0f : (hdrOutput ? 1.0f : 0.0f);
     constants.sourcePeakNits = FrameSourcePeakNits(frame);
     constants.targetPeakNits = TargetPeakNits(videoSettings_, displayCapabilities_);
     constants.padding = InitialHdrProcessingFlags(frame, videoSettings_, hdrOutput);
@@ -2543,7 +3347,8 @@ bool D3D12VideoRenderer::RenderPixelFrame(const NativeVideoFrame& frame) {
         TransitionBarrier(backBuffers_[backBufferIndex].Get(),
                           D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                           D3D12_RESOURCE_STATE_RENDER_TARGET,
-                          D3D12_RESOURCE_STATE_PRESENT)};
+                          nativeHlg ? D3D12_RESOURCE_STATE_COPY_SOURCE
+                                    : D3D12_RESOURCE_STATE_PRESENT)};
     commandList_->ResourceBarrier(
         static_cast<UINT>(endBarriers.size()), endBarriers.data());
     if (FAILED(commandList_->Close())) return false;
@@ -2556,11 +3361,10 @@ bool D3D12VideoRenderer::RenderPixelFrame(const NativeVideoFrame& frame) {
     }
     sourceGraphicsCompletions_[{frame.timelineSerial, frame.serial}] =
         graphSubmit.completion;
-    const HRESULT presentResult = swapChain_->Present(1, 0);
-    if (FAILED(presentResult)) return !DeviceLost(presentResult, L"Present");
-    const uint64_t fenceValue = nextFenceValue_++;
-    if (FAILED(queue_->Signal(fence_.Get(), fenceValue))) return false;
-    bufferFenceValues_[backBufferIndex] = fenceValue;
+    if (!PresentComposedFrame(
+            backBufferIndex, graphSubmit.completion, nativeHlg)) {
+        return false;
+    }
     inFlightFrames_[backBufferIndex] = std::make_unique<NativeVideoFrame>(frame);
     AnchorGeneratedFrames(frame, std::chrono::steady_clock::now());
 
@@ -2587,7 +3391,9 @@ bool D3D12VideoRenderer::RenderFrame(const NativeVideoFrame& frame) {
         return RenderPixelFrame(frame);
     }
     if (!frame.HasD3D12Texture() ||
-        (frame.d3dFormat != DXGI_FORMAT_NV12 && frame.d3dFormat != DXGI_FORMAT_P010)) {
+        (frame.d3dFormat != DXGI_FORMAT_NV12 &&
+         frame.d3dFormat != DXGI_FORMAT_P010 &&
+         frame.d3dFormat != DXGI_FORMAT_P016)) {
         Log(LogLevel::Warning, L"d3d12 compositor rejected non-resident or unsupported frame");
         return false;
     }
@@ -2680,18 +3486,20 @@ bool D3D12VideoRenderer::RenderFrame(const NativeVideoFrame& frame) {
         view.Texture2DArray.PlaneSlice = planeSlice;
         device_->CreateShaderResourceView(source.d3d12Texture.Get(), &view, handle);
     };
-    const bool tenBit = frame.d3dFormat == DXGI_FORMAT_P010;
-    makeSrv(frame, tenBit ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM, 0, srvCpu);
+    const bool highBitDepth = frame.d3dFormat == DXGI_FORMAT_P010 ||
+                              frame.d3dFormat == DXGI_FORMAT_P016;
+    makeSrv(frame, highBitDepth ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM, 0, srvCpu);
     srvCpu.ptr += srvIncrement_;
-    makeSrv(frame, tenBit ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R8G8_UNORM, 1, srvCpu);
+    makeSrv(frame, highBitDepth ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R8G8_UNORM, 1, srvCpu);
     srvCpu.ptr += srvIncrement_;
     const NativeVideoFrame& enhancementSource = enhancement ? *enhancement : frame;
-    const bool enhancementTenBit = enhancementSource.d3dFormat == DXGI_FORMAT_P010;
+    const bool enhancementHighBitDepth = enhancementSource.d3dFormat == DXGI_FORMAT_P010 ||
+                                         enhancementSource.d3dFormat == DXGI_FORMAT_P016;
     makeSrv(enhancementSource,
-            enhancementTenBit ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM, 0, srvCpu);
+            enhancementHighBitDepth ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM, 0, srvCpu);
     srvCpu.ptr += srvIncrement_;
     makeSrv(enhancementSource,
-            enhancementTenBit ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R8G8_UNORM, 1, srvCpu);
+            enhancementHighBitDepth ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R8G8_UNORM, 1, srvCpu);
 
     D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
     rtv.ptr += static_cast<SIZE_T>(backBufferIndex) * rtvIncrement_;
@@ -2742,12 +3550,15 @@ bool D3D12VideoRenderer::RenderFrame(const NativeVideoFrame& frame) {
         ? (reconstructionMetadata->blVideoFullRange ? 1u : 0u)
         : (frame.color.range == VideoColorRange::Full ? 1u : 0u);
     constants.transfer = TransferMode(frame.color.transfer);
-    constants.primaries = (tenBit ? 1u : 0u) |
-        (frame.color.primaries == VideoColorPrimaries::Bt2020 ? 2u : 0u);
+    constants.primaries = (highBitDepth ? 1u : 0u) |
+        (frame.color.primaries == VideoColorPrimaries::Bt2020 ? 2u : 0u) |
+        ToneMappingModeBits(videoSettings_.toneMapping);
+    const bool nativeHlg = WantsNativeHlgOutput(frame);
     const bool hdrOutput = SetHdrOutputState(
-        frame, HdrOutputEnabled(frame, videoSettings_, displayCapabilities_,
-                                hdr10ColorSpaceSupported_));
-    constants.hdrOutput = hdrOutput ? 1.0f : 0.0f;
+        frame, !nativeHlg &&
+                   HdrOutputEnabled(frame, videoSettings_, displayCapabilities_,
+                                    hdr10ColorSpaceSupported_));
+    constants.hdrOutput = nativeHlg ? 2.0f : (hdrOutput ? 1.0f : 0.0f);
     constants.sourcePeakNits = FrameSourcePeakNits(frame);
     constants.targetPeakNits = TargetPeakNits(videoSettings_, displayCapabilities_);
     constants.padding = InitialHdrProcessingFlags(frame, videoSettings_, hdrOutput);
@@ -2777,7 +3588,9 @@ bool D3D12VideoRenderer::RenderFrame(const NativeVideoFrame& frame) {
         TransitionBarrier(frame.d3d12Texture.Get(), plane1,
                           D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
         TransitionBarrier(backBuffers_[backBufferIndex].Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                          D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)};
+                          D3D12_RESOURCE_STATE_RENDER_TARGET,
+                          nativeHlg ? D3D12_RESOURCE_STATE_COPY_SOURCE
+                                    : D3D12_RESOURCE_STATE_PRESENT)};
     if (enhancement) {
         endBarriers.insert(endBarriers.end() - 1, TransitionBarrier(
             enhancement->d3d12Texture.Get(), enhancementPlane0,
@@ -2821,11 +3634,10 @@ bool D3D12VideoRenderer::RenderFrame(const NativeVideoFrame& frame) {
                 : L"Dolby Vision reconstruction path=d3d12_rpu_reshape canonical=bt2020_pq");
     }
 
-    const HRESULT presentResult = swapChain_->Present(1, 0);
-    if (FAILED(presentResult)) return !DeviceLost(presentResult, L"Present");
-    const uint64_t fenceValue = nextFenceValue_++;
-    if (FAILED(queue_->Signal(fence_.Get(), fenceValue))) return false;
-    bufferFenceValues_[backBufferIndex] = fenceValue;
+    if (!PresentComposedFrame(
+            backBufferIndex, graphSubmit.completion, nativeHlg)) {
+        return false;
+    }
     inFlightFrames_[backBufferIndex] = std::make_unique<NativeVideoFrame>(frame);
     AnchorGeneratedFrames(frame, std::chrono::steady_clock::now());
 
@@ -3560,9 +4372,11 @@ bool D3D12VideoRenderer::RenderGeneratedFrame(const std::size_t slotIndex) {
         ? slot.inputTransfer
         : (generatedSource ? TransferMode(generatedSource->color.transfer)
                            : TransferMode(mediaColor_.transfer));
-    constants.primaries = generatedSource &&
-            generatedSource->color.primaries == VideoColorPrimaries::Bt2020
-        ? 2u : 0u;
+    constants.primaries =
+        (generatedSource &&
+                 generatedSource->color.primaries == VideoColorPrimaries::Bt2020
+             ? 2u : 0u) |
+        ToneMappingModeBits(videoSettings_.toneMapping);
     // Generated frames must use the same per-frame DV trim as originals. The
     // trim is creative metadata and therefore remains active for HDR output.
     constants.trimA[0] = slot.doviTrim.enabled ? 1.0f : 0.0f;
@@ -3608,10 +4422,10 @@ bool D3D12VideoRenderer::RenderGeneratedFrame(const std::size_t slotIndex) {
     SubmitResult graphSubmit = frameGraph_.Submit(
         GpuFrameQueue::Graphics, commandList_.Get(), dependencies);
     if (!graphSubmit.accepted) return false;
-    if (FAILED(swapChain_->Present(1, 0))) return false;
-    const uint64_t fenceValue = nextFenceValue_++;
-    if (FAILED(queue_->Signal(fence_.Get(), fenceValue))) return false;
-    bufferFenceValues_[backBufferIndex] = fenceValue;
+    if (!PresentComposedFrame(
+            backBufferIndex, graphSubmit.completion, false)) {
+        return false;
+    }
     slot.reusable = graphSubmit.completion;
     if (!generatedPresentLogged_) {
         generatedPresentLogged_ = true;
@@ -3624,6 +4438,111 @@ bool D3D12VideoRenderer::RenderGeneratedFrame(const std::size_t slotIndex) {
         ++renderStats_.generatedFrames;
         publishedStats_ = renderStats_;
     }
+    return true;
+}
+
+bool D3D12VideoRenderer::EnsureTextSubtitleBitmap(
+    const std::wstring& text,
+    const D3D12_VIEWPORT& videoViewport) {
+    if (text.empty() || width_ == 0 || height_ == 0 ||
+        static_cast<uint64_t>(width_) * height_ > k8KPixelCount) {
+        textSubtitlePixels_.reset();
+        textSubtitleText_.clear();
+        return false;
+    }
+
+    const double fontScale = std::clamp(activeSubtitleSettings_.fontScale, 0.5, 2.0);
+    const int offsetX = activeSubtitleSettings_.offsetXPx;
+    const int offsetY = activeSubtitleSettings_.offsetYPx;
+    if (textSubtitlePixels_ && textSubtitleText_ == text &&
+        textSubtitleSurfaceWidth_ == width_ && textSubtitleSurfaceHeight_ == height_ &&
+        SameViewport(textSubtitleViewport_, videoViewport) &&
+        std::abs(textSubtitleFontScale_ - fontScale) < 0.001 &&
+        textSubtitleOffsetXPx_ == offsetX && textSubtitleOffsetYPx_ == offsetY) {
+        return true;
+    }
+
+    const std::size_t pixelBytes = static_cast<std::size_t>(width_) * height_ * 4;
+    auto pixels = std::make_shared<std::vector<uint8_t>>(pixelBytes, 0);
+    Gdiplus::Bitmap bitmap(static_cast<INT>(width_), static_cast<INT>(height_),
+                           PixelFormat32bppPARGB);
+    if (bitmap.GetLastStatus() != Gdiplus::Ok) return false;
+
+    Gdiplus::Graphics graphics(&bitmap);
+    graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+    graphics.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
+    graphics.SetCompositingQuality(Gdiplus::CompositingQualityHighQuality);
+    graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+    graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
+
+    const float baseFontPixels = std::clamp(videoViewport.Height * 0.048f, 20.0f, 54.0f);
+    const float fontPixels = baseFontPixels * static_cast<float>(fontScale);
+    const float maxTextWidth = std::max(1.0f, videoViewport.Width * 0.84f);
+    const float marginBottom = std::clamp(videoViewport.Height * 0.085f, 22.0f, 86.0f);
+    const float layoutHeight = std::min(
+        videoViewport.Height * 0.34f,
+        std::max(fontPixels * 2.1f,
+                 fontPixels * (static_cast<float>(CountSubtitleLines(text)) + 1.2f)));
+    const float layoutLeft = videoViewport.TopLeftX +
+        (videoViewport.Width - maxTextWidth) * 0.5f + static_cast<float>(offsetX);
+    const float layoutTop = std::max(
+        videoViewport.TopLeftY,
+        videoViewport.TopLeftY + videoViewport.Height - marginBottom - layoutHeight) +
+        static_cast<float>(offsetY);
+    const Gdiplus::RectF layout(layoutLeft, layoutTop, maxTextWidth, layoutHeight);
+
+    Gdiplus::FontFamily family(L"Segoe UI");
+    Gdiplus::StringFormat format;
+    format.SetAlignment(Gdiplus::StringAlignmentCenter);
+    format.SetLineAlignment(Gdiplus::StringAlignmentFar);
+    format.SetTrimming(Gdiplus::StringTrimmingEllipsisWord);
+    format.SetFormatFlags(Gdiplus::StringFormatFlagsLineLimit);
+    Gdiplus::GraphicsPath textPath;
+    textPath.AddString(text.c_str(), -1, &family, Gdiplus::FontStyleBold,
+                       fontPixels, layout, &format);
+    const float outlineWidth = std::clamp(fontPixels * 0.16f, 3.0f, 8.0f);
+    Gdiplus::Pen outline(Gdiplus::Color(220, 0, 0, 0), outlineWidth);
+    outline.SetLineJoin(Gdiplus::LineJoinRound);
+    Gdiplus::SolidBrush fill(Gdiplus::Color(245, 255, 255, 255));
+    graphics.DrawPath(&outline, &textPath);
+    graphics.FillPath(&fill, &textPath);
+
+    Gdiplus::BitmapData bitmapData{};
+    Gdiplus::Rect lockRect(0, 0, static_cast<INT>(width_), static_cast<INT>(height_));
+    if (bitmap.LockBits(&lockRect, Gdiplus::ImageLockModeRead,
+                        PixelFormat32bppPARGB, &bitmapData) != Gdiplus::Ok) {
+        return false;
+    }
+    const auto* source = static_cast<const uint8_t*>(bitmapData.Scan0);
+    const int sourceStride = bitmapData.Stride;
+    const std::size_t destinationStride = static_cast<std::size_t>(width_) * 4;
+    for (UINT row = 0; row < height_; ++row) {
+        const uint8_t* sourceRow = sourceStride >= 0
+            ? source + static_cast<std::size_t>(sourceStride) * row
+            : source + static_cast<std::size_t>(-sourceStride) * (height_ - 1 - row);
+        std::memcpy(pixels->data() + destinationStride * row, sourceRow,
+                    destinationStride);
+    }
+    bitmap.UnlockBits(&bitmapData);
+
+    textSubtitlePixels_ = std::move(pixels);
+    textSubtitleText_ = text;
+    textSubtitleViewport_ = videoViewport;
+    textSubtitleSurfaceWidth_ = width_;
+    textSubtitleSurfaceHeight_ = height_;
+    textSubtitleFontScale_ = fontScale;
+    textSubtitleOffsetXPx_ = offsetX;
+    textSubtitleOffsetYPx_ = offsetY;
+    if (++textSubtitleSerial_ == 0) ++textSubtitleSerial_;
+    {
+        std::scoped_lock lock(statsMutex_);
+        ++renderStats_.subtitleSurfaceRebuilds;
+    }
+    Log(LogLevel::Debug,
+        L"subtitle text fallback surface=" + std::to_wstring(width_) + L"x" +
+            std::to_wstring(height_) + L" lines=" +
+            std::to_wstring(CountSubtitleLines(text)));
     return true;
 }
 
@@ -3660,9 +4579,11 @@ bool D3D12VideoRenderer::DrawOverlays(const NativeVideoFrame* frame,
     }
     const std::size_t subtitleItemLimit = kMaxOverlayTextures -
         std::min<std::size_t>(activeUiOverlayCount, kMaxOverlayTextures);
+    bool hasDrawableSubtitleBitmap = false;
     if (frame) {
         for (const NativeSubtitleBitmap& bitmap : frame->subtitleBitmaps) {
             if (!bitmap.HasPixels() || items.size() >= subtitleItemLimit) continue;
+            hasDrawableSubtitleBitmap = true;
             const int canvasWidth = std::max(1, bitmap.canvasWidth > 0
                                                     ? bitmap.canvasWidth
                                                     : frame->width);
@@ -3675,10 +4596,35 @@ bool D3D12VideoRenderer::DrawOverlays(const NativeVideoFrame* frame,
             item.height = bitmap.height;
             item.stride = bitmap.stride;
             item.serial = bitmap.serial;
-            item.x = videoViewport.TopLeftX + videoViewport.Width * bitmap.x / canvasWidth;
-            item.y = videoViewport.TopLeftY + videoViewport.Height * bitmap.y / canvasHeight;
-            item.displayWidth = videoViewport.Width * bitmap.width / canvasWidth;
-            item.displayHeight = videoViewport.Height * bitmap.height / canvasHeight;
+            const float rawX = videoViewport.TopLeftX +
+                videoViewport.Width * bitmap.x / canvasWidth;
+            const float rawY = videoViewport.TopLeftY +
+                videoViewport.Height * bitmap.y / canvasHeight;
+            const float rawWidth = videoViewport.Width * bitmap.width / canvasWidth;
+            const float rawHeight = videoViewport.Height * bitmap.height / canvasHeight;
+            const float scale = static_cast<float>(
+                std::clamp(activeSubtitleSettings_.fontScale, 0.5, 2.0));
+            const float pivotX = videoViewport.TopLeftX + videoViewport.Width * 0.5f;
+            const float pivotY = videoViewport.TopLeftY + videoViewport.Height;
+            item.x = pivotX + (rawX - pivotX) * scale +
+                static_cast<float>(activeSubtitleSettings_.offsetXPx);
+            item.y = pivotY + (rawY - pivotY) * scale +
+                static_cast<float>(activeSubtitleSettings_.offsetYPx);
+            item.displayWidth = rawWidth * scale;
+            item.displayHeight = rawHeight * scale;
+            item.subtitle = true;
+            items.push_back(std::move(item));
+        }
+        if (!hasDrawableSubtitleBitmap && items.size() < subtitleItemLimit &&
+            EnsureTextSubtitleBitmap(frame->subtitleText, videoViewport)) {
+            DrawItem item;
+            item.pixels = textSubtitlePixels_;
+            item.width = static_cast<int>(width_);
+            item.height = static_cast<int>(height_);
+            item.stride = static_cast<int>(width_ * 4);
+            item.serial = textSubtitleSerial_;
+            item.displayWidth = static_cast<float>(width_);
+            item.displayHeight = static_cast<float>(height_);
             item.subtitle = true;
             items.push_back(std::move(item));
         }
@@ -3879,7 +4825,9 @@ bool D3D12VideoRenderer::DrawOverlays(const NativeVideoFrame* frame,
             float hdrComposition;
             float padding[4];
         } constants{item.opacity, item.alphaFromRgb ? 1u : 0u, 203.0f,
-                    swapChainHdr_ ? 1.0f : 0.0f, {}};
+                    nativeHlgComposition_ ? 2.0f
+                                          : (swapChainHdr_ ? 1.0f : 0.0f),
+                    {}};
         commandList_->SetGraphicsRoot32BitConstants(1, 8, &constants, 0);
         D3D12_VIEWPORT viewport{};
         viewport.TopLeftX = item.x;
@@ -4087,6 +5035,8 @@ void D3D12VideoRenderer::ResetInterpolationState() {
 void D3D12VideoRenderer::ClearFrame() {
     currentFrame_.reset();
     swapChainHdr_ = false;
+    nativeHlgComposition_ = false;
+    SelectCompositionSwapChain(false);
     loggedHdrOutputState_ = -1;
     presentedOriginalTimeline_ = 0;
     presentedOriginalPts_ = {};
@@ -4110,9 +5060,7 @@ void D3D12VideoRenderer::ClearFrame() {
     const SubmitResult graphSubmit = frameGraph_.Submit(
         GpuFrameQueue::Graphics, commandList_.Get());
     if (!graphSubmit.accepted) return;
-    swapChain_->Present(1, 0);
-    const uint64_t value = nextFenceValue_++;
-    if (SUCCEEDED(queue_->Signal(fence_.Get(), value))) bufferFenceValues_[index] = value;
+    PresentComposedFrame(index, graphSubmit.completion, false);
 }
 
 bool D3D12VideoRenderer::WaitForBackBuffer(const UINT index) {
@@ -4123,6 +5071,18 @@ bool D3D12VideoRenderer::WaitForBackBuffer(const UINT index) {
         if (WaitForSingleObject(fenceEvent_, 2000) == WAIT_OBJECT_0) return true;
     }
     Log(LogLevel::Error, L"d3d12 back buffer fence timeout");
+    return false;
+}
+
+bool D3D12VideoRenderer::WaitForHlgBackBuffer(const UINT index) {
+    if (!fence_ || index >= kBufferCount) return true;
+    const uint64_t value = hlgBufferFenceValues_[index];
+    if (value == 0 || fence_->GetCompletedValue() >= value) return true;
+    if (SUCCEEDED(fence_->SetEventOnCompletion(value, fenceEvent_)) &&
+        WaitForSingleObject(fenceEvent_, 2000) == WAIT_OBJECT_0) {
+        return true;
+    }
+    Log(LogLevel::Error, L"d3d12 HLG back buffer fence timeout");
     return false;
 }
 
@@ -4148,6 +5108,7 @@ void D3D12VideoRenderer::ReleaseGpu() {
     windowsMlExecutor_.Reset();
     directMlExecutor_.Reset();
     frameGraph_.WaitForIdle(2000);
+    ReleaseHlgPresentationResources();
     if (libplaceboBridge_) {
         libplaceboBridge_->Reset();
         libplaceboBridge_.reset();
@@ -4170,6 +5131,10 @@ void D3D12VideoRenderer::ReleaseGpu() {
         if (cache.upload && cache.mappedUpload) cache.upload->Unmap(0, nullptr);
         cache = {};
     }
+    textSubtitlePixels_.reset();
+    textSubtitleText_.clear();
+    textSubtitleSurfaceWidth_ = 0;
+    textSubtitleSurfaceHeight_ = 0;
     for (PixelFrameUploadCache& cache : pixelFrameUploadCaches_) {
         if (cache.upload && cache.mappedUpload) cache.upload->Unmap(0, nullptr);
         cache = {};
@@ -4207,6 +5172,10 @@ void D3D12VideoRenderer::ReleaseGpu() {
     swapChainWaitable_ = false;
     framePacingLogged_ = false;
     swapChain_.Reset();
+    compositionVisual_.Reset();
+    compositionTarget_.Reset();
+    compositionDevice_.Reset();
+    useComposition_ = false;
     frameGraph_.Reset();
     copyQueue_.Reset();
     mlQueue_.Reset();

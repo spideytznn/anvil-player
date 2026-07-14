@@ -369,6 +369,7 @@ private:
     void SetDisplayMetadataPassthrough(bool enabled);
     void SetDisplayPeakBrightnessNits(int peakNits);
     void SetDolbyVisionSystemPipelineExperimental(bool enabled);
+    void SetHardwareDecodeEnabled(bool enabled);
     void SetFrameInterpolationEnabled(bool enabled);
     void ToggleFullscreen();
     bool RefreshRateSyncEffective() const;

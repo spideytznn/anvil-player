@@ -272,7 +272,9 @@ struct LibplaceboD3D12Bridge::Impl {
 
     bool WrapVideoFrame(const NativeVideoFrame& input, WrappedFrame& output) {
         if (!input.HasD3D12Texture() ||
-            (input.d3dFormat != DXGI_FORMAT_NV12 && input.d3dFormat != DXGI_FORMAT_P010)) {
+            (input.d3dFormat != DXGI_FORMAT_NV12 &&
+             input.d3dFormat != DXGI_FORMAT_P010 &&
+             input.d3dFormat != DXGI_FORMAT_P016)) {
             return false;
         }
         D3D11_RESOURCE_FLAGS flags{};
@@ -289,10 +291,11 @@ struct LibplaceboD3D12Bridge::Impl {
         const int height = static_cast<int>(resource.Height);
         const int arraySlice = static_cast<int>(std::min<UINT>(
             input.d3d12Subresource, std::max<UINT>(1, resource.DepthOrArraySize) - 1));
-        const bool tenBit = input.d3dFormat == DXGI_FORMAT_P010;
+        const bool highBitDepth = input.d3dFormat == DXGI_FORMAT_P010 ||
+                                  input.d3dFormat == DXGI_FORMAT_P016;
         const std::array<DXGI_FORMAT, 2> formats{
-            tenBit ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM,
-            tenBit ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R8G8_UNORM};
+            highBitDepth ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM,
+            highBitDepth ? DXGI_FORMAT_R16G16_UNORM : DXGI_FORMAT_R8G8_UNORM};
         const std::array<int, 2> widths{width, (width + 1) / 2};
         const std::array<int, 2> heights{height, (height + 1) / 2};
         for (int plane = 0; plane < 2; ++plane) {
@@ -314,9 +317,10 @@ struct LibplaceboD3D12Bridge::Impl {
         output.description.planes[1].shift_x = -0.5f;
         output.description.repr.levels = PL_COLOR_LEVELS_LIMITED;
         output.description.repr.alpha = PL_ALPHA_NONE;
-        output.description.repr.bits.sample_depth = tenBit ? 16 : 8;
-        output.description.repr.bits.color_depth = tenBit ? 10 : 8;
-        output.description.repr.bits.bit_shift = tenBit ? 6 : 0;
+        output.description.repr.bits.sample_depth = highBitDepth ? 16 : 8;
+        output.description.repr.bits.color_depth = input.d3dFormat == DXGI_FORMAT_P016
+            ? 16 : (highBitDepth ? 10 : 8);
+        output.description.repr.bits.bit_shift = input.d3dFormat == DXGI_FORMAT_P010 ? 6 : 0;
         output.description.crop = {
             input.sourceUvRect.left * width,
             input.sourceUvRect.top * height,

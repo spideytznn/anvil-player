@@ -18,6 +18,7 @@ export interface PlayerState {
   sidebarCollapsed: boolean
   fullscreen: boolean
   customTitleBar: boolean
+  hardwareDecodeEnabled: boolean
   frameInterpolationEnabled: boolean
   frameInterpolationActive: boolean
   frameInterpolationMultiplier: number
@@ -256,6 +257,7 @@ export type NativeCommand =
   | { type: 'command'; command: 'forward' }
   | { type: 'command'; command: 'toggleSidebar' }
   | { type: 'command'; command: 'toggleFullscreen' }
+  | { type: 'command'; command: 'setHardwareDecode'; enabled: boolean }
   | { type: 'command'; command: 'setFrameInterpolation'; enabled: boolean }
   | { type: 'command'; command: 'setRefreshRateSync'; enabled: boolean }
   | { type: 'command'; command: 'setRefreshRateMaximumMultiple'; enabled: boolean }
@@ -367,6 +369,7 @@ export const EMPTY_STATE: PlayerState = {
   sidebarCollapsed: false,
   fullscreen: false,
   customTitleBar: false,
+  hardwareDecodeEnabled: true,
   frameInterpolationEnabled: false,
   frameInterpolationActive: false,
   frameInterpolationMultiplier: 1,
