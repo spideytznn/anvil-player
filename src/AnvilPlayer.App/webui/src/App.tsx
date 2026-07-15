@@ -95,6 +95,8 @@ const en = {
   hardwareDecodeHint: 'Use D3D12VA when available. Turn off to force FFmpeg software decoding; changing this restarts the video session.',
   frameInterpolation: 'GPU frame interpolation',
   frameInterpolationHint: 'Fixed 2x output within the display refresh-rate limit · current video',
+  frameInterpolationResolution: 'Interpolation resolution',
+  frameInterpolationResolutionHint: 'Maximum model resolution for larger sources. Higher values need substantially more GPU memory and compute.',
   frameInterpolationActual: 'Actual',
   frameInterpolationDynamicHdrUnavailable: 'Dynamic HDR and Dolby Vision are not supported yet.',
   refreshRateInterpolationBlocked: 'Unavailable while fixed 2x interpolation is enabled',
@@ -224,6 +226,8 @@ const zh: Record<keyof typeof en, string> = {
   frameRate: '帧率',
   frameInterpolation: 'GPU 补帧',
   frameInterpolationHint: '刷新率上限内固定 2x 输出 · 仅当前视频',
+  frameInterpolationResolution: '补帧推理分辨率',
+  frameInterpolationResolutionHint: '仅限制更高分辨率片源的模型尺寸；档位越高，显存与算力开销越大。',
   frameInterpolationActual: '实际',
   frameInterpolationDynamicHdrUnavailable: '暂不支持动态 HDR 和杜比视界片源。',
   refreshRateInterpolationBlocked: 'GPU 补帧开启时不可用',
@@ -1205,6 +1209,40 @@ function PassthroughSetting({
   )
 }
 
+function InterpolationResolutionSetting({
+  maximumHeight,
+  t
+}: {
+  maximumHeight: number
+  t: Copy
+}): JSX.Element {
+  return (
+    <div className="interpolation-resolution-setting">
+      <div>
+        <strong>{t.frameInterpolationResolution}</strong>
+        <small>{t.frameInterpolationResolutionHint}</small>
+      </div>
+      <div className="interpolation-resolution-options" role="group" aria-label={t.frameInterpolationResolution}>
+        {[1080, 1440, 2160].map((height) => (
+          <button
+            key={height}
+            className={maximumHeight === height ? 'is-active' : ''}
+            type="button"
+            aria-pressed={maximumHeight === height}
+            onClick={() => postNativeCommand({
+              type: 'command',
+              command: 'setFrameInterpolationMaximumHeight',
+              maximumHeight: height
+            })}
+          >
+            {height}p
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 function HdrDisplayPeakSetting({ state, t }: { state: PlayerState; t: Copy }): JSX.Element {
   const passthroughActive = state.displayMetadataPassthrough ||
     (state.dolbyVisionMedia && state.dolbyVisionSystemPipelineExperimental)
@@ -1480,6 +1518,10 @@ function InspectorContent({
           available
           unavailableHint={t.frameInterpolationDynamicHdrUnavailable}
           onChange={(enabled) => postNativeCommand({ type: 'command', command: 'setFrameInterpolation', enabled })}
+          t={t}
+        />
+        <InterpolationResolutionSetting
+          maximumHeight={state.frameInterpolationMaximumHeight}
           t={t}
         />
         <div className="refresh-rate-setting">

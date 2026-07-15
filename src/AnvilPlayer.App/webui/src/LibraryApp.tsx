@@ -1745,6 +1745,8 @@ const settingsCopy: Record<UiLanguage, {
   dolbyVisionSystemPipelineExperimentalCaption: string
   frameInterpolation: string
   frameInterpolationCaption: string
+  frameInterpolationResolution: string
+  frameInterpolationResolutionCaption: string
   frameInterpolationRefreshBlocked: string
   refreshRateSync: string
   refreshRateSyncCaption: string
@@ -1804,6 +1806,8 @@ const settingsCopy: Record<UiLanguage, {
     dolbyVisionSystemPipelineExperimentalCaption: '强制杜比视界片源使用 Windows MediaEngine 与 Dolby Vision Extensions；默认关闭。',
     frameInterpolation: 'GPU 补帧',
     frameInterpolationCaption: '全局默认。使用显卡运动补偿生成中间帧，在不超过当前显示刷新率时固定输出 2x。',
+    frameInterpolationResolution: '补帧推理分辨率',
+    frameInterpolationResolutionCaption: '高于所选档位的片源会等比缩小后送入模型；提高档位会显著增加显存和算力开销。',
     frameInterpolationRefreshBlocked: 'GPU 补帧开启时，刷新率同步会保留原设置但暂时失效。',
     refreshRateSync: '智能刷新率同步',
     refreshRateSyncCaption: '全局默认。播放视频进入全屏时，自动选择与帧率整数倍匹配的最高刷新率。',
@@ -1863,6 +1867,8 @@ const settingsCopy: Record<UiLanguage, {
     dolbyVisionSystemPipelineExperimentalCaption: 'Force Dolby Vision sources through Windows MediaEngine and Dolby Vision Extensions. Disabled by default.',
     frameInterpolation: 'GPU frame interpolation',
     frameInterpolationCaption: 'Global default. GPU interpolation uses fixed 2x output when it stays within the active display refresh rate.',
+    frameInterpolationResolution: 'Interpolation resolution',
+    frameInterpolationResolutionCaption: 'Sources above the selected cap are reduced proportionally for the model. Higher values substantially increase GPU memory and compute use.',
     frameInterpolationRefreshBlocked: 'Refresh-rate sync is unavailable while fixed 2x interpolation is enabled.',
     refreshRateSync: 'Smart refresh-rate sync',
     refreshRateSyncCaption: 'Global default. In fullscreen, select the highest refresh rate that is an integer multiple of the video frame rate.',
@@ -1910,6 +1916,8 @@ function LibrarySettingsPage(props: {
   onTrailerSettingsChange: (settings: TrailerSettings) => void
   frameInterpolationEnabled: boolean
   onFrameInterpolationChange: (enabled: boolean) => void
+  frameInterpolationMaximumHeight: number
+  onFrameInterpolationMaximumHeightChange: (maximumHeight: number) => void
   refreshRateSyncEnabled: boolean
   onRefreshRateSyncChange: (enabled: boolean) => void
   refreshRateMaximumMultiple: boolean
@@ -2184,6 +2192,23 @@ function LibrarySettingsPage(props: {
             </button>
           </div>
         </label>
+        <label className="library-settings-field">
+          <span>{t.frameInterpolationResolution}</span>
+          <small>{t.frameInterpolationResolutionCaption}</small>
+          <div className="library-setting-options library-interpolation-resolution-options" role="group" aria-label={t.frameInterpolationResolution}>
+            {[1080, 1440, 2160].map((height) => (
+              <button
+                key={height}
+                className={props.frameInterpolationMaximumHeight === height ? 'is-selected' : ''}
+                type="button"
+                aria-pressed={props.frameInterpolationMaximumHeight === height}
+                onClick={() => props.onFrameInterpolationMaximumHeightChange(height)}
+              >
+                <span>{height}p</span>
+              </button>
+            ))}
+          </div>
+        </label>
         <p>{t.refreshRateSyncCaption}</p>
         <p className="library-settings-warning">{props.frameInterpolationEnabled ? t.frameInterpolationRefreshBlocked : t.refreshRateSyncRequirement}</p>
         <div className={`library-refresh-sync-controls ${refreshRateSyncBlocked ? 'is-disabled' : ''}`}>
@@ -2316,6 +2341,7 @@ export default function LibraryApp(): JSX.Element {
   const [audioPassthroughEnabled, setAudioPassthroughEnabled] = useState(false)
   const [audioPassthroughSettingsLoaded, setAudioPassthroughSettingsLoaded] = useState(false)
   const [frameInterpolationEnabled, setFrameInterpolationEnabled] = useState(false)
+  const [frameInterpolationMaximumHeight, setFrameInterpolationMaximumHeight] = useState(1080)
   const [refreshRateSyncEnabled, setRefreshRateSyncEnabled] = useState(() => localStorage.getItem('anvil-player.refresh-rate-sync') === 'true')
   const [refreshRateMaximumMultiple, setRefreshRateMaximumMultiple] = useState(() => localStorage.getItem('anvil-player.refresh-rate-maximum-multiple') !== 'false')
   const { settings: tmdbSettings, status: tmdbStatus, isTesting: isTestingTmdb, updateSettings: updateTmdbSettings, testConnection: testTmdbSettingsConnection } = useTmdbSettings()
@@ -2655,6 +2681,15 @@ export default function LibraryApp(): JSX.Element {
     localStorage.setItem('anvil-player.frame-interpolation', String(frameInterpolationEnabled))
     postNativeCommand({ type: 'command', command: 'setGlobalFrameInterpolation', enabled: frameInterpolationEnabled })
   }, [frameInterpolationEnabled, videoPassthroughSettingsLoaded])
+
+  useEffect(() => {
+    if (!videoPassthroughSettingsLoaded) return
+    postNativeCommand({
+      type: 'command',
+      command: 'setGlobalFrameInterpolationMaximumHeight',
+      maximumHeight: frameInterpolationMaximumHeight
+    })
+  }, [frameInterpolationMaximumHeight, videoPassthroughSettingsLoaded])
 
   useEffect(() => {
     localStorage.setItem('anvil-player.refresh-rate-sync', String(refreshRateSyncEnabled))
@@ -3029,6 +3064,7 @@ export default function LibraryApp(): JSX.Element {
         setCustomTitleBarEnabled(message.customTitleBar)
       } else if (message.type === 'globalVideoPassthroughSettings') {
         setFrameInterpolationEnabled(message.frameInterpolationEnabled)
+        setFrameInterpolationMaximumHeight(message.frameInterpolationMaximumHeight)
         setAutoDisplayFormat(message.autoDisplayFormat)
         setDisplayMetadataPassthrough(message.displayMetadataPassthrough)
         setDisplayPeakBrightnessNits(message.displayPeakBrightnessNits)
@@ -5596,6 +5632,7 @@ export default function LibraryApp(): JSX.Element {
             dolbyVisionSystemPipelineExperimental={dolbyVisionSystemPipelineExperimental}
             windowsHdrEnabled={windowsHdrEnabled}
             frameInterpolationEnabled={frameInterpolationEnabled}
+            frameInterpolationMaximumHeight={frameInterpolationMaximumHeight}
             refreshRateSyncEnabled={refreshRateSyncEnabled}
             refreshRateMaximumMultiple={refreshRateMaximumMultiple}
             audioPassthroughEnabled={audioPassthroughEnabled}
@@ -5609,6 +5646,7 @@ export default function LibraryApp(): JSX.Element {
             onAutoDisplayFormatChange={setAutoDisplayFormat}
             onDolbyVisionSystemPipelineExperimentalChange={setDolbyVisionSystemPipelineExperimental}
             onFrameInterpolationChange={setFrameInterpolationEnabled}
+            onFrameInterpolationMaximumHeightChange={setFrameInterpolationMaximumHeight}
             onRefreshRateSyncChange={setRefreshRateSyncEnabled}
             onRefreshRateMaximumMultipleChange={setRefreshRateMaximumMultiple}
             onAudioPassthroughChange={setAudioPassthroughEnabled}

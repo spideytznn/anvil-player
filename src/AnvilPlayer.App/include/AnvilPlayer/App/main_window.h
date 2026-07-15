@@ -374,6 +374,7 @@ private:
     void SetDolbyVisionSystemPipelineExperimental(bool enabled);
     void SetHardwareDecodeEnabled(bool enabled);
     void SetFrameInterpolationEnabled(bool enabled);
+    void SetFrameInterpolationMaximumHeight(int maximumHeight);
     void ToggleFullscreen();
     bool RefreshRateSyncEffective() const;
     void SetRefreshRateSyncEnabled(bool enabled);

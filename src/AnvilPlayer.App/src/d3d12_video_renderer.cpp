@@ -1,5 +1,6 @@
 #include "AnvilPlayer/App/d3d12_video_renderer.h"
 
+#include "AnvilPlayer/App/frame_interpolation_policy.h"
 #include "AnvilPlayer/App/playback_timing_math.h"
 #include "AnvilPlayer/App/software_yuv_upload_layout.h"
 #include "AnvilPlayer/App/string_util.h"
@@ -107,19 +108,11 @@ struct TensorCompositionConstants {
     UINT tensorWidth = 0;
     UINT tensorHeight = 0;
     float hdrOutput = 0.0f;
-    float sourcePeakNits = 1000.0f;
-    float targetPeakNits = 100.0f;
     UINT transfer = 1;
-    UINT primaries = 0;
-    float padding = 0.0f;
-    float trimA[4]{};
-    float trimB[4]{};
-    float trimC[4]{};
-    float hdrToneCurve[20]{};
     float endpointReference[4]{};
 };
 
-static_assert(sizeof(TensorCompositionConstants) == 44 * sizeof(UINT));
+static_assert(sizeof(TensorCompositionConstants) == 8 * sizeof(UINT));
 
 static_assert(sizeof(CompositionConstants) == 60 * sizeof(UINT));
 
@@ -293,11 +286,12 @@ uint64_t FillHdrToneCurveConstants(float (&packedCurve)[20],
                                    float& processingFlags,
                                    const NativeVideoFrame& frame,
                                    const anvil::playback::VideoSettings& settings,
-                                   const bool hdrOutput) noexcept {
+                                   const bool hdrOutput,
+                                   const bool forceAppSideDisplayMapping = false) noexcept {
     const bool dolbyVision = FrameDolbyVisionMetadata(frame) != nullptr;
     const bool hdr10Plus = frame.hdr10Plus && frame.hdr10Plus->valid;
     if (!hdrOutput || !frame.color.IsHdr() || dolbyVision || hdr10Plus ||
-        settings.displayMetadataPassthrough) {
+        (settings.displayMetadataPassthrough && !forceAppSideDisplayMapping)) {
         return 0;
     }
 
@@ -334,11 +328,59 @@ uint64_t FillHdrToneCurveConstants(float (&packedCurve)[20],
 
 float InitialHdrProcessingFlags(const NativeVideoFrame& frame,
                                 const anvil::playback::VideoSettings& settings,
-                                const bool hdrOutput) noexcept {
+                                const bool hdrOutput,
+                                const bool forceAppSideDisplayMapping = false) noexcept {
     const bool appSideDisplayMapping = hdrOutput && frame.color.IsHdr() &&
-        FrameDolbyVisionMetadata(frame) == nullptr &&
-        !settings.displayMetadataPassthrough;
+        (forceAppSideDisplayMapping || FrameDolbyVisionMetadata(frame) == nullptr) &&
+        (forceAppSideDisplayMapping || !settings.displayMetadataPassthrough);
     return appSideDisplayMapping ? 2.0f : 0.0f;
+}
+
+void FillInterpolationDisplayEndpoint(
+    InterpolationDisplayMappingPair& mapping,
+    const std::size_t endpoint,
+    const NativeVideoFrame& frame,
+    const anvil::playback::VideoSettings& settings,
+    const bool hdrInput,
+    const bool hdrOutput,
+    const float targetPeakNits) noexcept {
+    if (endpoint >= 2) return;
+    CompositionConstants constants{};
+    constants.hdrOutput = hdrOutput ? 1.0f : 0.0f;
+    constants.sourcePeakNits = FrameSourcePeakNits(frame);
+    constants.targetPeakNits = targetPeakNits;
+    constants.padding = hdrInput
+        ? InitialHdrProcessingFlags(frame, settings, hdrOutput, true)
+        : 0.0f;
+    if (hdrInput) {
+        // Dynamic metadata is deliberately internalized per endpoint. The
+        // generated frame has no meaningful ST 2094-40 payload of its own.
+        FillHdr10PlusConstants(constants, frame, true);
+        FillHdrToneCurveConstants(constants.hdrToneCurve, constants.padding,
+                                  frame, settings, hdrOutput, true);
+    }
+    mapping.tone[endpoint][0] = constants.hdrOutput;
+    mapping.tone[endpoint][1] = constants.sourcePeakNits;
+    mapping.tone[endpoint][2] = constants.targetPeakNits;
+    mapping.tone[endpoint][3] = constants.padding;
+    mapping.options[endpoint][0] = hdrInput ? 1.0f : 0.0f;
+    mapping.options[endpoint][1] = static_cast<float>(
+        ToneMappingModeBits(settings.toneMapping) >> 2);
+    mapping.options[endpoint][2] = hdrInput &&
+        FrameDolbyVisionMetadata(frame) && settings.dolbyVisionCmv4Approx
+            ? 1.0f : 0.0f;
+    std::copy(std::begin(constants.hdr10PlusA),
+              std::end(constants.hdr10PlusA),
+              std::begin(mapping.hdr10PlusA[endpoint]));
+    std::copy(std::begin(constants.hdr10PlusB),
+              std::end(constants.hdr10PlusB),
+              std::begin(mapping.hdr10PlusB[endpoint]));
+    std::copy(std::begin(constants.hdr10PlusCurve),
+              std::end(constants.hdr10PlusCurve),
+              &mapping.hdr10PlusCurve[endpoint][0][0]);
+    std::copy(std::begin(constants.hdrToneCurve),
+              std::end(constants.hdrToneCurve),
+              &mapping.hdrToneCurve[endpoint][0][0]);
 }
 
 bool HdrOutputEnabled(const NativeVideoFrame& frame,
@@ -496,10 +538,6 @@ void D3D12VideoRenderer::ConfigureColorPipeline(
     const anvil::playback::VideoColorMetadata& mediaColor) {
     {
         std::scoped_lock lock(commandMutex_);
-        const bool interpolationChanged =
-            videoSettings_.frameInterpolationEnabled != settings.frameInterpolationEnabled;
-        videoSettings_ = settings;
-        displayCapabilities_ = display;
         int detectedPeakNits = detectedDisplayPeakNits_.load(std::memory_order_acquire);
         if (detectedPeakNits <= 0) {
             detectedPeakNits = SanitizeDisplayPeakNits(display.reportedPeakBrightnessNits);
@@ -507,9 +545,16 @@ void D3D12VideoRenderer::ConfigureColorPipeline(
                 detectedDisplayPeakNits_.store(detectedPeakNits, std::memory_order_release);
             }
         }
+        anvil::playback::DisplayCapabilities normalizedDisplay = display;
         if (detectedPeakNits > 0) {
-            displayCapabilities_.reportedPeakBrightnessNits = detectedPeakNits;
+            normalizedDisplay.reportedPeakBrightnessNits = detectedPeakNits;
         }
+        const bool interpolationPresentationChanged =
+            InterpolationPresentationConfigChanged(
+                videoSettings_, displayCapabilities_, mediaColor_,
+                settings, normalizedDisplay, mediaColor);
+        videoSettings_ = settings;
+        displayCapabilities_ = std::move(normalizedDisplay);
         const int configuredPeakNits =
             SanitizeDisplayPeakNits(settings.displayPeakBrightnessNits);
         effectiveDisplayPeakNits_.store(
@@ -523,7 +568,8 @@ void D3D12VideoRenderer::ConfigureColorPipeline(
         pendingMlInitialization_ = pendingMlInitialization_ ||
             (settings.frameInterpolationEnabled &&
              !mlInitializationStarted_.load(std::memory_order_acquire));
-        pendingInterpolationReset_ = pendingInterpolationReset_ || interpolationChanged;
+        pendingInterpolationReset_ = pendingInterpolationReset_ ||
+            interpolationPresentationChanged;
         pendingPresent_ = true;
     }
     commandCv_.notify_one();
@@ -644,6 +690,7 @@ void D3D12VideoRenderer::QueueFrameGraphInput(const NativeVideoFrame& frame) {
         (!frame.HasD3D12Texture() && !frame.HasPixels())) return;
     try {
         auto input = std::make_unique<NativeVideoFrame>(frame);
+        StripInterpolationPresentationData(*input);
         {
             std::scoped_lock lock(commandMutex_);
             if (pendingGraphInputs_.size() >= 6) {
@@ -731,6 +778,10 @@ void D3D12VideoRenderer::RenderThreadMain() {
             StartMlInitialization();
         }
         if (resize) {
+            // Presentation-size and monitor changes can alter both the DV
+            // endpoint render target and the effective HDR peak. Never allow
+            // a generated frame prepared under the old contract to survive.
+            ResetInterpolationState();
             RECT client{};
             GetClientRect(host_.load(), &client);
             Resize(static_cast<UINT>(std::max<LONG>(1, client.right - client.left)),
@@ -2401,7 +2452,7 @@ float4 main(float4 position : SV_POSITION,float2 uv : TEXCOORD0) : SV_Target {
     tensorParameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     tensorParameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     tensorParameters[1].Constants.ShaderRegister = 0;
-    tensorParameters[1].Constants.Num32BitValues = 44;
+    tensorParameters[1].Constants.Num32BitValues = 8;
     tensorParameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_ROOT_SIGNATURE_DESC tensorRootDesc{};
     tensorRootDesc.NumParameters = static_cast<UINT>(std::size(tensorParameters));
@@ -2435,15 +2486,7 @@ SamplerState endpointLinearClamp : register(s0);
 cbuffer TensorCompositionConstants : register(b0) {
     uint2 tensorSize;
     float hdrOutput;
-    float sourcePeakNits;
-    float targetPeakNits;
     uint inputTransfer;
-    uint inputPrimaries;
-    float padding;
-    float4 trimA;
-    float4 trimB;
-    float4 trimC;
-    float4 hdrToneCurve[5];
     float4 endpointReference;
 };
 float load_half(uint plane, uint2 position) {
@@ -2523,76 +2566,6 @@ float3 rec709_to_rec2020(float3 v) {
                        0.0691,0.9195,0.0114,
                        0.0164,0.0880,0.8956),v);
 }
-float3 sdr_tone_map_nits(float3 nits,float sourcePeak) {
-    nits=max(nits,0.0); float luma=max(dot(nits,float3(0.2627,0.6780,0.0593)),0.000001);
-    uint toneMapMode=(inputPrimaries>>2)&3;
-    float exposure=toneMapMode==2?0.72:(toneMapMode==3?0.95:0.80);
-    float target=100.0;
-    float knee=target*(toneMapMode==2?0.40:(toneMapMode==3?0.55:0.45));
-    float shoulder=max(target-knee,0.0001); float working=luma*exposure;
-    if(working<=knee) return nits*exposure;
-    float peak=max(max(sourcePeak*exposure,working),target+1.0);
-    float mapped=knee+shoulder*log(1.0+(working-knee)/shoulder)/
-        max(log(1.0+(peak-knee)/shoulder),0.0001);
-    return nits*(min(mapped,target)/luma);
-}
-float2 hdr_curve_point(int index) {
-    float4 pairs=hdrToneCurve[index/2];
-    return (index&1)==0?pairs.xy:pairs.zw;
-}
-float hdr_curve_luma(float lumaNits) {
-    float2 previous=hdr_curve_point(0);
-    if(lumaNits<=previous.x) return max(previous.y,0.0);
-    [unroll] for(int index=1;index<9;++index) {
-        float2 next=hdr_curve_point(index);
-        if(lumaNits<=next.x) {
-            float amount=saturate((lumaNits-previous.x)/max(next.x-previous.x,0.0001));
-            return max(lerp(previous.y,next.y,amount),0.0);
-        }
-        previous=next;
-    }
-    return max(previous.y,0.0);
-}
-float3 apply_hdr_tone_curve(float3 sourceNits) {
-    float3 nits=max(sourceNits,0.0);
-    float flags=floor(padding+0.5);
-    if(fmod(flags,2.0)<0.5) return nits;
-    float luma=max(dot(nits,float3(0.2627,0.6780,0.0593)),0.0);
-    return nits*(hdr_curve_luma(luma)/max(luma,0.0001));
-}
-float3 apply_hdr_display_mapping(float3 sourceNits) {
-    float3 nits=max(sourceNits,0.0); float flags=floor(padding+0.5);
-    float peak=max(nits.r,max(nits.g,nits.b));
-    if(flags<2.0 || peak<=0.0001) return nits;
-    float target=max(targetPeakNits,100.0),source=max(sourcePeakNits,peak);
-    if(source<=target+1.0) return nits;
-    uint toneMapMode=(inputPrimaries>>2)&3;
-    float knee=target*(toneMapMode==2?0.55:(toneMapMode==3?0.75:0.65));
-    if(peak<=knee) return nits;
-    float shoulder=max(target-knee,1.0);
-    float denominator=max(1.0-exp(-(source-knee)/shoulder),0.0001);
-    float mapped=knee+shoulder*(1.0-exp(-(min(peak,source)-knee)/shoulder))/denominator;
-    return nits*(min(mapped,target)/peak);
-}
-float3 apply_dovi_trim(float3 nits) {
-    if(trimA.x<0.5) return nits;
-    float3 src=saturate(nits_to_pq(max(nits,0.0)));
-    float l=saturate(dot(src,float3(0.2627,0.6780,0.0593)));
-    float toe=smoothstep(0.02,0.18,l);
-    float shoulder=1.0-smoothstep(0.70,0.98,l);
-    float mid=toe*shoulder;
-    float outputLuma=saturate(l+trimB.w*mid);
-    outputLuma=saturate(0.45+(outputLuma-0.45)*(1.0+trimC.x*mid));
-    outputLuma=saturate((outputLuma-0.5)*max(trimA.y,0.01)+0.5+trimA.z*toe);
-    outputLuma=pow(max(outputLuma,0.0),max(trimA.w,0.05));
-    float clipMask=smoothstep(0.62,1.0,outputLuma);
-    outputLuma=saturate(outputLuma+trimC.y*clipMask*(1.0-outputLuma)*0.45);
-    float3 color=saturate(src*(outputLuma/max(l,0.0001)));
-    float gray=saturate(dot(color,float3(0.2627,0.6780,0.0593)));
-    float saturation=clamp(trimB.x*lerp(1.0,trimB.y,0.25)*lerp(1.0,trimB.z,0.10),0.75,1.25);
-    color=saturate(gray.xxx+(color-gray.xxx)*saturation);
-    return pq_to_nits(color);
-}
 float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_Target {
     float3 generatedRgb=sample_rgb(uv);
     if (inputTransfer == 1) {
@@ -2638,13 +2611,10 @@ float4 main(float4 position : SV_POSITION, float2 uv : TEXCOORD0) : SV_Target {
         mappedNits=rec2020_to_rec709(mappedNits);
         return float4(linear_to_srgb(max(mappedNits,0.0)/100.0),1.0);
     }
-    float3 nits = apply_dovi_trim(pq_to_nits(generatedRgb));
-    nits=apply_hdr_tone_curve(nits);
-    nits=apply_hdr_display_mapping(nits);
-    if (hdrOutput < 0.5) nits=sdr_tone_map_nits(nits,sourcePeakNits);
-    if (hdrOutput >= 0.5) return float4(nits_to_pq(max(nits,0.0)),1.0);
-    nits=rec2020_to_rec709(nits);
-    return float4(linear_to_srgb(max(nits,0.0)/100.0),1.0);
+    // No source-domain HDR input is legal here. All HDR/DV transforms belong
+    // to the two endpoint preprocessors so the ML result cannot be tone-mapped
+    // a second time with either endpoint's metadata.
+    return float4(0.0,0.0,0.0,1.0);
 })";
     Microsoft::WRL::ComPtr<ID3DBlob> tensorPs;
     errors.Reset();
@@ -3149,11 +3119,15 @@ bool D3D12VideoRenderer::TryRenderDolbyVisionWithLibplacebo(
     constants.hdrOutput = hdrOutput ? 1.0f : 0.0f;
     constants.sourcePeakNits = FrameSourcePeakNits(frame);
     constants.targetPeakNits = targetPeakNits;
-    constants.padding = InitialHdrProcessingFlags(frame, videoSettings_, hdrOutput);
+    const bool fixedInterpolationDisplayDomain =
+        interpolationRequested_.load(std::memory_order_acquire);
+    constants.padding = InitialHdrProcessingFlags(
+        frame, videoSettings_, hdrOutput, fixedInterpolationDisplayDomain);
     FillHdr10PlusConstants(constants, frame,
                            !nvidiaHdrOutput_.Hdr10PlusGamingActive());
     const uint64_t hdrToneCurveFingerprint = FillHdrToneCurveConstants(
-        constants.hdrToneCurve, constants.padding, frame, videoSettings_, hdrOutput);
+        constants.hdrToneCurve, constants.padding, frame, videoSettings_, hdrOutput,
+        fixedInterpolationDisplayDomain);
     if (hdrToneCurveFingerprint != 0 &&
         hdrToneCurveFingerprint != loggedHdrToneCurveFingerprint_) {
         loggedHdrToneCurveFingerprint_ = hdrToneCurveFingerprint;
@@ -3373,11 +3347,15 @@ bool D3D12VideoRenderer::RenderPixelFrame(const NativeVideoFrame& frame) {
     constants.hdrOutput = nativeHlg ? 2.0f : (hdrOutput ? 1.0f : 0.0f);
     constants.sourcePeakNits = FrameSourcePeakNits(frame);
     constants.targetPeakNits = TargetPeakNits(videoSettings_, displayCapabilities_);
-    constants.padding = InitialHdrProcessingFlags(frame, videoSettings_, hdrOutput);
+    const bool fixedInterpolationDisplayDomain =
+        interpolationRequested_.load(std::memory_order_acquire);
+    constants.padding = InitialHdrProcessingFlags(
+        frame, videoSettings_, hdrOutput, fixedInterpolationDisplayDomain);
     FillHdr10PlusConstants(constants, frame,
                            !nvidiaHdrOutput_.Hdr10PlusGamingActive());
     const uint64_t hdrToneCurveFingerprint = FillHdrToneCurveConstants(
-        constants.hdrToneCurve, constants.padding, frame, videoSettings_, hdrOutput);
+        constants.hdrToneCurve, constants.padding, frame, videoSettings_, hdrOutput,
+        fixedInterpolationDisplayDomain);
     if (hdrToneCurveFingerprint != 0 &&
         hdrToneCurveFingerprint != loggedHdrToneCurveFingerprint_) {
         loggedHdrToneCurveFingerprint_ = hdrToneCurveFingerprint;
@@ -3852,11 +3830,15 @@ bool D3D12VideoRenderer::RenderFrame(const NativeVideoFrame& frame) {
     constants.hdrOutput = nativeHlg ? 2.0f : (hdrOutput ? 1.0f : 0.0f);
     constants.sourcePeakNits = FrameSourcePeakNits(renderFrame);
     constants.targetPeakNits = TargetPeakNits(videoSettings_, displayCapabilities_);
-    constants.padding = InitialHdrProcessingFlags(renderFrame, videoSettings_, hdrOutput);
+    const bool fixedInterpolationDisplayDomain =
+        interpolationRequested_.load(std::memory_order_acquire);
+    constants.padding = InitialHdrProcessingFlags(
+        renderFrame, videoSettings_, hdrOutput, fixedInterpolationDisplayDomain);
     FillHdr10PlusConstants(constants, renderFrame,
                            !nvidiaHdrOutput_.Hdr10PlusGamingActive());
     const uint64_t hdrToneCurveFingerprint = FillHdrToneCurveConstants(
-        constants.hdrToneCurve, constants.padding, renderFrame, videoSettings_, hdrOutput);
+        constants.hdrToneCurve, constants.padding, renderFrame, videoSettings_, hdrOutput,
+        fixedInterpolationDisplayDomain);
     if (hdrToneCurveFingerprint != 0 &&
         hdrToneCurveFingerprint != loggedHdrToneCurveFingerprint_) {
         loggedHdrToneCurveFingerprint_ = hdrToneCurveFingerprint;
@@ -3988,6 +3970,16 @@ int D3D12VideoRenderer::InterpolationMultiplier(const NativeVideoFrame& first,
 }
 
 void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
+    RefreshDisplayPeakNits();
+    if (!tensorDolbyVisionPipelineLogged_ &&
+        tensorPreprocessor_.DolbyVisionPipelineInitializationComplete()) {
+        tensorDolbyVisionPipelineLogged_ = true;
+        const bool ready = tensorPreprocessor_.DolbyVisionPipelineReady();
+        Log(ready ? LogLevel::Info : LogLevel::Warning,
+            std::wstring(L"Dolby Vision display-domain tensor pipeline=") +
+                (ready ? L"ready background=true"
+                       : L"unavailable shader_compile_failed=true"));
+    }
     IMlFrameInterpolationExecutor* executor =
         mlExecutor_.load(std::memory_order_acquire);
     if (!interpolationRequested_.load(std::memory_order_acquire) || !executor ||
@@ -3997,6 +3989,7 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
         tensorPreviousDoviLuminanceTarget_.Reset();
         tensorPreviousDoviTargetTimeline_ = 0;
         tensorPreviousDoviTargetFrameSerial_ = 0;
+        tensorPreviousDoviMetadataFingerprint_ = 0;
         sourceComputeCompletions_.clear();
         sourceGraphicsCompletions_.clear();
         return;
@@ -4008,16 +4001,6 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
     const bool libplaceboDolbyVisionInput = dolbyVisionFrame && frame.HasD3D12Texture() &&
         libplaceboBridge_ && libplaceboBridge_->IsReady();
     dolbyVisionInterpolationColorBypassLogged_ = false;
-    if (frame.hdr10Plus && frame.hdr10Plus->valid) {
-        if (!hdr10PlusInterpolationBypassLogged_) {
-            hdr10PlusInterpolationBypassLogged_ = true;
-            Log(LogLevel::Info,
-                L"HDR10+ interpolation bypassed reason=preserve_per_frame_st2094_40");
-        }
-        ResetInterpolationState();
-        return;
-    }
-    hdr10PlusInterpolationBypassLogged_ = false;
     const auto nominalInterval = frame.frameRateNumerator != 0
         ? std::chrono::milliseconds{static_cast<int64_t>(std::llround(
               1000.0 * frame.frameRateDenominator / frame.frameRateNumerator))}
@@ -4042,6 +4025,7 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
         tensorPreviousDoviLuminanceTarget_.Reset();
         tensorPreviousDoviTargetTimeline_ = 0;
         tensorPreviousDoviTargetFrameSerial_ = 0;
+        tensorPreviousDoviMetadataFingerprint_ = 0;
         sourceComputeCompletions_.clear();
         sourceGraphicsCompletions_.clear();
     }
@@ -4050,8 +4034,10 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
         tensorPreviousDoviLuminanceTarget_.Reset();
         tensorPreviousDoviTargetTimeline_ = 0;
         tensorPreviousDoviTargetFrameSerial_ = 0;
+        tensorPreviousDoviMetadataFingerprint_ = 0;
         try {
             tensorPreviousFrame_ = std::make_unique<NativeVideoFrame>(frame);
+            StripInterpolationPresentationData(*tensorPreviousFrame_);
         } catch (...) {
             tensorPreviousFrame_.reset();
         }
@@ -4059,9 +4045,19 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
     }
 
     const NativeVideoFrame& first = *tensorPreviousFrame_;
+    const auto* firstDovi = FrameDolbyVisionMetadata(first);
+    const uint64_t firstDoviFingerprint = firstDovi
+        ? firstDovi->dynamicMetadataFingerprint : 0;
     const bool pixelInterpolationInput = first.HasPixels() && frame.HasPixels();
     const bool libplaceboPixelDolbyVisionInput =
         dolbyVisionFrame && pixelInterpolationInput;
+    const auto pixelIsPq = [](const NativeVideoFrame& endpoint) {
+        return endpoint.softwareFormat == AV_PIX_FMT_X2BGR10LE;
+    };
+    const bool firstHdrTensorInput = pixelInterpolationInput
+        ? pixelIsPq(first) : FrameCarriesHdr(first);
+    const bool secondHdrTensorInput = pixelInterpolationInput
+        ? pixelIsPq(frame) : FrameCarriesHdr(frame);
     const int multiplier = InterpolationMultiplier(first, frame);
     if (multiplier <= 1) {
         sourceComputeCompletions_.clear();
@@ -4070,14 +4066,77 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
         tensorPreviousDoviLuminanceTarget_.Reset();
         tensorPreviousDoviTargetTimeline_ = 0;
         tensorPreviousDoviTargetFrameSerial_ = 0;
+        tensorPreviousDoviMetadataFingerprint_ = 0;
         try {
             tensorPreviousFrame_ = std::make_unique<NativeVideoFrame>(frame);
+            StripInterpolationPresentationData(*tensorPreviousFrame_);
         } catch (...) {
             tensorPreviousFrame_.reset();
         }
         std::scoped_lock lock(statsMutex_);
         renderStats_.interpolationMultiplier = 1;
         publishedStats_ = renderStats_;
+        return;
+    }
+    const bool interpolationHdrOutput = HdrOutputEnabled(
+        first, videoSettings_, displayCapabilities_, hdr10ColorSpaceSupported_);
+    const bool secondHdrOutput = HdrOutputEnabled(
+        frame, videoSettings_, displayCapabilities_, hdr10ColorSpaceSupported_);
+    if (IsInterpolationDisplayDomainBoundary(
+            firstHdrTensorInput, secondHdrTensorInput,
+            interpolationHdrOutput, secondHdrOutput)) {
+        Log(LogLevel::Info,
+            L"frame interpolation display-domain boundary left_hdr=" +
+                std::wstring(firstHdrTensorInput ? L"true" : L"false") +
+                L" right_hdr=" +
+                std::wstring(secondHdrTensorInput ? L"true" : L"false") +
+                L" left_output=" +
+                std::wstring(interpolationHdrOutput ? L"hdr" : L"sdr") +
+                L" right_output=" +
+                std::wstring(secondHdrOutput ? L"hdr" : L"sdr"));
+        {
+            std::scoped_lock lock(statsMutex_);
+            renderStats_.generatedDroppedSceneCut +=
+                static_cast<uint64_t>(multiplier - 1);
+            publishedStats_ = renderStats_;
+        }
+        tensorPreviousDoviTarget_.Reset();
+        tensorPreviousDoviLuminanceTarget_.Reset();
+        tensorPreviousDoviTargetTimeline_ = 0;
+        tensorPreviousDoviTargetFrameSerial_ = 0;
+        tensorPreviousDoviMetadataFingerprint_ = 0;
+        try {
+            tensorPreviousFrame_ = std::make_unique<NativeVideoFrame>(frame);
+            StripInterpolationPresentationData(*tensorPreviousFrame_);
+        } catch (...) {
+            tensorPreviousFrame_.reset();
+        }
+        return;
+    }
+    if (IsDolbyVisionSceneBoundary(FrameDolbyVisionMetadata(frame))) {
+        Log(LogLevel::Info,
+            L"frame interpolation scene boundary source=dolby_vision_scene_refresh "
+            L"left_pts_ms=" + std::to_wstring(first.pts.count()) +
+            L" right_pts_ms=" + std::to_wstring(frame.pts.count()));
+        {
+            std::scoped_lock lock(statsMutex_);
+            renderStats_.generatedDroppedSceneCut +=
+                static_cast<uint64_t>(multiplier - 1);
+            publishedStats_ = renderStats_;
+        }
+        sourceComputeCompletions_.clear();
+        sourceGraphicsCompletions_.clear();
+        tensorPreviousDoviTarget_.Reset();
+        tensorPreviousDoviLuminanceTarget_.Reset();
+        tensorPreviousDoviTargetTimeline_ = 0;
+        tensorPreviousDoviTargetFrameSerial_ = 0;
+        tensorPreviousDoviMetadataFingerprint_ = 0;
+        try {
+            tensorPreviousFrame_ = std::make_unique<NativeVideoFrame>(frame);
+            StripInterpolationPresentationData(*tensorPreviousFrame_);
+        } catch (...) {
+            tensorPreviousFrame_.reset();
+        }
         return;
     }
     if (!executor->CanSubmit()) {
@@ -4090,8 +4149,10 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
         tensorPreviousDoviLuminanceTarget_.Reset();
         tensorPreviousDoviTargetTimeline_ = 0;
         tensorPreviousDoviTargetFrameSerial_ = 0;
+        tensorPreviousDoviMetadataFingerprint_ = 0;
         try {
             tensorPreviousFrame_ = std::make_unique<NativeVideoFrame>(frame);
+            StripInterpolationPresentationData(*tensorPreviousFrame_);
         } catch (...) {
             tensorPreviousFrame_.reset();
         }
@@ -4099,11 +4160,23 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
     }
     const float interpolationHlgPeakNits = std::max(
         TargetPeakNits(videoSettings_, displayCapabilities_), 1000.0f);
+    const float interpolationTargetPeakNits =
+        TargetPeakNits(videoSettings_, displayCapabilities_);
+    InterpolationDisplayMappingPair interpolationDisplayMapping{};
+    FillInterpolationDisplayEndpoint(
+        interpolationDisplayMapping, 0, first, videoSettings_,
+        firstHdrTensorInput, interpolationHdrOutput,
+        interpolationTargetPeakNits);
+    FillInterpolationDisplayEndpoint(
+        interpolationDisplayMapping, 1, frame, videoSettings_,
+        secondHdrTensorInput, interpolationHdrOutput,
+        interpolationTargetPeakNits);
     if (frame.color.transfer == VideoTransferCharacteristic::Hlg &&
         !hlgInterpolationColorPathLogged_) {
         hlgInterpolationColorPathLogged_ = true;
         Log(LogLevel::Info,
-            L"HLG interpolation active canonical=bt2020_pq shared_ootf_peak_nits=" +
+            L"HLG interpolation active tensor_domain=display_mapped_bt2020_pq "
+            L"shared_ootf_peak_nits=" +
                 std::to_wstring(static_cast<int>(interpolationHlgPeakNits + 0.5f)) +
                 L" cadence=x" + std::to_wstring(multiplier));
     }
@@ -4124,17 +4197,26 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
 
     Microsoft::WRL::ComPtr<ID3D12Resource> currentDoviTarget;
     Microsoft::WRL::ComPtr<ID3D12Resource> currentDoviLuminanceTarget;
-    TensorShape doviShape{};
+    const UINT interpolationMaximumHeight = static_cast<UINT>(std::clamp(
+        videoSettings_.frameInterpolationMaximumHeight,
+        anvil::playback::kMinimumFrameInterpolationMaximumHeight,
+        anvil::playback::kMaximumFrameInterpolationMaximumHeight));
+    const TensorShape interpolationShape = SelectInterpolationTensorShape(
+        static_cast<UINT>(std::max(first.width, frame.width)),
+        static_cast<UINT>(std::max(first.height, frame.height)),
+        interpolationMaximumHeight);
+    if (!interpolationShape.IsValid()) {
+        Log(LogLevel::Warning,
+            L"frame interpolation skipped reason=no_tensor_shape_bucket");
+        return;
+    }
     if (libplaceboDolbyVisionInput) {
-        doviShape = SelectInterpolationTensorShape(
-            static_cast<UINT>(std::max(first.width, frame.width)),
-            static_cast<UINT>(std::max(first.height, frame.height)));
         const UINT endpointWidth = std::max<UINT>(1, width_);
         const UINT endpointHeight = std::max<UINT>(1, height_);
         const auto createTarget = [&](
             Microsoft::WRL::ComPtr<ID3D12Resource>& target,
             const UINT targetWidth, const UINT targetHeight) {
-            if (!doviShape.IsValid()) return false;
+            if (!interpolationShape.IsValid()) return false;
             D3D12_HEAP_PROPERTIES heap{};
             heap.Type = D3D12_HEAP_TYPE_DEFAULT;
             D3D12_RESOURCE_DESC desc{};
@@ -4154,9 +4236,6 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
                 &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
                 &clear, IID_PPV_ARGS(&target)));
         };
-        const bool hdrOutput = HdrOutputEnabled(
-            frame, videoSettings_, displayCapabilities_, hdr10ColorSpaceSupported_);
-        const float targetPeakNits = TargetPeakNits(videoSettings_, displayCapabilities_);
         const auto renderEndpoint = [&](const NativeVideoFrame& endpoint,
                                         Microsoft::WRL::ComPtr<ID3D12Resource>& target,
                                         const UINT targetWidth,
@@ -4164,7 +4243,8 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
             return (target || createTarget(target, targetWidth, targetHeight)) &&
                 libplaceboBridge_->RenderDolbyVision(
                     endpoint, target.Get(), targetWidth, targetHeight,
-                    hdrOutput, targetPeakNits, orderingDependency.fence.Get(),
+                    interpolationHdrOutput, interpolationTargetPeakNits,
+                    orderingDependency.fence.Get(),
                     orderingDependency.value, true);
         };
         const D3D12_RESOURCE_DESC cachedTensorDesc = tensorPreviousDoviTarget_
@@ -4177,29 +4257,37 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
             tensorPreviousDoviLuminanceTarget_ &&
             tensorPreviousDoviTargetTimeline_ == first.timelineSerial &&
             tensorPreviousDoviTargetFrameSerial_ == first.serial &&
-            cachedTensorDesc.Width == doviShape.width &&
-            cachedTensorDesc.Height == doviShape.height &&
+            tensorPreviousDoviMetadataFingerprint_ == firstDoviFingerprint &&
+            tensorPreviousDoviHdrOutput_ == interpolationHdrOutput &&
+            std::abs(tensorPreviousDoviTargetPeakNits_ -
+                     interpolationTargetPeakNits) <= 0.5f &&
+            cachedTensorDesc.Width == interpolationShape.width &&
+            cachedTensorDesc.Height == interpolationShape.height &&
             cachedLuminanceDesc.Width == endpointWidth &&
             cachedLuminanceDesc.Height == endpointHeight;
         if (cachedFirstEndpoint && !dolbyVisionImmutableEndpointLogged_) {
             dolbyVisionImmutableEndpointLogged_ = true;
             Log(LogLevel::Info,
                 L"Dolby Vision interpolation endpoint cache="
-                L"immutable_per_frame timeline_guard=enabled");
+                L"immutable_per_frame timeline_guard=enabled "
+                L"mapping=independent_per_endpoint fixed_display_target=true");
         }
         if (!cachedFirstEndpoint) {
             tensorPreviousDoviTarget_.Reset();
             tensorPreviousDoviLuminanceTarget_.Reset();
             tensorPreviousDoviTargetTimeline_ = 0;
             tensorPreviousDoviTargetFrameSerial_ = 0;
+            tensorPreviousDoviMetadataFingerprint_ = 0;
         }
         if ((!cachedFirstEndpoint &&
-             (!renderEndpoint(first, tensorPreviousDoviTarget_,
-                              doviShape.width, doviShape.height) ||
+            (!renderEndpoint(first, tensorPreviousDoviTarget_,
+                              interpolationShape.width,
+                              interpolationShape.height) ||
               !renderEndpoint(first, tensorPreviousDoviLuminanceTarget_,
                               endpointWidth, endpointHeight))) ||
             !renderEndpoint(frame, currentDoviTarget,
-                            doviShape.width, doviShape.height) ||
+                            interpolationShape.width,
+                            interpolationShape.height) ||
             !renderEndpoint(frame, currentDoviLuminanceTarget,
                             endpointWidth, endpointHeight)) {
             Log(LogLevel::Warning,
@@ -4218,14 +4306,16 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
             dolbyVisionInterpolationColorPathLogged_ = true;
             Log(LogLevel::Info,
                 L"Dolby Vision interpolation active color_source=libplacebo_scrgb "
-                L"tensor_domain=bt2020_pq");
+                L"tensor_domain=display_mapped_bt2020_pq "
+                L"endpoint_metadata=independent");
         }
     }
     if (libplaceboPixelDolbyVisionInput && !dolbyVisionInterpolationColorPathLogged_) {
         dolbyVisionInterpolationColorPathLogged_ = true;
         Log(LogLevel::Info,
             L"Dolby Vision interpolation active color_source=decoder_libplacebo_rgb "
-            L"tensor_domain=sdr_encoded_or_bt2020_pq");
+            L"tensor_domain=sdr_encoded_or_display_mapped_bt2020_pq "
+            L"endpoint_metadata=independent");
     }
     for (int sample = 1; sample < multiplier; ++sample) {
         if (!executor->CanSubmit()) break;
@@ -4237,14 +4327,18 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
         if (libplaceboDolbyVisionInput) {
             preprocess = tensorPreprocessor_.SubmitScRgbPair(
                 tensorPreviousDoviTarget_.Get(), currentDoviTarget.Get(),
-                doviShape, interpolationT, frameGraph_.CurrentEpoch(),
+                interpolationShape, interpolationT, frameGraph_.CurrentEpoch(),
                 orderingDependency);
         } else if (pixelInterpolationInput) {
             preprocess = tensorPreprocessor_.SubmitPixelPair(
-                first, frame, interpolationT, frameGraph_.CurrentEpoch(), orderingDependency);
+                first, frame, interpolationShape, interpolationT,
+                interpolationDisplayMapping,
+                frameGraph_.CurrentEpoch(), orderingDependency);
         } else {
             preprocess = tensorPreprocessor_.SubmitPair(
-                first, frame, interpolationT, interpolationHlgPeakNits,
+                first, frame, interpolationShape, interpolationT,
+                interpolationHlgPeakNits,
+                interpolationDisplayMapping,
                 frameGraph_.CurrentEpoch(), orderingDependency);
         }
         if (!preprocess.accepted) {
@@ -4283,6 +4377,7 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
         }
         output.shape = preprocess.shape;
         output.inputTensor = preprocess.tensor.resource;
+        output.sceneChangeProbe = preprocess.sceneChange;
         if (libplaceboDolbyVisionInput) {
             output.luminanceLeft = tensorPreviousDoviLuminanceTarget_;
             output.luminanceRight = currentDoviLuminanceTarget;
@@ -4303,32 +4398,23 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
         output.ready = inference.completion;
         output.reusable = inference.completion;
         output.completionStatusConsumed = false;
-        try {
-            output.overlayFrame = std::make_unique<NativeVideoFrame>(frame);
-            // The retained frame supplies only color/HDR presentation metadata.
-            // Subtitle pixels and timing live in the renderer-level presentation
-            // overlay and must never be copied into an interpolation slot.
-            output.overlayFrame->subtitleText.clear();
-            output.overlayFrame->subtitleBitmaps.clear();
-            output.overlayFrame->subtitlesPrepared = false;
-        } catch (...) {
-            output.overlayFrame.reset();
+        // The presentation target is immutable for the lifetime of this slot,
+        // but A and B have already been mapped with their own metadata. The
+        // left endpoint remains only a cadence anchor, never a color authority.
+        output.hdrOutput = interpolationHdrOutput;
+        output.targetPeakNits = interpolationTargetPeakNits;
+        const bool displayMappedTensor = libplaceboDolbyVisionInput ||
+            firstHdrTensorInput;
+        output.inputTransfer = displayMappedTensor ? 4u : 1u;
+        output.displayDomainReady = true;
+        if (!interpolationDisplayDomainLogged_) {
+            interpolationDisplayDomainLogged_ = true;
+            Log(LogLevel::Info,
+                L"interpolation color contract=display_domain "
+                L"endpoint_mapping=independent final_tone_mapping=disabled "
+                L"target_peak_nits=" +
+                    std::to_wstring(static_cast<int>(output.targetPeakNits + 0.5f)));
         }
-        const auto* generatedDovi =
-            frame.enhancementDovi && frame.enhancementDovi->valid
-                ? frame.enhancementDovi.get()
-                : (frame.dovi && frame.dovi->valid ? frame.dovi.get() : nullptr);
-        const float interpolationTargetPeak =
-            TargetPeakNits(videoSettings_, displayCapabilities_);
-        output.inputTransfer = libplaceboDolbyVisionInput
-            ? 4u
-            : (frame.color.transfer == VideoTransferCharacteristic::Pq ||
-               frame.color.transfer == VideoTransferCharacteristic::Hlg ? 2u : 0u);
-        output.doviTrim = libplaceboDolbyVisionInput
-            ? DoviDisplayTrim{}
-            : SelectDoviDisplayTrim(generatedDovi, interpolationTargetPeak);
-        output.doviSourcePeakNits = generatedDovi && generatedDovi->sourceMaxNits > 0.0f
-            ? generatedDovi->sourceMaxNits : SourcePeakNits(frame.color);
         if (presentedOriginalTimeline_ == first.timelineSerial &&
             presentedOriginalPts_ == first.pts) {
             output.anchored = true;
@@ -4356,23 +4442,42 @@ void D3D12VideoRenderer::ProcessFrameGraphInput(const NativeVideoFrame& frame) {
                 L"frame graph preprocess active shape=" +
                     std::to_wstring(preprocess.shape.width) + L"x" +
                     std::to_wstring(preprocess.shape.height) +
-                    L" layout=fp16_nchw_7 domain=sdr_encoded_or_bt2020_pq variable_t=true");
+                    L" maximum_picture_height=" +
+                    std::to_wstring(interpolationMaximumHeight) +
+                    L" layout=fp16_nchw_7 "
+                    L"domain=sdr_encoded_or_display_mapped_bt2020_pq variable_t=true");
+        }
+        if (!sceneChangeProbeLogged_) {
+            sceneChangeProbeLogged_ = true;
+            Log(LogLevel::Info,
+                L"frame interpolation scene protection=active "
+                L"probe=sparse_bt2020_luma grid=16x16 async_readback=true");
         }
     }
     if (libplaceboDolbyVisionInput) {
+        const auto* currentDovi = FrameDolbyVisionMetadata(frame);
+        const uint64_t currentDoviFingerprint = currentDovi
+            ? currentDovi->dynamicMetadataFingerprint : 0;
+        // B was rendered with B's own metadata into the immutable target, so
+        // it is exactly the next pair's A and can always be reused.
         tensorPreviousDoviTarget_ = std::move(currentDoviTarget);
         tensorPreviousDoviLuminanceTarget_ =
             std::move(currentDoviLuminanceTarget);
         tensorPreviousDoviTargetTimeline_ = frame.timelineSerial;
         tensorPreviousDoviTargetFrameSerial_ = frame.serial;
+        tensorPreviousDoviMetadataFingerprint_ = currentDoviFingerprint;
+        tensorPreviousDoviTargetPeakNits_ = interpolationTargetPeakNits;
+        tensorPreviousDoviHdrOutput_ = interpolationHdrOutput;
     } else {
         tensorPreviousDoviTarget_.Reset();
         tensorPreviousDoviLuminanceTarget_.Reset();
         tensorPreviousDoviTargetTimeline_ = 0;
         tensorPreviousDoviTargetFrameSerial_ = 0;
+        tensorPreviousDoviMetadataFingerprint_ = 0;
     }
     try {
         tensorPreviousFrame_ = std::make_unique<NativeVideoFrame>(frame);
+        StripInterpolationPresentationData(*tensorPreviousFrame_);
     } catch (...) {
         tensorPreviousFrame_.reset();
     }
@@ -4412,10 +4517,12 @@ std::optional<std::size_t> D3D12VideoRenderer::AcquireGeneratedSlot() {
         }
         slot.ready = {};
         slot.reusable = {};
-        slot.overlayFrame.reset();
+        slot.sceneChangeProbe = {};
         slot.anchored = false;
         slot.completionStatusConsumed = false;
         slot.inputTransfer = 0;
+        slot.hdrOutput = false;
+        slot.displayDomainReady = false;
         return index;
     }
     return std::nullopt;
@@ -4481,6 +4588,41 @@ void D3D12VideoRenderer::ProcessReadyGeneratedFrame() {
             pendingGeneratedSlots_.pop_front();
             continue;
         }
+        SceneChangeMetrics sceneMetrics;
+        const SceneChangeProbeStatus sceneStatus =
+            ReadSceneChangeProbe(slot.sceneChangeProbe, sceneMetrics);
+        if (sceneStatus != SceneChangeProbeStatus::Ready) {
+            Log(LogLevel::Warning,
+                L"generated frame dropped reason=scene_probe_" +
+                    std::wstring(sceneStatus == SceneChangeProbeStatus::Pending
+                        ? L"not_ready" : L"invalid"));
+            {
+                std::scoped_lock lock(statsMutex_);
+                ++renderStats_.generatedDroppedSceneProbeUnavailable;
+                publishedStats_ = renderStats_;
+            }
+            RetireGeneratedSlot(slotIndex, false);
+            pendingGeneratedSlots_.pop_front();
+            continue;
+        }
+        if (IsHardSceneCut(sceneMetrics)) {
+            Log(LogLevel::Info,
+                L"generated frame dropped reason=scene_cut mean_luma_diff=" +
+                    std::to_wstring(sceneMetrics.meanAbsoluteLumaDifference) +
+                    L" changed_ratio=" +
+                    std::to_wstring(sceneMetrics.changedSampleRatio) +
+                    L" global_luma_shift=" +
+                    std::to_wstring(std::abs(
+                        sceneMetrics.meanLeftLuma - sceneMetrics.meanRightLuma)));
+            {
+                std::scoped_lock lock(statsMutex_);
+                ++renderStats_.generatedDroppedSceneCut;
+                publishedStats_ = renderStats_;
+            }
+            RetireGeneratedSlot(slotIndex, false);
+            pendingGeneratedSlots_.pop_front();
+            continue;
+        }
         const bool presented = RenderGeneratedFrame(slotIndex);
         if (!presented) {
             Log(LogLevel::Warning, L"generated tensor composite failed");
@@ -4535,9 +4677,10 @@ void D3D12VideoRenderer::RetireGeneratedSlot(const std::size_t slotIndex,
     }
     slot.luminanceLeft.Reset();
     slot.luminanceRight.Reset();
+    slot.sceneChangeProbe = {};
     slot.pending = false;
     slot.anchored = false;
-    slot.overlayFrame.reset();
+    slot.displayDomainReady = false;
 }
 
 bool D3D12VideoRenderer::RenderGeneratedFrame(const std::size_t slotIndex) {
@@ -4546,11 +4689,22 @@ bool D3D12VideoRenderer::RenderGeneratedFrame(const std::size_t slotIndex) {
     }
     GeneratedFrameSlot& slot = generatedSlots_[slotIndex];
     if (!slot.output || !slot.inputTensor || !slot.shape.IsValid()) return false;
-    // A generated frame may only be presented while its displayed left
-    // endpoint is still the renderer's timeline authority. Subtitle state is
-    // deliberately not part of this slot and is composed independently below.
-    if (!slot.overlayFrame || presentedOriginalTimeline_ != slot.timelineSerial ||
+    if (slot.inputTransfer != 1u && slot.inputTransfer != 4u) return false;
+    // A generated frame may only be presented while its left endpoint is the
+    // active cadence anchor. Color authority is the fixed display-domain
+    // contract shared by A and B. Subtitle state is composed independently.
+    if (!slot.displayDomainReady || presentedOriginalTimeline_ != slot.timelineSerial ||
         presentedOriginalPts_ != slot.leftPts) {
+        return false;
+    }
+    // The left original already established the swap-chain color space and
+    // display metadata. A generated frame must inherit that state, never
+    // switch it independently. If an external change invalidated the state,
+    // drop the generated frame instead of risking a brightness pulse.
+    if (swapChainHdr_ != slot.hdrOutput) return false;
+    RefreshDisplayPeakNits();
+    if (std::abs(TargetPeakNits(videoSettings_, displayCapabilities_) -
+                 slot.targetPeakNits) > 0.5f) {
         return false;
     }
     WaitForFrameLatencyObject();
@@ -4649,38 +4803,25 @@ bool D3D12VideoRenderer::RenderGeneratedFrame(const std::size_t slotIndex) {
     TensorCompositionConstants constants{};
     constants.tensorWidth = slot.shape.width;
     constants.tensorHeight = slot.shape.height;
-    const NativeVideoFrame* generatedSource = slot.overlayFrame.get();
-    const bool hdrOutput = generatedSource && SetHdrOutputState(
-        *generatedSource, HdrOutputEnabled(*generatedSource, videoSettings_,
-                                           displayCapabilities_, hdr10ColorSpaceSupported_));
-    if (generatedSource) {
-        // SetHdrOutputState above also switches the RGB10 presentation color space.
-    } else {
-        swapChainHdr_ = false;
-    }
-    constants.hdrOutput = hdrOutput ? 1.0f : 0.0f;
-    constants.sourcePeakNits = slot.doviSourcePeakNits > 0.0f
-        ? slot.doviSourcePeakNits : SourcePeakNits(mediaColor_);
-    constants.targetPeakNits = TargetPeakNits(videoSettings_, displayCapabilities_);
-    constants.transfer = slot.inputTransfer != 0
-        ? slot.inputTransfer
-        : (generatedSource ? TransferMode(generatedSource->color.transfer)
-                           : TransferMode(mediaColor_.transfer));
+    constants.hdrOutput = slot.hdrOutput ? 1.0f : 0.0f;
+    constants.transfer = slot.inputTransfer;
     constants.endpointReference[0] = fullResolutionEndpointLuma ? 1.0f : 0.0f;
     const D3D12_RESOURCE_DESC referenceDesc = fullResolutionEndpointLuma
         ? slot.luminanceLeft->GetDesc() : D3D12_RESOURCE_DESC{};
     const bool luminanceReferenceChanged =
         fullResolutionEndpointLuma &&
-        (referenceDesc.Width != loggedDoviLuminanceReferenceWidth_ ||
-         referenceDesc.Height != loggedDoviLuminanceReferenceHeight_);
+        (referenceDesc.Width != loggedEndpointLuminanceReferenceWidth_ ||
+         referenceDesc.Height != loggedEndpointLuminanceReferenceHeight_);
     if (constants.transfer == 4u &&
-        (!dolbyVisionInterpolationLuminanceGuardLogged_ || luminanceReferenceChanged)) {
-        dolbyVisionInterpolationLuminanceGuardLogged_ = true;
+        (!displayDomainInterpolationLuminanceGuardLogged_ ||
+         luminanceReferenceChanged)) {
+        displayDomainInterpolationLuminanceGuardLogged_ = true;
         if (fullResolutionEndpointLuma) {
-            loggedDoviLuminanceReferenceWidth_ = static_cast<UINT>(referenceDesc.Width);
-            loggedDoviLuminanceReferenceHeight_ = referenceDesc.Height;
+            loggedEndpointLuminanceReferenceWidth_ =
+                static_cast<UINT>(referenceDesc.Width);
+            loggedEndpointLuminanceReferenceHeight_ = referenceDesc.Height;
             Log(LogLevel::Info,
-                L"Dolby Vision interpolation luminance contract="
+                L"HDR display-domain interpolation luminance contract="
                 L"motion_preserving_full_resolution_exposure_guard "
                 L"domain=display_mapped_bt2020_pq "
                 L"reference=" + std::to_wstring(referenceDesc.Width) + L"x" +
@@ -4688,45 +4829,17 @@ bool D3D12VideoRenderer::RenderGeneratedFrame(const std::size_t slotIndex) {
                 std::to_wstring(slot.shape.width) + L"x" +
                 std::to_wstring(slot.shape.height));
         } else {
-            loggedDoviLuminanceReferenceWidth_ = 0;
-            loggedDoviLuminanceReferenceHeight_ = 0;
+            loggedEndpointLuminanceReferenceWidth_ = 0;
+            loggedEndpointLuminanceReferenceHeight_ = 0;
             Log(LogLevel::Info,
-                L"Dolby Vision interpolation luminance contract="
+                L"HDR display-domain interpolation luminance contract="
                 L"motion_preserving_temporal_exposure_guard "
                 L"domain=display_mapped_bt2020_pq");
         }
     }
-    constants.primaries =
-        (generatedSource &&
-                 generatedSource->color.primaries == VideoColorPrimaries::Bt2020
-             ? 2u : 0u) |
-        ToneMappingModeBits(videoSettings_.toneMapping);
-    // Generated frames must use the same per-frame DV trim as originals. The
-    // trim is creative metadata and therefore remains active for HDR output.
-    constants.trimA[0] = slot.doviTrim.enabled ? 1.0f : 0.0f;
-    constants.trimA[1] = slot.doviTrim.slope;
-    constants.trimA[2] = slot.doviTrim.offset;
-    constants.trimA[3] = slot.doviTrim.power;
-    constants.trimB[0] = slot.doviTrim.saturation;
-    constants.trimB[1] = slot.doviTrim.chromaWeight;
-    constants.trimB[2] = slot.doviTrim.msWeight;
-    constants.trimB[3] = slot.doviTrim.midOffset;
-    constants.trimC[0] = slot.doviTrim.midContrast;
-    constants.trimC[1] = slot.doviTrim.clip;
-    constants.trimC[2] = slot.doviSourcePeakNits;
-    if (generatedSource) {
-        constants.padding = InitialHdrProcessingFlags(
-            *generatedSource, videoSettings_, hdrOutput);
-        const uint64_t hdrToneCurveFingerprint = FillHdrToneCurveConstants(
-            constants.hdrToneCurve, constants.padding, *generatedSource,
-            videoSettings_, hdrOutput);
-        if (hdrToneCurveFingerprint != 0 &&
-            hdrToneCurveFingerprint != loggedHdrToneCurveFingerprint_) {
-            loggedHdrToneCurveFingerprint_ = hdrToneCurveFingerprint;
-            Log(LogLevel::Info, L"HDR custom tone curve active pipeline=interpolated");
-        }
-    }
-    commandList_->SetGraphicsRoot32BitConstants(1, 44, &constants, 0);
+    // There are intentionally no tone-map or metadata fields in this final
+    // interface. Endpoint preprocessing owns the complete display transform.
+    commandList_->SetGraphicsRoot32BitConstants(1, 8, &constants, 0);
     commandList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     commandList_->DrawInstanced(3, 1, 0, 0);
     DrawOverlays(viewport, backBufferIndex);
@@ -5031,6 +5144,7 @@ bool D3D12VideoRenderer::DrawOverlays(const D3D12_VIEWPORT& videoViewport,
     commandList_->RSSetScissorRects(1, &scissor);
 
     bool drewSubtitle = false;
+    bool drewUiOverlay = false;
     UINT subtitleItemIndex = 0;
     for (UINT itemIndex = 0; itemIndex < static_cast<UINT>(items.size()); ++itemIndex) {
         const DrawItem& item = items[itemIndex];
@@ -5174,6 +5288,7 @@ bool D3D12VideoRenderer::DrawOverlays(const D3D12_VIEWPORT& videoViewport,
         commandList_->RSSetViewports(1, &viewport);
         commandList_->DrawInstanced(3, 1, 0, 0);
         drewSubtitle = drewSubtitle || item.subtitle;
+        drewUiOverlay = drewUiOverlay || !item.subtitle;
     }
     if (drewSubtitle) {
         if (!independentSubtitleCompositionLogged_) {
@@ -5200,6 +5315,12 @@ bool D3D12VideoRenderer::DrawOverlays(const D3D12_VIEWPORT& videoViewport,
         std::scoped_lock lock(statsMutex_);
         ++renderStats_.subtitleFrames;
     }
+    if (drewUiOverlay && !independentUiOverlayCompositionLogged_) {
+        independentUiOverlayCompositionLogged_ = true;
+        Log(LogLevel::Info,
+            L"ui overlay composition active mode=independent_post_interpolation "
+            L"source=presentation_snapshot");
+    }
     return true;
 }
 
@@ -5209,6 +5330,8 @@ bool D3D12VideoRenderer::RenderLastFrame() {
 
 bool D3D12VideoRenderer::SetHdrOutputState(const NativeVideoFrame& frame,
                                            const bool enabled) {
+    const bool fixedInterpolationDisplayDomain =
+        interpolationRequested_.load(std::memory_order_acquire);
     bool active = enabled && hdr10ColorSpaceSupported_;
     const DXGI_COLOR_SPACE_TYPE desiredColorSpace = active
         ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
@@ -5227,11 +5350,30 @@ bool D3D12VideoRenderer::SetHdrOutputState(const NativeVideoFrame& frame,
         [this](const std::wstring& message) { Log(LogLevel::Info, message); });
     bool hdr10PlusDisplayPath = false;
     if (active) {
-        hdr10PlusDisplayPath = videoSettings_.displayMetadataPassthrough &&
+        hdr10PlusDisplayPath = !fixedInterpolationDisplayDomain &&
+            videoSettings_.displayMetadataPassthrough &&
             frame.hdr10PlusPayload && !frame.hdr10PlusPayload->empty() &&
             nvidiaHdrOutput_.ApplyHdr10PlusGaming(host_.load(), frame.color);
         if (!hdr10PlusDisplayPath) {
-            nvidiaHdrOutput_.ApplyHdr10(host_.load(), frame.color);
+            auto outputColor = frame.color;
+            if (fixedInterpolationDisplayDomain) {
+                const double targetPeak =
+                    TargetPeakNits(videoSettings_, displayCapabilities_);
+                outputColor.masteringDisplay.hasPrimaries = true;
+                outputColor.masteringDisplay.red = {0.708, 0.292};
+                outputColor.masteringDisplay.green = {0.170, 0.797};
+                outputColor.masteringDisplay.blue = {0.131, 0.046};
+                outputColor.masteringDisplay.whitePoint = {0.3127, 0.3290};
+                outputColor.masteringDisplay.hasLuminance = true;
+                outputColor.masteringDisplay.minLuminanceNits = 0.005;
+                outputColor.masteringDisplay.maxLuminanceNits = targetPeak;
+                outputColor.contentLight.hasValues = true;
+                outputColor.contentLight.maxContentLightLevelNits =
+                    static_cast<int>(std::lround(targetPeak));
+                outputColor.contentLight.maxFrameAverageLightLevelNits =
+                    static_cast<int>(std::lround(targetPeak));
+            }
+            nvidiaHdrOutput_.ApplyHdr10(host_.load(), outputColor);
         }
     } else {
         nvidiaHdrOutput_.Restore();
@@ -5272,7 +5414,7 @@ bool D3D12VideoRenderer::SetHdrOutputState(const NativeVideoFrame& frame,
                 target[0] = chromaticity(point.x);
                 target[1] = chromaticity(point.y);
             };
-            if (mastering.hasPrimaries) {
+            if (mastering.hasPrimaries && !fixedInterpolationDisplayDomain) {
                 setPrimary(metadata.RedPrimary, mastering.red);
                 setPrimary(metadata.GreenPrimary, mastering.green);
                 setPrimary(metadata.BluePrimary, mastering.blue);
@@ -5287,19 +5429,29 @@ bool D3D12VideoRenderer::SetHdrOutputState(const NativeVideoFrame& frame,
                 metadata.WhitePoint[0] = chromaticity(0.3127);
                 metadata.WhitePoint[1] = chromaticity(0.3290);
             }
-            const bool appSideDisplayMapping =
+            const bool appSideDisplayMapping = fixedInterpolationDisplayDomain ||
                 !videoSettings_.displayMetadataPassthrough;
             const double targetPeakNits =
                 TargetPeakNits(videoSettings_, displayCapabilities_);
             const double sourceMasteringPeak =
                 mastering.hasLuminance ? mastering.maxLuminanceNits : 1000.0;
-            const double signaledPeak = appSideDisplayMapping
-                ? std::clamp(sourceMasteringPeak, 100.0, targetPeakNits)
-                : sourceMasteringPeak;
+            const double signaledPeak = fixedInterpolationDisplayDomain
+                ? targetPeakNits
+                : (appSideDisplayMapping
+                       ? std::clamp(sourceMasteringPeak, 100.0, targetPeakNits)
+                       : sourceMasteringPeak);
             metadata.MaxMasteringLuminance = luminance(signaledPeak);
             metadata.MinMasteringLuminance = luminance(
-                mastering.hasLuminance ? mastering.minLuminanceNits : 0.005);
-            if (frame.color.contentLight.hasValues) {
+                fixedInterpolationDisplayDomain
+                    ? 0.005
+                    : (mastering.hasLuminance
+                           ? mastering.minLuminanceNits : 0.005));
+            if (fixedInterpolationDisplayDomain) {
+                metadata.MaxContentLightLevel = static_cast<UINT16>(
+                    std::clamp(targetPeakNits, 0.0, 65535.0));
+                metadata.MaxFrameAverageLightLevel =
+                    metadata.MaxContentLightLevel;
+            } else if (frame.color.contentLight.hasValues) {
                 metadata.MaxContentLightLevel = static_cast<UINT16>(std::clamp(
                     appSideDisplayMapping
                         ? std::min<double>(
@@ -5361,6 +5513,9 @@ void D3D12VideoRenderer::ResetInterpolationState() {
     tensorPreviousDoviLuminanceTarget_.Reset();
     tensorPreviousDoviTargetTimeline_ = 0;
     tensorPreviousDoviTargetFrameSerial_ = 0;
+    tensorPreviousDoviMetadataFingerprint_ = 0;
+    tensorPreviousDoviTargetPeakNits_ = 0.0f;
+    tensorPreviousDoviHdrOutput_ = false;
     sourceComputeCompletions_.clear();
     sourceGraphicsCompletions_.clear();
     for (const std::size_t slotIndex : pendingGeneratedSlots_) {
@@ -5368,12 +5523,14 @@ void D3D12VideoRenderer::ResetInterpolationState() {
     }
     pendingGeneratedSlots_.clear();
     tensorPreprocessorLogged_ = false;
+    sceneChangeProbeLogged_ = false;
     directMlSubmitLogged_ = false;
     generatedPresentLogged_ = false;
+    interpolationDisplayDomainLogged_ = false;
     dolbyVisionInterpolationColorPathLogged_ = false;
-    dolbyVisionInterpolationLuminanceGuardLogged_ = false;
-    loggedDoviLuminanceReferenceWidth_ = 0;
-    loggedDoviLuminanceReferenceHeight_ = 0;
+    displayDomainInterpolationLuminanceGuardLogged_ = false;
+    loggedEndpointLuminanceReferenceWidth_ = 0;
+    loggedEndpointLuminanceReferenceHeight_ = 0;
     hlgInterpolationColorPathLogged_ = false;
     frameGraph_.AdvanceEpoch();
     {
@@ -5474,12 +5631,16 @@ void D3D12VideoRenderer::ReleaseGpu() {
     tensorPreviousDoviLuminanceTarget_.Reset();
     tensorPreviousDoviTargetTimeline_ = 0;
     tensorPreviousDoviTargetFrameSerial_ = 0;
-    dolbyVisionInterpolationLuminanceGuardLogged_ = false;
-    loggedDoviLuminanceReferenceWidth_ = 0;
-    loggedDoviLuminanceReferenceHeight_ = 0;
+    tensorPreviousDoviMetadataFingerprint_ = 0;
+    tensorPreviousDoviTargetPeakNits_ = 0.0f;
+    tensorPreviousDoviHdrOutput_ = false;
+    displayDomainInterpolationLuminanceGuardLogged_ = false;
+    loggedEndpointLuminanceReferenceWidth_ = 0;
+    loggedEndpointLuminanceReferenceHeight_ = 0;
     sourceComputeCompletions_.clear();
     sourceGraphicsCompletions_.clear();
     tensorPreprocessor_.Reset();
+    tensorDolbyVisionPipelineLogged_ = false;
     pendingGeneratedSlots_.clear();
     for (GeneratedFrameSlot& slot : generatedSlots_) slot = {};
     for (auto& backBufferCaches : overlayTextureCaches_) {
@@ -5503,6 +5664,8 @@ void D3D12VideoRenderer::ReleaseGpu() {
     presentedSubtitleSourceWidth_ = 0;
     presentedSubtitleSourceHeight_ = 0;
     independentSubtitleCompositionLogged_ = false;
+    interpolationDisplayDomainLogged_ = false;
+    independentUiOverlayCompositionLogged_ = false;
     perBackBufferSubtitleTextureLogged_ = false;
     for (PixelFrameUploadCache& cache : pixelFrameUploadCaches_) {
         if (cache.upload && cache.mappedUpload) cache.upload->Unmap(0, nullptr);

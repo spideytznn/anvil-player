@@ -116,6 +116,7 @@ if exist "$(SolutionDir)third_party\webview2-runtime\Microsoft.WebView2.FixedVer
     <ClInclude Include="include\AnvilPlayer\App\embedded_ffplay.h" />
     <ClInclude Include="include\AnvilPlayer\App\external_video_decoder.h" />
     <ClInclude Include="include\AnvilPlayer\App\ffmpeg_video_decoder.h" />
+    <ClInclude Include="include\AnvilPlayer\App\frame_interpolation_policy.h" />
     <ClInclude Include="include\AnvilPlayer\App\hdr_tone_curve_math.h" />
     <ClInclude Include="include\AnvilPlayer\App\icon_painter.h" />
     <ClInclude Include="include\AnvilPlayer\App\library_commands.h" />

@@ -1759,9 +1759,24 @@ void LibraryWindow::HandleWebUiMessage(const std::wstring_view message) {
         SaveVideoPassthroughSetting(
             L"FrameInterpolationEnabled", MessageContains(message, L"\"enabled\":true"));
         if (videoPassthroughPreferencesChangedRequest_) videoPassthroughPreferencesChangedRequest_();
+    } else if (MessageContains(message, L"\"command\":\"setGlobalFrameInterpolationMaximumHeight\"")) {
+        if (const auto maximumHeight = ReadJsonNumber(message, L"maximumHeight")) {
+            const int normalized =
+                anvil::playback::NormalizeFrameInterpolationMaximumHeight(
+                    static_cast<int>(std::round(*maximumHeight)));
+            SaveVideoDwordSetting(L"FrameInterpolationMaximumHeight", normalized);
+            if (videoPassthroughPreferencesChangedRequest_) {
+                videoPassthroughPreferencesChangedRequest_();
+            }
+        }
     } else if (MessageContains(message, L"\"command\":\"requestGlobalVideoPassthroughSettings\"")) {
         const bool frameInterpolation =
             LoadVideoPassthroughSetting(L"FrameInterpolationEnabled", false);
+        const int frameInterpolationMaximumHeight =
+            anvil::playback::NormalizeFrameInterpolationMaximumHeight(
+                LoadVideoDwordSetting(
+                    L"FrameInterpolationMaximumHeight",
+                    anvil::playback::kDefaultFrameInterpolationMaximumHeight));
         const bool displayMetadata = LoadVideoPassthroughSetting(L"DisplayMetadataPassthrough", false);
         const bool autoDisplayFormat = LoadVideoPassthroughSetting(L"AutoDisplayFormat", false);
         const bool windowsHdrEnabled = anvil::playback::CapabilityDetector::IsHdrEnabledNow();
@@ -1774,6 +1789,8 @@ void LibraryWindow::HandleWebUiMessage(const std::wstring_view message) {
             LoadVideoPassthroughSetting(L"DolbyVisionSystemPipelineExperimental", false);
         PostScanResult(L"{\"type\":\"globalVideoPassthroughSettings\",\"frameInterpolationEnabled\":" +
                        std::wstring(frameInterpolation ? L"true" : L"false") +
+                       L",\"frameInterpolationMaximumHeight\":" +
+                       std::to_wstring(frameInterpolationMaximumHeight) +
                        L",\"autoDisplayFormat\":" +
                        std::wstring(autoDisplayFormat ? L"true" : L"false") +
                        L",\"displayMetadataPassthrough\":" +

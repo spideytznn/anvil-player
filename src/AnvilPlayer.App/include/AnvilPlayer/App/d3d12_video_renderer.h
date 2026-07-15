@@ -115,12 +115,13 @@ private:
         uint64_t epoch = 0;
         GpuFencePoint ready;
         GpuFencePoint reusable;
-        std::unique_ptr<NativeVideoFrame> overlayFrame;
+        SceneChangeProbe sceneChangeProbe;
         std::chrono::steady_clock::time_point dueAt{};
-        DoviDisplayTrim doviTrim;
-        float doviSourcePeakNits = 1000.0f;
-        UINT inputTransfer = 0;  // Zero derives the transfer from overlayFrame.
+        float targetPeakNits = 1000.0f;
+        UINT inputTransfer = 0;
         float interpolationT = 0.5f;
+        bool hdrOutput = false;
+        bool displayDomainReady = false;
         bool anchored = false;
         bool completionStatusConsumed = false;
         bool pending = false;
@@ -361,6 +362,9 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> tensorPreviousDoviLuminanceTarget_;
     uint64_t tensorPreviousDoviTargetTimeline_ = 0;
     uint64_t tensorPreviousDoviTargetFrameSerial_ = 0;
+    uint64_t tensorPreviousDoviMetadataFingerprint_ = 0;
+    float tensorPreviousDoviTargetPeakNits_ = 0.0f;
+    bool tensorPreviousDoviHdrOutput_ = false;
     std::map<std::pair<uint64_t, uint64_t>, GpuFencePoint> sourceComputeCompletions_;
     std::map<std::pair<uint64_t, uint64_t>, GpuFencePoint> sourceGraphicsCompletions_;
     std::chrono::milliseconds presentedOriginalPts_{0};
@@ -374,6 +378,8 @@ private:
     int presentedSubtitleSourceWidth_ = 0;
     int presentedSubtitleSourceHeight_ = 0;
     bool tensorPreprocessorLogged_ = false;
+    bool tensorDolbyVisionPipelineLogged_ = false;
+    bool sceneChangeProbeLogged_ = false;
     bool directMlSubmitLogged_ = false;
     bool generatedPresentLogged_ = false;
     bool dolbyVisionD3D12Logged_ = false;
@@ -407,13 +413,14 @@ private:
     bool dolbyVisionInterpolationColorBypassLogged_ = false;
     bool dolbyVisionInterpolationColorPathLogged_ = false;
     bool dolbyVisionImmutableEndpointLogged_ = false;
-    bool hdr10PlusInterpolationBypassLogged_ = false;
     bool dolbyVisionDynamicTrimLogged_ = false;
+    bool interpolationDisplayDomainLogged_ = false;
     bool independentSubtitleCompositionLogged_ = false;
+    bool independentUiOverlayCompositionLogged_ = false;
     bool perBackBufferSubtitleTextureLogged_ = false;
-    bool dolbyVisionInterpolationLuminanceGuardLogged_ = false;
-    UINT loggedDoviLuminanceReferenceWidth_ = 0;
-    UINT loggedDoviLuminanceReferenceHeight_ = 0;
+    bool displayDomainInterpolationLuminanceGuardLogged_ = false;
+    UINT loggedEndpointLuminanceReferenceWidth_ = 0;
+    UINT loggedEndpointLuminanceReferenceHeight_ = 0;
     uint64_t loggedDoviTrimFingerprint_ = 0;
     uint64_t loggedHdr10PlusFingerprint_ = 0;
     uint64_t loggedHdrToneCurveFingerprint_ = 0;

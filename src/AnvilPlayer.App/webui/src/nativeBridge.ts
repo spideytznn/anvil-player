@@ -20,6 +20,7 @@ export interface PlayerState {
   customTitleBar: boolean
   hardwareDecodeEnabled: boolean
   frameInterpolationEnabled: boolean
+  frameInterpolationMaximumHeight: number
   frameInterpolationActive: boolean
   frameInterpolationMultiplier: number
   frameInterpolationBackend: string
@@ -205,7 +206,7 @@ export type NativeMessage =
   | MediaDetailsProbed
   | MediaDetailsProbeFailed
   | { type: 'windowChrome'; customTitleBar: boolean }
-  | { type: 'globalVideoPassthroughSettings'; frameInterpolationEnabled: boolean; autoDisplayFormat: boolean; displayMetadataPassthrough: boolean; dolbyVisionSystemPipelineExperimental: boolean; windowsHdrEnabled: boolean; displayPeakBrightnessNits: number; detectedDisplayPeakBrightnessNits: number }
+  | { type: 'globalVideoPassthroughSettings'; frameInterpolationEnabled: boolean; frameInterpolationMaximumHeight: number; autoDisplayFormat: boolean; displayMetadataPassthrough: boolean; dolbyVisionSystemPipelineExperimental: boolean; windowsHdrEnabled: boolean; displayPeakBrightnessNits: number; detectedDisplayPeakBrightnessNits: number }
   | { type: 'globalAudioPassthroughSettings'; enabled: boolean }
   | { type: 'deliverEmbyPlaybackReport'; report: unknown }
   | { type: 'command'; command: 'localPlaybackProgress'; path: string; positionMs: number; durationMs: number; playbackState: string }
@@ -259,12 +260,14 @@ export type NativeCommand =
   | { type: 'command'; command: 'toggleFullscreen' }
   | { type: 'command'; command: 'setHardwareDecode'; enabled: boolean }
   | { type: 'command'; command: 'setFrameInterpolation'; enabled: boolean }
+  | { type: 'command'; command: 'setFrameInterpolationMaximumHeight'; maximumHeight: number }
   | { type: 'command'; command: 'setRefreshRateSync'; enabled: boolean }
   | { type: 'command'; command: 'setRefreshRateMaximumMultiple'; enabled: boolean }
   | { type: 'command'; command: 'dismissRefreshRateSyncUnavailable' }
   | { type: 'command'; command: 'setGlobalRefreshRateSync'; enabled: boolean }
   | { type: 'command'; command: 'setGlobalRefreshRateMaximumMultiple'; enabled: boolean }
   | { type: 'command'; command: 'setGlobalFrameInterpolation'; enabled: boolean }
+  | { type: 'command'; command: 'setGlobalFrameInterpolationMaximumHeight'; maximumHeight: number }
   | { type: 'command'; command: 'requestGlobalVideoPassthroughSettings' }
   | { type: 'command'; command: 'setGlobalAutoDisplayFormat'; enabled: boolean }
   | { type: 'command'; command: 'setGlobalDisplayMetadataPassthrough'; enabled: boolean }
@@ -371,6 +374,7 @@ export const EMPTY_STATE: PlayerState = {
   customTitleBar: false,
   hardwareDecodeEnabled: true,
   frameInterpolationEnabled: false,
+  frameInterpolationMaximumHeight: 1080,
   frameInterpolationActive: false,
   frameInterpolationMultiplier: 1,
   frameInterpolationBackend: 'inactive',

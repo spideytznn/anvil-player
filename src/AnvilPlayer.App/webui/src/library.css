@@ -1889,6 +1889,10 @@
   opacity: 0.58;
 }
 
+.library-interpolation-resolution-options button {
+  min-width: 72px;
+}
+
 .library-settings-form-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

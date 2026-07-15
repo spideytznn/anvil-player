@@ -12,6 +12,9 @@
 namespace anvil::app {
 namespace {
 
+constexpr UINT64 kSceneChangeMetricBytes = 4 * sizeof(UINT);
+constexpr double kSceneChangeMetricScale = 65535.0;
+
 using anvil::playback::VideoColorPrimaries;
 using anvil::playback::VideoColorRange;
 using anvil::playback::VideoMatrixCoefficients;
@@ -74,10 +77,41 @@ bool IsSupportedFrame(const NativeVideoFrame& frame) noexcept {
 
 }  // namespace
 
-TensorShape SelectInterpolationTensorShape(const UINT width, const UINT height) noexcept {
+TensorShape SelectInterpolationTensorShape(
+    const UINT width,
+    const UINT height,
+    const UINT maximumPictureHeight) noexcept {
     const InterpolationTensorExtent extent =
-        SelectCapped1080pInterpolationExtent(width, height);
+        SelectCappedInterpolationExtent(width, height, maximumPictureHeight);
     return {extent.width, extent.height};
+}
+
+SceneChangeProbeStatus ReadSceneChangeProbe(
+    const SceneChangeProbe& probe,
+    SceneChangeMetrics& metrics) noexcept {
+    metrics = {};
+    if (!probe.IsValid()) return SceneChangeProbeStatus::Invalid;
+    if (probe.ready.fence->GetCompletedValue() < probe.ready.value) {
+        return SceneChangeProbeStatus::Pending;
+    }
+    const D3D12_RANGE readRange{0, static_cast<SIZE_T>(kSceneChangeMetricBytes)};
+    void* mapping = nullptr;
+    if (FAILED(probe.readback->Map(0, &readRange, &mapping)) || !mapping) {
+        return SceneChangeProbeStatus::Invalid;
+    }
+    std::array<UINT, 4> values{};
+    std::memcpy(values.data(), mapping, sizeof(values));
+    const D3D12_RANGE noWrite{0, 0};
+    probe.readback->Unmap(0, &noWrite);
+    const double samples = static_cast<double>(probe.sampleCount);
+    metrics.meanAbsoluteLumaDifference =
+        static_cast<double>(values[0]) / (samples * kSceneChangeMetricScale);
+    metrics.changedSampleRatio = static_cast<double>(values[1]) / samples;
+    metrics.meanLeftLuma =
+        static_cast<double>(values[2]) / (samples * kSceneChangeMetricScale);
+    metrics.meanRightLuma =
+        static_cast<double>(values[3]) / (samples * kSceneChangeMetricScale);
+    return SceneChangeProbeStatus::Ready;
 }
 
 bool D3D12TensorPreprocessor::Initialize(ID3D12Device* device,
@@ -108,21 +142,29 @@ bool D3D12TensorPreprocessor::Initialize(ID3D12Device* device,
         }
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        heapDesc.NumDescriptors = 9;
+        heapDesc.NumDescriptors = 10;
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         if (FAILED(device_->CreateDescriptorHeap(&heapDesc,
                                                  IID_PPV_ARGS(&slot.descriptors)))) {
             Reset();
             return false;
         }
-        const UINT64 constantBytes =
+        if (!CreateSceneChangeResources(slot)) {
+            Reset();
+            return false;
+        }
+        const UINT64 doviConstantBytes =
             (sizeof(DoviShaderConstantsPair) + D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1) &
+            ~(static_cast<UINT64>(D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT) - 1);
+        const UINT64 displayConstantBytes =
+            (sizeof(InterpolationDisplayMappingPair) +
+             D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1) &
             ~(static_cast<UINT64>(D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT) - 1);
         D3D12_HEAP_PROPERTIES uploadHeap{};
         uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
         D3D12_RESOURCE_DESC bufferDesc{};
         bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        bufferDesc.Width = constantBytes;
+        bufferDesc.Width = doviConstantBytes;
         bufferDesc.Height = 1;
         bufferDesc.DepthOrArraySize = 1;
         bufferDesc.MipLevels = 1;
@@ -137,7 +179,21 @@ bool D3D12TensorPreprocessor::Initialize(ID3D12Device* device,
             Reset();
             return false;
         }
+        bufferDesc.Width = displayConstantBytes;
+        if (FAILED(device_->CreateCommittedResource(
+                &uploadHeap, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                IID_PPV_ARGS(&slot.displayConstants))) ||
+            FAILED(slot.displayConstants->Map(
+                0, &noRead, &slot.displayConstantsMapping))) {
+            Reset();
+            return false;
+        }
     }
+    // Compile the native DV endpoint mapper in the background during renderer
+    // warm-up. A Profile 7 stream must not lose its first otherwise-valid
+    // interpolation pair merely because this much larger shader was lazy.
+    StartDolbyVisionInitialization();
     return true;
 }
 
@@ -147,9 +203,13 @@ void D3D12TensorPreprocessor::Reset() {
     }
     publishedDoviPipeline_.store(nullptr, std::memory_order_release);
     doviInitializationStarted_.store(false, std::memory_order_release);
+    doviInitializationComplete_.store(false, std::memory_order_release);
     for (Slot& slot : slots_) {
         if (slot.doviConstants && slot.doviConstantsMapping) {
             slot.doviConstants->Unmap(0, nullptr);
+        }
+        if (slot.displayConstants && slot.displayConstantsMapping) {
+            slot.displayConstants->Unmap(0, nullptr);
         }
         slot = {};
     }
@@ -163,6 +223,81 @@ void D3D12TensorPreprocessor::Reset() {
     descriptorIncrement_ = 0;
 }
 
+bool D3D12TensorPreprocessor::CreateSceneChangeResources(Slot& slot) {
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = kSceneChangeMetricBytes;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    D3D12_HEAP_PROPERTIES defaultHeap{};
+    defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    if (FAILED(device_->CreateCommittedResource(
+            &defaultHeap, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+            IID_PPV_ARGS(&slot.sceneMetrics)))) {
+        return false;
+    }
+
+    D3D12_HEAP_PROPERTIES readbackHeap{};
+    readbackHeap.Type = D3D12_HEAP_TYPE_READBACK;
+    desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    return SUCCEEDED(device_->CreateCommittedResource(
+        &readbackHeap, D3D12_HEAP_FLAG_NONE, &desc,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+        IID_PPV_ARGS(&slot.sceneMetricsReadback)));
+}
+
+void D3D12TensorPreprocessor::CreateSceneChangeDescriptor(
+    Slot& slot,
+    const D3D12_CPU_DESCRIPTOR_HANDLE cpu) {
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format = DXGI_FORMAT_R32_TYPELESS;
+    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Buffer.NumElements = static_cast<UINT>(
+        kSceneChangeMetricBytes / sizeof(UINT));
+    uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+    device_->CreateUnorderedAccessView(slot.sceneMetrics.Get(), nullptr, &uav, cpu);
+}
+
+void D3D12TensorPreprocessor::ClearSceneChangeProbe(Slot& slot) {
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu =
+        slot.descriptors->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += static_cast<SIZE_T>(9) * descriptorIncrement_;
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu =
+        slot.descriptors->GetGPUDescriptorHandleForHeapStart();
+    gpu.ptr += static_cast<UINT64>(9) * descriptorIncrement_;
+    constexpr UINT zeros[4]{};
+    slot.commandList->ClearUnorderedAccessViewUint(
+        gpu, cpu, slot.sceneMetrics.Get(), zeros, 0, nullptr);
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    barrier.UAV.pResource = slot.sceneMetrics.Get();
+    slot.commandList->ResourceBarrier(1, &barrier);
+}
+
+void D3D12TensorPreprocessor::CopySceneChangeProbe(Slot& slot) {
+    D3D12_RESOURCE_BARRIER barriers[2]{};
+    barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    barriers[0].UAV.pResource = slot.sceneMetrics.Get();
+    barriers[1] = TransitionBarrier(
+        slot.sceneMetrics.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    slot.commandList->ResourceBarrier(2, barriers);
+    slot.commandList->CopyBufferRegion(
+        slot.sceneMetricsReadback.Get(), 0, slot.sceneMetrics.Get(), 0,
+        kSceneChangeMetricBytes);
+    barriers[0] = TransitionBarrier(
+        slot.sceneMetrics.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+        D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    slot.commandList->ResourceBarrier(1, barriers);
+}
+
 bool D3D12TensorPreprocessor::CreatePipeline() {
     D3D12_DESCRIPTOR_RANGE ranges[2]{};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -170,11 +305,11 @@ bool D3D12TensorPreprocessor::CreatePipeline() {
     ranges[0].BaseShaderRegister = 0;
     ranges[0].OffsetInDescriptorsFromTableStart = 0;
     ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    ranges[1].NumDescriptors = 1;
+    ranges[1].NumDescriptors = 2;
     ranges[1].BaseShaderRegister = 0;
     ranges[1].OffsetInDescriptorsFromTableStart = 8;
 
-    D3D12_ROOT_PARAMETER parameters[3]{};
+    D3D12_ROOT_PARAMETER parameters[4]{};
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     parameters[0].DescriptorTable.NumDescriptorRanges = 2;
     parameters[0].DescriptorTable.pDescriptorRanges = ranges;
@@ -186,6 +321,9 @@ bool D3D12TensorPreprocessor::CreatePipeline() {
     parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     parameters[2].Descriptor.ShaderRegister = 1;
     parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    parameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    parameters[3].Descriptor.ShaderRegister = 2;
+    parameters[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     D3D12_STATIC_SAMPLER_DESC sampler{};
     sampler.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
@@ -211,6 +349,99 @@ bool D3D12TensorPreprocessor::CreatePipeline() {
         return false;
     }
 
+    // The same transform is compiled into the ordinary HDR and native Dolby
+    // Vision preprocessors. Each endpoint is evaluated independently, but
+    // both are mapped to the same output mode and physical target peak before
+    // RIFE sees either image.
+    const std::string displayMappingHlsl = R"(
+float display_hdr10plus_curve(uint endpoint, float t) {
+    float position=saturate(t)*15.0;
+    int lower=clamp((int)floor(position),0,14),upper=lower+1;
+    float a=displayHdr10PlusCurve[endpoint][lower/4][lower%4];
+    float b=displayHdr10PlusCurve[endpoint][upper/4][upper%4];
+    return lerp(a,b,position-lower);
+}
+float3 display_apply_hdr10plus(uint endpoint,float3 sourceNits) {
+    float4 a=displayHdr10PlusA[endpoint],b=displayHdr10PlusB[endpoint];
+    if(a.x<0.5) return max(sourceNits,0.0);
+    float3 nits=max(sourceNits,0.0);
+    float maxRgb=max(nits.r,max(nits.g,nits.b));
+    if(maxRgb<=0.0001) return nits;
+    float x=saturate(maxRgb/max(a.z,1.0)),kx=a.w,ky=b.x;
+    float y=x<=kx?x*ky/max(kx,0.0001):
+        ky+(1.0-ky)*display_hdr10plus_curve(endpoint,(x-kx)/max(1.0-kx,0.0001));
+    float3 mapped=nits*(y*max(a.y,1.0)/maxRgb);
+    float luma=max(dot(mapped,float3(0.2627,0.6780,0.0593)),0.0);
+    return max(luma.xxx+(mapped-luma.xxx)*max(b.z,0.0),0.0);
+}
+float2 display_hdr_curve_point(uint endpoint,int index) {
+    float4 pairs=displayHdrToneCurve[endpoint][index/2];
+    return (index&1)==0?pairs.xy:pairs.zw;
+}
+float display_hdr_curve_luma(uint endpoint,float lumaNits) {
+    float2 previous=display_hdr_curve_point(endpoint,0);
+    if(lumaNits<=previous.x) return max(previous.y,0.0);
+    [unroll] for(int index=1;index<9;++index) {
+        float2 next=display_hdr_curve_point(endpoint,index);
+        if(lumaNits<=next.x) {
+            float amount=saturate((lumaNits-previous.x)/
+                                  max(next.x-previous.x,0.0001));
+            return max(lerp(previous.y,next.y,amount),0.0);
+        }
+        previous=next;
+    }
+    return max(previous.y,0.0);
+}
+float3 display_apply_hdr_curve(uint endpoint,float3 sourceNits) {
+    float3 nits=max(sourceNits,0.0);
+    float flags=floor(displayTone[endpoint].w+0.5);
+    if(fmod(flags,2.0)<0.5) return nits;
+    float luma=max(dot(nits,float3(0.2627,0.6780,0.0593)),0.0);
+    return nits*(display_hdr_curve_luma(endpoint,luma)/max(luma,0.0001));
+}
+float3 display_apply_peak_mapping(uint endpoint,float3 sourceNits) {
+    float3 nits=max(sourceNits,0.0);
+    float4 tone=displayTone[endpoint];
+    float flags=floor(tone.w+0.5);
+    float peak=max(nits.r,max(nits.g,nits.b));
+    if(flags<2.0||peak<=0.0001) return nits;
+    float target=max(tone.z,100.0),source=max(tone.y,peak);
+    if(source<=target+1.0) return nits;
+    uint mode=(uint)floor(displayOptions[endpoint].y+0.5);
+    float knee=target*(mode==2?0.55:(mode==3?0.75:0.65));
+    if(peak<=knee) return nits;
+    float shoulder=max(target-knee,1.0);
+    float denominator=max(1.0-exp(-(source-knee)/shoulder),0.0001);
+    float mapped=knee+shoulder*(1.0-exp(-(min(peak,source)-knee)/shoulder))/denominator;
+    return nits*(min(mapped,target)/peak);
+}
+float3 display_sdr_tone_map(uint endpoint,float3 sourceNits) {
+    float3 nits=max(sourceNits,0.0);
+    float luma=max(dot(nits,float3(0.2627,0.6780,0.0593)),0.000001);
+    uint mode=(uint)floor(displayOptions[endpoint].y+0.5);
+    float exposure=mode==2?0.72:(mode==3?0.95:0.80);
+    float target=100.0;
+    float knee=target*(mode==2?0.40:(mode==3?0.55:0.45));
+    float shoulder=max(target-knee,0.0001),working=luma*exposure;
+    if(working<=knee) return nits*exposure;
+    float peak=max(max(displayTone[endpoint].y*exposure,working),target+1.0);
+    float mapped=knee+shoulder*log(1.0+(working-knee)/shoulder)/
+        max(log(1.0+(peak-knee)/shoulder),0.0001);
+    return nits*(min(mapped,target)/luma);
+}
+float3 display_finish_mapping(uint endpoint,float3 nits) {
+    nits=display_apply_hdr_curve(endpoint,nits);
+    nits=display_apply_peak_mapping(endpoint,nits);
+    if(displayTone[endpoint].x<0.5) nits=display_sdr_tone_map(endpoint,nits);
+    return nits_to_pq(max(nits,0.0));
+}
+float3 display_map_encoded(uint endpoint,float3 encoded) {
+    if(displayOptions[endpoint].x<0.5) return encoded;
+    return display_finish_mapping(endpoint,
+        display_apply_hdr10plus(endpoint,pq_to_nits(encoded)));
+}
+)";
+
     const std::string shader = std::string(R"(
 Texture2DArray<float> firstY : register(t0);
 Texture2DArray<float2> firstUv : register(t1);
@@ -221,6 +452,7 @@ Texture2DArray<float2> firstElUv : register(t5);
 Texture2DArray<float> secondElY : register(t6);
 Texture2DArray<float2> secondElUv : register(t7);
 RWByteAddressBuffer outputTensor : register(u0);
+RWByteAddressBuffer sceneMetrics : register(u1);
 SamplerState linearClamp : register(s0);
 cbuffer PreprocessConstants : register(b0) {
     float4 firstSourceRect;
@@ -233,6 +465,14 @@ cbuffer PreprocessConstants : register(b0) {
     float2 hlgPeakNits;
     float interpolationT;
     float preprocessPadding;
+};
+cbuffer DisplayMappingConstants : register(b2) {
+    float4 displayTone[2];
+    float4 displayOptions[2];
+    float4 displayHdr10PlusA[2];
+    float4 displayHdr10PlusB[2];
+    float4 displayHdr10PlusCurve[2][4];
+    float4 displayHdrToneCurve[2][5];
 };
 )") + std::string(D3D12DolbyVisionHlsl()) + R"(
 float3 yuv_to_rgb(float y, float2 uv, uint4 modes) {
@@ -289,6 +529,7 @@ float3 canonical(float3 encoded, uint4 modes, float hlgPeak) {
     if (modes.w < 2) nits = max(rec709_to_rec2020(nits), 0.0);
     return nits_to_pq(min(nits, 10000.0));
 }
+)" + displayMappingHlsl + R"(
 float cubic_weight(float x) {
     x=abs(x); if(x<=1.0) return (1.5*x-2.5)*x*x+1.0;
     if(x<2.0) return ((-0.5*x+2.5)*x-4.0)*x+2.0; return 0.0;
@@ -336,10 +577,23 @@ float3 load_first(float2 uv,float2 displayUv) {
         float2 elUv=lerp(firstEnhancementRect.xy,firstEnhancementRect.zw,displayUv);
         float3 composed=dovi_compose_p7_fel(0,float3(y,chroma),float3(chroma_site_y(firstY,uv),chroma),
             float3(sample_el_y(firstElY,elUv,doviComposerScale[0].w>0.5),sample_el_uv(firstElUv,elUv,doviComposerScale[0].w>0.5)));
-        return dovi_decode_reshaped(0,composed);
+        float3 encoded=dovi_decode_reshaped(0,composed);
+        if(displayOptions[0].x<0.5) return encoded;
+        float3 nits=display_apply_hdr10plus(0,pq_to_nits(encoded));
+        if(displayOptions[0].z>0.5)
+            nits=dovi_apply_display_trim(0,nits,displayTone[0].z);
+        return display_finish_mapping(0,nits);
     }
-    if(doviSignalMeta[0].x>0.5) return dovi_decode_single_layer(0,saturate(float3(y,chroma)*doviSignalMeta[0].w));
-    return canonical(yuv_to_rgb(y,chroma,firstModes),firstModes,hlgPeakNits.x);
+    if(doviSignalMeta[0].x>0.5) {
+        float3 encoded=dovi_decode_single_layer(0,saturate(float3(y,chroma)*doviSignalMeta[0].w));
+        if(displayOptions[0].x<0.5) return encoded;
+        float3 nits=display_apply_hdr10plus(0,pq_to_nits(encoded));
+        if(displayOptions[0].z>0.5)
+            nits=dovi_apply_display_trim(0,nits,displayTone[0].z);
+        return display_finish_mapping(0,nits);
+    }
+    return display_map_encoded(0,
+        canonical(yuv_to_rgb(y,chroma,firstModes),firstModes,hlgPeakNits.x));
 }
 float3 load_second(float2 uv,float2 displayUv) {
     if(doviSignalMeta[1].x>0.5 && (displayUv.x<doviTrimC[1].z || displayUv.y<doviTrimC[1].w ||
@@ -350,10 +604,23 @@ float3 load_second(float2 uv,float2 displayUv) {
         float2 elUv=lerp(secondEnhancementRect.xy,secondEnhancementRect.zw,displayUv);
         float3 composed=dovi_compose_p7_fel(1,float3(y,chroma),float3(chroma_site_y(secondY,uv),chroma),
             float3(sample_el_y(secondElY,elUv,doviComposerScale[1].w>0.5),sample_el_uv(secondElUv,elUv,doviComposerScale[1].w>0.5)));
-        return dovi_decode_reshaped(1,composed);
+        float3 encoded=dovi_decode_reshaped(1,composed);
+        if(displayOptions[1].x<0.5) return encoded;
+        float3 nits=display_apply_hdr10plus(1,pq_to_nits(encoded));
+        if(displayOptions[1].z>0.5)
+            nits=dovi_apply_display_trim(1,nits,displayTone[1].z);
+        return display_finish_mapping(1,nits);
     }
-    if(doviSignalMeta[1].x>0.5) return dovi_decode_single_layer(1,saturate(float3(y,chroma)*doviSignalMeta[1].w));
-    return canonical(yuv_to_rgb(y,chroma,secondModes),secondModes,hlgPeakNits.y);
+    if(doviSignalMeta[1].x>0.5) {
+        float3 encoded=dovi_decode_single_layer(1,saturate(float3(y,chroma)*doviSignalMeta[1].w));
+        if(displayOptions[1].x<0.5) return encoded;
+        float3 nits=display_apply_hdr10plus(1,pq_to_nits(encoded));
+        if(displayOptions[1].z>0.5)
+            nits=dovi_apply_display_trim(1,nits,displayTone[1].z);
+        return display_finish_mapping(1,nits);
+    }
+    return display_map_encoded(1,
+        canonical(yuv_to_rgb(y,chroma,secondModes),secondModes,hlgPeakNits.y));
 }
 uint pack_half2(float first, float second) {
     return f32tof16(first) | (f32tof16(second) << 16);
@@ -362,6 +629,17 @@ void store_pair(uint plane, uint y, uint x,
                 float firstValue, float secondValue) {
     uint element = (plane * outputSize.y + y) * outputSize.x + x;
     outputTensor.Store(element * 2, pack_half2(firstValue, secondValue));
+}
+void accumulate_scene_metrics(uint x, uint y, float3 left, float3 right) {
+    if ((x & 15u) != 0u || (y & 15u) != 0u) return;
+    float leftLuma = saturate(dot(left, float3(0.2627, 0.6780, 0.0593)));
+    float rightLuma = saturate(dot(right, float3(0.2627, 0.6780, 0.0593)));
+    float difference = abs(leftLuma - rightLuma);
+    uint ignored;
+    sceneMetrics.InterlockedAdd(0, (uint)(difference * 65535.0 + 0.5), ignored);
+    sceneMetrics.InterlockedAdd(4, difference >= 0.12 ? 1u : 0u, ignored);
+    sceneMetrics.InterlockedAdd(8, (uint)(leftLuma * 65535.0 + 0.5), ignored);
+    sceneMetrics.InterlockedAdd(12, (uint)(rightLuma * 65535.0 + 0.5), ignored);
 }
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
@@ -376,6 +654,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     float2 secondUv1 = lerp(secondSourceRect.xy, secondSourceRect.zw, normalized1);
     float3 a0 = load_first(firstUv0,normalized0), a1 = load_first(firstUv1,normalized1);
     float3 b0 = load_second(secondUv0,normalized0), b1 = load_second(secondUv1,normalized1);
+    accumulate_scene_metrics(x, id.y, a0, b0);
     [unroll] for (uint channel = 0; channel < 3; ++channel) {
         store_pair(channel, id.y, x, a0[channel], a1[channel]);
         store_pair(channel + 3, id.y, x, b0[channel], b1[channel]);
@@ -384,12 +663,13 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 )";
     doviShaderSource_ = shader;
-    constexpr char baseShader[] = R"(
+    const std::string baseShader = std::string(R"(
 Texture2DArray<float> firstY : register(t0);
 Texture2DArray<float2> firstUv : register(t1);
 Texture2DArray<float> secondY : register(t2);
 Texture2DArray<float2> secondUv : register(t3);
 RWByteAddressBuffer outputTensor : register(u0);
+RWByteAddressBuffer sceneMetrics : register(u1);
 SamplerState linearClamp : register(s0);
 cbuffer PreprocessConstants : register(b0) {
     float4 firstSourceRect;
@@ -402,6 +682,14 @@ cbuffer PreprocessConstants : register(b0) {
     float2 hlgPeakNits;
     float interpolationT;
     float preprocessPadding;
+};
+cbuffer DisplayMappingConstants : register(b2) {
+    float4 displayTone[2];
+    float4 displayOptions[2];
+    float4 displayHdr10PlusA[2];
+    float4 displayHdr10PlusB[2];
+    float4 displayHdr10PlusCurve[2][4];
+    float4 displayHdrToneCurve[2][5];
 };
 float3 yuv_to_rgb(float y, float2 uv, uint4 modes) {
     bool full = modes.y != 0;
@@ -458,6 +746,7 @@ float3 canonical(float3 encoded, uint4 modes, float hlgPeak) {
     if (modes.w < 2) nits = max(rec709_to_rec2020(nits), 0.0);
     return nits_to_pq(min(nits, 10000.0));
 }
+)") + displayMappingHlsl + R"(
 uint pack_half2(float first, float second) {
     return f32tof16(first) | (f32tof16(second) << 16);
 }
@@ -465,6 +754,17 @@ void store_pair(uint plane, uint y, uint x,
                 float firstValue, float secondValue) {
     uint element = (plane * outputSize.y + y) * outputSize.x + x;
     outputTensor.Store(element * 2, pack_half2(firstValue, secondValue));
+}
+void accumulate_scene_metrics(uint x, uint y, float3 left, float3 right) {
+    if ((x & 15u) != 0u || (y & 15u) != 0u) return;
+    float leftLuma = saturate(dot(left, float3(0.2627, 0.6780, 0.0593)));
+    float rightLuma = saturate(dot(right, float3(0.2627, 0.6780, 0.0593)));
+    float difference = abs(leftLuma - rightLuma);
+    uint ignored;
+    sceneMetrics.InterlockedAdd(0, (uint)(difference * 65535.0 + 0.5), ignored);
+    sceneMetrics.InterlockedAdd(4, difference >= 0.12 ? 1u : 0u, ignored);
+    sceneMetrics.InterlockedAdd(8, (uint)(leftLuma * 65535.0 + 0.5), ignored);
+    sceneMetrics.InterlockedAdd(12, (uint)(rightLuma * 65535.0 + 0.5), ignored);
 }
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
@@ -477,22 +777,23 @@ void main(uint3 id : SV_DispatchThreadID) {
     float2 firstUv1 = lerp(firstSourceRect.xy, firstSourceRect.zw, p1);
     float2 secondUv0 = lerp(secondSourceRect.xy, secondSourceRect.zw, p0);
     float2 secondUv1 = lerp(secondSourceRect.xy, secondSourceRect.zw, p1);
-    float3 a0 = canonical(yuv_to_rgb(
+    float3 a0 = display_map_encoded(0,canonical(yuv_to_rgb(
         firstY.SampleLevel(linearClamp, float3(firstUv0, 0), 0),
         firstUv.SampleLevel(linearClamp, float3(firstUv0, 0), 0), firstModes),
-        firstModes, hlgPeakNits.x);
-    float3 a1 = canonical(yuv_to_rgb(
+        firstModes, hlgPeakNits.x));
+    float3 a1 = display_map_encoded(0,canonical(yuv_to_rgb(
         firstY.SampleLevel(linearClamp, float3(firstUv1, 0), 0),
         firstUv.SampleLevel(linearClamp, float3(firstUv1, 0), 0), firstModes),
-        firstModes, hlgPeakNits.x);
-    float3 b0 = canonical(yuv_to_rgb(
+        firstModes, hlgPeakNits.x));
+    float3 b0 = display_map_encoded(1,canonical(yuv_to_rgb(
         secondY.SampleLevel(linearClamp, float3(secondUv0, 0), 0),
         secondUv.SampleLevel(linearClamp, float3(secondUv0, 0), 0), secondModes),
-        secondModes, hlgPeakNits.y);
-    float3 b1 = canonical(yuv_to_rgb(
+        secondModes, hlgPeakNits.y));
+    float3 b1 = display_map_encoded(1,canonical(yuv_to_rgb(
         secondY.SampleLevel(linearClamp, float3(secondUv1, 0), 0),
         secondUv.SampleLevel(linearClamp, float3(secondUv1, 0), 0), secondModes),
-        secondModes, hlgPeakNits.y);
+        secondModes, hlgPeakNits.y));
+    accumulate_scene_metrics(x, id.y, a0, b0);
     [unroll] for (uint channel = 0; channel < 3; ++channel) {
         store_pair(channel, id.y, x, a0[channel], a1[channel]);
         store_pair(channel + 3, id.y, x, b0[channel], b1[channel]);
@@ -501,7 +802,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 )";
     Microsoft::WRL::ComPtr<ID3DBlob> bytecode;
-    if (FAILED(D3DCompile(baseShader, std::strlen(baseShader), nullptr, nullptr, nullptr,
+    if (FAILED(D3DCompile(baseShader.data(), baseShader.size(), nullptr, nullptr, nullptr,
                           "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL1, 0,
                           &bytecode, &errors))) {
         return false;
@@ -514,10 +815,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         return false;
     }
 
-    constexpr char scRgbShader[] = R"(
+    const std::string scRgbShader = std::string(R"(
 Texture2D<float4> firstRgb : register(t0);
 Texture2D<float4> secondRgb : register(t2);
 RWByteAddressBuffer outputTensor : register(u0);
+RWByteAddressBuffer sceneMetrics : register(u1);
 SamplerState linearClamp : register(s0);
 cbuffer PreprocessConstants : register(b0) {
     float4 firstSourceRect;
@@ -531,6 +833,14 @@ cbuffer PreprocessConstants : register(b0) {
     float interpolationT;
     float preprocessPadding;
 };
+cbuffer DisplayMappingConstants : register(b2) {
+    float4 displayTone[2];
+    float4 displayOptions[2];
+    float4 displayHdr10PlusA[2];
+    float4 displayHdr10PlusB[2];
+    float4 displayHdr10PlusCurve[2][4];
+    float4 displayHdrToneCurve[2][5];
+};
 float3 rec709_to_rec2020(float3 value) {
     return mul(float3x3(0.6274,0.3293,0.0433,
                        0.0691,0.9195,0.0114,
@@ -542,17 +852,35 @@ float3 nits_to_pq(float3 nits) {
     float3 p=pow(max(nits/10000.0,0.0),m1);
     return pow((c1+c2*p)/max(1.0+c3*p,0.000001),m2);
 }
+float3 pq_to_nits(float3 v) {
+    const float m1=2610.0/16384.0,m2=2523.0/32.0;
+    const float c1=3424.0/4096.0,c2=2413.0/128.0,c3=2392.0/128.0;
+    float3 p=pow(saturate(v),1.0/m2);
+    return 10000.0*pow(max(p-c1,0.0)/max(c2-c3*p,0.000001),1.0/m1);
+}
 float3 canonical(float3 sampledRgb,uint mode) {
     if(mode==1||mode==2) return saturate(sampledRgb);
     float3 scRgb=max(sampledRgb,0.0);
     return nits_to_pq(max(rec709_to_rec2020(scRgb*80.0),0.0));
 }
+)") + displayMappingHlsl + R"(
 uint pack_half2(float first,float second) {
     return f32tof16(first)|(f32tof16(second)<<16);
 }
 void store_pair(uint plane,uint y,uint x,float firstValue,float secondValue) {
     uint element=(plane*outputSize.y+y)*outputSize.x+x;
     outputTensor.Store(element*2,pack_half2(firstValue,secondValue));
+}
+void accumulate_scene_metrics(uint x,uint y,float3 left,float3 right) {
+    if((x&15u)!=0u||(y&15u)!=0u) return;
+    float leftLuma=saturate(dot(left,float3(0.2627,0.6780,0.0593)));
+    float rightLuma=saturate(dot(right,float3(0.2627,0.6780,0.0593)));
+    float difference=abs(leftLuma-rightLuma);
+    uint ignored;
+    sceneMetrics.InterlockedAdd(0,(uint)(difference*65535.0+0.5),ignored);
+    sceneMetrics.InterlockedAdd(4,difference>=0.12?1u:0u,ignored);
+    sceneMetrics.InterlockedAdd(8,(uint)(leftLuma*65535.0+0.5),ignored);
+    sceneMetrics.InterlockedAdd(12,(uint)(rightLuma*65535.0+0.5),ignored);
 }
 [numthreads(8,8,1)]
 void main(uint3 id : SV_DispatchThreadID) {
@@ -561,10 +889,15 @@ void main(uint3 id : SV_DispatchThreadID) {
     uint x1=min(x+1,outputSize.x-1);
     float2 p0=(float2(x,id.y)+0.5)/float2(outputSize);
     float2 p1=(float2(x1,id.y)+0.5)/float2(outputSize);
-    float3 a0=canonical(firstRgb.SampleLevel(linearClamp,p0,0).rgb,firstModes.z);
-    float3 a1=canonical(firstRgb.SampleLevel(linearClamp,p1,0).rgb,firstModes.z);
-    float3 b0=canonical(secondRgb.SampleLevel(linearClamp,p0,0).rgb,secondModes.z);
-    float3 b1=canonical(secondRgb.SampleLevel(linearClamp,p1,0).rgb,secondModes.z);
+    float3 a0=display_map_encoded(0,
+        canonical(firstRgb.SampleLevel(linearClamp,p0,0).rgb,firstModes.z));
+    float3 a1=display_map_encoded(0,
+        canonical(firstRgb.SampleLevel(linearClamp,p1,0).rgb,firstModes.z));
+    float3 b0=display_map_encoded(1,
+        canonical(secondRgb.SampleLevel(linearClamp,p0,0).rgb,secondModes.z));
+    float3 b1=display_map_encoded(1,
+        canonical(secondRgb.SampleLevel(linearClamp,p1,0).rgb,secondModes.z));
+    accumulate_scene_metrics(x,id.y,a0,b0);
     [unroll] for(uint channel=0;channel<3;++channel) {
         store_pair(channel,id.y,x,a0[channel],a1[channel]);
         store_pair(channel+3,id.y,x,b0[channel],b1[channel]);
@@ -574,7 +907,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 )";
     bytecode.Reset();
     errors.Reset();
-    if (FAILED(D3DCompile(scRgbShader, std::strlen(scRgbShader), nullptr, nullptr, nullptr,
+    if (FAILED(D3DCompile(scRgbShader.data(), scRgbShader.size(), nullptr, nullptr, nullptr,
                           "main", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL1, 0,
                           &bytecode, &errors))) {
         return false;
@@ -615,9 +948,11 @@ void D3D12TensorPreprocessor::StartDolbyVisionInitialization() {
         doviInitializationThread_ = std::thread([this]() {
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
             InitializeDolbyVisionPipeline();
+            doviInitializationComplete_.store(true, std::memory_order_release);
         });
     } catch (...) {
         doviInitializationStarted_.store(false, std::memory_order_release);
+        doviInitializationComplete_.store(true, std::memory_order_release);
     }
 }
 
@@ -694,8 +1029,10 @@ bool D3D12TensorPreprocessor::ReleaseRetained(
 TensorPreprocessResult D3D12TensorPreprocessor::SubmitPair(
     const NativeVideoFrame& first,
     const NativeVideoFrame& second,
+    const TensorShape outputShape,
     const float interpolationT,
     const float hlgPeakNits,
+    const InterpolationDisplayMappingPair& displayMapping,
     const uint64_t epoch,
     const GpuFencePoint& orderingDependency) {
     TensorPreprocessResult result;
@@ -720,13 +1057,14 @@ TensorPreprocessResult D3D12TensorPreprocessor::SubmitPair(
             publishedDoviPipeline_.load(std::memory_order_acquire);
         if (!preprocessPipeline) {
             StartDolbyVisionInitialization();
-            result.reason = L"dolby_vision_tensor_pipeline_initializing";
+            result.reason = doviInitializationComplete_.load(
+                                std::memory_order_acquire)
+                ? L"dolby_vision_tensor_pipeline_unavailable"
+                : L"dolby_vision_tensor_pipeline_initializing";
             return result;
         }
     }
-    const TensorShape shape = SelectInterpolationTensorShape(
-        static_cast<UINT>(std::max(first.width, second.width)),
-        static_cast<UINT>(std::max(first.height, second.height)));
+    const TensorShape shape = outputShape;
     if (!shape.IsValid()) {
         result.reason = L"no_tensor_shape_bucket";
         return result;
@@ -782,6 +1120,8 @@ TensorPreprocessResult D3D12TensorPreprocessor::SubmitPair(
     uav.Buffer.NumElements = static_cast<UINT>(bytes / sizeof(UINT));
     uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
     device_->CreateUnorderedAccessView(slot->output.Get(), nullptr, &uav, cpu);
+    cpu.ptr += descriptorIncrement_;
+    CreateSceneChangeDescriptor(*slot, cpu);
 
     const auto planeSubresources = [](const NativeVideoFrame& frame) {
         const UINT arraySize = std::max<UINT>(1, frame.d3d12Texture->GetDesc().DepthOrArraySize);
@@ -818,6 +1158,7 @@ TensorPreprocessResult D3D12TensorPreprocessor::SubmitPair(
     slot->commandList->SetComputeRootSignature(rootSignature_.Get());
     ID3D12DescriptorHeap* heaps[] = {slot->descriptors.Get()};
     slot->commandList->SetDescriptorHeaps(1, heaps);
+    ClearSceneChangeProbe(*slot);
     slot->commandList->SetComputeRootDescriptorTable(
         0, slot->descriptors->GetGPUDescriptorHandleForHeapStart());
 
@@ -859,12 +1200,19 @@ TensorPreprocessResult D3D12TensorPreprocessor::SubmitPair(
     constants.interpolationT = std::clamp(interpolationT, 0.0f, 1.0f);
     slot->commandList->SetComputeRoot32BitConstants(1, 30, &constants, 0);
     DoviShaderConstantsPair doviConstants{};
-    FillDoviShaderConstants(doviConstants, 0, first, 1000.0f);
-    FillDoviShaderConstants(doviConstants, 1, second, 1000.0f);
+    FillDoviShaderConstants(
+        doviConstants, 0, first, std::max(displayMapping.tone[0][2], 100.0f));
+    FillDoviShaderConstants(
+        doviConstants, 1, second, std::max(displayMapping.tone[1][2], 100.0f));
     std::memcpy(slot->doviConstantsMapping, &doviConstants, sizeof(doviConstants));
     slot->commandList->SetComputeRootConstantBufferView(
         2, slot->doviConstants->GetGPUVirtualAddress());
+    std::memcpy(slot->displayConstantsMapping, &displayMapping,
+                sizeof(displayMapping));
+    slot->commandList->SetComputeRootConstantBufferView(
+        3, slot->displayConstants->GetGPUVirtualAddress());
     slot->commandList->Dispatch((shape.width + 15) / 16, (shape.height + 7) / 8, 1);
+    CopySceneChangeProbe(*slot);
 
     std::vector<D3D12_RESOURCE_BARRIER> endBarriers{
         TransitionBarrier(first.d3d12Texture.Get(), firstPlanes[0],
@@ -941,6 +1289,10 @@ TensorPreprocessResult D3D12TensorPreprocessor::SubmitPair(
     result.tensor.producingQueue = GpuFrameQueue::ComputeMl;
     result.tensor.ready = submit.completion;
     result.tensor.color = second.color;
+    result.sceneChange.readback = slot->sceneMetricsReadback;
+    result.sceneChange.ready = submit.completion;
+    result.sceneChange.sampleCount =
+        ((shape.width + 15) / 16) * ((shape.height + 15) / 16);
     return result;
 }
 
@@ -1013,6 +1365,8 @@ TensorPreprocessResult D3D12TensorPreprocessor::SubmitScRgbPair(
     uav.Buffer.NumElements = static_cast<UINT>(bytes / sizeof(UINT));
     uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
     device_->CreateUnorderedAccessView(slot->output.Get(), nullptr, &uav, cpu);
+    cpu.ptr += descriptorIncrement_;
+    CreateSceneChangeDescriptor(*slot, cpu);
 
     const std::array beginBarriers{
         TransitionBarrier(first, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
@@ -1026,6 +1380,7 @@ TensorPreprocessResult D3D12TensorPreprocessor::SubmitScRgbPair(
     slot->commandList->SetComputeRootSignature(rootSignature_.Get());
     ID3D12DescriptorHeap* heaps[] = {slot->descriptors.Get()};
     slot->commandList->SetDescriptorHeaps(1, heaps);
+    ClearSceneChangeProbe(*slot);
     slot->commandList->SetComputeRootDescriptorTable(
         0, slot->descriptors->GetGPUDescriptorHandleForHeapStart());
     PreprocessConstants constants{};
@@ -1041,8 +1396,14 @@ TensorPreprocessResult D3D12TensorPreprocessor::SubmitScRgbPair(
     slot->commandList->SetComputeRoot32BitConstants(1, 30, &constants, 0);
     slot->commandList->SetComputeRootConstantBufferView(
         2, slot->doviConstants->GetGPUVirtualAddress());
+    const InterpolationDisplayMappingPair displayMapping{};
+    std::memcpy(slot->displayConstantsMapping, &displayMapping,
+                sizeof(displayMapping));
+    slot->commandList->SetComputeRootConstantBufferView(
+        3, slot->displayConstants->GetGPUVirtualAddress());
     slot->commandList->Dispatch((shape.width + 15) / 16,
                                 (shape.height + 7) / 8, 1);
+    CopySceneChangeProbe(*slot);
     const std::array endBarriers{
         TransitionBarrier(first, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -1072,13 +1433,19 @@ TensorPreprocessResult D3D12TensorPreprocessor::SubmitScRgbPair(
     result.tensor.resource = slot->output;
     result.tensor.producingQueue = GpuFrameQueue::ComputeMl;
     result.tensor.ready = submit.completion;
+    result.sceneChange.readback = slot->sceneMetricsReadback;
+    result.sceneChange.ready = submit.completion;
+    result.sceneChange.sampleCount =
+        ((shape.width + 15) / 16) * ((shape.height + 15) / 16);
     return result;
 }
 
 TensorPreprocessResult D3D12TensorPreprocessor::SubmitPixelPair(
     const NativeVideoFrame& first,
     const NativeVideoFrame& second,
+    const TensorShape outputShape,
     const float interpolationT,
+    const InterpolationDisplayMappingPair& displayMapping,
     const uint64_t epoch,
     const GpuFencePoint& orderingDependency) {
     TensorPreprocessResult result;
@@ -1096,12 +1463,9 @@ TensorPreprocessResult D3D12TensorPreprocessor::SubmitPixelPair(
         result.reason = L"unsupported_rgb_tensor_input";
         return result;
     }
-    const UINT maxWidth = static_cast<UINT>(std::max(first.width, second.width));
-    const UINT maxHeight = static_cast<UINT>(std::max(first.height, second.height));
-    // Pixel-backed and decode-surface inputs share one resolution contract:
-    // retain the source extent up to 1080p and proportionally cap larger
-    // sources. Presentation keeps using the original full-resolution frame.
-    const TensorShape shape = SelectInterpolationTensorShape(maxWidth, maxHeight);
+    // Pixel-backed and decode-surface inputs share one resolution contract.
+    // Presentation keeps using the original full-resolution frame.
+    const TensorShape shape = outputShape;
     if (!shape.IsValid()) {
         result.reason = L"no_tensor_shape_bucket";
         return result;
@@ -1286,10 +1650,13 @@ TensorPreprocessResult D3D12TensorPreprocessor::SubmitPixelPair(
     uav.Buffer.NumElements = static_cast<UINT>(bytes / sizeof(UINT));
     uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
     device_->CreateUnorderedAccessView(slot->output.Get(), nullptr, &uav, cpu);
+    cpu.ptr += descriptorIncrement_;
+    CreateSceneChangeDescriptor(*slot, cpu);
 
     slot->commandList->SetComputeRootSignature(rootSignature_.Get());
     ID3D12DescriptorHeap* heaps[] = {slot->descriptors.Get()};
     slot->commandList->SetDescriptorHeaps(1, heaps);
+    ClearSceneChangeProbe(*slot);
     slot->commandList->SetComputeRootDescriptorTable(
         0, slot->descriptors->GetGPUDescriptorHandleForHeapStart());
     PreprocessConstants constants{};
@@ -1305,8 +1672,13 @@ TensorPreprocessResult D3D12TensorPreprocessor::SubmitPixelPair(
     slot->commandList->SetComputeRoot32BitConstants(1, 30, &constants, 0);
     slot->commandList->SetComputeRootConstantBufferView(
         2, slot->doviConstants->GetGPUVirtualAddress());
+    std::memcpy(slot->displayConstantsMapping, &displayMapping,
+                sizeof(displayMapping));
+    slot->commandList->SetComputeRootConstantBufferView(
+        3, slot->displayConstants->GetGPUVirtualAddress());
     slot->commandList->Dispatch((shape.width + 15) / 16,
                                 (shape.height + 7) / 8, 1);
+    CopySceneChangeProbe(*slot);
     const std::array endBarriers{
         TransitionBarrier(firstInput.texture, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -1338,6 +1710,10 @@ TensorPreprocessResult D3D12TensorPreprocessor::SubmitPixelPair(
     result.tensor.producingQueue = GpuFrameQueue::ComputeMl;
     result.tensor.ready = submit.completion;
     result.tensor.color = second.color;
+    result.sceneChange.readback = slot->sceneMetricsReadback;
+    result.sceneChange.ready = submit.completion;
+    result.sceneChange.sampleCount =
+        ((shape.width + 15) / 16) * ((shape.height + 15) / 16);
     return result;
 }
 

@@ -32,6 +32,8 @@ struct VideoRenderStats {
     uint64_t generatedFrames = 0;
     uint64_t generatedSubmitted = 0;
     uint64_t generatedDroppedNotReady = 0;
+    uint64_t generatedDroppedSceneCut = 0;
+    uint64_t generatedDroppedSceneProbeUnavailable = 0;
     uint64_t inferenceFailures = 0;
     int interpolationMultiplier = 1;
     std::wstring interpolationBackend = L"inactive";

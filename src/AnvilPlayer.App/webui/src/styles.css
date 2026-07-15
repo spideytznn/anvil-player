@@ -1892,6 +1892,52 @@ input:focus-visible {
   color: #d5a36b;
 }
 
+.interpolation-resolution-setting {
+  display: grid;
+  gap: 8px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.interpolation-resolution-setting > div:first-child {
+  display: grid;
+  gap: 3px;
+}
+
+.interpolation-resolution-setting strong {
+  font-size: 12px;
+}
+
+.interpolation-resolution-setting small {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.interpolation-resolution-options {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 5px;
+}
+
+.interpolation-resolution-options button {
+  height: 28px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-soft);
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 760;
+  cursor: pointer;
+}
+
+.interpolation-resolution-options button:hover,
+.interpolation-resolution-options button.is-active {
+  border-color: color-mix(in srgb, var(--accent) 62%, var(--line));
+  background: var(--panel-raised);
+  color: var(--text);
+}
+
 .hdr-display-peak-setting {
   display: grid;
   gap: 9px;

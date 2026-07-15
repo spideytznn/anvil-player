@@ -16,6 +16,18 @@ inline constexpr int kAudioTrackOff = -1;
 inline constexpr int kSubtitleTrackAuto = -2;
 inline constexpr int kSubtitleTrackOff = -1;
 inline constexpr std::size_t kHdrToneCurvePointCount = 9;
+inline constexpr int kDefaultFrameInterpolationMaximumHeight = 1080;
+inline constexpr int kMinimumFrameInterpolationMaximumHeight = 1080;
+inline constexpr int kMaximumFrameInterpolationMaximumHeight = 2160;
+
+inline constexpr int NormalizeFrameInterpolationMaximumHeight(
+    const int height) noexcept {
+    return height < kMinimumFrameInterpolationMaximumHeight
+        ? kMinimumFrameInterpolationMaximumHeight
+        : (height > kMaximumFrameInterpolationMaximumHeight
+            ? kMaximumFrameInterpolationMaximumHeight
+            : height);
+}
 
 struct HdrToneCurvePoint {
     double inputNits = 0.0;
@@ -40,6 +52,11 @@ struct VideoSettings {
     // rate synchronization preference remains intact, but is not effective
     // while this option is enabled.
     bool frameInterpolationEnabled = false;
+    // Maximum picture height used by the interpolation model. Sources below
+    // this limit retain their native extent; larger sources are reduced
+    // proportionally. Presentation always stays at the source resolution.
+    int frameInterpolationMaximumHeight =
+        kDefaultFrameInterpolationMaximumHeight;
     HardwareDecodeMode hardwareDecode = HardwareDecodeMode::Auto;
     std::wstring renderer = L"D3D12";
     int selectedTrackIndex = kVideoTrackAuto;

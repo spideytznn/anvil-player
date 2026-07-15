@@ -51,18 +51,28 @@ struct InterpolationTensorExtent {
     uint32_t height = 0;
 };
 
-inline InterpolationTensorExtent SelectCapped1080pInterpolationExtent(
+inline InterpolationTensorExtent SelectCappedInterpolationExtent(
     const uint32_t sourceWidth,
-    const uint32_t sourceHeight) noexcept {
-    if (sourceWidth == 0 || sourceHeight == 0) return {};
-    constexpr uint32_t kMaximumWidth = 1920;
-    constexpr uint32_t kMaximumPictureHeight = 1080;
-    constexpr uint32_t kMaximumAlignedHeight = 1088;
+    const uint32_t sourceHeight,
+    const uint32_t requestedMaximumPictureHeight) noexcept {
+    if (sourceWidth == 0 || sourceHeight == 0 ||
+        requestedMaximumPictureHeight == 0) {
+        return {};
+    }
+    constexpr uint32_t kMinimumPictureHeight = 1080;
+    constexpr uint32_t kMaximumPictureHeightLimit = 2160;
     constexpr uint32_t kAlignment = 32;
+    const uint32_t maximumPictureHeight = std::clamp(
+        requestedMaximumPictureHeight,
+        kMinimumPictureHeight,
+        kMaximumPictureHeightLimit);
+    const uint32_t maximumWidth = maximumPictureHeight * 16 / 9;
+    const uint32_t maximumAlignedHeight =
+        ((maximumPictureHeight + kAlignment - 1) / kAlignment) * kAlignment;
     const double scale = std::min({
         1.0,
-        static_cast<double>(kMaximumWidth) / sourceWidth,
-        static_cast<double>(kMaximumPictureHeight) / sourceHeight});
+        static_cast<double>(maximumWidth) / sourceWidth,
+        static_cast<double>(maximumPictureHeight) / sourceHeight});
     const uint32_t scaledWidth = std::max<uint32_t>(
         1, static_cast<uint32_t>(std::llround(sourceWidth * scale)));
     const uint32_t scaledHeight = std::max<uint32_t>(
@@ -74,14 +84,14 @@ inline InterpolationTensorExtent SelectCapped1080pInterpolationExtent(
         return std::max(kAlignment,
                         ((value + kAlignment / 2) / kAlignment) * kAlignment);
     };
-    // Never reduce a source that is already at or below 1080p. Larger sources
-    // are scaled proportionally first, then rounded to the nearest model-safe
-    // extent so ultrawide and portrait content retain their shape.
+    // Never reduce a source that is already within the selected cap. Larger
+    // sources are scaled proportionally first, then rounded to the nearest
+    // model-safe extent so ultrawide and portrait content retain their shape.
     const bool capped = scale < 0.999999;
     return {
-        std::min(kMaximumWidth,
+        std::min(maximumWidth,
                  capped ? alignNearest(scaledWidth) : alignUp(scaledWidth)),
-        std::min(kMaximumAlignedHeight,
+        std::min(maximumAlignedHeight,
                  capped ? alignNearest(scaledHeight) : alignUp(scaledHeight))};
 }
 

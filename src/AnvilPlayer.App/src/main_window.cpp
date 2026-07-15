@@ -517,6 +517,10 @@ MainWindow::MainWindow(std::shared_ptr<anvil::playback::InMemoryLogSink> logSink
     }
     settings.video.frameInterpolationEnabled =
         LoadVideoBooleanSetting(L"FrameInterpolationEnabled").value_or(false);
+    settings.video.frameInterpolationMaximumHeight =
+        anvil::playback::NormalizeFrameInterpolationMaximumHeight(
+            LoadVideoDwordSetting(L"FrameInterpolationMaximumHeight")
+                .value_or(anvil::playback::kDefaultFrameInterpolationMaximumHeight));
     if (const auto value = LoadVideoBooleanSetting(L"DisplayMetadataPassthrough")) {
         settings.video.displayMetadataPassthrough = *value;
     }
@@ -934,6 +938,8 @@ std::wstring MainWindow::BuildWebUiStateJson() const {
          << L",";
     json << L"\"frameInterpolationEnabled\":"
          << (settings.video.frameInterpolationEnabled ? L"true" : L"false") << L",";
+    json << L"\"frameInterpolationMaximumHeight\":"
+         << settings.video.frameInterpolationMaximumHeight << L",";
     json << L"\"frameInterpolationActive\":"
          << (rendererStats.generatedSubmitted > 0 ? L"true" : L"false") << L",";
     json << L"\"frameInterpolationMultiplier\":" << std::fixed
@@ -1123,6 +1129,11 @@ void MainWindow::HandleWebUiMessage(const std::wstring_view message) {
             MessageContains(message, L"\"enabled\":true"));
     } else if (MessageContains(message, L"\"command\":\"setFrameInterpolation\"")) {
         SetFrameInterpolationEnabled(MessageContains(message, L"\"enabled\":true"));
+    } else if (MessageContains(message, L"\"command\":\"setFrameInterpolationMaximumHeight\"")) {
+        if (const auto maximumHeight = ReadJsonNumber(message, L"maximumHeight")) {
+            SetFrameInterpolationMaximumHeight(
+                static_cast<int>(std::round(*maximumHeight)));
+        }
     } else if (MessageContains(message, L"\"command\":\"setRefreshRateSync\"")) {
         SetRefreshRateSyncEnabled(MessageContains(message, L"\"enabled\":true"));
     } else if (MessageContains(message, L"\"command\":\"setRefreshRateMaximumMultiple\"")) {
@@ -2353,6 +2364,10 @@ void MainWindow::MaybeLogNativeSchedulerStats(const NativeVideoQueueStats& stats
         L" generated_submitted=" + std::to_wstring(renderStats.generatedSubmitted) +
         L" generated_dropped_not_ready=" +
             std::to_wstring(renderStats.generatedDroppedNotReady) +
+        L" generated_dropped_scene_cut=" +
+            std::to_wstring(renderStats.generatedDroppedSceneCut) +
+        L" generated_dropped_scene_probe_unavailable=" +
+            std::to_wstring(renderStats.generatedDroppedSceneProbeUnavailable) +
         L" inference_failures=" + std::to_wstring(renderStats.inferenceFailures) +
         L" interpolation_multiplier=" +
             std::to_wstring(renderStats.interpolationMultiplier) +
@@ -5400,6 +5415,10 @@ void MainWindow::OpenPath(const std::filesystem::path& path, const bool autoplay
         auto settings = controller_.Settings();
         settings.video.frameInterpolationEnabled =
             LoadVideoBooleanSetting(L"FrameInterpolationEnabled").value_or(false);
+        settings.video.frameInterpolationMaximumHeight =
+            anvil::playback::NormalizeFrameInterpolationMaximumHeight(
+                LoadVideoDwordSetting(L"FrameInterpolationMaximumHeight")
+                    .value_or(anvil::playback::kDefaultFrameInterpolationMaximumHeight));
         settings.audio.passthroughPreferred = LoadAudioPassthroughSetting().value_or(false);
         controller_.ApplySettings(settings);
     }
@@ -6259,6 +6278,32 @@ void MainWindow::SetFrameInterpolationEnabled(const bool enabled) {
     PostWebUiState();
 }
 
+void MainWindow::SetFrameInterpolationMaximumHeight(const int maximumHeight) {
+    const int normalized =
+        anvil::playback::NormalizeFrameInterpolationMaximumHeight(maximumHeight);
+    auto settings = controller_.Settings();
+    if (settings.video.frameInterpolationMaximumHeight == normalized) {
+        return;
+    }
+    settings.video.frameInterpolationMaximumHeight = normalized;
+    controller_.ApplySettings(settings);
+    SaveVideoDwordSetting(L"FrameInterpolationMaximumHeight", normalized);
+
+    const auto snapshot = controller_.Snapshot();
+    if (d3dRenderer_ && snapshot.media.has_value() && snapshot.media->hasVideo &&
+        backend_ == PlaybackBackend::NativeFfmpegD3D12) {
+        d3dRenderer_->ConfigureColorPipeline(
+            settings.video, CachedCapabilities().display,
+            snapshot.media->videoColor);
+        d3dRenderer_->ResetRenderStats();
+        lastNativeStatsLog_ = {};
+    }
+    LogApp(LogLevel::Info,
+           L"frame interpolation maximum_picture_height=" +
+               std::to_wstring(normalized) + L" live_update=true");
+    PostWebUiState(true);
+}
+
 void MainWindow::SetRefreshRateSyncEnabled(const bool enabled) {
     if (controller_.Settings().video.frameInterpolationEnabled) {
         PostWebUiState();
@@ -6337,6 +6382,10 @@ void MainWindow::ApplyGlobalVideoPassthroughPreferences() {
         LoadVideoBooleanSetting(L"HardwareDecodeEnabled").value_or(true);
     const bool frameInterpolation =
         LoadVideoBooleanSetting(L"FrameInterpolationEnabled").value_or(false);
+    const int frameInterpolationMaximumHeight =
+        anvil::playback::NormalizeFrameInterpolationMaximumHeight(
+            LoadVideoDwordSetting(L"FrameInterpolationMaximumHeight")
+                .value_or(anvil::playback::kDefaultFrameInterpolationMaximumHeight));
     const bool autoDisplayFormat = LoadVideoBooleanSetting(L"AutoDisplayFormat").value_or(false);
     const bool displayMetadata = LoadVideoBooleanSetting(L"DisplayMetadataPassthrough").value_or(false);
     const bool dolbySystemPipeline =
@@ -6344,6 +6393,7 @@ void MainWindow::ApplyGlobalVideoPassthroughPreferences() {
     const int displayPeakBrightnessNits =
         LoadVideoDwordSetting(L"DisplayPeakBrightnessNits").value_or(0);
     SetHardwareDecodeEnabled(hardwareDecode);
+    SetFrameInterpolationMaximumHeight(frameInterpolationMaximumHeight);
     SetFrameInterpolationEnabled(frameInterpolation);
     SetAutomaticDisplayFormat(autoDisplayFormat);
     if (!autoDisplayFormat) {

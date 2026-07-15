@@ -4,6 +4,7 @@
 #include "AnvilPlayer/Playback/PlayerController.h"
 #include "AnvilPlayer/Playback/PlaybackPlan.h"
 #include "AnvilPlayer/App/color_metadata_util.h"
+#include "AnvilPlayer/App/frame_interpolation_policy.h"
 #include "AnvilPlayer/App/playback_timing_math.h"
 #include "AnvilPlayer/App/software_yuv_upload_layout.h"
 #include "AnvilPlayer/App/video_texture_sampling_math.h"
@@ -162,22 +163,129 @@ void TestFixed2xInterpolationRespectsRefreshCeiling() {
     assert(Fixed2xInterpolationMultiplier(0.0, 120.0) == 1);
 }
 
-void TestInterpolationTensorExtentUsesSourceResolutionUpTo1080p() {
-    using anvil::app::SelectCapped1080pInterpolationExtent;
+void TestInterpolationTensorExtentUsesConfigurableResolutionCap() {
+    using anvil::app::SelectCappedInterpolationExtent;
 
-    const auto uhd = SelectCapped1080pInterpolationExtent(3840, 2160);
+    const auto uhd = SelectCappedInterpolationExtent(3840, 2160, 1080);
     assert(uhd.width == 1920 && uhd.height == 1088);
-    const auto fullHd = SelectCapped1080pInterpolationExtent(1920, 1080);
+    const auto fullHd = SelectCappedInterpolationExtent(1920, 1080, 1080);
     assert(fullHd.width == 1920 && fullHd.height == 1088);
-    const auto hd = SelectCapped1080pInterpolationExtent(1280, 720);
+    const auto hd = SelectCappedInterpolationExtent(1280, 720, 1080);
     assert(hd.width == 1280 && hd.height == 736);
-    const auto sd = SelectCapped1080pInterpolationExtent(854, 480);
+    const auto sd = SelectCappedInterpolationExtent(854, 480, 1080);
     assert(sd.width == 864 && sd.height == 480);
-    const auto ultrawide = SelectCapped1080pInterpolationExtent(2560, 1080);
+    const auto ultrawide = SelectCappedInterpolationExtent(2560, 1080, 1080);
     assert(ultrawide.width == 1920 && ultrawide.height == 800);
-    const auto portrait = SelectCapped1080pInterpolationExtent(1080, 1920);
+    const auto portrait = SelectCappedInterpolationExtent(1080, 1920, 1080);
     assert(portrait.width == 608 && portrait.height == 1088);
-    assert(SelectCapped1080pInterpolationExtent(0, 1080).width == 0);
+    assert(SelectCappedInterpolationExtent(0, 1080, 1080).width == 0);
+
+    const auto uhdAt1440p =
+        SelectCappedInterpolationExtent(3840, 2160, 1440);
+    assert(uhdAt1440p.width == 2560 && uhdAt1440p.height == 1440);
+    const auto qhdAt1440p =
+        SelectCappedInterpolationExtent(2560, 1440, 1440);
+    assert(qhdAt1440p.width == 2560 && qhdAt1440p.height == 1440);
+    const auto uhdAt2160p =
+        SelectCappedInterpolationExtent(3840, 2160, 2160);
+    assert(uhdAt2160p.width == 3840 && uhdAt2160p.height == 2176);
+
+    // Persisted or bridged values are bounded to the supported UI range.
+    assert(SelectCappedInterpolationExtent(3840, 2160, 720).width == 1920);
+    assert(SelectCappedInterpolationExtent(7680, 4320, 4320).width == 3840);
+}
+
+void TestInterpolationEndpointsExcludePresentationOverlays() {
+    anvil::app::NativeVideoFrame frame;
+    frame.subtitleText = L"presentation only";
+    frame.subtitleBitmaps.emplace_back();
+    frame.subtitlesPrepared = true;
+    frame.color.transfer = anvil::playback::VideoTransferCharacteristic::Srgb;
+    auto endpointDovi =
+        std::make_shared<anvil::playback::DolbyVisionFrameMetadata>();
+    endpointDovi->valid = true;
+    endpointDovi->dynamicMetadataFingerprint = 84;
+    frame.dovi = endpointDovi;
+    frame.timelineSerial = 7;
+
+    anvil::app::StripInterpolationPresentationData(frame);
+
+    assert(frame.subtitleText.empty());
+    assert(frame.subtitleBitmaps.empty());
+    assert(!frame.subtitlesPrepared);
+    // Endpoint color/RPU state remains independent. Only overlays are removed
+    // before A and B are mapped into their shared target display domain.
+    assert(frame.color.transfer ==
+           anvil::playback::VideoTransferCharacteristic::Srgb);
+    assert(frame.dovi == endpointDovi);
+    assert(frame.dovi->dynamicMetadataFingerprint == 84);
+    assert(frame.timelineSerial == 7);
+
+    assert(!anvil::app::IsInterpolationDisplayDomainBoundary(
+        true, true, true, true));
+    assert(anvil::app::IsInterpolationDisplayDomainBoundary(
+        true, false, true, false));
+}
+
+void TestInterpolationPresentationChangesInvalidateDisplayDomainFrames() {
+    anvil::playback::VideoSettings settings;
+    settings.frameInterpolationEnabled = true;
+    anvil::playback::DisplayCapabilities display;
+    display.hdrEnabled = true;
+    display.reportedPeakBrightnessNits = 1000;
+    anvil::playback::VideoColorMetadata color;
+    color.primaries = anvil::playback::VideoColorPrimaries::Bt2020;
+    color.transfer = anvil::playback::VideoTransferCharacteristic::Pq;
+
+    assert(!anvil::app::InterpolationPresentationConfigChanged(
+        settings, display, color, settings, display, color));
+
+    auto unrelated = settings;
+    unrelated.hardwareDecode = anvil::playback::HardwareDecodeMode::Off;
+    assert(!anvil::app::InterpolationPresentationConfigChanged(
+        settings, display, color, unrelated, display, color));
+
+    auto toneMapping = settings;
+    toneMapping.toneMapping = anvil::playback::ToneMappingMode::PreserveHighlights;
+    assert(anvil::app::InterpolationPresentationConfigChanged(
+        settings, display, color, toneMapping, display, color));
+
+    auto interpolationResolution = settings;
+    interpolationResolution.frameInterpolationMaximumHeight = 1440;
+    assert(anvil::app::InterpolationPresentationConfigChanged(
+        settings, display, color, interpolationResolution, display, color));
+
+    auto movedDisplay = display;
+    movedDisplay.reportedPeakBrightnessNits = 1600;
+    assert(anvil::app::InterpolationPresentationConfigChanged(
+        settings, display, color, settings, movedDisplay, color));
+
+    auto changedMetadata = color;
+    changedMetadata.contentLight.hasValues = true;
+    changedMetadata.contentLight.maxContentLightLevelNits = 4000;
+    assert(anvil::app::InterpolationPresentationConfigChanged(
+        settings, display, color, settings, display, changedMetadata));
+}
+
+void TestInterpolationSceneChangePolicy() {
+    using anvil::app::IsDolbyVisionSceneBoundary;
+    using anvil::app::IsHardSceneCut;
+    using anvil::app::SceneChangeMetrics;
+
+    assert(!IsHardSceneCut(SceneChangeMetrics{0.05, 0.20, 0.45, 0.44}));
+    // A uniform fade changes almost every sample but is explained by its
+    // global luminance shift and must not be classified as a hard cut.
+    assert(!IsHardSceneCut(SceneChangeMetrics{0.25, 0.90, 0.60, 0.35}));
+    assert(IsHardSceneCut(SceneChangeMetrics{0.28, 0.82, 0.48, 0.50}));
+
+    anvil::playback::DolbyVisionFrameMetadata dovi;
+    dovi.valid = true;
+    assert(!IsDolbyVisionSceneBoundary(&dovi));
+    dovi.sceneRefreshFlag = 1;
+    assert(IsDolbyVisionSceneBoundary(&dovi));
+    dovi.valid = false;
+    assert(!IsDolbyVisionSceneBoundary(&dovi));
+    assert(!IsDolbyVisionSceneBoundary(nullptr));
 }
 
 std::filesystem::path MakeTempMediaFile() {
@@ -654,6 +762,7 @@ void TestDolbyVisionPlaybackPlanPrefersSystemExtensions() {
 void TestDisplayMetadataPassthroughDefaults() {
     const auto settings = anvil::playback::MakeDefaultSettings();
     assert(!settings.video.frameInterpolationEnabled);
+    assert(settings.video.frameInterpolationMaximumHeight == 1080);
     assert(!settings.video.displayMetadataPassthrough);
     assert(!settings.video.dolbyVisionSystemPipelineExperimental);
     // Zero means auto: use the player window's current monitor peak and let
@@ -747,7 +856,10 @@ int main() {
     TestWasapiEndpointClockMath();
     TestNetworkRebufferPolicyHysteresis();
     TestFixed2xInterpolationRespectsRefreshCeiling();
-    TestInterpolationTensorExtentUsesSourceResolutionUpTo1080p();
+    TestInterpolationTensorExtentUsesConfigurableResolutionCap();
+    TestInterpolationEndpointsExcludePresentationOverlays();
+    TestInterpolationPresentationChangesInvalidateDisplayDomainFrames();
+    TestInterpolationSceneChangePolicy();
     TestCapabilityProbeDoesNotBlockRepeatedPrepare();
     TestOpenAndTransport();
     TestStartupResumePositionSurvivesPlay();
