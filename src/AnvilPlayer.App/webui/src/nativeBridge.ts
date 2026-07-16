@@ -238,7 +238,7 @@ export type NativeCommand =
   | { type: 'command'; command: 'cancelLibraryProbe'; requestId: string }
   | { type: 'command'; command: 'debugLog'; message: string }
   | { type: 'command'; command: 'searchBilibiliTrailers'; requestId: string; keyword: string }
-  | { type: 'command'; command: 'probeMediaDetails'; requestId: string; path: string }
+  | { type: 'command'; command: 'probeMediaDetails'; requestId: string; path: string; username?: string; password?: string }
   | { type: 'command'; command: 'setWebUiRoute'; route: 'player' | 'library' }
   | { type: 'command'; command: 'requestPlayback'; path: string; startPositionRatio?: number; audioTrackIndex?: number; subtitleTrackIndex?: number }
   | { type: 'command'; command: 'localPlaybackProgress'; path: string; positionMs: number; durationMs: number; playbackState: string }

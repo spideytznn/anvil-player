@@ -44,7 +44,7 @@ export function MetadataMatchDialog(props: MetadataMatchDialogProps): JSX.Elemen
           <input value={query} onChange={(event) => setQuery(event.currentTarget.value)} autoFocus />
           <button type="submit" disabled={props.searching || !query.trim()}>{props.searching ? (zh ? '搜索中…' : 'Searching…') : (zh ? '搜索' : 'Search')}</button>
         </form>
-        <div className="library-metadata-candidates">
+        <div className="library-metadata-candidates" data-scroll-fade>
           {props.candidates.map((candidate) => {
             const candidateKey = `${candidate.type}:${candidate.id}`
             return (

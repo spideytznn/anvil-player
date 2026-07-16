@@ -37,7 +37,7 @@ export function MediaManagementDialog(props: MediaManagementDialogProps): JSX.El
           <button className={tab === 'missing' ? 'is-active' : ''} type="button" onClick={() => setTab('missing')}><FileWarning size={15} />{zh ? '缺失文件' : 'Missing'}<b>{missingItems.length}</b></button>
           <button className={tab === 'duplicates' ? 'is-active' : ''} type="button" onClick={() => setTab('duplicates')}><Copy size={15} />{zh ? '重复与多版本' : 'Duplicates & versions'}<b>{duplicateItems.length}</b></button>
         </nav>
-        <div className="library-management-list">
+        <div className="library-management-list" data-scroll-fade>
           {rows.map((item) => {
             const source = sourceMap.get(item.sourceId)
             return (

@@ -121,6 +121,61 @@
   font: inherit;
 }
 
+.library-window [data-scroll-fade] {
+  --library-scroll-fade-size: 30px;
+}
+
+.library-window [data-scroll-fade][data-scroll-fade-top]:not([data-scroll-fade-bottom]) {
+  -webkit-mask-image: linear-gradient(
+    180deg,
+    transparent 0,
+    black var(--library-scroll-fade-size),
+    black 100%
+  );
+  mask-image: linear-gradient(
+    180deg,
+    transparent 0,
+    black var(--library-scroll-fade-size),
+    black 100%
+  );
+}
+
+.library-window [data-scroll-fade][data-scroll-fade-bottom]:not([data-scroll-fade-top]) {
+  -webkit-mask-image: linear-gradient(
+    180deg,
+    black 0,
+    black calc(100% - var(--library-scroll-fade-size)),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    180deg,
+    black 0,
+    black calc(100% - var(--library-scroll-fade-size)),
+    transparent 100%
+  );
+}
+
+.library-window [data-scroll-fade][data-scroll-fade-top][data-scroll-fade-bottom] {
+  -webkit-mask-image: linear-gradient(
+    180deg,
+    transparent 0,
+    black var(--library-scroll-fade-size),
+    black calc(100% - var(--library-scroll-fade-size)),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    180deg,
+    transparent 0,
+    black var(--library-scroll-fade-size),
+    black calc(100% - var(--library-scroll-fade-size)),
+    transparent 100%
+  );
+}
+
+.library-window .toolbar-select-options[data-scroll-fade] {
+  --library-scroll-fade-size: 18px;
+}
+
 .library-sidebar {
   display: grid;
   min-height: 0;

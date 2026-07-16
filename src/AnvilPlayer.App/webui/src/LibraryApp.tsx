@@ -40,7 +40,7 @@ import {
 } from 'lucide-react'
 import { applyAppearanceSettings } from './appearance'
 import { loadSavedEmbyConnections, removeSavedEmbyConnection, saveSavedEmbyConnection, type SavedEmbyConnection } from './manager/connectionStorage'
-import { createEmptyLibraryClient } from './manager/mediaLibraryClient'
+import { createEmptyLibraryClient, sortContinueWatchingItems } from './manager/mediaLibraryClient'
 import {
   addItemToEmbyPlaylist,
   createEmbyPlaylist,
@@ -158,6 +158,7 @@ import {
 } from './library/SourceManager'
 import { DetailPanel as DetailPanelLayout } from './library/DetailPanel'
 import { useLibraryRequestCancellation } from './library/useLibraryRequestCancellation'
+import { useScrollEdgeFades } from './library/useScrollEdgeFades'
 
 const LIBRARY_LISTING_PAGE_SIZE = 60
 const DISSOLVED_COLLECTION_PATHS_KEY = 'anvil-player.library.dissolved-paths.v1'
@@ -314,12 +315,12 @@ function playbackLocationKey(value: string): string {
   }
 }
 
-function applyPlaybackProgress(item: MediaItem, path: string, ratio: number, ended: boolean): { item: MediaItem; changed: boolean } {
+function applyPlaybackProgress(item: MediaItem, path: string, ratio: number, ended: boolean, playedAt: number): { item: MediaItem; changed: boolean } {
   const matches = [item.path, item.playbackPath].some((value) => value && playbackLocationKey(value) === playbackLocationKey(path))
   let nestedChanged = false
   const updateNested = (nested: MediaItem | undefined): MediaItem | undefined => {
     if (!nested) return nested
-    const updated = applyPlaybackProgress(nested, path, ratio, ended)
+    const updated = applyPlaybackProgress(nested, path, ratio, ended, playedAt)
     nestedChanged ||= updated.changed
     return updated.item
   }
@@ -341,7 +342,8 @@ function applyPlaybackProgress(item: MediaItem, path: string, ratio: number, end
       versions,
       progress,
       watched,
-      continueWatching: !watched && progress >= 0.005
+      continueWatching: !watched && progress >= 0.005,
+      lastPlayedAt: playedAt
     }
   }
 }
@@ -636,7 +638,7 @@ function ToolbarSelect<T extends string>(props: {
             aria-label={props.ariaLabel}
             aria-hidden={!isExpanded}
           >
-            <div className="toolbar-select-options" ref={menuContentRef}>
+            <div className="toolbar-select-options" data-scroll-fade ref={menuContentRef}>
               {props.options.map((option) => (
                 <button
                   className={option.key === props.value ? 'is-selected' : ''}
@@ -1215,7 +1217,7 @@ function DetailPanelContent(props: {
         ) : null}
       </div>
 
-      <div className="library-detail-body">
+      <div className="library-detail-body" data-scroll-fade>
         {props.item.type !== 'series' ? (
           <><div className="library-version-row">
           <span>{props.language === 'zh' ? '视频' : 'Video'}</span>
@@ -1608,6 +1610,7 @@ function MetadataEditorDialog(props: {
     <div className="library-metadata-editor-backdrop" role="presentation" onMouseDown={props.onClose}>
       <form
         className="library-metadata-editor"
+        data-scroll-fade
         onSubmit={submitForm}
         onMouseDown={(event) => event.stopPropagation()}
       >
@@ -2311,6 +2314,8 @@ function LibrarySettingsPage(props: {
 
 export default function LibraryApp(): JSX.Element {
   const requestCancellation = useLibraryRequestCancellation()
+  const scrollFadeRootRef = useRef<HTMLDivElement | null>(null)
+  useScrollEdgeFades(scrollFadeRootRef)
   const savedConnections = useMemo(() => loadSavedEmbyConnections(), [])
   const savedConnection = savedConnections[0]
   const initialActiveNav = useMemo(() => loadSavedLibraryNav(savedConnections), [savedConnections])
@@ -3042,18 +3047,26 @@ export default function LibraryApp(): JSX.Element {
       if (message.type === 'command' && message.command === 'localPlaybackProgress') {
         const ratio = message.durationMs > 0 ? Math.max(0, Math.min(1, message.positionMs / message.durationMs)) : 0
         const ended = message.playbackState === 'Ended'
+        const playedAt = Date.now()
         const changed: MediaItem[] = []
         const nextItems = allItemsRef.current.map((candidate) => {
           if (sources.find((source) => source.id === candidate.sourceId)?.kind === 'Emby') return candidate
-          const updated = applyPlaybackProgress(candidate, message.path, ratio, ended)
+          const updated = applyPlaybackProgress(candidate, message.path, ratio, ended, playedAt)
           if (updated.changed) changed.push(updated.item)
           return updated.item
         })
         if (!changed.length) return
         allItemsRef.current = nextItems
         setAllItems(nextItems)
-        setVisibleItems((current) => current.map((candidate) => changed.find((item) => item.id === candidate.id) ?? candidate))
-        setContinueItems(nextItems.filter((item) => item.continueWatching || (item.progress > 0 && item.progress < 1)))
+        setVisibleItems((current) => {
+          const updated = current.map((candidate) => changed.find((item) => item.id === candidate.id) ?? candidate)
+          return activeNavRef.current === 'continue'
+            ? sortContinueWatchingItems(updated.filter((item) => item.continueWatching || (item.progress > 0 && item.progress < 1)))
+            : updated
+        })
+        setContinueItems(sortContinueWatchingItems(
+          nextItems.filter((item) => item.continueWatching || (item.progress > 0 && item.progress < 1))
+        ))
         setDetailItemsById((current) => {
           const next = new Map(current)
           changed.forEach((item) => next.set(item.id, item))
@@ -3452,8 +3465,16 @@ export default function LibraryApp(): JSX.Element {
     mediaProbeRequestedIdsRef.current.add(selectedDetailItem.id)
     const taskId = `probe:${selectedDetailItem.id}`
     const requestProbe = (): void => {
+      const smbCredentials = source.kind === 'SMB' ? loadSmbCredentials(source.id) : undefined
       startTaskRef.current(taskId, 'probe', `${language === 'zh' ? '媒体探测' : 'Media probe'} · ${selectedDetailItem.title}`, probePath, 1, requestProbe)
-      postNativeCommand({ type: 'command', command: 'probeMediaDetails', requestId: selectedDetailItem.id, path: probePath })
+      postNativeCommand({
+        type: 'command',
+        command: 'probeMediaDetails',
+        requestId: selectedDetailItem.id,
+        path: probePath,
+        username: smbCredentials?.username,
+        password: smbCredentials?.password
+      })
     }
     taskNativeCancelRef.current.set(taskId, () => postNativeCommand({ type: 'command', command: 'cancelLibraryProbe', requestId: selectedDetailItem.id }))
     requestProbe()
@@ -5428,7 +5449,7 @@ export default function LibraryApp(): JSX.Element {
   }
 
   return (
-    <div className="library-window">
+    <div className="library-window" ref={scrollFadeRootRef}>
       {customTitleBarEnabled ? <header
         className="library-window-titlebar"
         onPointerDown={(event) => {
@@ -5466,7 +5487,7 @@ export default function LibraryApp(): JSX.Element {
           </div>
         </div>
 
-        <nav className="library-nav">
+        <nav className="library-nav" data-scroll-fade>
           <div className="library-nav-group">
             <div className="library-nav-heading">
               <span>{language === 'zh' ? '媒体库' : 'Library'}</span>
@@ -5531,7 +5552,7 @@ export default function LibraryApp(): JSX.Element {
         </div>
       </aside>
 
-      <main className="library-main">
+      <main className="library-main" data-scroll-fade>
         <section className={`library-toolbar ${!isSourceSetup && !isActiveEmby ? 'has-management-tools' : ''}`}>
           <div className="library-title-block">
             <span>{pageEyebrow}</span>

@@ -707,10 +707,20 @@ bool MainWindow::Create(HINSTANCE instance) {
         this);
 
     if (!hwnd_) {
+        LogApp(LogLevel::Error,
+               L"player window creation failed error=" + std::to_wstring(GetLastError()));
         return false;
     }
 
+    // Keep WM_CREATE free of APIs that can synchronously re-enter the window
+    // procedure. Initialize shell integration and layout only after the HWND is
+    // fully created.
     ApplyWindowChrome();
+    DragAcceptFiles(hwnd_, TRUE);
+    RegisterMediaDropTarget();
+    SetPlaybackTimer(false);
+    MarkLayoutDirty();
+    EnsureLayout();
 
     playbackSupervisor_ = std::make_unique<PlaybackSupervisor>(controller_);
     if (!playbackSupervisor_->Start(
@@ -1720,13 +1730,9 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
         }
         return HTCLIENT;
     case WM_CREATE:
-        dpi_ = GetDpiForWindow(hwnd_);
-        ApplyWindowChrome();
-        DragAcceptFiles(hwnd_, TRUE);
-        RegisterMediaDropTarget();
-        SetPlaybackTimer(false);
-        MarkLayoutDirty();
-        EnsureLayout();
+        // Create() performs initialization after CreateWindowExW returns. Doing
+        // shell/OLE setup while the HWND is only partially created can block the
+        // UI thread inside synchronous Windows callbacks.
         return 0;
     case kVideoFrameReadyMessage:
         if (static_cast<uint64_t>(wParam) != windowLifetimeCookie_) {

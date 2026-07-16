@@ -38,7 +38,7 @@ export function FileServiceDirectoryBrowser(props: {
         <button className="library-secondary-action" type="button" disabled={props.loading || !props.currentPath} onClick={() => props.onToggle(props.currentPath)}><Check size={15} /><span>{selected(props.currentPath) ? '取消当前' : '选择当前'}</span></button>
         <span className="library-folder-browser-path">{props.currentPath || '尚未连接'}</span>
       </div>
-      <div className="library-folder-browser-list">
+      <div className="library-folder-browser-list" data-scroll-fade>
         {props.directories.length ? props.directories.map((directory) => (
           <div className="library-folder-browser-row" key={directory.path}>
             <label><input type="checkbox" checked={selected(directory.path)} onChange={() => props.onToggle(directory.path)} /><FolderOpen size={16} /><span>{directory.name}</span></label>

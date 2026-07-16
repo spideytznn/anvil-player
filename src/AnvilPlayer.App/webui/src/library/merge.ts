@@ -188,10 +188,11 @@ function stripMergedVersionRelations(item: MediaItem): MediaItem {
   }
 }
 
-function mergeWatchState(primary: MediaItem, rows: MediaItem[]): Pick<MediaItem, 'progress' | 'continueWatching' | 'watched' | 'favorite' | 'addedDaysAgo'> {
+function mergeWatchState(primary: MediaItem, rows: MediaItem[]): Pick<MediaItem, 'progress' | 'continueWatching' | 'lastPlayedAt' | 'watched' | 'favorite' | 'addedDaysAgo'> {
   return {
     progress: Math.max(primary.progress, ...rows.map((item) => item.progress)),
     continueWatching: rows.some((item) => item.continueWatching || (item.progress > 0 && item.progress < 1)),
+    lastPlayedAt: Math.max(primary.lastPlayedAt ?? 0, ...rows.map((item) => item.lastPlayedAt ?? 0)) || undefined,
     watched: rows.some((item) => item.watched),
     favorite: rows.some((item) => item.favorite),
     addedDaysAgo: Math.min(primary.addedDaysAgo, ...rows.map((item) => item.addedDaysAgo))
@@ -466,9 +467,10 @@ export function mergeLocalScannedItem(existingItem: MediaItem | undefined, scann
     existingItem.fileFingerprint !== scannedItem.fileFingerprint
   )
 
-  const preservedState: Pick<MediaItem, 'progress' | 'continueWatching' | 'watched' | 'favorite'> = {
+  const preservedState: Pick<MediaItem, 'progress' | 'continueWatching' | 'lastPlayedAt' | 'watched' | 'favorite'> = {
     progress: existingItem.progress,
     continueWatching: existingItem.continueWatching,
+    lastPlayedAt: existingItem.lastPlayedAt,
     watched: existingItem.watched,
     favorite: existingItem.favorite
   }

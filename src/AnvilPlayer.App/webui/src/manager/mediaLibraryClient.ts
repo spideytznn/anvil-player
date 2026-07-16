@@ -84,6 +84,15 @@ function sortItems(items: MediaItem[], sortKey: SortKey, sortOrder?: SortOrder):
   }
 }
 
+function playbackRecency(item: MediaItem): number {
+  if (Number.isFinite(item.lastPlayedAt)) return item.lastPlayedAt ?? 0
+  return -item.addedDaysAgo * 86_400_000
+}
+
+export function sortContinueWatchingItems(items: MediaItem[]): MediaItem[] {
+  return [...items].sort((a, b) => playbackRecency(b) - playbackRecency(a))
+}
+
 function matchesSearch(item: MediaItem, search: string): boolean {
   const normalized = search.trim().toLowerCase()
   if (!normalized) return true
@@ -251,6 +260,7 @@ function tinyNestedItemForCache(item: MediaItem): MediaItem {
     audioSpec: '',
     progress: item.progress,
     continueWatching: item.continueWatching,
+    lastPlayedAt: item.lastPlayedAt,
     watched: item.watched,
     favorite: item.favorite,
     inPlaylist: item.inPlaylist,
@@ -435,17 +445,16 @@ export function createEmptyLibraryClient(): MediaLibraryClient {
       const queryItems = query.navKey.startsWith('source:') || includesUserCollections
         ? items.filter((item) => !isHidden(item))
         : localLibraryItems(items.filter((item) => !isHidden(item)), sources)
-      return sortItems(
-        filterByMediaFilter(
-          filterByView(
-            filterByLibraryView(filterByNav(queryItems, query.navKey), query.libraryViewId),
-            query.view
-          ).filter((item) => matchesSearch(item, query.search)),
-          query.filterKey
-        ),
-        query.sortKey,
-        query.sortOrder
+      const filteredItems = filterByMediaFilter(
+        filterByView(
+          filterByLibraryView(filterByNav(queryItems, query.navKey), query.libraryViewId),
+          query.view
+        ).filter((item) => matchesSearch(item, query.search)),
+        query.filterKey
       )
+      return query.navKey === 'continue' && query.sortKey === 'recent'
+        ? sortContinueWatchingItems(filteredItems)
+        : sortItems(filteredItems, query.sortKey, query.sortOrder)
     },
 
     async listHomeSections(sourceId) {
@@ -459,7 +468,9 @@ export function createEmptyLibraryClient(): MediaLibraryClient {
     },
 
     async getContinueWatching() {
-      return items.filter((item) => !isHidden(item) && (item.continueWatching || (item.progress > 0 && item.progress < 1)))
+      return sortContinueWatchingItems(
+        items.filter((item) => !isHidden(item) && (item.continueWatching || (item.progress > 0 && item.progress < 1)))
+      )
     },
 
     async saveSourceDraft(draft) {

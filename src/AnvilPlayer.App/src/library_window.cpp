@@ -1357,7 +1357,10 @@ void LibraryWindow::StartWebDavDirectoryList(std::wstring requestId,
     }
 }
 
-void LibraryWindow::StartMediaDetailsProbe(std::wstring requestId, std::filesystem::path path) {
+void LibraryWindow::StartMediaDetailsProbe(std::wstring requestId,
+                                           std::filesystem::path path,
+                                           std::wstring username,
+                                           std::wstring password) {
     if (requestId.empty() || path.empty()) return;
     auto start = BeginLibraryOperation(asyncIoState_, L"media-probe:" + requestId);
     if (!start.operation) {
@@ -1367,12 +1370,27 @@ void LibraryWindow::StartMediaDetailsProbe(std::wstring requestId, std::filesyst
     }
     const auto state = asyncIoState_;
     const auto operation = std::move(start.operation);
+    const SmbCredentials credentials{std::move(username), std::move(password)};
     const auto queueStatus = QueueLibraryJob(
         state,
         operation,
-        [state, operation, requestId = std::move(requestId), path = std::move(path)]() {
+        [state, operation, requestId = std::move(requestId), path = std::move(path), credentials]() {
             LibraryAsyncResult result;
             try {
+                // Cached SMB library items survive application restarts, but
+                // the temporary Windows network connection does not. Scans
+                // and playback reconnect before touching a UNC path; detail
+                // probes must do the same instead of passing an inaccessible
+                // share directly to FFmpeg (which can surface as EINVAL).
+                if (const auto connectError = ConnectSmbPathForAccess(path, credentials)) {
+                    if (operation->StopRequested()) return;
+                    result.json = L"{\"type\":\"mediaDetailsProbeFailed\",\"requestId\":\"" +
+                                  JsonEscape(requestId) + L"\",\"message\":\"" +
+                                  JsonEscape(L"SMB 连接失败：" + *connectError) + L"\"}";
+                    PublishLibraryResult(state, operation, std::move(result));
+                    return;
+                }
+                if (operation->StopRequested()) return;
                 anvil::playback::MediaProbeOptions options;
                 options.stopToken = operation->stopSource.get_token();
                 options.timeout = std::chrono::seconds(20);
@@ -1732,7 +1750,9 @@ void LibraryWindow::HandleWebUiMessage(const std::wstring_view message) {
     } else if (MessageContains(message, L"\"command\":\"probeMediaDetails\"")) {
         StartMediaDetailsProbe(
             ReadJsonString(message, L"requestId").value_or(L""),
-            std::filesystem::path(ReadJsonString(message, L"path").value_or(L"")));
+            std::filesystem::path(ReadJsonString(message, L"path").value_or(L"")),
+            ReadJsonString(message, L"username").value_or(L""),
+            ReadJsonString(message, L"password").value_or(L""));
     } else if (MessageContains(message, L"\"command\":\"requestPlayback\"")) {
         if (const auto path = ReadJsonString(message, L"path")) {
             const double startRatio = ReadJsonNumber(message, L"startPositionRatio").value_or(0.0);

@@ -67,7 +67,10 @@ private:
     bool TryCreateWebUi();
     std::filesystem::path WebUiRoot() const;
     void HandleWebUiMessage(std::wstring_view message);
-    void StartMediaDetailsProbe(std::wstring requestId, std::filesystem::path path);
+    void StartMediaDetailsProbe(std::wstring requestId,
+                                std::filesystem::path path,
+                                std::wstring username,
+                                std::wstring password);
     void StartBilibiliTrailerSearch(std::wstring requestId, std::wstring keyword);
     void PostScanResult(const std::wstring& json);
     void StartLocalFolderScan(std::filesystem::path folder,

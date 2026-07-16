@@ -71,6 +71,12 @@ function daysSince(dateValue?: string): number {
   return Math.max(0, Math.floor((Date.now() - time) / 86_400_000))
 }
 
+function timestampFromDate(dateValue?: string): number | undefined {
+  if (!dateValue) return undefined
+  const parsed = new Date(dateValue.endsWith('Z') ? dateValue : `${dateValue}Z`).getTime()
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
 export function qualityLabel(item: EmbyItem): string {
   const source = item.MediaSources?.[0]
   const videoStream = source?.MediaStreams?.find((stream) => stream.Type === 'Video')
@@ -563,6 +569,7 @@ export function mapItem(
     audioSpec: audioSpecLabel(item),
     progress: progressRatio(item),
     continueWatching,
+    lastPlayedAt: timestampFromDate(item.UserData?.LastPlayedDate),
     watched: item.UserData?.Played ?? false,
     favorite: item.UserData?.IsFavorite ?? false,
     addedDaysAgo: daysSince(item.UserData?.LastPlayedDate ?? item.DateCreated),

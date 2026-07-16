@@ -55,7 +55,7 @@ export function TaskCenter(props: TaskCenterProps): JSX.Element | null {
         </div>
         <button type="button" aria-label={zh ? '关闭' : 'Close'} onClick={props.onClose}><X size={17} /></button>
       </header>
-      <div className="library-task-list">
+      <div className="library-task-list" data-scroll-fade>
         {props.tasks.map((task) => {
           const progress = taskProgress(task)
           const finished = task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled'

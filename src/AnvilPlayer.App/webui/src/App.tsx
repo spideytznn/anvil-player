@@ -93,6 +93,10 @@ const en = {
   frameRate: 'Frame rate',
   hardwareDecode: 'Hardware decoding',
   hardwareDecodeHint: 'Use D3D12VA when available. Turn off to force FFmpeg software decoding; changing this restarts the video session.',
+  videoProcessing: 'Video processing',
+  displayAndHdr: 'Display & HDR',
+  playbackTiming: 'Playback timing',
+  sessionInfo: 'Current session',
   frameInterpolation: 'GPU frame interpolation',
   frameInterpolationHint: 'Fixed 2x output within the display refresh-rate limit · current video',
   frameInterpolationResolution: 'Interpolation resolution',
@@ -224,6 +228,10 @@ const zh: Record<keyof typeof en, string> = {
   audio: '音频',
   resolution: '分辨率',
   frameRate: '帧率',
+  videoProcessing: '视频处理',
+  displayAndHdr: '显示与 HDR',
+  playbackTiming: '播放时序',
+  sessionInfo: '当前会话',
   frameInterpolation: 'GPU 补帧',
   frameInterpolationHint: '刷新率上限内固定 2x 输出 · 仅当前视频',
   frameInterpolationResolution: '补帧推理分辨率',
@@ -1470,95 +1478,110 @@ function InspectorContent({
           <SlidersHorizontal size={15} />
           <span>{t.settings}</span>
         </div>
-        <PassthroughSetting
-          label={t.hardwareDecode}
-          hint={t.hardwareDecodeHint}
-          enabled={state.hardwareDecodeEnabled}
-          available
-          onChange={(enabled) => postNativeCommand({ type: 'command', command: 'setHardwareDecode', enabled })}
-          t={t}
-        />
-        <PassthroughSetting
-          label={t.autoDisplayFormat}
-          hint={t.autoDisplayFormatHint}
-          enabled={state.autoDisplayFormat}
-          available
-          onChange={(enabled) => postNativeCommand({ type: 'command', command: 'setAutoDisplayFormat', enabled })}
-          t={t}
-        />
-        <HdrDisplayPeakSetting state={state} t={t} />
-        <HdrCurveEditor state={state} t={t} />
-        {!state.dolbyVisionMedia && (
+        <section className="settings-group">
+          <div className="settings-group-title">{t.videoProcessing}</div>
           <PassthroughSetting
-            label={t.displayMetadataPassthrough}
-            hint={t.displayMetadataPassthroughHint}
-            enabled={state.displayMetadataPassthrough}
-            available={state.windowsHdrEnabled && !state.autoDisplayFormat}
-            onChange={(enabled) => postNativeCommand({ type: 'command', command: 'setDisplayMetadataPassthrough', enabled })}
+            label={t.hardwareDecode}
+            hint={t.hardwareDecodeHint}
+            enabled={state.hardwareDecodeEnabled}
+            available
+            onChange={(enabled) => postNativeCommand({ type: 'command', command: 'setHardwareDecode', enabled })}
             t={t}
           />
-        )}
-        {state.dolbyVisionMedia && (
           <PassthroughSetting
-            label={t.dolbyVisionSystemPipelineExperimental}
-            hint={t.dolbyVisionSystemPipelineExperimentalHint}
-            enabled={state.dolbyVisionSystemPipelineExperimental}
-            available={state.dolbyVisionSystemPipelineAvailable && !state.autoDisplayFormat}
-            unavailableHint={t.dolbyVisionSystemPipelineUnavailable}
-            onChange={(enabled) => postNativeCommand({ type: 'command', command: 'setDolbyVisionSystemPipelineExperimental', enabled })}
+            label={t.frameInterpolation}
+            hint={state.frameInterpolationEnabled
+              ? `${t.frameInterpolationHint} · ${t.frameInterpolationActual} ${formatInterpolationMultiplier(state.frameInterpolationMultiplier)}${state.frameInterpolationActive ? ` · ${state.frameInterpolationBackend}` : ''}`
+              : t.frameInterpolationHint}
+            enabled={state.frameInterpolationEnabled}
+            available
+            unavailableHint={t.frameInterpolationDynamicHdrUnavailable}
+            onChange={(enabled) => postNativeCommand({ type: 'command', command: 'setFrameInterpolation', enabled })}
             t={t}
           />
-        )}
-        <PassthroughSetting
-          label={t.frameInterpolation}
-          hint={state.frameInterpolationEnabled
-            ? `${t.frameInterpolationHint} · ${t.frameInterpolationActual} ${formatInterpolationMultiplier(state.frameInterpolationMultiplier)}${state.frameInterpolationActive ? ` · ${state.frameInterpolationBackend}` : ''}`
-            : t.frameInterpolationHint}
-          enabled={state.frameInterpolationEnabled}
-          available
-          unavailableHint={t.frameInterpolationDynamicHdrUnavailable}
-          onChange={(enabled) => postNativeCommand({ type: 'command', command: 'setFrameInterpolation', enabled })}
-          t={t}
-        />
-        <InterpolationResolutionSetting
-          maximumHeight={state.frameInterpolationMaximumHeight}
-          t={t}
-        />
-        <div className="refresh-rate-setting">
-          <div>
-            <strong>{t.refreshRateSync}</strong>
-            <small>{state.refreshRateSyncActive && state.refreshRateSyncHz > 0
-              ? `${state.refreshRateSyncHz.toFixed(3).replace(/\.0+$/, '')} Hz`
-              : state.frameInterpolationEnabled
-                ? t.refreshRateInterpolationBlocked
-                : t.refreshRateSyncHint}</small>
-          </div>
-          <label className={`refresh-rate-maximum ${refreshRateSyncEffective ? '' : 'is-disabled'}`}>
-            <input
-              type="checkbox"
-              checked={state.refreshRateMaximumMultiple}
-              disabled={!refreshRateSyncEffective}
-              onChange={(event) => postNativeCommand({ type: 'command', command: 'setRefreshRateMaximumMultiple', enabled: event.currentTarget.checked })}
+          <InterpolationResolutionSetting
+            maximumHeight={state.frameInterpolationMaximumHeight}
+            t={t}
+          />
+        </section>
+
+        <section className="settings-group">
+          <div className="settings-group-title">{t.displayAndHdr}</div>
+          <PassthroughSetting
+            label={t.autoDisplayFormat}
+            hint={t.autoDisplayFormatHint}
+            enabled={state.autoDisplayFormat}
+            available
+            onChange={(enabled) => postNativeCommand({ type: 'command', command: 'setAutoDisplayFormat', enabled })}
+            t={t}
+          />
+          <HdrDisplayPeakSetting state={state} t={t} />
+          <HdrCurveEditor state={state} t={t} />
+          {!state.dolbyVisionMedia && (
+            <PassthroughSetting
+              label={t.displayMetadataPassthrough}
+              hint={t.displayMetadataPassthroughHint}
+              enabled={state.displayMetadataPassthrough}
+              available={state.windowsHdrEnabled && !state.autoDisplayFormat}
+              onChange={(enabled) => postNativeCommand({ type: 'command', command: 'setDisplayMetadataPassthrough', enabled })}
+              t={t}
             />
-            <span>{t.maximumRefreshMultiple}</span>
-          </label>
-          <button
-            className={`refresh-rate-toggle ${refreshRateSyncEffective ? 'is-active' : ''}`}
-            type="button"
-            role="switch"
-            aria-checked={refreshRateSyncEffective}
-            aria-label={t.refreshRateSync}
-            disabled={state.frameInterpolationEnabled}
-            onClick={() => postNativeCommand({ type: 'command', command: 'setRefreshRateSync', enabled: !state.refreshRateSyncEnabled })}
-          >
-            <span className="refresh-rate-toggle-track" aria-hidden="true">
-              <span className="refresh-rate-toggle-thumb" />
-            </span>
-            <span className="refresh-rate-toggle-label">{refreshRateSyncEffective ? t.on : t.off}</span>
-          </button>
-        </div>
-        <InfoRow label={t.backend} value={state.backendLabel} emptyLabel={t.none} />
-        <InfoRow label={t.volume} value={`${Math.round(state.volume * 100)}%`} emptyLabel={t.none} />
+          )}
+          {state.dolbyVisionMedia && (
+            <PassthroughSetting
+              label={t.dolbyVisionSystemPipelineExperimental}
+              hint={t.dolbyVisionSystemPipelineExperimentalHint}
+              enabled={state.dolbyVisionSystemPipelineExperimental}
+              available={state.dolbyVisionSystemPipelineAvailable && !state.autoDisplayFormat}
+              unavailableHint={t.dolbyVisionSystemPipelineUnavailable}
+              onChange={(enabled) => postNativeCommand({ type: 'command', command: 'setDolbyVisionSystemPipelineExperimental', enabled })}
+              t={t}
+            />
+          )}
+        </section>
+
+        <section className="settings-group">
+          <div className="settings-group-title">{t.playbackTiming}</div>
+          <div className="refresh-rate-setting">
+            <div>
+              <strong>{t.refreshRateSync}</strong>
+              <small>{state.refreshRateSyncActive && state.refreshRateSyncHz > 0
+                ? `${state.refreshRateSyncHz.toFixed(3).replace(/\.0+$/, '')} Hz`
+                : state.frameInterpolationEnabled
+                  ? t.refreshRateInterpolationBlocked
+                  : t.refreshRateSyncHint}</small>
+            </div>
+            <label className={`refresh-rate-maximum ${refreshRateSyncEffective ? '' : 'is-disabled'}`}>
+              <input
+                type="checkbox"
+                checked={state.refreshRateMaximumMultiple}
+                disabled={!refreshRateSyncEffective}
+                onChange={(event) => postNativeCommand({ type: 'command', command: 'setRefreshRateMaximumMultiple', enabled: event.currentTarget.checked })}
+              />
+              <span>{t.maximumRefreshMultiple}</span>
+            </label>
+            <button
+              className={`refresh-rate-toggle ${refreshRateSyncEffective ? 'is-active' : ''}`}
+              type="button"
+              role="switch"
+              aria-checked={refreshRateSyncEffective}
+              aria-label={t.refreshRateSync}
+              disabled={state.frameInterpolationEnabled}
+              onClick={() => postNativeCommand({ type: 'command', command: 'setRefreshRateSync', enabled: !state.refreshRateSyncEnabled })}
+            >
+              <span className="refresh-rate-toggle-track" aria-hidden="true">
+                <span className="refresh-rate-toggle-thumb" />
+              </span>
+              <span className="refresh-rate-toggle-label">{refreshRateSyncEffective ? t.on : t.off}</span>
+            </button>
+          </div>
+        </section>
+
+        <section className="settings-group settings-group-compact">
+          <div className="settings-group-title">{t.sessionInfo}</div>
+          <InfoRow label={t.backend} value={state.backendLabel} emptyLabel={t.none} />
+          <InfoRow label={t.volume} value={`${Math.round(state.volume * 100)}%`} emptyLabel={t.none} />
+        </section>
       </div>
     )
   }
