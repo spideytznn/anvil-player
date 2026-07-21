@@ -63,7 +63,9 @@ import {
 } from './manager/embyClient'
 import { buildLocalFolderLibrary, buildLocalFolderSource } from './manager/localFolderLibrary'
 import {
+  fetchTmdbCast,
   fetchTmdbTrailerUrls,
+  refreshTmdbCoreMetadata,
   scrapeTmdbItem,
   scrapeTmdbCandidate,
   searchTmdbCandidates,
@@ -227,6 +229,73 @@ function applyEmbyPlaylistMembership(
   }))
 }
 
+function isContinueWatchingItem(item: MediaItem): boolean {
+  return Boolean(item.continueWatching || (item.progress > 0 && item.progress < 1 && !item.watched))
+}
+
+function mergeEmbyCollectionItem(existing: MediaItem, incoming: MediaItem): MediaItem {
+  const merged = { ...existing, ...incoming }
+  const existingResumeRank = Number.isFinite(existing.continueWatchingRank)
+    ? existing.continueWatchingRank
+    : undefined
+  const incomingResumeRank = Number.isFinite(incoming.continueWatchingRank)
+    ? incoming.continueWatchingRank
+    : undefined
+  if (existingResumeRank !== undefined && incomingResumeRank === undefined) {
+    return {
+      ...merged,
+      progress: existing.progress,
+      continueWatching: existing.continueWatching,
+      continueWatchingRank: existingResumeRank,
+      lastPlayedAt: existing.lastPlayedAt,
+      watched: existing.watched
+    }
+  }
+  const existingPlayedAt = existing.lastPlayedAt ?? 0
+  const incomingPlayedAt = incoming.lastPlayedAt ?? 0
+  if (!isContinueWatchingItem(existing) || !existingPlayedAt || incomingPlayedAt >= existingPlayedAt) {
+    return merged
+  }
+  return {
+    ...merged,
+    progress: existing.progress,
+    continueWatching: existing.continueWatching,
+    continueWatchingRank: existing.continueWatchingRank,
+    lastPlayedAt: existing.lastPlayedAt,
+    watched: existing.watched
+  }
+}
+
+function preserveNewerLocalEmbyPlayback(
+  snapshot: EmbyLibrarySnapshot,
+  existingItems: MediaItem[]
+): EmbyLibrarySnapshot {
+  const existingById = new Map(
+    existingItems
+      .filter((item) => item.sourceId === snapshot.source.id)
+      .map((item) => [item.id, item])
+  )
+  return {
+    ...snapshot,
+    items: snapshot.items.map((incoming) => {
+      if (!isContinueWatchingItem(incoming)) return incoming
+      const existing = existingById.get(incoming.id)
+      if (!existing || !isContinueWatchingItem(existing)) return incoming
+      const existingPlayedAt = existing.lastPlayedAt ?? 0
+      const incomingPlayedAt = incoming.lastPlayedAt ?? 0
+      if (!existingPlayedAt || incomingPlayedAt >= existingPlayedAt) return incoming
+      return {
+        ...incoming,
+        progress: existing.progress,
+        continueWatching: existing.continueWatching,
+        continueWatchingRank: existing.continueWatchingRank,
+        lastPlayedAt: existing.lastPlayedAt,
+        watched: existing.watched
+      }
+    })
+  }
+}
+
 function mergeEmbyUserCollections(
   snapshot: EmbyLibrarySnapshot,
   favorites: MediaItem[],
@@ -237,7 +306,7 @@ function mergeEmbyUserCollections(
   const collectionItems = [...snapshot.items, ...favorites, ...playlists.flatMap((playlist) => playlist.items)]
   collectionItems.forEach((item) => {
     const existing = itemsById.get(item.id)
-    itemsById.set(item.id, existing ? { ...existing, ...item } : item)
+    itemsById.set(item.id, existing ? mergeEmbyCollectionItem(existing, item) : item)
   })
 
   return {
@@ -315,12 +384,24 @@ function playbackLocationKey(value: string): string {
   }
 }
 
-function applyPlaybackProgress(item: MediaItem, path: string, ratio: number, ended: boolean, playedAt: number): { item: MediaItem; changed: boolean } {
-  const matches = [item.path, item.playbackPath].some((value) => value && playbackLocationKey(value) === playbackLocationKey(path))
+function applyPlaybackProgress(
+  item: MediaItem,
+  path: string,
+  providerItemId: string | undefined,
+  ratio: number,
+  ended: boolean,
+  playedAt: number
+): { item: MediaItem; changed: boolean } {
+  const normalizedProviderItemId = providerItemId?.trim().toLowerCase() ?? ''
+  const matchesProviderItem = Boolean(normalizedProviderItemId && [item.id, item.providerItemId]
+    .some((value) => value?.trim().toLowerCase() === normalizedProviderItemId))
+  const matchesPath = [item.path, item.playbackPath]
+    .some((value) => value && playbackLocationKey(value) === playbackLocationKey(path))
+  const matches = matchesProviderItem || matchesPath
   let nestedChanged = false
   const updateNested = (nested: MediaItem | undefined): MediaItem | undefined => {
     if (!nested) return nested
-    const updated = applyPlaybackProgress(nested, path, ratio, ended, playedAt)
+    const updated = applyPlaybackProgress(nested, path, providerItemId, ratio, ended, playedAt)
     nestedChanged ||= updated.changed
     return updated.item
   }
@@ -343,6 +424,7 @@ function applyPlaybackProgress(item: MediaItem, path: string, ratio: number, end
       progress,
       watched,
       continueWatching: !watched && progress >= 0.005,
+      continueWatchingRank: !watched && progress >= 0.005 ? -1 : undefined,
       lastPlayedAt: playedAt
     }
   }
@@ -2363,6 +2445,7 @@ export default function LibraryApp(): JSX.Element {
   const [loadedDetailIds, setLoadedDetailIds] = useState<Set<string>>(() => new Set())
   const [continueItems, setContinueItems] = useState<MediaItem[]>([])
   const [embyRefreshPulse, setEmbyRefreshPulse] = useState(0)
+  const [initialLibraryReady, setInitialLibraryReady] = useState(false)
   const [homeSections, setHomeSections] = useState<LibraryHomeSection[]>([])
   const [activeNav, setActiveNav] = useState<NavKey>(initialActiveNav)
   const [activeView, setActiveView] = useState<LibraryView>('home')
@@ -2530,7 +2613,7 @@ export default function LibraryApp(): JSX.Element {
   }
 
   function resumeTask(task: BackgroundTask): void {
-    if (task.kind === 'scan' || task.kind === 'probe') {
+    if (task.kind === 'scan' || task.kind === 'probe' || task.kind === 'metadata') {
       taskRetryRef.current.get(task.id)?.()
       return
     }
@@ -2781,6 +2864,7 @@ export default function LibraryApp(): JSX.Element {
       if (sourceRows.length && !savedConnection) {
         setSourceSetupMode('hidden')
       }
+      setInitialLibraryReady(true)
     }
 
     void loadInitialLibrary()
@@ -3050,11 +3134,22 @@ export default function LibraryApp(): JSX.Element {
         const playedAt = Date.now()
         const changed: MediaItem[] = []
         const nextItems = allItemsRef.current.map((candidate) => {
-          if (sources.find((source) => source.id === candidate.sourceId)?.kind === 'Emby') return candidate
-          const updated = applyPlaybackProgress(candidate, message.path, ratio, ended, playedAt)
+          const updated = applyPlaybackProgress(
+            candidate,
+            message.path,
+            message.providerItemId,
+            ratio,
+            ended,
+            playedAt
+          )
           if (updated.changed) changed.push(updated.item)
           return updated.item
         })
+        if (message.providerItemId) {
+          debugLibraryPlayback(
+            `emby local progress ${changed.length ? 'applied' : 'unmatched'} itemId=${message.providerItemId} positionMs=${Math.round(message.positionMs)}`
+          )
+        }
         if (!changed.length) return
         allItemsRef.current = nextItems
         setAllItems(nextItems)
@@ -3184,6 +3279,7 @@ export default function LibraryApp(): JSX.Element {
   }, [])
 
   useEffect(() => {
+    if (!initialLibraryReady) return undefined
     const connections = savedConnections.filter((connection) => connection.session)
     if (!connections.length) return undefined
     const abortController = new AbortController()
@@ -3193,6 +3289,7 @@ export default function LibraryApp(): JSX.Element {
       for (const connection of connections) {
         const savedSession = connection.session as EmbySession
         try {
+          debugLibraryPlayback(`emby startup refresh start source=${connection.sourceId || connection.name}`)
           postNativeCommand({
             type: 'command',
             command: 'setAllowInsecureCertificates',
@@ -3226,6 +3323,12 @@ export default function LibraryApp(): JSX.Element {
           setAllItems(allRows)
           setContinueItems(continueRows)
           setHomeSections(homeRows)
+          debugLibraryPlayback(
+            `emby startup refresh ok source=${snapshot.source.id} continue=${continueRows.length} order=${continueRows
+              .slice(0, 8)
+              .map((item) => `${item.id}@${item.lastPlayedAt ?? 0}#${item.continueWatchingRank ?? '-'}`)
+              .join(',')}`
+          )
           setEmbySessionsBySourceId((current) => {
             const next = new Map(current)
             next.set(snapshot.source.id, snapshot.session)
@@ -3247,7 +3350,7 @@ export default function LibraryApp(): JSX.Element {
       cancelled = true
       abortController.abort()
     }
-  }, [client, savedConnections, embyRefreshPulse])
+  }, [client, savedConnections, embyRefreshPulse, initialLibraryReady])
 
   useEffect(() => {
     const timer = window.setTimeout(() => setDebouncedQuery(query), 220)
@@ -3500,13 +3603,34 @@ export default function LibraryApp(): JSX.Element {
         castRefreshRequestedIdsRef.current.has(selectedDetailItem.id)) return
     const abortController = new AbortController()
     castRefreshRequestedIdsRef.current.add(selectedDetailItem.id)
-    void scrapeTmdbItem(selectedDetailItem, tmdbSettings, { signal: abortController.signal })
-      .then((updatedItem) => applyUpdatedMediaItemRef.current(updatedItem))
-      .catch(() => {
+    const refreshMissingMetadata = async (): Promise<void> => {
+      const legacyCacheNeedsRepair = !selectedDetailItem.overview.trim() && !selectedDetailItem.backdrop
+      if (legacyCacheNeedsRepair) {
+        const repairedItem = await refreshTmdbCoreMetadata(selectedDetailItem, tmdbSettings, abortController.signal)
+        if (!abortController.signal.aborted) {
+          await applyUpdatedMediaItemRef.current(repairedItem)
+        }
+        return
+      }
+
+      const cast = await fetchTmdbCast(selectedDetailItem, tmdbSettings, abortController.signal)
+      if (abortController.signal.aborted || !cast.length) return
+      const currentItem = detailItemsByIdRef.current.get(selectedDetailItem.id)
+        ?? allItemsRef.current.find((item) => item.id === selectedDetailItem.id)
+      if (!currentItem) return
+      await applyUpdatedMediaItemRef.current({ ...currentItem, cast })
+    }
+    void refreshMissingMetadata()
+      .catch((error) => {
         castRefreshRequestedIdsRef.current.delete(selectedDetailItem.id)
+        if (!abortController.signal.aborted) {
+          const message = errorText(error)
+          setPlayIntent(language === 'zh' ? `元数据补全失败：${message}` : `Metadata refresh failed: ${message}`)
+          debugLibraryPlayback(`tmdb detail refresh failed item=${selectedDetailItem.id} error=${message}`)
+        }
       })
     return () => abortController.abort()
-  }, [isDetailOpen, selectedDetailItem, tmdbSettings])
+  }, [isDetailOpen, language, selectedDetailItem, tmdbSettings])
   const activeMetadataEditorItem = metadataEditorItem
     ? detailItemsById.get(metadataEditorItem.id)
       ?? allItems.find((item) => item.id === metadataEditorItem.id)
@@ -3907,7 +4031,18 @@ export default function LibraryApp(): JSX.Element {
         return next
       })
     }
-    return mergeEmbyUserCollections(snapshot, favorites, remotePlaylists)
+    const enriched = preserveNewerLocalEmbyPlayback(
+      mergeEmbyUserCollections(snapshot, favorites, remotePlaylists),
+      allItemsRef.current
+    )
+    const continueRows = sortContinueWatchingItems(enriched.items.filter(isContinueWatchingItem))
+    debugLibraryPlayback(
+      `emby continue refresh source=${snapshot.source.id} missingTime=${continueRows.filter((item) => !item.lastPlayedAt).length} order=${continueRows
+        .slice(0, 8)
+        .map((item) => `${item.id}@${item.lastPlayedAt ?? 0}`)
+        .join(',')}`
+    )
+    return enriched
   }
 
   async function refreshEmbyPlaylistsForSource(
@@ -4476,6 +4611,9 @@ export default function LibraryApp(): JSX.Element {
 
     setScrapingSourceMetadataId(sourceId)
     const taskId = `metadata-source:${sourceId}`
+    taskAbortControllerRef.current.get(taskId)?.abort()
+    const abortController = new AbortController()
+    taskAbortControllerRef.current.set(taskId, abortController)
     startTask(taskId, 'metadata', `${language === 'zh' ? '批量刮削' : 'Batch metadata'} · ${source.name}`, 'TMDB', sourceItems.length, () => { void scrapeSourceMetadata(sourceId) })
     setConnectTone('idle')
     setConnectMessage(`正在刮削 ${source.name}：0 / ${sourceItems.length}`)
@@ -4487,14 +4625,26 @@ export default function LibraryApp(): JSX.Element {
     try {
       for (let index = 0; index < sourceItems.length; index += 1) {
         if (await waitWhileTaskPaused(taskId)) break
+        if (abortController.signal.aborted) break
         const item = sourceItems[index]
         updateTask(taskId, { detail: item.title })
         setConnectMessage(`正在刮削 ${source.name}：${index + 1} / ${sourceItems.length} · ${item.title}`)
         try {
-          const updatedItem = await scrapeTmdbItem(updatedItems.get(item.id) ?? item, tmdbSettings)
+          const updatedItem = await scrapeTmdbItem(updatedItems.get(item.id) ?? item, tmdbSettings, {
+            signal: abortController.signal
+          })
           updatedItems.set(item.id, updatedItem)
+          await client.updateItem(updatedItem)
+          const replaceUpdatedItem = (candidate: MediaItem): MediaItem =>
+            candidate.id === updatedItem.id ? updatedItem : candidate
+          allItemsRef.current = allItemsRef.current.map(replaceUpdatedItem)
+          setAllItems(allItemsRef.current)
+          setVisibleItems((current) => current.map(replaceUpdatedItem))
+          setContinueItems((current) => current.map(replaceUpdatedItem))
+          setDetailItemsById((current) => new Map(current).set(updatedItem.id, updatedItem))
           debugLibraryPlayback(`tmdb source scrape item ok source=${sourceId} item=${item.id} tmdb=${updatedItem.externalIds?.tmdb ?? 'unknown'}`)
         } catch (error) {
+          if (abortController.signal.aborted) break
           failedCount += 1
           const message = error instanceof Error ? error.message : 'TMDB 刮削失败'
           debugLibraryPlayback(`tmdb source scrape item failed source=${sourceId} item=${item.id} error=${message}`)
@@ -4502,7 +4652,7 @@ export default function LibraryApp(): JSX.Element {
         advanceTask(taskId, {})
       }
 
-      if (taskStatusRef.current.get(taskId) === 'cancelled') return
+      if (['cancelled', 'paused'].includes(taskStatusRef.current.get(taskId) ?? '')) return
 
       const nextAllItems = allItems.map((item) => updatedItems.get(item.id) ?? item)
       const rawNextSourceItems = nextAllItems.filter((item) => item.sourceId === sourceId)
@@ -4561,6 +4711,9 @@ export default function LibraryApp(): JSX.Element {
       updateTask(taskId, { status: 'failed', error: message })
       debugLibraryPlayback(`tmdb source scrape failed source=${sourceId} error=${message}`)
     } finally {
+      if (taskAbortControllerRef.current.get(taskId) === abortController) {
+        taskAbortControllerRef.current.delete(taskId)
+      }
       setScrapingSourceMetadataId((current) => current === sourceId ? '' : current)
     }
   }

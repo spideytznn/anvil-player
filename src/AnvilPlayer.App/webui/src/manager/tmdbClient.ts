@@ -2,6 +2,7 @@ import { pathBaseName, pathDirName, safeDecodeURIComponent } from './pathUtils'
 import type { MediaItem, PersonCredit } from './types'
 
 const TMDB_SETTINGS_KEY = 'anvil-player.tmdb.settings.v1'
+const TMDB_REQUEST_TIMEOUT_MS = 15_000
 
 export type TmdbNetworkMode = 'official' | 'alternate' | 'custom'
 export type TmdbAuthMode = 'apiKey' | 'readToken'
@@ -84,6 +85,10 @@ interface TmdbVideo {
 
 interface TmdbVideosResponse {
   results?: TmdbVideo[]
+}
+
+interface TmdbCreditsResponse {
+  cast?: TmdbCreditCast[]
 }
 
 interface TmdbMovieDetails {
@@ -220,16 +225,39 @@ async function tmdbFetch<T>(
     url.searchParams.set('api_key', credential)
   }
 
-  const response = await fetch(url.toString(), {
-    signal,
-    headers: settings.authMode === 'readToken'
-      ? { Authorization: `Bearer ${credential}` }
-      : undefined
-  })
-  if (!response.ok) {
-    throw new Error(`TMDB 请求失败：${response.status} ${response.statusText}`)
+  const requestController = new AbortController()
+  let timedOut = false
+  const abortFromCaller = (): void => requestController.abort(signal?.reason)
+  if (signal?.aborted) {
+    abortFromCaller()
+  } else {
+    signal?.addEventListener('abort', abortFromCaller, { once: true })
   }
-  return await response.json() as T
+  const timeout = window.setTimeout(() => {
+    timedOut = true
+    requestController.abort()
+  }, TMDB_REQUEST_TIMEOUT_MS)
+
+  try {
+    const response = await fetch(url.toString(), {
+      signal: requestController.signal,
+      headers: settings.authMode === 'readToken'
+        ? { Authorization: `Bearer ${credential}` }
+        : undefined
+    })
+    if (!response.ok) {
+      throw new Error(`TMDB 请求失败：${response.status} ${response.statusText}`)
+    }
+    return await response.json() as T
+  } catch (error) {
+    if (timedOut) {
+      throw new Error(`TMDB 请求超时（${TMDB_REQUEST_TIMEOUT_MS / 1000} 秒）`)
+    }
+    throw error
+  } finally {
+    window.clearTimeout(timeout)
+    signal?.removeEventListener('abort', abortFromCaller)
+  }
 }
 
 function itemYear(item: MediaItem): number | undefined {
@@ -514,6 +542,20 @@ function castRows(settings: TmdbSettings, cast: TmdbCreditCast[] | undefined): P
   }))
 }
 
+export async function fetchTmdbCast(
+  item: MediaItem,
+  settings: TmdbSettings,
+  signal?: AbortSignal
+): Promise<PersonCredit[]> {
+  const tmdbId = Number(item.externalIds?.tmdb)
+  if (!Number.isFinite(tmdbId) || tmdbId <= 0 || item.type === 'folder') return []
+  const mediaPath = item.type === 'series' ? 'tv' : 'movie'
+  const response = await tmdbFetch<TmdbCreditsResponse>(settings, `/${mediaPath}/${tmdbId}/credits`, {
+    language: settings.language
+  }, signal)
+  return castRows(settings, response.cast)
+}
+
 function trailerUrls(videos: TmdbVideo[] | undefined): string[] {
   return (videos ?? [])
     .filter((video) => video.site === 'YouTube' && video.key)
@@ -585,8 +627,8 @@ function movieToItem(settings: TmdbSettings, item: MediaItem, details: TmdbMovie
     runtime: formatRuntime(details.runtime),
     genres: details.genres?.map((genre) => genre.name) ?? item.genres,
     country: details.production_countries?.map((country) => country.name).filter(Boolean).join(' / ') || item.country,
-    poster: tmdbImageUrl(settings, details.poster_path, 'w500'),
-    backdrop: tmdbImageUrl(settings, details.backdrop_path, 'w780'),
+    poster: tmdbImageUrl(settings, details.poster_path, 'w500') || item.poster,
+    backdrop: tmdbImageUrl(settings, details.backdrop_path, 'w780') || item.backdrop,
     tagline: details.tagline || 'TMDB',
     overview: details.overview || item.overview,
     trailerUrl: trailerUrl(details.videos?.results) || item.trailerUrl,
@@ -614,8 +656,8 @@ function tvToItem(settings: TmdbSettings, item: MediaItem, details: TmdbTvDetail
     runtime: formatRuntime(details.episode_run_time?.[0]),
     genres: details.genres?.map((genre) => genre.name) ?? item.genres,
     country: details.origin_country?.join(' / ') || item.country,
-    poster: tmdbImageUrl(settings, details.poster_path, 'w500'),
-    backdrop: tmdbImageUrl(settings, details.backdrop_path, 'w780'),
+    poster: tmdbImageUrl(settings, details.poster_path, 'w500') || item.poster,
+    backdrop: tmdbImageUrl(settings, details.backdrop_path, 'w780') || item.backdrop,
     tagline: details.tagline || 'TMDB',
     overview: details.overview || item.overview,
     trailerUrl: trailerUrl(details.videos?.results) || item.trailerUrl,
@@ -629,6 +671,30 @@ function tvToItem(settings: TmdbSettings, item: MediaItem, details: TmdbTvDetail
     },
     metadataProvider: 'tmdb',
     metadataMatchedAt: Date.now()
+  }
+}
+
+export async function refreshTmdbCoreMetadata(
+  item: MediaItem,
+  settings: TmdbSettings,
+  signal?: AbortSignal
+): Promise<MediaItem> {
+  const tmdbId = Number(item.externalIds?.tmdb)
+  if (!Number.isFinite(tmdbId) || tmdbId <= 0) {
+    throw new Error('缺少有效的 TMDB ID')
+  }
+  const updatedItem = item.type === 'series'
+    ? tvToItem(settings, item, await tmdbFetch<TmdbTvDetails>(settings, `/tv/${tmdbId}`, {
+        language: settings.language,
+        append_to_response: 'credits,external_ids'
+      }, signal))
+    : movieToItem(settings, item, await tmdbFetch<TmdbMovieDetails>(settings, `/movie/${tmdbId}`, {
+        language: settings.language,
+        append_to_response: 'credits,external_ids'
+      }, signal))
+  return {
+    ...updatedItem,
+    metadataMatchTitle: item.metadataMatchTitle || updatedItem.title
   }
 }
 

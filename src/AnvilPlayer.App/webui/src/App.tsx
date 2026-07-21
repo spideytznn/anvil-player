@@ -337,7 +337,7 @@ const copy = { en, zh }
 type Copy = Record<keyof typeof en, string>
 type SubtitlePanel = 'subtitles' | 'audio' | 'danmaku'
 
-const EMBY_PROGRESS_REPORT_INTERVAL_MS = 5_000
+const EMBY_PROGRESS_REPORT_INTERVAL_MS = 10_000
 
 interface ActiveEmbyPlaybackReport {
   report: EmbyPlaybackReportRecord
@@ -517,6 +517,15 @@ function useEmbyPlaybackReporting(state: PlayerState): void {
   }, [])
 
   useEffect(() => {
+    return subscribeNativeMessages((message) => {
+      if (message.type !== 'playerClosing') return
+      const active = activeRef.current
+      if (!active?.started || active.stopped) return
+      stopActiveEmbyPlaybackReport(active, active.lastPositionMs, false, true)
+    })
+  }, [])
+
+  useEffect(() => {
     let active = activeRef.current
     if (active?.stopped) {
       activeRef.current = null
@@ -676,8 +685,18 @@ function audioPassthroughStatus(state: PlayerState, t: Copy): string {
 
 function useLocalPlaybackReporting(state: PlayerState): void {
   const lastPostedRef = useRef({ path: '', at: 0, positionMs: -1, playbackState: '' })
+  const embyItemRef = useRef({ path: '', itemId: '' })
   useEffect(() => {
     if (!state.hasMedia || !state.mediaPath || state.durationMs <= 0) return
+    const pendingEmbyReport = loadPendingEmbyPlaybackReport()
+    if (pendingEmbyReport && playbackPathMatchesEmbyReport(state.mediaPath, pendingEmbyReport)) {
+      embyItemRef.current = {
+        path: state.mediaPath,
+        itemId: pendingEmbyReport.target.itemId
+      }
+    } else if (embyItemRef.current.path !== state.mediaPath) {
+      embyItemRef.current = { path: state.mediaPath, itemId: '' }
+    }
     const now = Date.now()
     const last = lastPostedRef.current
     const stateChanged = last.path !== state.mediaPath || last.playbackState !== state.playbackState
@@ -688,6 +707,7 @@ function useLocalPlaybackReporting(state: PlayerState): void {
       type: 'command',
       command: 'localPlaybackProgress',
       path: state.mediaPath,
+      providerItemId: embyItemRef.current.itemId || undefined,
       positionMs: state.positionMs,
       durationMs: state.durationMs,
       playbackState: state.playbackState
@@ -2225,12 +2245,24 @@ export default function App(): JSX.Element {
   useEffect(() => {
     // The library window relays pending Emby playback reports through native
     // because the player window has its own WebView2 storage. Inject the
-    // received report here so useEmbyPlaybackReporting picks it up.
-    return subscribeNativeMessages((message) => {
+    // received report here so useEmbyPlaybackReporting picks it up. Subscribe
+    // before announcing readiness, then acknowledge only after localStorage
+    // has accepted the report.
+    const unsubscribe = subscribeNativeMessages((message) => {
       if (message && message.type === 'deliverEmbyPlaybackReport') {
-        receiveEmbyPlaybackReportFromNative(message.report)
+        const reportId = receiveEmbyPlaybackReportFromNative(message.report)
+        if (reportId) {
+          postNativeCommand({
+            type: 'command',
+            command: 'acknowledgeEmbyPlaybackReport',
+            reportId
+          })
+          debugEmbyPlaybackReport(`relay stored reportId=${reportId}`)
+        }
       }
     })
+    postNativeCommand({ type: 'command', command: 'requestEmbyPlaybackReport' })
+    return unsubscribe
   }, [])
 
   useEffect(() => {
@@ -2242,7 +2274,7 @@ export default function App(): JSX.Element {
       }
       if (event.code !== 'Space' || event.repeat) return
       const target = event.target instanceof Element ? event.target : null
-      if (target?.closest('button, input, select, textarea, [contenteditable="true"]')) return
+      if (target?.closest('input, select, textarea, [contenteditable="true"]')) return
       event.preventDefault()
       postNativeCommand({ type: 'command', command: 'playPause' })
     }

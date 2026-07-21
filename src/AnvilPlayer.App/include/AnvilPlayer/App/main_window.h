@@ -84,6 +84,13 @@ public:
     void SetLocalPlaybackProgressRelay(std::function<void(const std::wstring&)> callback) {
         localPlaybackProgressRelay_ = std::move(callback);
     }
+    void SetEmbyPlaybackReportRequestHandler(std::function<void()> callback) {
+        embyPlaybackReportRequestHandler_ = std::move(callback);
+    }
+    void SetEmbyPlaybackReportAcknowledgedHandler(
+        std::function<void(const std::wstring&)> callback) {
+        embyPlaybackReportAcknowledgedHandler_ = std::move(callback);
+    }
     void RefreshUiLanguage() const { PostWebUiState(true); }
     void ApplyGlobalRefreshRatePreferences();
     void ApplyGlobalVideoPassthroughPreferences();
@@ -687,6 +694,8 @@ private:
     mutable HBITMAP previewBitmap_ = nullptr;
     mutable std::filesystem::path previewBitmapPath_;
     std::function<void(const std::wstring&)> localPlaybackProgressRelay_;
+    std::function<void()> embyPlaybackReportRequestHandler_;
+    std::function<void(const std::wstring&)> embyPlaybackReportAcknowledgedHandler_;
 };
 
 }  // namespace anvil::app

@@ -214,11 +214,11 @@ export function getDeviceId(): string {
   }
 }
 
-export function authorizationHeader(userId?: string): string {
+export function authorizationHeader(userId?: string, deviceId = getDeviceId()): string {
   const parts = [
     `Client="${CLIENT_NAME}"`,
     `Device="${DEVICE_NAME}"`,
-    `DeviceId="${getDeviceId()}"`,
+    `DeviceId="${deviceId}"`,
     `Version="${CLIENT_VERSION}"`
   ]
   if (userId) parts.unshift(`UserId="${userId}"`)
@@ -248,6 +248,7 @@ export async function fetchJson<T>(url: string, init: RequestInit, label: string
   try {
     response = await fetch(url, {
       ...init,
+      cache: init.cache ?? ((init.method ?? 'GET').toUpperCase() === 'GET' ? 'no-store' : undefined),
       headers: {
         Accept: 'application/json',
         ...init.headers
@@ -331,9 +332,9 @@ export function sourceIdForSession(session: EmbySession): string {
   return `emby-${normalized || 'server'}`
 }
 
-export function authHeadersForSession(session: EmbySession): Record<string, string> {
+export function authHeadersForSession(session: EmbySession, deviceId?: string): Record<string, string> {
   return {
-    'X-Emby-Authorization': authorizationHeader(session.userId),
+    'X-Emby-Authorization': authorizationHeader(session.userId, deviceId),
     'X-Emby-Token': session.accessToken
   }
 }

@@ -1,6 +1,7 @@
 #include "AnvilPlayer/App/application.h"
 
 #include "AnvilPlayer/App/ui_draw.h"
+#include "AnvilPlayer/App/web_ui_json.h"
 
 #include <windows.h>
 
@@ -33,7 +34,9 @@ namespace {
 // that does not collide with MainWindow/overlay timer ids (1001..1005).
 constexpr UINT_PTR kApplicationTimerId = 9001;
 constexpr UINT kEmbyReportRetryIntervalMs = 300;
-constexpr int kEmbyReportMaxRetries = 15;  // ~4.5s total, stops once delivered
+// Stop the timer after ~30 seconds, but retain the report. A later player-ready
+// request restarts delivery; only a matching ACK consumes the report.
+constexpr int kEmbyReportMaxRetries = 100;
 constexpr UINT kPlayerReaperPollIntervalMs = 50;
 
 struct PlayerReaperContext {
@@ -173,6 +176,12 @@ void Application::EnsurePlayerWindow() {
     player_->SetLocalPlaybackProgressRelay([this](const std::wstring& progressJson) {
         if (library_) library_->DeliverLocalPlaybackProgress(progressJson);
     });
+    player_->SetEmbyPlaybackReportRequestHandler([this] {
+        OnPlayerEmbyPlaybackReportRequested();
+    });
+    player_->SetEmbyPlaybackReportAcknowledgedHandler([this](const std::wstring& reportId) {
+        OnPlayerEmbyPlaybackReportAcknowledged(reportId);
+    });
     if (!player_->Create(instance_)) {
         player_.reset();
         return;
@@ -180,8 +189,8 @@ void Application::EnsurePlayerWindow() {
     player_->ApplyGlobalRefreshRatePreferences();
     player_->ApplyGlobalAudioPassthroughPreferences();
     player_->Show(SW_SHOWNORMAL);
-    // Note: a buffered Emby report (if any) is delivered/retried by the timer
-    // started in RelayEmbyPlaybackReport; nothing extra needed here.
+    // The player page requests the pending report after its message listener is
+    // registered. The timer remains a fallback for lost messages.
 }
 
 void Application::OpenInPlayer(const std::filesystem::path& path,
@@ -231,30 +240,94 @@ void Application::FocusPlayer() {
 }
 
 void Application::RelayEmbyPlaybackReport(const std::wstring& reportJson) {
-    pendingEmbyReport_ = reportJson;
-    embyReportDelivered_ = false;
-    embyReportRetries_ = 0;
-    // Try once immediately; if the player WebView isn't ready yet, the retry
-    // timer will keep trying until it succeeds (bounded).
+    const std::wstring reportId = ReadJsonString(reportJson, L"id").value_or(L"");
+    embyReportRelay_.Queue(reportId, reportJson);
+    if (logSink_) {
+        logSink_->Write(
+            anvil::playback::LogLevel::Debug, L"library",
+            L"emby relay queued reportId=" +
+                (reportId.empty() ? std::wstring(L"<missing>") : reportId));
+    }
+    // An immediate attempt keeps an already-running player responsive. It is
+    // deliberately not treated as success until the player acknowledges that
+    // the report has been persisted.
     TryDeliverPendingEmbyReport();
 }
 
 void Application::TryDeliverPendingEmbyReport() {
-    if (pendingEmbyReport_.empty() || embyReportDelivered_) {
+    if (!embyReportRelay_.HasPending()) {
         return;
     }
-    if (player_ && player_->DeliverEmbyPlaybackReport(pendingEmbyReport_)) {
-        // Delivered once into the player's storage; App.tsx re-checks pending
-        // state every second, so no need to re-inject. Stop retrying.
-        embyReportDelivered_ = true;
-        return;
+    const bool posted =
+        player_ && player_->DeliverEmbyPlaybackReport(embyReportRelay_.ReportJson());
+    const int attempt = embyReportRelay_.NoteDeliveryAttempt();
+    if (logSink_ && (attempt == 1 || attempt % 10 == 0)) {
+        logSink_->Write(
+            anvil::playback::LogLevel::Debug, L"library",
+            L"emby relay attempt reportId=" +
+                (embyReportRelay_.ReportId().empty()
+                    ? std::wstring(L"<missing>")
+                    : embyReportRelay_.ReportId()) +
+                L" attempt=" + std::to_wstring(attempt) +
+                L" posted=" + (posted ? L"true" : L"false") +
+                L" acknowledged=false");
     }
-    // WebView not ready yet (or player not created); retry on the UI thread.
-    if (++embyReportRetries_ < kEmbyReportMaxRetries && library_ && library_->Handle()) {
+    if (attempt < kEmbyReportMaxRetries && library_ && library_->Handle()) {
         SetTimer(library_->Handle(), kApplicationTimerId, kEmbyReportRetryIntervalMs, nullptr);
-    } else {
-        pendingEmbyReport_.clear();
-        embyReportRetries_ = 0;
+    } else if (attempt == kEmbyReportMaxRetries && logSink_) {
+        logSink_->Write(
+            anvil::playback::LogLevel::Warning, L"library",
+            L"emby relay retry window elapsed; report retained reportId=" +
+                (embyReportRelay_.ReportId().empty()
+                    ? std::wstring(L"<missing>")
+                    : embyReportRelay_.ReportId()));
+    }
+}
+
+void Application::OnPlayerEmbyPlaybackReportRequested() {
+    if (logSink_) {
+        logSink_->Write(
+            anvil::playback::LogLevel::Debug, L"library",
+            L"emby relay player ready pending=" +
+                std::wstring(embyReportRelay_.HasPending() ? L"true" : L"false") +
+                L" reportId=" +
+                (embyReportRelay_.ReportId().empty()
+                    ? std::wstring(L"<none>")
+                    : embyReportRelay_.ReportId()));
+    }
+    if (!embyReportRelay_.HasPending()) {
+        return;
+    }
+    embyReportRelay_.RestartDelivery();
+    TryDeliverPendingEmbyReport();
+}
+
+void Application::OnPlayerEmbyPlaybackReportAcknowledged(const std::wstring& reportId) {
+    if (!embyReportRelay_.HasPending()) {
+        if (logSink_) {
+            logSink_->Write(
+                anvil::playback::LogLevel::Debug, L"library",
+                L"emby relay duplicate acknowledgement reportId=" +
+                    (reportId.empty() ? std::wstring(L"<missing>") : reportId));
+        }
+        return;
+    }
+    const std::wstring expectedId = embyReportRelay_.ReportId();
+    if (embyReportRelay_.Acknowledge(reportId)) {
+        if (logSink_) {
+            logSink_->Write(
+                anvil::playback::LogLevel::Debug, L"library",
+                L"emby relay acknowledged reportId=" + reportId);
+        }
+        return;
+    }
+    if (logSink_) {
+        logSink_->Write(
+            anvil::playback::LogLevel::Warning, L"library",
+            L"emby relay ignored acknowledgement reportId=" +
+                (reportId.empty() ? std::wstring(L"<missing>") : reportId) +
+                L" expected=" +
+                (expectedId.empty() ? std::wstring(L"<none>") : expectedId));
     }
 }
 

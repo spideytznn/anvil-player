@@ -1,6 +1,7 @@
 #pragma once
 
 #include "AnvilPlayer/App/app_arguments.h"
+#include "AnvilPlayer/App/emby_report_relay.h"
 #include "AnvilPlayer/App/library_window.h"
 #include "AnvilPlayer/App/main_window.h"
 
@@ -57,6 +58,8 @@ private:
     void EnsurePlayerWindow();
     void OnLibraryClosed();
     void OnPlayerClosed();
+    void OnPlayerEmbyPlaybackReportRequested();
+    void OnPlayerEmbyPlaybackReportAcknowledged(const std::wstring& reportId);
     void TryDeliverPendingEmbyReport();
     void OnApplicationTimer();
     void ProcessDeferredWindowLifetime();
@@ -71,11 +74,9 @@ private:
     std::unique_ptr<MainWindow> player_;
     std::shared_ptr<anvil::playback::InMemoryLogSink> logSink_;
     std::shared_ptr<PlayerReaperState> playerReaperState_;
-    // Emby report relay: buffered when it arrives before the player WebView is
-    // ready, then redelivered on a timer until consumed once.
-    std::wstring pendingEmbyReport_;
-    bool embyReportDelivered_ = false;
-    int embyReportRetries_ = 0;
+    // Retained until the player WebView confirms that it persisted the report.
+    // A successful PostWebMessage call alone is not delivery confirmation.
+    EmbyReportRelayState embyReportRelay_;
     bool playerResetPending_ = false;
     bool libraryResetPending_ = false;
     bool shutdownRequested_ = false;

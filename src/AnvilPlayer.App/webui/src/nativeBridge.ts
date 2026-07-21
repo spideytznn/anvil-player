@@ -209,7 +209,8 @@ export type NativeMessage =
   | { type: 'globalVideoPassthroughSettings'; frameInterpolationEnabled: boolean; frameInterpolationMaximumHeight: number; autoDisplayFormat: boolean; displayMetadataPassthrough: boolean; dolbyVisionSystemPipelineExperimental: boolean; windowsHdrEnabled: boolean; displayPeakBrightnessNits: number; detectedDisplayPeakBrightnessNits: number }
   | { type: 'globalAudioPassthroughSettings'; enabled: boolean }
   | { type: 'deliverEmbyPlaybackReport'; report: unknown }
-  | { type: 'command'; command: 'localPlaybackProgress'; path: string; positionMs: number; durationMs: number; playbackState: string }
+  | { type: 'playerClosing' }
+  | { type: 'command'; command: 'localPlaybackProgress'; path: string; providerItemId?: string; positionMs: number; durationMs: number; playbackState: string }
   | { type: 'bilibiliTrailerSearchCompleted'; requestId: string; response: unknown }
   | { type: 'bilibiliTrailerSearchFailed'; requestId: string; message: string }
 
@@ -241,7 +242,7 @@ export type NativeCommand =
   | { type: 'command'; command: 'probeMediaDetails'; requestId: string; path: string; username?: string; password?: string }
   | { type: 'command'; command: 'setWebUiRoute'; route: 'player' | 'library' }
   | { type: 'command'; command: 'requestPlayback'; path: string; startPositionRatio?: number; audioTrackIndex?: number; subtitleTrackIndex?: number }
-  | { type: 'command'; command: 'localPlaybackProgress'; path: string; positionMs: number; durationMs: number; playbackState: string }
+  | { type: 'command'; command: 'localPlaybackProgress'; path: string; providerItemId?: string; positionMs: number; durationMs: number; playbackState: string }
   | { type: 'command'; command: 'openExternalUrl'; url: string }
   | { type: 'command'; command: 'focusPlayer' }
   | { type: 'command'; command: 'requestWindowChrome' }
@@ -250,6 +251,8 @@ export type NativeCommand =
   | { type: 'command'; command: 'toggleMaximizeWindow' }
   | { type: 'command'; command: 'closeWindow' }
   | { type: 'command'; command: 'deliverEmbyPlaybackReport'; report: unknown }
+  | { type: 'command'; command: 'requestEmbyPlaybackReport' }
+  | { type: 'command'; command: 'acknowledgeEmbyPlaybackReport'; reportId: string }
   | { type: 'command'; command: 'setAllowInsecureCertificates'; enabled: boolean }
   | { type: 'command'; command: 'setLibraryWebViewMuted'; muted: boolean }
   | { type: 'command'; command: 'playPause' }

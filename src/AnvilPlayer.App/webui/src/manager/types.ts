@@ -82,6 +82,7 @@ export interface MediaItem {
   audioSpec?: string
   progress: number
   continueWatching?: boolean
+  continueWatchingRank?: number
   lastPlayedAt?: number
   watched: boolean
   favorite: boolean

@@ -4,6 +4,7 @@
 #include "AnvilPlayer/Playback/PlayerController.h"
 #include "AnvilPlayer/Playback/PlaybackPlan.h"
 #include "AnvilPlayer/App/color_metadata_util.h"
+#include "AnvilPlayer/App/emby_report_relay.h"
 #include "AnvilPlayer/App/frame_interpolation_policy.h"
 #include "AnvilPlayer/App/playback_timing_math.h"
 #include "AnvilPlayer/App/software_yuv_upload_layout.h"
@@ -37,6 +38,39 @@ namespace {
 
 void AssertNear(const float actual, const float expected) {
     assert(std::abs(actual - expected) < 0.000001f);
+}
+
+void TestEmbyReportRelaySurvivesLostDeliveryUntilMatchingAck() {
+    anvil::app::EmbyReportRelayState relay;
+    relay.Queue(L"report-a", L"{\"id\":\"report-a\"}");
+
+    assert(relay.HasPending());
+    assert(relay.ReportId() == L"report-a");
+    assert(relay.ReportJson() == L"{\"id\":\"report-a\"}");
+    for (int attempt = 1; attempt <= 100; ++attempt) {
+        assert(relay.NoteDeliveryAttempt() == attempt);
+    }
+    // Exhausting a delivery window must not discard a report: the player can
+    // request it again after a cold start or WebView recreation.
+    assert(relay.HasPending());
+    relay.RestartDelivery();
+    assert(relay.DeliveryAttempts() == 0);
+
+    assert(!relay.Acknowledge(L""));
+    assert(!relay.Acknowledge(L"report-b"));
+    assert(relay.HasPending());
+    assert(relay.Acknowledge(L"report-a"));
+    assert(!relay.HasPending());
+
+    // A newer playback supersedes the native pending copy, and a late ACK for
+    // the previous playback must never consume the new report.
+    relay.Queue(L"report-a", L"{\"id\":\"report-a\"}");
+    relay.Queue(L"report-b", L"{\"id\":\"report-b\"}");
+    assert(!relay.Acknowledge(L"report-a"));
+    assert(relay.HasPending());
+    assert(relay.ReportId() == L"report-b");
+    assert(relay.Acknowledge(L"report-b"));
+    assert(!relay.HasPending());
 }
 
 void TestVideoTextureSamplingRegion() {
@@ -851,6 +885,7 @@ void TestHdr10PlusFrameMetadataExtraction() {
 }  // namespace
 
 int main() {
+    TestEmbyReportRelaySurvivesLostDeliveryUntilMatchingAck();
     TestVideoTextureSamplingRegion();
     TestSoftwareYuvUploadLayoutContract();
     TestWasapiEndpointClockMath();

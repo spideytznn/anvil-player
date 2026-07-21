@@ -4,6 +4,10 @@ import type { EpisodeItem, LibraryHomeSection, LibraryQuery, LibrarySource, Libr
 const LIBRARY_CACHE_KEY = 'anvil-player.library.cache.v1'
 const HIDDEN_MEDIA_KEY = 'anvil-player.library.hidden-media.v1'
 const LIBRARY_CACHE_WRITE_DELAY_MS = 250
+const LIBRARY_DATABASE_NAME = 'anvil-player.library'
+const LIBRARY_DATABASE_VERSION = 1
+const LIBRARY_DATABASE_STORE = 'cache'
+const LIBRARY_DATABASE_RECORD_KEY = 'library'
 
 export interface MediaLibraryClient {
   listSources: () => Promise<LibrarySource[]>
@@ -90,7 +94,18 @@ function playbackRecency(item: MediaItem): number {
 }
 
 export function sortContinueWatchingItems(items: MediaItem[]): MediaItem[] {
-  return [...items].sort((a, b) => playbackRecency(b) - playbackRecency(a))
+  return [...items].sort((a, b) => {
+    if (a.sourceId === b.sourceId) {
+      const aRank = Number.isFinite(a.continueWatchingRank) ? a.continueWatchingRank : undefined
+      const bRank = Number.isFinite(b.continueWatchingRank) ? b.continueWatchingRank : undefined
+      if (aRank !== undefined || bRank !== undefined) {
+        if (aRank === undefined) return 1
+        if (bRank === undefined) return -1
+        if (aRank !== bRank) return aRank - bRank
+      }
+    }
+    return playbackRecency(b) - playbackRecency(a)
+  })
 }
 
 function matchesSearch(item: MediaItem, search: string): boolean {
@@ -260,6 +275,7 @@ function tinyNestedItemForCache(item: MediaItem): MediaItem {
     audioSpec: '',
     progress: item.progress,
     continueWatching: item.continueWatching,
+    continueWatchingRank: item.continueWatchingRank,
     lastPlayedAt: item.lastPlayedAt,
     watched: item.watched,
     favorite: item.favorite,
@@ -363,6 +379,85 @@ function loadHiddenMediaKeys(): Set<string> {
   }
 }
 
+function validLibraryCache(value: unknown): value is LibraryCache {
+  if (!isObject(value)) return false
+  return Array.isArray(value.sources) && Array.isArray(value.items) && Array.isArray(value.homeSections)
+}
+
+function openLibraryDatabase(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    if (!window.indexedDB) {
+      reject(new Error('IndexedDB is unavailable'))
+      return
+    }
+    const request = window.indexedDB.open(LIBRARY_DATABASE_NAME, LIBRARY_DATABASE_VERSION)
+    request.onupgradeneeded = () => {
+      const database = request.result
+      if (!database.objectStoreNames.contains(LIBRARY_DATABASE_STORE)) {
+        database.createObjectStore(LIBRARY_DATABASE_STORE)
+      }
+    }
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error ?? new Error('Unable to open the library database'))
+    request.onblocked = () => reject(new Error('Library database upgrade is blocked'))
+  })
+}
+
+async function readIndexedDbCache(): Promise<LibraryCache | undefined> {
+  const database = await openLibraryDatabase()
+  try {
+    return await new Promise((resolve, reject) => {
+      const request = database
+        .transaction(LIBRARY_DATABASE_STORE, 'readonly')
+        .objectStore(LIBRARY_DATABASE_STORE)
+        .get(LIBRARY_DATABASE_RECORD_KEY)
+      request.onsuccess = () => resolve(validLibraryCache(request.result) ? request.result : undefined)
+      request.onerror = () => reject(request.error ?? new Error('Unable to read the library cache'))
+    })
+  } finally {
+    database.close()
+  }
+}
+
+async function writeIndexedDbCache(cache: LibraryCache): Promise<void> {
+  const database = await openLibraryDatabase()
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const transaction = database.transaction(LIBRARY_DATABASE_STORE, 'readwrite')
+      transaction.objectStore(LIBRARY_DATABASE_STORE).put(cache, LIBRARY_DATABASE_RECORD_KEY)
+      transaction.oncomplete = () => resolve()
+      transaction.onerror = () => reject(transaction.error ?? new Error('Unable to write the library cache'))
+      transaction.onabort = () => reject(transaction.error ?? new Error('Library cache write was aborted'))
+    })
+  } finally {
+    database.close()
+  }
+}
+
+async function loadPersistentCache(legacyCache: LibraryCache): Promise<LibraryCache> {
+  try {
+    const indexedDbCache = await readIndexedDbCache()
+    if (indexedDbCache) return indexedDbCache
+    if (legacyCache.sources.length || legacyCache.items.length || legacyCache.homeSections.length) {
+      await writeIndexedDbCache(legacyCache)
+      window.localStorage.removeItem(LIBRARY_CACHE_KEY)
+    }
+  } catch {
+    // Older WebView runtimes and private profiles can disable IndexedDB.
+  }
+  return legacyCache
+}
+
+async function savePersistentCache(cache: LibraryCache): Promise<void> {
+  try {
+    await writeIndexedDbCache(cache)
+    window.localStorage.removeItem(LIBRARY_CACHE_KEY)
+  } catch {
+    // Retain the compact localStorage writer as a compatibility fallback.
+    saveCache(cache)
+  }
+}
+
 function saveHiddenMediaKeys(keys: Set<string>): void {
   window.localStorage.setItem(HIDDEN_MEDIA_KEY, JSON.stringify([...keys]))
 }
@@ -396,12 +491,14 @@ function saveCache(cache: LibraryCache): void {
 function createCacheWriter(readCache: () => LibraryCache): () => void {
   let dirty = false
   let writeTimer: number | undefined
+  let writeChain = Promise.resolve()
 
   const flush = (): void => {
     if (!dirty) return
     dirty = false
     writeTimer = undefined
-    saveCache(readCache())
+    const snapshot = readCache()
+    writeChain = writeChain.then(() => savePersistentCache(snapshot))
   }
 
   const schedule = (): void => {
@@ -422,25 +519,34 @@ function createCacheWriter(readCache: () => LibraryCache): () => void {
 }
 
 export function createEmptyLibraryClient(): MediaLibraryClient {
-  const cached = loadCache()
-  let sources: LibrarySource[] = cached.sources
-  let items: MediaItem[] = cached.items
-  let homeSections: LibraryHomeSection[] = cached.homeSections
+  const legacyCache = loadCache()
+  let sources: LibrarySource[] = legacyCache.sources
+  let items: MediaItem[] = legacyCache.items
+  let homeSections: LibraryHomeSection[] = legacyCache.homeSections
   const hiddenMediaKeys = loadHiddenMediaKeys()
   const isHidden = (item: MediaItem): boolean => hiddenIdentityKeys(item).some((key) => hiddenMediaKeys.has(key))
   items = items.filter((item) => !isHidden(item))
+  const hydration = loadPersistentCache(legacyCache).then((cached) => {
+    sources = cached.sources
+    items = cached.items.filter((item) => !isHidden(item))
+    homeSections = cached.homeSections
+  })
   const scheduleCacheWrite = createCacheWriter(() => ({ version: 1, sources, items, homeSections }))
+  void navigator.storage?.persist?.().catch(() => false)
 
   return {
     async listSources() {
+      await hydration
       return [...sources]
     },
 
     async listAllItems() {
+      await hydration
       return items.filter((item) => !isHidden(item))
     },
 
     async listItems(query) {
+      await hydration
       const includesUserCollections = query.navKey === 'favorites' || query.navKey === 'playlist'
       const queryItems = query.navKey.startsWith('source:') || includesUserCollections
         ? items.filter((item) => !isHidden(item))
@@ -452,12 +558,13 @@ export function createEmptyLibraryClient(): MediaLibraryClient {
         ).filter((item) => matchesSearch(item, query.search)),
         query.filterKey
       )
-      return query.navKey === 'continue' && query.sortKey === 'recent'
+      return (query.navKey === 'continue' || query.filterKey === 'inProgress') && query.sortKey === 'recent'
         ? sortContinueWatchingItems(filteredItems)
         : sortItems(filteredItems, query.sortKey, query.sortOrder)
     },
 
     async listHomeSections(sourceId) {
+      await hydration
       const rows = sourceId
         ? homeSections.filter((section) => section.sourceId === sourceId)
         : homeSections
@@ -468,12 +575,14 @@ export function createEmptyLibraryClient(): MediaLibraryClient {
     },
 
     async getContinueWatching() {
+      await hydration
       return sortContinueWatchingItems(
         items.filter((item) => !isHidden(item) && (item.continueWatching || (item.progress > 0 && item.progress < 1)))
       )
     },
 
     async saveSourceDraft(draft) {
+      await hydration
       const existingIndex = sources.findIndex((source) => source.kind === draft.kind && source.name === draft.name)
       const source: LibrarySource = {
         id: existingIndex >= 0 ? sources[existingIndex].id : sourceIdFromName(draft.name),
@@ -493,16 +602,19 @@ export function createEmptyLibraryClient(): MediaLibraryClient {
     },
 
     async updateItem(item) {
+      await hydration
       items = items.map((candidate) => candidate.id === item.id ? item : candidate)
       scheduleCacheWrite()
     },
 
     async removeItem(itemId) {
+      await hydration
       items = items.filter((candidate) => candidate.id !== itemId)
       scheduleCacheWrite()
     },
 
     async hideItem(item) {
+      await hydration
       hiddenIdentityKeys(item).forEach((key) => hiddenMediaKeys.add(key))
       for (const version of item.versions ?? []) {
         hiddenIdentityKeys(version).forEach((key) => hiddenMediaKeys.add(key))
@@ -513,6 +625,7 @@ export function createEmptyLibraryClient(): MediaLibraryClient {
     },
 
     async removeSource(sourceId) {
+      await hydration
       sources = sources.filter((source) => source.id !== sourceId)
       items = items.filter((item) => item.sourceId !== sourceId)
       homeSections = homeSections.filter((section) => section.sourceId !== sourceId)
@@ -520,6 +633,7 @@ export function createEmptyLibraryClient(): MediaLibraryClient {
     },
 
     async upsertSourceItems(source, sourceItems, sourceHomeSections = []) {
+      await hydration
       const existingIndex = sources.findIndex((candidate) => candidate.id === source.id)
       sources = existingIndex >= 0
         ? sources.map((candidate, index) => index === existingIndex ? source : candidate)

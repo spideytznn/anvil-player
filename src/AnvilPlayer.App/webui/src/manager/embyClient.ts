@@ -229,14 +229,114 @@ export async function removeItemFromEmbyPlaylist(
 }
 
 const EMBY_LIST_PAGE_SIZE = 200
+const EMBY_RESUME_DETAIL_CONCURRENCY = 6
+const EMBY_RESUME_DETAIL_CACHE_TTL_MS = 30_000
+
+interface CachedEmbyResumeDetail {
+  fetchedAt: number
+  item: EmbyItem
+}
+
+const embyResumeDetailCache = new Map<string, CachedEmbyResumeDetail>()
 
 export interface EmbyPlaybackTarget {
   itemId: string
   title: string
   url: string
+  deviceId?: string
   mediaSourceId?: string
   playSessionId?: string
   runTimeTicks?: number
+}
+
+function embyResumeDetailCacheKey(session: EmbySession, itemId: string): string {
+  return `${session.serverId}|${session.userId}|${itemId}`
+}
+
+function mergeEmbyItemDetail(summary: EmbyItem, detail: EmbyItem): EmbyItem {
+  return {
+    ...summary,
+    ...detail,
+    UserData: {
+      ...summary.UserData,
+      ...detail.UserData
+    }
+  }
+}
+
+function embyLastPlayedTimestamp(item: EmbyItem): number {
+  const value = item.UserData?.LastPlayedDate
+  if (!value) return 0
+  const timestamp = Date.parse(value.endsWith('Z') ? value : `${value}Z`)
+  return Number.isFinite(timestamp) ? timestamp : 0
+}
+
+async function hydrateEmbyResumeItems(
+  session: EmbySession,
+  items: EmbyItem[],
+  fields: string,
+  signal?: AbortSignal
+): Promise<EmbyItem[]> {
+  if (!items.length) return items
+
+  const hydrated = [...items]
+  let nextIndex = 0
+  const workerCount = Math.min(EMBY_RESUME_DETAIL_CONCURRENCY, items.length)
+
+  async function hydrateNext(): Promise<void> {
+    while (nextIndex < items.length) {
+      const index = nextIndex
+      nextIndex += 1
+      const summary = items[index]
+      if (embyLastPlayedTimestamp(summary) > 0) continue
+
+      const cacheKey = embyResumeDetailCacheKey(session, summary.Id)
+      const cached = embyResumeDetailCache.get(cacheKey)
+      const summaryPosition = summary.UserData?.PlaybackPositionTicks ?? 0
+      const cachedPosition = cached?.item.UserData?.PlaybackPositionTicks ?? 0
+      if (
+        cached &&
+        Date.now() - cached.fetchedAt < EMBY_RESUME_DETAIL_CACHE_TTL_MS &&
+        cachedPosition === summaryPosition
+      ) {
+        hydrated[index] = mergeEmbyItemDetail(summary, cached.item)
+        continue
+      }
+
+      try {
+        const detail = await fetchJson<EmbyItem>(
+          apiUrl(session.apiBaseUrl, `/Users/${session.userId}/Items/${summary.Id}`, {
+            Fields: fields
+          }),
+          {
+            method: 'GET',
+            headers: authHeadersForSession(session),
+            signal
+          },
+          '璇诲彇 Emby 缁х画瑙傜湅鏃堕棿'
+        )
+        const merged = mergeEmbyItemDetail(summary, detail)
+        hydrated[index] = merged
+        embyResumeDetailCache.set(cacheKey, {
+          fetchedAt: Date.now(),
+          item: merged
+        })
+      } catch {
+        signal?.throwIfAborted()
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: workerCount }, () => hydrateNext()))
+  return hydrated
+    .map((item, index) => ({ item, index, timestamp: embyLastPlayedTimestamp(item) }))
+    .sort((left, right) => {
+      if (left.timestamp && right.timestamp) return right.timestamp - left.timestamp
+      if (left.timestamp) return -1
+      if (right.timestamp) return 1
+      return left.index - right.index
+    })
+    .map((row) => row.item)
 }
 
 export interface EmbyPlaybackReportRecord {
@@ -261,6 +361,7 @@ function loadReportTarget(value: unknown): EmbyPlaybackTarget | undefined {
     itemId,
     title,
     url,
+    deviceId: stringValue(target.deviceId) || undefined,
     mediaSourceId: stringValue(target.mediaSourceId) || undefined,
     playSessionId: stringValue(target.playSessionId) || undefined,
     runTimeTicks: numberValue(target.runTimeTicks)
@@ -290,6 +391,7 @@ function playbackReportBody(
 ): Record<string, unknown> {
   const target = report.target
   return {
+    QueueableMediaTypes: ['Video'],
     CanSeek: true,
     ItemId: target.itemId,
     MediaSourceId: target.mediaSourceId,
@@ -299,7 +401,7 @@ function playbackReportBody(
     IsPaused: options.paused ?? false,
     IsMuted: false,
     VolumeLevel: 100,
-    PlayMethod: 'DirectStream',
+    PlayMethod: 'DirectPlay',
     PlaybackRate: 1,
     EventName: options.eventName,
     Failed: options.failed ?? false
@@ -313,7 +415,7 @@ async function postPlaybackReport(
   label: string,
   keepalive = false
 ): Promise<void> {
-  const headers = authHeadersForSession(report.session)
+  const headers = authHeadersForSession(report.session, report.target.deviceId)
   await fetchEmpty(
     apiUrl(report.session.apiBaseUrl, path),
     {
@@ -415,13 +517,13 @@ function deliverEmbyPlaybackReportToNative(report: EmbyPlaybackReportRecord): vo
 // Player-window side: injects a report received from native (relayed from the
 // library window) into this environment's storage and fires the pending event
 // so useEmbyPlaybackReporting picks it up.
-export function receiveEmbyPlaybackReportFromNative(report: unknown): void {
+export function receiveEmbyPlaybackReportFromNative(report: unknown): string | undefined {
   try {
     const row = objectValue(report)
-    if (!row) return
+    if (!row) return undefined
     const session = loadReportSession(row.session)
     const target = loadReportTarget(row.target)
-    if (!session || !target) return
+    if (!session || !target) return undefined
     const record: EmbyPlaybackReportRecord = {
       id: stringValue(row.id) || `emby-playback-${numberValue(row.createdAt) ?? Date.now()}`,
       createdAt: numberValue(row.createdAt) ?? Date.now(),
@@ -430,8 +532,10 @@ export function receiveEmbyPlaybackReportFromNative(report: unknown): void {
     }
     window.localStorage.setItem(PLAYBACK_REPORT_STORAGE_KEY, JSON.stringify(record))
     notifyPendingEmbyPlaybackReport(record.id)
+    return record.id
   } catch {
     // Malformed relay payload; ignore.
+    return undefined
   }
 }
 
@@ -518,11 +622,12 @@ function playbackStreamUrl(
   session: EmbySession,
   itemId: string,
   source: EmbyMediaSource | undefined,
-  playSessionId?: string
+  playSessionId: string | undefined,
+  deviceId: string
 ): string {
   const mediaSourceId = source?.Id
   const playbackParams = {
-    DeviceId: getDeviceId(),
+    DeviceId: deviceId,
     MediaSourceId: mediaSourceId,
     PlaySessionId: playSessionId
   }
@@ -539,7 +644,7 @@ function playbackStreamUrl(
     Static: true,
     api_key: session.accessToken,
     MediaSourceId: mediaSourceId,
-    DeviceId: getDeviceId(),
+    DeviceId: deviceId,
     PlaySessionId: playSessionId
   })
 }
@@ -591,7 +696,11 @@ async function assertPlayableHttpUrl(url: string, signal?: AbortSignal): Promise
   throw new Error(`播放地址返回的不是视频${detail ? `：${detail}` : ''}`)
 }
 
-async function fetchPlaybackInfo(session: EmbySession, itemId: string, signal?: AbortSignal): Promise<EmbyPlaybackInfoResponse> {
+async function fetchPlaybackInfo(
+  session: EmbySession,
+  itemId: string,
+  signal?: AbortSignal
+): Promise<EmbyPlaybackInfoResponse> {
   return await fetchJson<EmbyPlaybackInfoResponse>(
     apiUrl(session.apiBaseUrl, `/Items/${itemId}/PlaybackInfo`, {
       UserId: session.userId,
@@ -620,6 +729,7 @@ export async function resolveEmbyPlaybackTarget(
   item: MediaItem,
   signal?: AbortSignal
 ): Promise<EmbyPlaybackTarget> {
+  const deviceId = getDeviceId()
   const fields = [
     'MediaSources',
     'UserData',
@@ -646,12 +756,13 @@ export async function resolveEmbyPlaybackTarget(
     const fallbackSource = item.mediaSourceId
       ? detail.MediaSources?.find((row) => row.Id === item.mediaSourceId)
       : detail.MediaSources?.[0]
-    const url = playbackStreamUrl(session, detail.Id, source ?? fallbackSource, playbackInfo.PlaySessionId)
+    const url = playbackStreamUrl(session, detail.Id, source ?? fallbackSource, playbackInfo.PlaySessionId, deviceId)
     await assertPlayableHttpUrl(url, signal)
     return {
       itemId: detail.Id,
       title: detail.Name ?? item.title,
       url,
+      deviceId,
       mediaSourceId: source?.Id ?? fallbackSource?.Id,
       playSessionId: playbackInfo.PlaySessionId,
       runTimeTicks: detail.RunTimeTicks ?? source?.RunTimeTicks ?? fallbackSource?.RunTimeTicks ?? undefined
@@ -684,12 +795,13 @@ export async function resolveEmbyPlaybackTarget(
     const playbackInfo = await fetchPlaybackInfo(session, episode.Id, signal)
     const source = playbackInfo.MediaSources?.[0]
     const fallbackSource = episode.MediaSources?.[0]
-    const url = playbackStreamUrl(session, episode.Id, source ?? fallbackSource, playbackInfo.PlaySessionId)
+    const url = playbackStreamUrl(session, episode.Id, source ?? fallbackSource, playbackInfo.PlaySessionId, deviceId)
     await assertPlayableHttpUrl(url, signal)
     return {
       itemId: episode.Id,
       title: titleParts.join(' - '),
       url,
+      deviceId,
       mediaSourceId: source?.Id ?? fallbackSource?.Id,
       playSessionId: playbackInfo.PlaySessionId,
       runTimeTicks: episode.RunTimeTicks ?? source?.RunTimeTicks ?? fallbackSource?.RunTimeTicks ?? undefined
@@ -1031,20 +1143,30 @@ async function loadLibraryForSession(
           MediaTypes: 'Video',
           IncludeItemTypes: 'Movie,Episode',
           Fields: fields,
+          SortBy: 'DatePlayed',
+          SortOrder: 'Descending',
+          EnableUserData: true,
           Limit: Math.min(Math.max(limit, 24), 80)
         }),
         { method: 'GET', headers: authHeaders, signal },
         '读取 Emby 继续观看'
       )
-      return resume.Items ?? []
+      return await hydrateEmbyResumeItems(session, resume.Items ?? [], fields, signal)
     } catch {
       signal?.throwIfAborted()
       return []
     }
   })()
-  const itemRows = new Map<string, { item: EmbyItem; libraryViewId?: string; continueWatching?: boolean }>()
-  resumeItems.forEach((item) => {
-    if (!itemRows.has(item.Id)) itemRows.set(item.Id, { item, continueWatching: true })
+  const itemRows = new Map<string, {
+    item: EmbyItem
+    libraryViewId?: string
+    continueWatching?: boolean
+    continueWatchingRank?: number
+  }>()
+  resumeItems.forEach((item, continueWatchingRank) => {
+    if (!itemRows.has(item.Id)) {
+      itemRows.set(item.Id, { item, continueWatching: true, continueWatchingRank })
+    }
   })
   itemsByView.forEach((row) => {
     row.items.forEach((item) => {
@@ -1054,9 +1176,10 @@ async function loadLibraryForSession(
   mediaItems.forEach((item) => {
     if (!itemRows.has(item.Id)) itemRows.set(item.Id, { item })
   })
-  const mappedItems = [...itemRows.values()].map((row) =>
-    mapItem(session, sourceId, row.item, row.libraryViewId, row.continueWatching ?? false)
-  )
+  const mappedItems = [...itemRows.values()].map((row) => ({
+    ...mapItem(session, sourceId, row.item, row.libraryViewId, row.continueWatching ?? false),
+    continueWatchingRank: row.continueWatchingRank
+  }))
   const homeSections = buildHomeSections(
     session,
     sourceId,

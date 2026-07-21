@@ -1075,7 +1075,18 @@ void MainWindow::HandleWebUiMessage(const std::wstring_view message) {
         return;
     }
 
-    if (MessageContains(message, L"\"command\":\"setAllowInsecureCertificates\"")) {
+    if (MessageContains(message, L"\"command\":\"requestEmbyPlaybackReport\"")) {
+        if (embyPlaybackReportRequestHandler_) {
+            embyPlaybackReportRequestHandler_();
+        }
+        return;
+    } else if (MessageContains(message, L"\"command\":\"acknowledgeEmbyPlaybackReport\"")) {
+        if (embyPlaybackReportAcknowledgedHandler_) {
+            embyPlaybackReportAcknowledgedHandler_(
+                ReadJsonString(message, L"reportId").value_or(L""));
+        }
+        return;
+    } else if (MessageContains(message, L"\"command\":\"setAllowInsecureCertificates\"")) {
         const bool enabled = MessageContains(message, L"\"enabled\":true");
         if (webUiHost_) {
             webUiHost_->SetAllowInsecureCertificates(enabled);
@@ -4486,10 +4497,10 @@ void MainWindow::BeginClose() {
                                   kRenderThreadStoppedMessage,
                                   windowLifetimeCookie_);
     }
-    // WebView callbacks are invalidated only after all backend cancellation
-    // has been broadcast. Controller teardown remains on its owning apartment.
-    if (webUiHost_) {
-        webUiHost_->Shutdown();
+    // Give the player WebView a chance to send Emby's keepalive stop check-in
+    // before its controller is released in WM_DESTROY.
+    if (webUiHost_ && webUiHost_->Ready()) {
+        webUiHost_->PostJson(L"{\"type\":\"playerClosing\"}");
     }
     TryFinishClose();
 }
@@ -4498,10 +4509,18 @@ void MainWindow::TryFinishClose() {
     if (!closePending_ || closeReady_) {
         return;
     }
+    const auto closeElapsed = closeStartedAt_.time_since_epoch().count() != 0
+        ? std::chrono::steady_clock::now() - closeStartedAt_
+        : std::chrono::steady_clock::duration::zero();
     const bool closeDeadlineExpired =
-        closeStartedAt_.time_since_epoch().count() != 0 &&
-        std::chrono::steady_clock::now() - closeStartedAt_ >= std::chrono::seconds{2};
+        closeElapsed >= std::chrono::seconds{2};
     if (!closeDeadlineExpired) {
+        // PostWebMessageAsJson is asynchronous. Keep the hidden WebView alive
+        // briefly so its keepalive /Stopped request can leave the renderer.
+        if (webUiHost_ && webUiHost_->Ready() &&
+            closeElapsed < std::chrono::milliseconds{150}) {
+            return;
+        }
         if (RuntimeStopInProgress()) {
             return;
         }
