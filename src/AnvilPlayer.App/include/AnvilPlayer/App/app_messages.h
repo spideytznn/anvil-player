@@ -44,6 +44,7 @@ constexpr UINT kInspectorFolderScanCompleteMessage = WM_APP + 11;
 constexpr UINT kRenderThreadStoppedMessage = WM_APP + 12;
 constexpr UINT kRenderInitializationCompleteMessage = WM_APP + 13;
 constexpr UINT kRenderDeviceLostMessage = WM_APP + 15;
+constexpr UINT kAssrtSubtitleResultMessage = WM_APP + 16;
 
 // DWM attribute constants for window chrome customization.
 constexpr DWORD kDwmUseImmersiveDarkMode = 20;

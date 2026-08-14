@@ -59,6 +59,7 @@ export interface PlayerState {
   subtitleFontScale: number
   subtitleOffsetX: number
   subtitleOffsetY: number
+  assrtConfigured: boolean
   danmakuEnabled: boolean
   danmakuMode: number
   danmakuOpacityPercent: number
@@ -192,6 +193,17 @@ export interface MediaDetailsProbeFailed {
   message: string
 }
 
+export interface AssrtSubtitleCandidate {
+  id: number
+  name: string
+  videoName: string
+  language: string
+  format: string
+  releaseSite: string
+  uploadTime: string
+  score: number
+}
+
 export type NativeMessage =
   | { type?: 'state'; state?: PlayerState }
   | LocalFolderPickResult
@@ -213,6 +225,11 @@ export type NativeMessage =
   | { type: 'command'; command: 'localPlaybackProgress'; path: string; providerItemId?: string; positionMs: number; durationMs: number; playbackState: string }
   | { type: 'bilibiliTrailerSearchCompleted'; requestId: string; response: unknown }
   | { type: 'bilibiliTrailerSearchFailed'; requestId: string; message: string }
+  | { type: 'assrtSubtitleSearchCompleted'; requestId: string; items: AssrtSubtitleCandidate[] }
+  | { type: 'assrtSubtitleSearchFailed'; requestId: string; message: string }
+  | { type: 'assrtSubtitleDownloadCompleted'; requestId: string; fileName: string }
+  | { type: 'assrtSubtitleDownloadFailed'; requestId: string; message: string }
+  | { type: 'assrtTokenSaveFailed'; requestId: string; message: string }
 
 export interface TrackOption {
   index: number
@@ -332,6 +349,9 @@ export type NativeCommand =
       height: number
     }
   | { type: 'command'; command: 'openSubtitleFile' }
+  | { type: 'command'; command: 'setAssrtToken'; token: string }
+  | { type: 'command'; command: 'searchAssrtSubtitles'; requestId: string; query: string }
+  | { type: 'command'; command: 'downloadAssrtSubtitle'; requestId: string; subtitleId: number }
   | { type: 'command'; command: 'toggleDanmakuEnabled' }
   | { type: 'command'; command: 'cycleDanmakuMode' }
   | { type: 'command'; command: 'setDanmakuOpacity'; opacityPercent: number }
@@ -416,6 +436,7 @@ export const EMPTY_STATE: PlayerState = {
   subtitleFontScale: 1,
   subtitleOffsetX: 0,
   subtitleOffsetY: 0,
+  assrtConfigured: false,
   danmakuEnabled: false,
   danmakuMode: 0,
   danmakuOpacityPercent: 70,

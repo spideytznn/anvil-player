@@ -41,7 +41,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <AdditionalLibraryDirectories>$(SolutionDir)third_party\ffmpeg\lib;$(SolutionDir)third_party\webview2\lib\win-$(Platform);$(SolutionDir)third_party\onnxruntime-directml\lib\$(Platform);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>avformat.lib;avcodec.lib;avutil.lib;avfilter.lib;swscale.lib;swresample.lib;onnxruntime.lib;DirectML.lib;WebView2LoaderStatic.lib;advapi32.lib;comdlg32.lib;d3d11.lib;d3d12.lib;d3dcompiler.lib;dxgi.lib;dxguid.lib;dwmapi.lib;dcomp.lib;gdiplus.lib;shell32.lib;shlwapi.lib;ole32.lib;oleaut32.lib;runtimeobject.lib;mf.lib;mfplat.lib;mfuuid.lib;version.lib;mpr.lib;netapi32.lib;winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>avformat.lib;avcodec.lib;avutil.lib;avfilter.lib;swscale.lib;swresample.lib;onnxruntime.lib;DirectML.lib;WebView2LoaderStatic.lib;advapi32.lib;crypt32.lib;comdlg32.lib;d3d11.lib;d3d12.lib;d3dcompiler.lib;dxgi.lib;dxguid.lib;dwmapi.lib;dcomp.lib;gdiplus.lib;shell32.lib;shlwapi.lib;ole32.lib;oleaut32.lib;runtimeobject.lib;mf.lib;mfplat.lib;mfuuid.lib;version.lib;mpr.lib;netapi32.lib;winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Manifest>
       <AdditionalManifestFiles>app.manifest;%(AdditionalManifestFiles)</AdditionalManifestFiles>
@@ -61,6 +61,7 @@ if exist "$(SolutionDir)third_party\webview2-runtime\Microsoft.WebView2.FixedVer
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="src\assrt_subtitle_service.cpp" />
     <ClCompile Include="src\app_arguments.cpp" />
     <ClCompile Include="src\application.cpp" />
     <ClCompile Include="src\d3d12_video_renderer.cpp" />
@@ -101,6 +102,7 @@ if exist "$(SolutionDir)third_party\webview2-runtime\Microsoft.WebView2.FixedVer
     <ClCompile Include="src\webui_root.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="include\AnvilPlayer\App\assrt_subtitle_service.h" />
     <ClInclude Include="include\AnvilPlayer\App\app_arguments.h" />
     <ClInclude Include="include\AnvilPlayer\App\app_messages.h" />
     <ClInclude Include="include\AnvilPlayer\App\application.h" />

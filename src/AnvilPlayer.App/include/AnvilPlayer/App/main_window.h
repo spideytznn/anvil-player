@@ -306,6 +306,9 @@ private:
     void OpenFileDialog();
     void OpenLocalFolderDialog();
     void OpenSubtitleFileDialog();
+    void ApplyExternalSubtitlePath(const std::filesystem::path& path);
+    void StartAssrtSubtitleSearch(const std::wstring& requestId, const std::wstring& query);
+    void StartAssrtSubtitleDownload(const std::wstring& requestId, int subtitleId);
     void OpenDanmakuFileDialog();
 
     // main_window.cpp runtime + transport
@@ -615,6 +618,7 @@ private:
     bool fullscreenTransportVisible_ = false;
     bool subtitleMenuOpen_ = false;
     bool webUiSubtitleGeometryValid_ = false;
+    bool assrtConfigured_ = false;
     bool webUiTransportGeometryValid_ = false;
     bool webUiVideoGeometryValid_ = false;
     bool progressHovered_ = false;

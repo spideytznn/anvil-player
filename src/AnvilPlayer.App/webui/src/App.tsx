@@ -3,6 +3,7 @@ import {
   Captions,
   ChevronLeft,
   ChevronRight,
+  Download,
   Folder,
   FolderOpen,
   History,
@@ -15,6 +16,7 @@ import {
   AlertTriangle,
   RotateCcw,
   ScrollText,
+  Search,
   Settings,
   SlidersHorizontal,
   Square,
@@ -40,6 +42,7 @@ import {
   postNativeCommand,
   subscribeNativeMessages,
   subscribeNativeState,
+  type AssrtSubtitleCandidate,
   type HdrToneCurvePoint,
   type MediaListItem,
   type NativeCommand,
@@ -171,6 +174,21 @@ const en = {
   audioPassthroughRuntimeFailed: 'Passthrough output was interrupted',
   danmaku: 'Danmaku',
   addSubtitleFile: 'Add subtitle file...',
+  onlineSubtitles: 'Online',
+  assrtToken: 'ASSRT Token',
+  assrtTokenHint: 'Get your personal token from the ASSRT account panel. It is encrypted for your Windows account.',
+  saveToken: 'Save token',
+  changeToken: 'Change token',
+  clearToken: 'Clear token',
+  subtitleSearchQuery: 'Movie title or release file name',
+  searchSubtitles: 'Search subtitles',
+  searchingSubtitles: 'Searching ASSRT...',
+  subtitleNoResults: 'No matching subtitles found',
+  subtitleSearchHint: 'Search by the full release file name for the best match.',
+  subtitleDownload: 'Download and use',
+  subtitleDownloading: 'Downloading subtitle...',
+  subtitleLoaded: 'Subtitle loaded',
+  assrtTokenSaved: 'ASSRT Token saved',
   addDanmakuFile: 'Add danmaku file...',
   delay: 'Delay',
   subtitleSize: 'Subtitle size',
@@ -306,6 +324,21 @@ const zh: Record<keyof typeof en, string> = {
   audioPassthroughRuntimeFailed: '直通输出已中断',
   danmaku: '弹幕',
   addSubtitleFile: '添加字幕文件...',
+  onlineSubtitles: '在线字幕',
+  assrtToken: 'ASSRT Token',
+  assrtTokenHint: '请在 ASSRT 用户面板获取个人 Token。保存时会使用当前 Windows 账户加密。',
+  saveToken: '保存 Token',
+  changeToken: '更换 Token',
+  clearToken: '清除 Token',
+  subtitleSearchQuery: '片名或完整片源文件名',
+  searchSubtitles: '搜索字幕',
+  searchingSubtitles: '正在搜索 ASSRT…',
+  subtitleNoResults: '没有找到匹配的字幕',
+  subtitleSearchHint: '使用完整片源文件名搜索可以获得更准确的匹配。',
+  subtitleDownload: '下载并使用',
+  subtitleDownloading: '正在下载字幕…',
+  subtitleLoaded: '字幕已加载',
+  assrtTokenSaved: 'ASSRT Token 已保存',
   addDanmakuFile: '添加弹幕文件...',
   delay: '延迟',
   subtitleSize: '字幕大小',
@@ -335,7 +368,7 @@ const zh: Record<keyof typeof en, string> = {
 const copy = { en, zh }
 
 type Copy = Record<keyof typeof en, string>
-type SubtitlePanel = 'subtitles' | 'audio' | 'danmaku'
+type SubtitlePanel = 'subtitles' | 'online' | 'audio' | 'danmaku'
 
 const EMBY_PROGRESS_REPORT_INTERVAL_MS = 10_000
 
@@ -1773,6 +1806,19 @@ function RangeControl({
   )
 }
 
+function assrtRequestId(prefix: string): string {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
+function assrtCandidateDetail(item: AssrtSubtitleCandidate): string {
+  return [
+    item.language,
+    item.format,
+    item.releaseSite,
+    item.score > 0 ? `★ ${item.score}` : ''
+  ].filter(Boolean).join(' · ')
+}
+
 function SubtitlePopover({
   state,
   t,
@@ -1785,6 +1831,17 @@ function SubtitlePopover({
   anchor: RectSnapshot
 }): JSX.Element {
   const [activePanel, setActivePanel] = useState<SubtitlePanel>('subtitles')
+  const [assrtQuery, setAssrtQuery] = useState(state.mediaName)
+  const [assrtItems, setAssrtItems] = useState<AssrtSubtitleCandidate[]>([])
+  const [assrtSearching, setAssrtSearching] = useState(false)
+  const [assrtDownloadingId, setAssrtDownloadingId] = useState<number>()
+  const [assrtTokenDraft, setAssrtTokenDraft] = useState('')
+  const [assrtEditingToken, setAssrtEditingToken] = useState(false)
+  const [assrtError, setAssrtError] = useState('')
+  const [assrtLoadedFile, setAssrtLoadedFile] = useState('')
+  const [assrtTokenSaved, setAssrtTokenSaved] = useState(false)
+  const assrtSearchRequestRef = useRef('')
+  const assrtDownloadRequestRef = useRef('')
   const selectedSubtitle = state.subtitleTracks.find((track) => track.index === state.subtitleSelectedTrack)
   const selectedSubtitleLabel = selectedSubtitle ? displayTrackLabel(selectedSubtitle.label, t) : t.off
   const selectedAudio = state.audioTracks.find((track) => track.index === state.audioSelectedTrack)
@@ -1804,9 +1861,90 @@ function SubtitlePopover({
   } as CSSProperties
   const tabs = [
     { key: 'subtitles' as SubtitlePanel, label: t.subtitles, value: selectedSubtitleLabel, icon: Captions },
+    { key: 'online' as SubtitlePanel, label: t.onlineSubtitles, value: 'ASSRT', icon: Search },
     { key: 'audio' as SubtitlePanel, label: t.audio, value: selectedAudioLabel, icon: Volume2 },
     { key: 'danmaku' as SubtitlePanel, label: t.danmaku, value: danmakuLabel, icon: ScrollText }
   ]
+
+  useEffect(() => {
+    setAssrtQuery(state.mediaName)
+    setAssrtItems([])
+    setAssrtError('')
+    setAssrtLoadedFile('')
+    setAssrtTokenSaved(false)
+  }, [state.mediaPath, state.mediaName])
+
+  useEffect(() => {
+    if (state.assrtConfigured) setAssrtEditingToken(false)
+  }, [state.assrtConfigured])
+
+  useEffect(() => subscribeNativeMessages((message) => {
+    if (message.type === 'assrtSubtitleSearchCompleted' && message.requestId === assrtSearchRequestRef.current) {
+      setAssrtSearching(false)
+      setAssrtItems(message.items)
+      setAssrtError('')
+    } else if (message.type === 'assrtSubtitleSearchFailed' && message.requestId === assrtSearchRequestRef.current) {
+      setAssrtSearching(false)
+      setAssrtItems([])
+      setAssrtError(message.message)
+    } else if (message.type === 'assrtSubtitleDownloadCompleted' && message.requestId === assrtDownloadRequestRef.current) {
+      setAssrtDownloadingId(undefined)
+      setAssrtLoadedFile(message.fileName)
+      setAssrtTokenSaved(false)
+      setAssrtError('')
+    } else if (message.type === 'assrtSubtitleDownloadFailed' && message.requestId === assrtDownloadRequestRef.current) {
+      setAssrtDownloadingId(undefined)
+      setAssrtError(message.message)
+    } else if (message.type === 'assrtTokenSaveFailed') {
+      setAssrtEditingToken(true)
+      setAssrtTokenSaved(false)
+      setAssrtError(message.message)
+    }
+  }), [])
+
+  const searchAssrt = (): void => {
+    const query = assrtQuery.trim()
+    if (!state.assrtConfigured || query.length < 3 || assrtSearching) return
+    const requestId = assrtRequestId('assrt-search')
+    assrtSearchRequestRef.current = requestId
+    setAssrtSearching(true)
+    setAssrtItems([])
+    setAssrtError('')
+    setAssrtLoadedFile('')
+    setAssrtTokenSaved(false)
+    postNativeCommand({ type: 'command', command: 'searchAssrtSubtitles', requestId, query })
+  }
+
+  const downloadAssrt = (item: AssrtSubtitleCandidate): void => {
+    if (assrtDownloadingId !== undefined) return
+    const requestId = assrtRequestId('assrt-download')
+    assrtDownloadRequestRef.current = requestId
+    setAssrtDownloadingId(item.id)
+    setAssrtError('')
+    setAssrtLoadedFile('')
+    setAssrtTokenSaved(false)
+    postNativeCommand({ type: 'command', command: 'downloadAssrtSubtitle', requestId, subtitleId: item.id })
+  }
+
+  const saveAssrtToken = (): void => {
+    const token = assrtTokenDraft.trim()
+    if (!token) return
+    postNativeCommand({ type: 'command', command: 'setAssrtToken', token })
+    setAssrtTokenDraft('')
+    setAssrtEditingToken(false)
+    setAssrtError('')
+    setAssrtLoadedFile('')
+    setAssrtTokenSaved(true)
+  }
+
+  const clearAssrtToken = (): void => {
+    postNativeCommand({ type: 'command', command: 'setAssrtToken', token: '' })
+    setAssrtTokenDraft('')
+    setAssrtEditingToken(true)
+    setAssrtItems([])
+    setAssrtLoadedFile('')
+    setAssrtTokenSaved(false)
+  }
 
   return (
     <div
@@ -1906,6 +2044,90 @@ function SubtitlePopover({
                   />
                 </RangeControl>
               </section>
+            </div>
+          )}
+
+          {activePanel === 'online' && (
+            <div className="subtitle-page assrt-page">
+              {!state.assrtConfigured || assrtEditingToken ? (
+                <section className="subtitle-section assrt-token-section">
+                  <div className="control-title">{t.assrtToken}</div>
+                  <p>{t.assrtTokenHint}</p>
+                  <input
+                    className="assrt-text-input"
+                    type="password"
+                    value={assrtTokenDraft}
+                    autoComplete="off"
+                    spellCheck={false}
+                    placeholder={t.assrtToken}
+                    onChange={(event) => setAssrtTokenDraft(event.currentTarget.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') saveAssrtToken()
+                    }}
+                  />
+                  <div className="assrt-inline-actions">
+                    <button className="line-button text-button is-active" type="button" disabled={!assrtTokenDraft.trim()} onClick={saveAssrtToken}>
+                      {t.saveToken}
+                    </button>
+                    {state.assrtConfigured && (
+                      <button className="line-button text-button" type="button" onClick={() => setAssrtEditingToken(false)}>
+                        {t.confirm}
+                      </button>
+                    )}
+                  </div>
+                </section>
+              ) : (
+                <section className="subtitle-section">
+                  <div className="assrt-configured-row">
+                    <span>ASSRT</span>
+                    <div>
+                      <button type="button" onClick={() => setAssrtEditingToken(true)}>{t.changeToken}</button>
+                      <button type="button" onClick={clearAssrtToken}>{t.clearToken}</button>
+                    </div>
+                  </div>
+                  <form className="assrt-search-form" onSubmit={(event) => { event.preventDefault(); searchAssrt() }}>
+                    <input
+                      className="assrt-text-input"
+                      type="search"
+                      value={assrtQuery}
+                      spellCheck={false}
+                      placeholder={t.subtitleSearchQuery}
+                      onChange={(event) => setAssrtQuery(event.currentTarget.value)}
+                    />
+                    <button className="line-button text-button is-active" type="submit" disabled={!state.hasMedia || assrtQuery.trim().length < 3 || assrtSearching}>
+                      <Search size={14} />
+                      <span>{assrtSearching ? t.searchingSubtitles : t.searchSubtitles}</span>
+                    </button>
+                  </form>
+                  <small className="assrt-hint">{t.subtitleSearchHint}</small>
+                </section>
+              )}
+
+              {assrtError && <div className="assrt-notice is-error" role="alert">{assrtError}</div>}
+              {(assrtTokenSaved || assrtLoadedFile) && <div className="assrt-notice is-success">{assrtTokenSaved ? t.assrtTokenSaved : `${t.subtitleLoaded}: ${assrtLoadedFile}`}</div>}
+              {state.assrtConfigured && !assrtEditingToken && !assrtSearching && assrtSearchRequestRef.current && !assrtItems.length && !assrtError && (
+                <div className="assrt-empty">{t.subtitleNoResults}</div>
+              )}
+              {assrtSearching && <div className="assrt-empty">{t.searchingSubtitles}</div>}
+              {assrtItems.length > 0 && (
+                <section className="assrt-results" aria-label={t.onlineSubtitles}>
+                  {assrtItems.map((item) => (
+                    <button
+                      className="assrt-result"
+                      type="button"
+                      key={item.id}
+                      disabled={assrtDownloadingId !== undefined}
+                      title={t.subtitleDownload}
+                      onClick={() => downloadAssrt(item)}
+                    >
+                      <span>{item.name}</span>
+                      {item.videoName && <small>{item.videoName}</small>}
+                      <em>{assrtCandidateDetail(item)}</em>
+                      <strong><Download size={13} />{assrtDownloadingId === item.id ? t.subtitleDownloading : t.subtitleDownload}</strong>
+                    </button>
+                  ))}
+                </section>
+              )}
             </div>
           )}
 

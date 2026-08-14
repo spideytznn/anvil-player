@@ -1,4 +1,5 @@
 #include "AnvilPlayer/App/app_arguments.h"
+#include "AnvilPlayer/App/assrt_subtitle_service.h"
 #include "AnvilPlayer/App/library_commands.h"
 #include "AnvilPlayer/App/main_window.h"
 #include "AnvilPlayer/App/rect_util.h"
@@ -64,6 +65,63 @@ constexpr unsigned int kMaxRendererDeviceRecoveryAttempts = 3;
 constexpr auto kRendererDeviceRecoveryWindow = std::chrono::seconds{30};
 constexpr auto kRecentMediaSaveCoalesceDelay = std::chrono::milliseconds{150};
 constexpr UINT kRecentMediaLoadCompleteMessage = WM_APP + 14;
+
+struct AssrtAsyncCompletion {
+    uint64_t windowCookie = 0;
+    std::wstring requestId;
+    std::wstring json;
+    std::filesystem::path subtitlePath;
+    std::filesystem::path mediaPath;
+};
+
+std::wstring AssrtFailureJson(
+    const wchar_t* type,
+    const std::wstring& requestId,
+    const std::wstring& message) {
+    return L"{\"type\":\"" + std::wstring(type) +
+           L"\",\"requestId\":\"" + JsonEscape(requestId) +
+           L"\",\"message\":\"" + JsonEscape(message) + L"\"}";
+}
+
+std::wstring AssrtSearchResultJson(
+    const std::wstring& requestId,
+    const AssrtSubtitleSearchResult& result) {
+    if (!result.error.empty()) {
+        return AssrtFailureJson(L"assrtSubtitleSearchFailed", requestId, result.error);
+    }
+    std::wostringstream json;
+    json << L"{\"type\":\"assrtSubtitleSearchCompleted\",\"requestId\":\""
+         << JsonEscape(requestId) << L"\",\"items\":[";
+    for (std::size_t index = 0; index < result.items.size(); ++index) {
+        const auto& item = result.items[index];
+        if (index > 0) {
+            json << L",";
+        }
+        json << L"{\"id\":" << item.id
+             << L",\"name\":\"" << JsonEscape(item.name)
+             << L"\",\"videoName\":\"" << JsonEscape(item.videoName)
+             << L"\",\"language\":\"" << JsonEscape(item.language)
+             << L"\",\"format\":\"" << JsonEscape(item.format)
+             << L"\",\"releaseSite\":\"" << JsonEscape(item.releaseSite)
+             << L"\",\"uploadTime\":\"" << JsonEscape(item.uploadTime)
+             << L"\",\"score\":" << std::fixed << std::setprecision(1) << item.score
+             << L"}";
+    }
+    json << L"]}";
+    return json.str();
+}
+
+void PostAssrtCompletion(HWND target, std::unique_ptr<AssrtAsyncCompletion> completion) {
+    if (!target || !completion ||
+        !PostMessageW(
+            target,
+            kAssrtSubtitleResultMessage,
+            0,
+            reinterpret_cast<LPARAM>(completion.get()))) {
+        return;
+    }
+    completion.release();
+}
 
 bool IsInspectorNetworkPath(const std::filesystem::path& path) {
     if (IsNetworkMediaPath(path)) {
@@ -540,6 +598,7 @@ MainWindow::MainWindow(std::shared_ptr<anvil::playback::InMemoryLogSink> logSink
     }
     settings.audio.passthroughPreferred = LoadAudioPassthroughSetting().value_or(false);
     controller_.ApplySettings(settings);
+    assrtConfigured_ = !LoadAssrtToken().empty();
 }
 
 MainWindow::~MainWindow() {
@@ -1018,6 +1077,7 @@ std::wstring MainWindow::BuildWebUiStateJson() const {
     json << L"\"subtitleFontScale\":" << std::fixed << std::setprecision(2) << settings.subtitles.fontScale << L",";
     json << L"\"subtitleOffsetX\":" << settings.subtitles.offsetXPx << L",";
     json << L"\"subtitleOffsetY\":" << settings.subtitles.offsetYPx << L",";
+    json << L"\"assrtConfigured\":" << (assrtConfigured_ ? L"true" : L"false") << L",";
     json << L"\"danmakuEnabled\":" << (settings.danmaku.enabled ? L"true" : L"false") << L",";
     json << L"\"danmakuMode\":" << settings.danmaku.mode << L",";
     json << L"\"danmakuOpacityPercent\":" << settings.danmaku.opacityPercent << L",";
@@ -1128,6 +1188,26 @@ void MainWindow::HandleWebUiMessage(const std::wstring_view message) {
         // not echo a state snapshot: Web UI state handlers may log diagnostics,
         // and reflecting those logs back as state creates a feedback loop.
         return;
+    } else if (MessageContains(message, L"\"command\":\"setAssrtToken\"")) {
+        const std::wstring token = ReadJsonString(message, L"token").value_or(L"");
+        if (SaveAssrtToken(token)) {
+            assrtConfigured_ = !token.empty();
+            LogApp(LogLevel::Info,
+                   std::wstring(L"ASSRT token ") + (assrtConfigured_ ? L"configured" : L"cleared"));
+        } else if (webUiActive_ && webUiHost_ && webUiHost_->Ready()) {
+            webUiHost_->PostJson(AssrtFailureJson(
+                L"assrtTokenSaveFailed",
+                L"",
+                L"无法安全保存 ASSRT Token"));
+        }
+    } else if (MessageContains(message, L"\"command\":\"searchAssrtSubtitles\"")) {
+        const std::wstring requestId = ReadJsonString(message, L"requestId").value_or(L"");
+        const std::wstring query = ReadJsonString(message, L"query").value_or(L"");
+        StartAssrtSubtitleSearch(requestId, query);
+    } else if (MessageContains(message, L"\"command\":\"downloadAssrtSubtitle\"")) {
+        const std::wstring requestId = ReadJsonString(message, L"requestId").value_or(L"");
+        const int subtitleId = static_cast<int>(std::round(ReadJsonNumber(message, L"subtitleId").value_or(0.0)));
+        StartAssrtSubtitleDownload(requestId, subtitleId);
     } else if (MessageContains(message, L"\"command\":\"openPath\"")) {
         if (const auto path = ReadJsonString(message, L"path")) {
             pendingStartPositionRatio_ = ReadJsonNumber(message, L"startPositionRatio").value_or(0.0);
@@ -1878,6 +1958,29 @@ LRESULT MainWindow::HandleMessage(const UINT message, const WPARAM wParam, const
         }
         TryFinishClose();
         return 0;
+    case kAssrtSubtitleResultMessage: {
+        std::unique_ptr<AssrtAsyncCompletion> completion(
+            reinterpret_cast<AssrtAsyncCompletion*>(lParam));
+        if (!completion || completion->windowCookie != windowLifetimeCookie_) {
+            return 0;
+        }
+        if (!completion->subtitlePath.empty()) {
+            const auto snapshot = controller_.Snapshot();
+            if (!snapshot.media.has_value() || snapshot.media->path != completion->mediaPath) {
+                completion->json = AssrtFailureJson(
+                    L"assrtSubtitleDownloadFailed",
+                    completion->requestId,
+                    L"播放媒体已变化，请重新搜索字幕");
+            } else {
+                ApplyExternalSubtitlePath(completion->subtitlePath);
+            }
+        }
+        if (webUiActive_ && webUiHost_ && webUiHost_->Ready()) {
+            webUiHost_->PostJson(completion->json);
+        }
+        PostWebUiState(true);
+        return 0;
+    }
     case kRecentMediaLoadCompleteMessage:
         if (recentMediaWriter_) {
             std::vector<std::filesystem::path> loadedItems;
@@ -4062,8 +4165,17 @@ void MainWindow::OpenSubtitleFileDialog() {
         return;
     }
 
+    ApplyExternalSubtitlePath(filePath.data());
+}
+
+void MainWindow::ApplyExternalSubtitlePath(const std::filesystem::path& path) {
+    const auto snapshot = controller_.Snapshot();
+    if (!snapshot.media.has_value() || path.empty()) {
+        return;
+    }
+
     auto settings = controller_.Settings();
-    settings.subtitles.externalSubtitlePath = filePath.data();
+    settings.subtitles.externalSubtitlePath = path;
     settings.subtitles.selectedTrackIndex = anvil::playback::kSubtitleTrackAuto;
     controller_.ApplySettings(settings);
     LogApp(LogLevel::Info, L"subtitle external=" + settings.subtitles.externalSubtitlePath.filename().wstring());
@@ -4082,6 +4194,110 @@ void MainWindow::OpenSubtitleFileDialog() {
     InvalidateTransportArea();
     InvalidateFullscreenOverlay();
     InvalidateRect(hwnd_, nullptr, FALSE);
+}
+
+void MainWindow::StartAssrtSubtitleSearch(
+    const std::wstring& requestId,
+    const std::wstring& query) {
+    if (requestId.empty()) {
+        return;
+    }
+    std::wstring token = LoadAssrtToken();
+    if (token.empty()) {
+        if (webUiActive_ && webUiHost_ && webUiHost_->Ready()) {
+            webUiHost_->PostJson(AssrtFailureJson(
+                L"assrtSubtitleSearchFailed",
+                requestId,
+                L"请先配置 ASSRT Token"));
+        }
+        return;
+    }
+    const HWND target = hwnd_;
+    const uint64_t windowCookie = windowLifetimeCookie_;
+    LogApp(LogLevel::Info, L"ASSRT subtitle search query=" + query);
+    std::thread worker([
+        target,
+        windowCookie,
+        requestId,
+        query,
+        token = std::move(token)]() mutable {
+        const AssrtSubtitleSearchResult result = SearchAssrtSubtitles(token, query);
+        if (!token.empty()) {
+            SecureZeroMemory(token.data(), token.size() * sizeof(wchar_t));
+        }
+        auto completion = std::make_unique<AssrtAsyncCompletion>();
+        completion->windowCookie = windowCookie;
+        completion->requestId = requestId;
+        completion->json = AssrtSearchResultJson(requestId, result);
+        PostAssrtCompletion(target, std::move(completion));
+    });
+    worker.detach();
+}
+
+void MainWindow::StartAssrtSubtitleDownload(
+    const std::wstring& requestId,
+    const int subtitleId) {
+    if (requestId.empty()) {
+        return;
+    }
+    const auto snapshot = controller_.Snapshot();
+    if (!snapshot.media.has_value()) {
+        if (webUiActive_ && webUiHost_ && webUiHost_->Ready()) {
+            webUiHost_->PostJson(AssrtFailureJson(
+                L"assrtSubtitleDownloadFailed",
+                requestId,
+                L"当前没有正在播放的媒体"));
+        }
+        return;
+    }
+    std::wstring token = LoadAssrtToken();
+    if (token.empty()) {
+        if (webUiActive_ && webUiHost_ && webUiHost_->Ready()) {
+            webUiHost_->PostJson(AssrtFailureJson(
+                L"assrtSubtitleDownloadFailed",
+                requestId,
+                L"请先配置 ASSRT Token"));
+        }
+        return;
+    }
+    const HWND target = hwnd_;
+    const uint64_t windowCookie = windowLifetimeCookie_;
+    const std::filesystem::path mediaPath = snapshot.media->path;
+    const std::wstring mediaName = snapshot.media->displayName.empty()
+                                       ? mediaPath.filename().wstring()
+                                       : snapshot.media->displayName;
+    LogApp(LogLevel::Info, L"ASSRT subtitle download id=" + std::to_wstring(subtitleId));
+    std::thread worker([
+        target,
+        windowCookie,
+        requestId,
+        subtitleId,
+        mediaPath,
+        mediaName,
+        token = std::move(token)]() mutable {
+        const AssrtSubtitleDownloadResult result =
+            DownloadAssrtSubtitle(token, subtitleId, mediaName);
+        if (!token.empty()) {
+            SecureZeroMemory(token.data(), token.size() * sizeof(wchar_t));
+        }
+        auto completion = std::make_unique<AssrtAsyncCompletion>();
+        completion->windowCookie = windowCookie;
+        completion->requestId = requestId;
+        completion->mediaPath = mediaPath;
+        if (result.error.empty() && !result.path.empty()) {
+            completion->subtitlePath = result.path;
+            completion->json = L"{\"type\":\"assrtSubtitleDownloadCompleted\",\"requestId\":\"" +
+                               JsonEscape(requestId) + L"\",\"fileName\":\"" +
+                               JsonEscape(result.fileName) + L"\"}";
+        } else {
+            completion->json = AssrtFailureJson(
+                L"assrtSubtitleDownloadFailed",
+                requestId,
+                result.error.empty() ? L"字幕下载失败" : result.error);
+        }
+        PostAssrtCompletion(target, std::move(completion));
+    });
+    worker.detach();
 }
 
 void MainWindow::OpenDanmakuFileDialog() {
