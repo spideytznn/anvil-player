@@ -821,14 +821,16 @@ export async function searchEmbyLibrary(
 
   const sourceId = sourceIdForSession(session)
   const sort = sortParamsForSearch(options.sortKey, options.sortOrder)
-  const response = await fetchJson<EmbyItemsResponse>(
+  const limit = options.limit ?? 80
+  const itemTypes = itemTypesForSearch(options.view)
+  const responsePromise = fetchJson<EmbyItemsResponse>(
     apiUrl(session.apiBaseUrl, `/Users/${session.userId}/Items`, {
       Recursive: true,
       ParentId: options.libraryViewId,
       SearchTerm: searchTerm,
-      IncludeItemTypes: itemTypesForSearch(options.view),
+      IncludeItemTypes: itemTypes,
       Fields: EMBY_ITEM_FIELDS,
-      Limit: options.limit ?? 80,
+      Limit: limit,
       SortBy: sort.SortBy,
       SortOrder: sort.SortOrder,
       ...filterParamsForSearch(options.filterKey)
@@ -837,9 +839,31 @@ export async function searchEmbyLibrary(
     '鎼滅储 Emby'
   )
 
-  return orderSearchResults(response.Items ?? []).map((item) =>
-    mapItem(session, sourceId, item, options.libraryViewId)
+  const seriesResponsePromise = itemTypes.split(',').includes('Series')
+    ? fetchJson<EmbyItemsResponse>(
+        apiUrl(session.apiBaseUrl, `/Users/${session.userId}/Items`, {
+          Recursive: true,
+          ParentId: options.libraryViewId,
+          SearchTerm: searchTerm,
+          IncludeItemTypes: 'Series',
+          Fields: EMBY_ITEM_FIELDS,
+          Limit: limit,
+          SortBy: sort.SortBy,
+          SortOrder: sort.SortOrder,
+          ...filterParamsForSearch(options.filterKey)
+        }),
+        { method: 'GET', headers: authHeadersForSession(session), signal: options.signal },
+        'Search Emby series'
+      )
+    : Promise.resolve(undefined)
+  const [response, seriesResponse] = await Promise.all([responsePromise, seriesResponsePromise])
+  const uniqueItems = [...(seriesResponse?.Items ?? []), ...(response.Items ?? [])].filter((item, index, rows) =>
+    rows.findIndex((candidate) => candidate.Id === item.Id) === index
   )
+
+  return orderSearchResults(uniqueItems)
+    .slice(0, limit)
+    .map((item) => mapItem(session, sourceId, item, options.libraryViewId))
 }
 
 export async function listEmbyLibraryView(
